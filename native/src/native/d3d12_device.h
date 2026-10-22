@@ -24,11 +24,14 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <thread>
 
 namespace pgr4::native {
 
 using Microsoft::WRL::ComPtr;
+
+class GpuTimer;
 
 class D3D12Device {
  public:
@@ -46,6 +49,10 @@ class D3D12Device {
   // Present with sync interval 1 (vsync) instead of 0 (tearing when supported).
   void set_vsync(bool vsync) { vsync_ = vsync; }
 
+  // Child mode: hides the window (and skips presenting) while false, so the game window's own
+  // content, such as the SDK's XAM dialogs, shows instead. No effect on the debug window.
+  void SetShown(bool shown);
+
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
@@ -59,6 +66,9 @@ class D3D12Device {
   // Fence value EndFrame signals for the frame being recorded; last value the GPU reached.
   uint64_t frame_fence() const { return next_fence_; }
   uint64_t completed_fence() const { return fence_->GetCompletedValue(); }
+  // The frame being recorded's slot in [0, kFramesInFlight): its previous frame has completed,
+  // so per-frame upload memory indexed by it is free to write.
+  uint32_t frame_slot() const { return slot_; }
   void WaitFence(uint64_t value);
 
   // Closes and submits the frame's command list (the caller recorded into the back buffer;
@@ -67,11 +77,24 @@ class D3D12Device {
   // next frame's list.
   // Returns false once the device or swapchain failed (logged once); the caller stops.
   bool EndFrame();
+  // Where the last EndFrame spent its time.
+  struct EndFrameTimes {
+    uint64_t submit_ns = 0;   // Close + ExecuteCommandLists
+    uint64_t present_ns = 0;  // Present
+    uint64_t fence_ns = 0;    // OpenList: waiting for the GPU to finish the slot's last frame
+  };
+  const EndFrameTimes& end_frame_times() const { return end_frame_times_; }
 
   // Shows a frame counter in the window title (posted to the window thread).
   void SetTitleFrame(uint64_t frame) { title_frame_.store(frame, std::memory_order_relaxed); }
 
   void WaitIdle();
+
+  // Timestamps per pass in every frame from now on (gpu_timer.h), starting with the open list.
+  // Logs and returns false on failure.
+  bool EnableGpuTimer();
+  // nullptr unless EnableGpuTimer succeeded.
+  GpuTimer* gpu_timer() const { return gpu_timer_.get(); }
 
  private:
   bool CreateWindowThread(const wchar_t* title);
@@ -91,6 +114,7 @@ class D3D12Device {
   uint64_t slot_fence_[kFramesInFlight] = {};
   uint32_t slot_ = 0;
   ComPtr<ID3D12GraphicsCommandList> list_;
+  EndFrameTimes end_frame_times_;
 
   ComPtr<IDXGISwapChain3> swapchain_;
   ComPtr<ID3D12Resource> back_buffers_[kBackBuffers];
@@ -99,7 +123,10 @@ class D3D12Device {
   uint32_t back_index_ = 0;
   bool tearing_ = false;
   bool vsync_ = false;
+  bool shown_ = true;
   HWND parent_ = nullptr;
+
+  std::unique_ptr<GpuTimer> gpu_timer_;
 
   std::thread window_thread_;
   std::atomic<HWND> hwnd_{nullptr};

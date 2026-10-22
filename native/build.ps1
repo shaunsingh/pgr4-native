@@ -11,7 +11,8 @@
 # Stages, in order (default: all):
 #   prep     robocopy $Root\MTR-PGR4 (source and patched SDK source; no build dirs, no
 #            generated code) to $Dest\MTR-PGR4, apply rexglue-drawcount.patch and then
-#            rexglue-native-primary.patch (--gpu_skip_draws) to the SDK copy,
+#            rexglue-native-primary.patch (--gpu_skip_draws) and rexglue-runtime-perf.patch
+#            (blocking timer queue, cheaper write-watch faults) to the SDK copy,
 #            copy src\pgr4_d3d_trace.cpp and src\d3d_surface.inc into the game's src\ and add
 #            the .cpp to its CMakeLists.txt; mirror src\native\ to the game's src\native\ and
 #            append a CMake block that compiles src/native/*.cpp and links d3d12, dxgi, dxguid.
@@ -40,6 +41,8 @@ $Sdk = Join-Path $Dest 'sdk-install'
 $Patch = Join-Path $PSScriptRoot '..\instrument\rexglue-drawcount.patch'
 # Applied after rexglue-drawcount.patch: --gpu_skip_draws for --pgr4_native_primary.
 $PrimaryPatch = Join-Path $PSScriptRoot 'rexglue-native-primary.patch'
+# Runtime fixes: a blocking timer queue and write-watch faults without VirtualQuery.
+$RuntimePatch = Join-Path $PSScriptRoot 'rexglue-runtime-perf.patch'
 $Sources = @('pgr4_d3d_trace.cpp', 'd3d_surface.inc') | ForEach-Object { Join-Path $PSScriptRoot "src\$_" }
 $NativeSrc = Join-Path $PSScriptRoot 'src\native'
 # Appended to the game's CMakeLists.txt by prep, replaced whole when it changes. The two SDK
@@ -108,12 +111,18 @@ if (Want 'prep') {
         if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
         $global:LASTEXITCODE = 0
 
-        foreach ($p in @($Patch, $PrimaryPatch)) {
+        foreach ($p in @($Patch, $PrimaryPatch, $RuntimePatch)) {
             $name = Split-Path $p -Leaf
             & git -C $SdkSrc apply --check --reverse $p 2>$null
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "$name already applied"
             } else {
+                # Files a patch creates are not in the source, so robocopy leaves an earlier prep's.
+                git -C $SdkSrc apply --summary $p | ForEach-Object {
+                    if ($_ -match '^ create mode [0-7]+ (.+)$') {
+                        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $SdkSrc $Matches[1])
+                    }
+                }
                 git -C $SdkSrc apply --check $p
                 if ($LASTEXITCODE -ne 0) { throw "$name does not apply to the MTR-patched SDK copy" }
                 git -C $SdkSrc apply $p

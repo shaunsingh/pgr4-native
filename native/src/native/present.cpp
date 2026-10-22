@@ -7,7 +7,10 @@
 #include "texture_layout.h"
 
 #include <rex/cvar.h>
+#include <rex/graphics/command_processor.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
+#include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
@@ -43,20 +46,72 @@ inline uint32_t Load32(const uint8_t* base, uint32_t a) {
   return __builtin_bswap32(v);
 }
 
-// uv_scale: the image's share of the host texture (the texture can be larger than the image).
+// The display controller's gamma ramp, as the Xenos command processor holds it from the guest's
+// DC_LUT register writes: 128 PWL entries per channel (DC_LUT_PWL_DATA: base 0:15, delta
+// 16:31) for 2_10_10_10 front buffers, 256 table entries (DC_LUT_30_COLOR: blue 0:9, green
+// 10:19, red 20:29) for 8_8_8_8 ones, as D3D's presentation parameters set them up. The ramp
+// math follows Xenia's apply_gamma_pwl / apply_gamma_table (BSD-3-Clause, see
+// THIRD_PARTY_NOTICES.md). The ramp applies to each texel before filtering, so a scaled image
+// filters display values like the console's scaler does.
+enum RampMode : uint32_t { kRampNone = 0, kRampPwl = 1, kRampTable = 2 };
+constexpr uint32_t kPwlWords = 128 * 3, kTableWords = 256;
+constexpr uint32_t kRampSlotBytes = kPwlWords * 4;  // a multiple of the 256-byte CBV alignment
+static_assert(kRampSlotBytes % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT == 0);
+static_assert(sizeof(rex::graphics::reg::DC_LUT_PWL_DATA) == 4 &&
+              sizeof(rex::graphics::reg::DC_LUT_30_COLOR) == 4);
+
+// image_size: the image in texels (the texture can be larger than the image); point: the
+// viewport is the image's size, every pixel is one texel.
 const char kBlitHlsl[] = R"(
 Texture2D<float4> src : register(t0);
-SamplerState smp : register(s0);
-cbuffer c : register(b0) { float2 uv_scale; };
-void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD0) {
-  uv = float2((id << 1) & 2, id & 2);
+cbuffer blit : register(b0) { float2 image_size; uint ramp_mode; uint point_sampled; };
+cbuffer gamma : register(b1) { uint4 ramp[96]; };
+void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 texel : TEXCOORD0) {
+  float2 uv = float2((id << 1) & 2, id & 2);
   pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-  uv *= uv_scale;
+  texel = uv * image_size;
 }
-float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-  return float4(src.SampleLevel(smp, uv, 0.0).rgb, 1.0);
+uint RampWord(uint i) { return ramp[i >> 2][i & 3]; }
+float3 Gamma(float3 c) {
+  if (ramp_mode == 1) {
+    uint3 x = uint3(c * 1023.0 + 0.5);
+    uint3 w = uint3(RampWord((x.r >> 3) * 3), RampWord((x.g >> 3) * 3 + 1),
+                    RampWord((x.b >> 3) * 3 + 2));
+    return min((float3(w & 0xFFFF) + float3((x & 7) * (w >> 16)) * 0.125) * (1.0 / 65472.0), 1.0);
+  }
+  if (ramp_mode == 2) {
+    uint3 x = uint3(c * 255.0 + 0.5);
+    return float3((RampWord(x.r) >> 20) & 1023, (RampWord(x.g) >> 10) & 1023,
+                  RampWord(x.b) & 1023) * (1.0 / 1023.0);
+  }
+  return c;
+}
+float3 Texel(int2 p) { return Gamma(src.Load(int3(p, 0)).rgb); }
+float4 ps(float4 pos : SV_Position, float2 texel : TEXCOORD0) : SV_Target {
+  int2 hi = int2(image_size) - 1;
+  if (point_sampled) return float4(Texel(min(int2(texel), hi)), 1.0);
+  float2 t = texel - 0.5;
+  float2 f = t - floor(t);
+  int2 a = clamp(int2(floor(t)), 0, hi), b = min(a + 1, hi);
+  float3 top = lerp(Texel(a), Texel(int2(b.x, a.y)), f.x);
+  float3 bottom = lerp(Texel(int2(a.x, b.y)), Texel(b), f.x);
+  return float4(lerp(top, bottom, f.y), 1.0);
 }
 )";
+
+const rex::graphics::CommandProcessor* GuestCommandProcessor() {
+  rex::Runtime* runtime = rex::Runtime::instance();
+  // The Xenos plugin's graphics system is the only IGraphicsSystem this title runs with.
+  auto* graphics = runtime ? static_cast<rex::graphics::GraphicsSystem*>(runtime->graphics_system())
+                           : nullptr;
+  return graphics ? graphics->command_processor() : nullptr;
+}
+
+// Output of a PWL ramp channel for a 10-bit input (the shader's math), for the log.
+double PwlOut(const uint32_t* words, uint32_t channel, uint32_t x) {
+  const uint32_t w = words[(x >> 3) * 3 + channel];
+  return std::min(1.0, ((w & 0xFFFFu) + (x & 7u) * (w >> 16) / 8.0) / 65472.0);
+}
 
 using PFN_D3DCompile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*,
                                         ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**,
@@ -183,6 +238,13 @@ struct Presenter::Impl {
   ComPtr<ID3D12DescriptorHeap> heap;
   uint32_t heap_stride = 0, heap_next = 0;
   static constexpr uint32_t kHeapSize = 16;
+  // One gamma ramp slot per frame in flight (D3D12Device::frame_slot), persistently mapped.
+  ComPtr<ID3D12Resource> ramp_buffer;
+  uint8_t* ramp_mapped = nullptr;
+  const rex::graphics::CommandProcessor* command_processor = nullptr;
+  uint32_t last_ramp[kPwlWords] = {};
+  RampMode last_ramp_mode = kRampNone;
+  uint32_t ramp_changes_logged = 0;
 
   struct Capture {
     bool armed = false;  // requested at the previous Swap: full readback held, capture this one
@@ -201,6 +263,8 @@ struct Presenter::Impl {
   explicit Impl(NativeRenderer& renderer) : r(renderer) {}
 
   bool Initialize();
+  // Copies the guest's current ramp of the mode into the frame's slot; false without one.
+  bool WriteRamp(RampMode mode, uint32_t slot);
   bool CaptureRequested(uint64_t frame);
   void FinishCapture(const uint8_t* base);
 };
@@ -223,20 +287,17 @@ bool Presenter::Impl::Initialize() {
     return false;
   }
   D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-  D3D12_ROOT_PARAMETER params[2] = {};
+  D3D12_ROOT_PARAMETER params[3] = {};
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   params[0].DescriptorTable = {1, &range};
   params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  params[1].Constants = {0, 0, 2};  // b0: uv_scale
-  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-  D3D12_STATIC_SAMPLER_DESC sampler = {};
-  // Linear: the image is scaled to fit the window (1:1 at the guest size samples texel centers).
-  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-  sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-  sampler.MaxLOD = D3D12_FLOAT32_MAX;
-  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  D3D12_ROOT_SIGNATURE_DESC rs = {2, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  params[1].Constants = {0, 0, 4};  // b0: image_size, ramp_mode, point_sampled
+  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  params[2].Descriptor = {1, 0};  // b1: the gamma ramp
+  params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC rs = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   ComPtr<ID3DBlob> blob;
   if (Failed(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
              "present root signature serialize") ||
@@ -262,8 +323,59 @@ bool Presenter::Impl::Initialize() {
                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "present heap")) return false;
   heap_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  {
+    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = uint64_t(kRampSlotBytes) * D3D12Device::kFramesInFlight;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* p = nullptr;
+    const D3D12_RANGE none = {0, 0};
+    if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&ramp_buffer)),
+               "present gamma ramp buffer") ||
+        Failed(ramp_buffer->Map(0, &none, &p), "present gamma ramp map"))
+      return false;
+    ramp_mapped = static_cast<uint8_t*>(p);
+  }
   std::error_code ec;
   std::filesystem::create_directories(REXCVAR_GET(pgr4_native_capture_dir), ec);
+  return true;
+}
+
+bool Presenter::Impl::WriteRamp(RampMode mode, uint32_t slot) {
+  if (!command_processor && !(command_processor = GuestCommandProcessor())) return false;
+  const uint32_t* words =
+      mode == kRampPwl
+          ? reinterpret_cast<const uint32_t*>(command_processor->gamma_ramp_pwl_rgb())
+          : reinterpret_cast<const uint32_t*>(command_processor->gamma_ramp_256_entry_table());
+  const uint32_t count = mode == kRampPwl ? kPwlWords : kTableWords;
+  // The command processor's thread writes the ramp as it executes the guest's register writes;
+  // a ramp read during an update shows for one frame, the next frame reads the finished one.
+  uint32_t ramp[kPwlWords];
+  for (uint32_t i = 0; i < count; ++i) ramp[i] = __atomic_load_n(words + i, __ATOMIC_RELAXED);
+  std::memcpy(ramp_mapped + size_t(slot) * kRampSlotBytes, ramp, count * 4);
+  if (mode != last_ramp_mode || std::memcmp(ramp, last_ramp, count * 4)) {
+    last_ramp_mode = mode;
+    std::memcpy(last_ramp, ramp, count * 4);
+    if (ramp_changes_logged < 8) {
+      ++ramp_changes_logged;
+      if (mode == kRampPwl)
+        REXLOG_INFO("PGR4 native present: PWL gamma ramp at frame {}: 0.25/0.5/0.75 -> R {:.3f} "
+                    "{:.3f} {:.3f}, G {:.3f} {:.3f} {:.3f}, B {:.3f} {:.3f} {:.3f}",
+                    r.frame_index(), PwlOut(ramp, 0, 256), PwlOut(ramp, 0, 512),
+                    PwlOut(ramp, 0, 767), PwlOut(ramp, 1, 256), PwlOut(ramp, 1, 512),
+                    PwlOut(ramp, 1, 767), PwlOut(ramp, 2, 256), PwlOut(ramp, 2, 512),
+                    PwlOut(ramp, 2, 767));
+      else
+        REXLOG_INFO("PGR4 native present: gamma table at frame {}: 64/128/192 -> R {} {} {} (of 1023)",
+                    r.frame_index(), (ramp[64] >> 20) & 1023, (ramp[128] >> 20) & 1023,
+                    (ramp[192] >> 20) & 1023);
+    }
+  }
   return true;
 }
 
@@ -437,12 +549,20 @@ void Presenter::OnSwap(const SwapCall& swap) {
     const D3D12_RESOURCE_DESC desc = image->texture->GetDesc();
     const float iw = float(std::min<uint64_t>(image->width ? image->width : desc.Width, desc.Width));
     const float ih = float(std::min<uint32_t>(image->height ? image->height : desc.Height, desc.Height));
-    const float uv_scale[2] = {iw / float(desc.Width), ih / float(desc.Height)};
-    list->SetGraphicsRoot32BitConstants(1, 2, uv_scale, 0);
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     const float ww = float(d.width()), wh = float(d.height());
     const float s = std::min(ww / iw, wh / ih);
     const float vw = std::round(iw * s), vh = std::round(ih * s);
+    const RampMode wanted = format == xenos::TextureFormat::k_2_10_10_10 ? kRampPwl : kRampTable;
+    const uint32_t ramp_slot = d.frame_slot();
+    struct {
+      float image_size[2];
+      uint32_t ramp_mode, point_sampled;
+    } constants = {{iw, ih}, m.WriteRamp(wanted, ramp_slot) ? wanted : kRampNone,
+                   vw == iw && vh == ih};
+    list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+    list->SetGraphicsRootConstantBufferView(
+        2, m.ramp_buffer->GetGPUVirtualAddress() + uint64_t(ramp_slot) * kRampSlotBytes);
+    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     D3D12_VIEWPORT vp = {std::floor((ww - vw) * 0.5f), std::floor((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
     D3D12_RECT sc = {0, 0, LONG(d.width()), LONG(d.height())};
     list->RSSetViewports(1, &vp);

@@ -2,10 +2,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <string>
 
 #include <xxhash.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_STRING(pgr4_native_shader_dump_dir, "", "PGR4 native",
+                      "Write every translation (DXBC) to <dir>/<ucode hash>_<modification>.<vs|ps>"
+                      ".dxbc as it is made (empty = off)");
 
 namespace pgr4::native {
 
@@ -36,6 +44,12 @@ DxbcShader* ShaderCache::Load(rex::graphics::xenos::ShaderType type, const uint3
   return shaders_.emplace(hash, std::move(shader)).first->second.get();
 }
 
+const DxbcShader* ShaderCache::Find(uint64_t hash) {
+  std::lock_guard<std::mutex> lock(load_mutex_);
+  auto it = shaders_.find(hash);
+  return it != shaders_.end() ? it->second.get() : nullptr;
+}
+
 DxbcShader::Translation* ShaderCache::Translate(DxbcShader& shader, uint64_t modification) {
   bool is_new = false;
   DxbcShader::Translation* translation = shader.GetOrCreateTranslation(modification, &is_new);
@@ -46,6 +60,21 @@ DxbcShader::Translation* ShaderCache::Translate(DxbcShader& shader, uint64_t mod
     stats_.translate_us += us;
     stats_.max_translate_us = std::max(stats_.max_translate_us, us);
     ++stats_.translations;
+    if (const std::string& dir = REXCVAR_GET(pgr4_native_shader_dump_dir);
+        !dir.empty() && translation->is_valid()) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "%016llX_%016llX.%s.dxbc",
+                    static_cast<unsigned long long>(shader.ucode_data_hash()),
+                    static_cast<unsigned long long>(modification),
+                    shader.type() == rex::graphics::xenos::ShaderType::kVertex ? "vs" : "ps");
+      std::error_code ec;
+      std::filesystem::create_directories(dir, ec);
+      if (std::FILE* out = _wfopen((std::filesystem::path(dir) / name).c_str(), L"wb")) {
+        const std::vector<uint8_t>& binary = translation->translated_binary();
+        std::fwrite(binary.data(), 1, binary.size(), out);
+        std::fclose(out);
+      }
+    }
     if (!translation->is_valid()) {
       ++stats_.failures;
       REXLOG_ERROR("pgr4 native: {} shader {:016X} modification {:016X} failed to translate",

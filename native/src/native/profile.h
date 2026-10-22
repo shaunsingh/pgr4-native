@@ -40,6 +40,9 @@ enum Stage : uint32_t {
   kTexMiss,     // bind_textures with no BindMemo hit (includes kTexGet and kTexSrv)
   kTexGet,      // TextureCache::Get calls on that path
   kTexSrv,      // SRV index lookups on that path
+  // Nested inside kCapVertices: Memory::EnablePhysicalMemoryAccessCallbacks (the SDK's global
+  // lock, then page protection on each of the three physical views).
+  kCapWatch,
   // Hook side, overlapping kTrack (not summed with the others): time inside the original guest
   // D3D functions at the outermost hooked call, i.e. the D3D library's own work (packet
   // building, state flushes) that a recompilation which replaces the D3D API would not run.
@@ -51,7 +54,7 @@ inline constexpr const char* kStageNames[kStageCount] = {
     "read_state", "shaders",  "setup",    "rt_bind",  "translate", "pipeline",
     "textures",   "sysconst", "pack",     "vertices", "cbv",       "record",
     "track",      "imm_vs",   "cap_shaders", "cap_vertices", "cap_record", "tex_miss",
-    "tex_get",    "tex_srv",  "guest_d3d"};
+    "tex_get",    "tex_srv",  "cap_watch", "guest_d3d"};
 
 // Per-frame event counts (CSV columns, reset every frame). Counted whether or not the profiler
 // is on (one increment each).

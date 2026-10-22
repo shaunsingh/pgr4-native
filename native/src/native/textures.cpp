@@ -2,6 +2,7 @@
 #include "textures.h"
 
 #include "profile.h"
+#include "renderer.h"  // NowNs
 
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -48,6 +49,8 @@ struct TextureCache::Texture {
   // A resolve may have changed an image at one of its subresource addresses (OnResolved), or
   // the texture was uploaded: the next Get runs CopyResolved.
   bool resolve_pending = true;
+  // The resolved image bound in place of `resource` (CopyResolved), or null.
+  ID3D12Resource* alias = nullptr;
   uint32_t uploads = 0;                // Upload calls so far (the slow-upload log)
 };
 
@@ -55,12 +58,6 @@ namespace {
 
 constexpr D3D12_RESOURCE_STATES kShaderRead =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-uint64_t NowNs() {
-  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count());
-}
 
 // Typeless family for CopyTextureRegion compatibility.
 DXGI_FORMAT Family(DXGI_FORMAT f) {
@@ -91,6 +88,8 @@ DXGI_FORMAT Family(DXGI_FORMAT f) {
       return DXGI_FORMAT_R8G8_TYPELESS;
     case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT:
       return DXGI_FORMAT_R32G32_TYPELESS;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+      return DXGI_FORMAT_R32G32B32A32_TYPELESS;
     default:
       return f;
   }
@@ -208,25 +207,56 @@ void TextureCache::ArmWatch(uint32_t physical, uint32_t length) {
 }
 
 std::pair<uint32_t, uint32_t> TextureCache::InvalidationThunk(void* context, uint32_t start,
-                                                              uint32_t length, bool) {
-  static_cast<TextureCache*>(context)->Invalidate(start, length);
-  // Only the pages reported here may be unwatched: textures on other pages were not marked.
-  return {start, length};
+                                                              uint32_t length, bool exact) {
+  return static_cast<TextureCache*>(context)->Invalidate(start, length, exact);
 }
 
-void TextureCache::Invalidate(uint32_t start, uint32_t length) {
-  uint32_t end = start + length;
+std::pair<uint32_t, uint32_t> TextureCache::Invalidate(uint32_t start, uint32_t length,
+                                                       bool exact) {
+  constexpr uint32_t kMemorySize = kWatchBucketCount << kWatchBucketShift;
+  if (start >= kMemorySize || !length) return {start, length};
+  const uint32_t end = start + std::min(length, kMemorySize - start);
+  uint32_t lo = start, hi = end;
   bool any = false;
   {
     std::lock_guard<std::mutex> lock(watch_mutex_);
-    for (const Watch& w : watches_) {
-      if (w.start < end && start < w.end) {
-        w.texture->dirty.store(true, std::memory_order_release);
-        any = true;
+    for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b) {
+      for (const Watch& w : watch_buckets_[b]) {
+        if (w.start < end && start < w.end) {
+          w.texture->dirty.store(true, std::memory_order_release);
+          any = true;
+        }
       }
+    }
+    if (!exact) {
+      // Out to the nearest clean texture on each side: the pages of stale textures need no
+      // watch (their next upload re-arms all of them), so a texture being streamed in faults
+      // once rather than once per 4 KB page. Any texture overlapping [start, end) is dirty now,
+      // and a watch lies in every bucket it touches, so the scan stops at the first bucket
+      // holding a clean one. A texture cleared meanwhile re-arms after the unwatch (both hold
+      // the global lock).
+      auto clean = [](const Watch& w) { return !w.texture->dirty.load(std::memory_order_acquire); };
+      const uint32_t window_lo = start & ~(kUnwatchWindow - 1);
+      const uint32_t window_hi = ((end - 1) | (kUnwatchWindow - 1)) + 1;
+      lo = window_lo;
+      for (uint32_t b = start >> kWatchBucketShift;; --b) {
+        for (const Watch& w : watch_buckets_[b])
+          if (w.end <= start && clean(w)) lo = std::max(lo, w.end);
+        if (lo != window_lo || b == window_lo >> kWatchBucketShift) break;
+      }
+      hi = window_hi;
+      for (uint32_t b = (end - 1) >> kWatchBucketShift;; ++b) {
+        for (const Watch& w : watch_buckets_[b])
+          if (w.start >= end && clean(w)) hi = std::min(hi, w.start);
+        if (hi != window_hi || b == (window_hi - 1) >> kWatchBucketShift) break;
+      }
+      // The page holding a clean texture's last byte stays watched.
+      lo = std::min(start, (lo + kPageMask) & ~kPageMask);
+      hi = std::max(end, hi & ~kPageMask);
     }
   }
   if (any) change_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  return {lo, hi - lo};
 }
 
 void TextureCache::OnResolved(uint32_t guest_physical) {
@@ -242,11 +272,12 @@ bool TextureCache::Unchanged(const void* entry) const {
 }
 
 void TextureCache::WatchRange(Texture& t, uint32_t start, uint32_t length) {
-  if (!length) return;
-  {
-    std::lock_guard<std::mutex> lock(watch_mutex_);
-    watches_.push_back({start, start + length, &t});
-  }
+  constexpr uint32_t kMemorySize = kWatchBucketCount << kWatchBucketShift;
+  if (!length || start >= kMemorySize) return;
+  const uint32_t end = start + std::min(length, kMemorySize - start);
+  std::lock_guard<std::mutex> lock(watch_mutex_);
+  for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b)
+    watch_buckets_[b].push_back({start, end, &t});
 }
 
 TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFormat& host) {
@@ -447,6 +478,7 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   }
   std::fill(t.resolved_seq.begin(), t.resolved_seq.end(), 0);
   t.resolve_pending = true;
+  t.alias = nullptr;  // the resource holds the newer data now
   change_epoch_.fetch_add(1, std::memory_order_acq_rel);
   ++stats_.uploads;
   stats_.upload_bytes += size;
@@ -485,6 +517,38 @@ bool TextureCache::ResolvesCoverAll(const Texture& t) const {
 
 bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
   const TextureKey& key = t.key;
+  // A 2D texture with one subresource that a resolved image of its format family covers
+  // exactly binds that image in place of its resource: no copy, and the draws read the texels
+  // the resolve wrote. Most resolve destinations (full-screen buffers, shadow maps) are such
+  // textures.
+  if (t.resolved_seq.size() == 1 && !key.is_3d()) {
+    const ResolvedImage* image = nullptr;
+    ForEachResolveAddress(key, t.layout, [&](size_t, uint32_t address) { image = resolved_lookup_(address); });
+    ID3D12Resource* source = image ? ResolvedSource(t, *image) : nullptr;
+    if (source) {
+      const D3D12_RESOURCE_DESC sd = source->GetDesc();
+      if (sd.Width == key.width && sd.Height == key.height) {
+        t.alias = source;
+        t.resolved_seq[0] = image->seq;
+        ++stats_.resolved_aliases;
+        return true;
+      }
+    }
+  }
+  if (t.alias) {
+    // Leaving the alias (the address now holds an image of another size or format): the
+    // resource takes over the aliased image's texels, which resolved_seq describes, before the
+    // copies below update it. Images outlive the cache's use of them (Resolver).
+    Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = t.resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = t.alias;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    ++stats_.resolved_copies;
+    t.alias = nullptr;
+  }
   bool any = false;
   ForEachResolveAddress(key, t.layout, [&](size_t index, uint32_t address) {
     const ResolvedImage* image = resolved_lookup_(address);
@@ -526,7 +590,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   const bool same_fetch =
       memo.texture && std::memcmp(memo.fetch, fetch_dwords, sizeof(memo.fetch)) == 0;
   if (same_fetch && Unchanged(memo.texture)) {
-    Transition(*memo.texture, list, kShaderRead);
+    if (!memo.texture->alias) Transition(*memo.texture, list, kShaderRead);
     *out = memo.binding;
     return true;
   }
@@ -595,13 +659,15 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
                 image ? image->width : 0, image ? image->height : 0);
   }
 #endif
-  Transition(*t, list, kShaderRead);
+  // An alias is in the Resolver's read state, which includes kShaderRead.
+  if (!t->alias) Transition(*t, list, kShaderRead);
 
   xenos::xe_gpu_texture_fetch_t fetch;
   std::memcpy(&fetch, fetch_dwords, sizeof(fetch));
-  out->resource = t->resource.Get();
+  out->resource = t->alias ? t->alias : t->resource.Get();
   out->key = key;
   out->entry = t;
+  out->aliased = t->alias != nullptr;
   out->srv_signed_format = t->host->snorm;
   out->swizzled_signs = texture_util::SwizzleSigns(fetch);
   D3D12_SHADER_RESOURCE_VIEW_DESC& srv = out->srv;

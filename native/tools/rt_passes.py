@@ -160,9 +160,10 @@ def main():
             c = ev[1]
             pending_clear = c
             if c['fn'] == 'Clear':
-                print(f'CLEAR c={c["seq"]} count={int(c["r4"], 16)} rects={c["r5"]} flags={c["r6"]} color={c["r7"]} stencil={c["r8"]}')
+                # The stencil is in r9 (Z in f1 takes r8's slot), which C lines do not record.
+                print(f'CLEAR c={c["seq"]} count={int(c["r4"], 16)} rects={c["r5"]} flags={c["r6"]} color={c["r7"]}')
             else:
-                print(f'CLEARF c={c["seq"]} flags={c["r4"]} rect={c["r5"]} color_ptr={c["r6"]} stencil={c["r7"]}')
+                print(f'CLEARF c={c["seq"]} flags={c["r4"]} rect={c["r5"]} color_ptr={c["r6"]} stencil={c["r8"]}')
         else:
             d, c = ev[1], ev[2]
             ctl, dest, pitch, info = (int(d[k], 16) for k in ('copy_ctl', 'dest', 'pitch', 'info'))

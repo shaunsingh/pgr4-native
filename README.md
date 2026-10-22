@@ -44,10 +44,61 @@ the render thread takes 33 % less time per frame than the Xenos plugin (5.36 aga
 - The render thread (`--pgr4_native_render_thread`) is on by default. Its wrong-geometry bug is
   fixed: the game thread and the render thread shared one list of pending vertex copies, so
   copies could be lost or reordered. Nine race captures since the fix are all 30.8 to 32.7 dB.
-- Not run on a Steam Deck yet.
+- Runs on a Steam Deck OLED under Proton at 68-74 fps; see [Steam Deck](#steam-deck-oled).
 - The game runs at 30 fps by default; MTR-PGR4's `--pgr4_60fps` makes it 60, which has not been
   tried with this renderer yet. The uncapped numbers above measure how much headroom there is.
 
+## Steam Deck (OLED)
+
+Steam Deck OLED in SteamOS desktop mode, GE-Proton 11-5 (vkd3d-proton on RADV), the same Windows
+build cross-compiled on Linux (`native/build.sh`: clang-cl and xwin in a distrobox). The game
+runs at 1280x800 in a gamescope window on the Deck's panel at 90 Hz with MTR-PGR4's frame-rate
+patch, so it presents at most once per 90 Hz vblank. `proton/deck-run.sh` drives the scripted
+race and reports frame times, GPU load and the APU's power split (`proton/deck_sampler.py`).
+
+St Petersburg race, 40 s after the start (2026-10-22):
+
+| | |
+|---|---|
+| Average | 68-74 fps |
+| 1 % low | 33-47 fps |
+| GPU | 82-92 % busy at 630-830 MHz (of 1600) |
+| APU power | 15 W cap reached in 99 % of samples: CPU 8.7 W, GPU 2.5 W, SoC 1.2 W |
+
+The APU's 15 W limit is shared, and the CPU takes most of it, so the GPU runs at about half its
+top clock. CPU time saved on any thread becomes GPU clock; GPU work saved shortens the frame
+directly. The target is a steady 90 fps with no loss of image quality (MSAA, motion blur and
+every other effect stay on, and the frame rate is not capped).
+
+Changes made on the Deck, in order. Each was checked in a race run on the Deck.
+
+- Depth around the car: shaders that write depth no longer scale it into the Xenos plugin's
+  float24 range (0...0.5), which halved the depth that depth-restoring passes wrote.
+- EDRAM clears: resolve clears cover the stencil plane and land at the right EDRAM offset.
+- Per-pass and per-shader GPU timing (`--pgr4_native_gpu_timing`,
+  `--pgr4_native_gpu_timing_shaders`, `gpu_timer`).
+- The Xenos command processor's thread blocks when its ring is empty instead of yielding in a
+  loop, and the timer queue sleeps until its next timer (`native/rexglue-runtime-perf.patch`).
+- Guest memory: physical memory is committed with its section, so a page protection change no
+  longer costs a commit through wineserver.
+- State tracking copies only the register blocks the guest marked dirty.
+- Copy segments: vertex copies are recorded ahead of the segment of draws that reads them, one
+  pair of barriers per segment instead of one per uploading draw.
+- Hot vertex pages: pages the game rewrites every frame are hashed and copied when changed
+  instead of being watched and refaulted.
+- The frame clock reads the TSC instead of calling QueryPerformanceCounter.
+- Resolves copy through compute shaders specialized for each kind of resolve (formats, layout,
+  flags, exponent bias compiled in, built on a worker while the generic shader stands in), and
+  each resolve phase is timed.
+- The display controller's gamma ramp (PWL or table) is applied at present; the image was too
+  light without it.
+- Pixel shaders are specialized for the textures they sample: when a texture's fetch constant
+  is unsigned, or signed in a format whose host view is the same for signed and unsigned, the
+  translated shader drops the per-sample sign handling. The motion blur pass went from 1.6 to
+  1.0 ms and GPU time per race frame from 13.7 to 10.8 ms.
+- `sample_b` (sampling with a LOD bias) translates to a biased sample with implicit gradients
+  instead of explicit gradient math.
+- `--pgr4_native_shader_dump_dir` writes every translated shader (DXBC) for inspection.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -288,7 +339,8 @@ It also has a texture untiling harness and an offline shader translation test.
 
 - Fix the render thread's wrong geometry.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
-- Run on a Steam Deck, and measure a GPU-limited case.
+- Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
+  work per frame (bool-constant shader specialization next).
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
 
 ## Tooling and agents

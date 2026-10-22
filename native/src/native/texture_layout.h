@@ -78,6 +78,11 @@ struct HostFormat {
 // nullptr for formats PGR4 does not use yet (or that need a decompressing load).
 const HostFormat* GetHostFormat(rex::graphics::xenos::TextureFormat base_format);
 
+// Bit f is set when fetch constant format f (before GetBaseFormat) has a host format whose
+// signed view is its unsigned view (the float and depth formats): signed components of such a
+// texture fetch the same values as unsigned ones.
+uint64_t SignedViewIsUnsignedFormats();
+
 // D3D12 Shader4ComponentMapping for a fetch constant swizzle on a host format (ReXGlue's
 // TextureCache::GuestToHostSwizzle; Xenos 0/1 constants map to FORCE_VALUE_0/1).
 uint32_t GuestToHostComponentMapping(uint32_t guest_swizzle, uint32_t host_swizzle);

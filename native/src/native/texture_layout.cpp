@@ -250,6 +250,15 @@ const HostFormat* GetHostFormat(TextureFormat f) {
   }
 }
 
+uint64_t SignedViewIsUnsignedFormats() {
+  uint64_t formats = 0;
+  for (uint32_t f = 0; f < 64; ++f) {
+    const HostFormat* h = GetHostFormat(rex::graphics::GetBaseFormat(TextureFormat(f)));
+    if (h && h->snorm == h->unorm) formats |= uint64_t(1) << f;
+  }
+  return formats;
+}
+
 uint32_t GuestToHostComponentMapping(uint32_t guest_swizzle, uint32_t host_swizzle) {
   uint32_t mapping = 0;
   for (uint32_t i = 0; i < 4; ++i) {

@@ -35,6 +35,7 @@
 #include <emmintrin.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <atomic>
@@ -58,6 +59,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_pipeline_cache, true, "PGR4 native",
                     "Keep the shaders and pipelines the native renderer creates under "
                     "<cache_root>\\pgr4-native and compile them at start-up in later runs "
                     "(prewarm, plus a D3D12 pipeline library)");
+REXCVAR_DEFINE_STRING(pgr4_native_watch_trace, "", "PGR4 native",
+                      "Binary log of vertex write-watch events (arms and faults, one 64-bit "
+                      "record each, see WatchTrace) for offline analysis of the watch policy");
 REXCVAR_DEFINE_BOOL(pgr4_native_dynamic_depth_bias, true, "PGR4 native",
                     "Set the polygon offset with RSSetDepthBias instead of baking it into the "
                     "pipeline state, where the driver supports it (the game animates it, which "
@@ -84,8 +88,16 @@ namespace {
   } while (0)
 
 constexpr uint32_t kSharedMemorySize = 512u << 20;  // guest physical address space
+// Shared memory is a reserved buffer whose 4 MB chunks get memory when a range in them is first
+// requested (the Xenos plugin's shared memory does the same): a committed 512 MB buffer took half
+// of a Steam Deck's 1 GB of VRAM, of which a race touches a fraction.
+constexpr uint32_t kSharedChunkShift = 22;
+constexpr uint32_t kSharedChunkCount = kSharedMemorySize >> kSharedChunkShift;
 constexpr uint32_t kPageShift = 12;
 constexpr uint32_t kPageCount = kSharedMemorySize >> kPageShift;
+// The memory unwatches at most the 4 MB-aligned block around a write fault
+// (PhysicalHeap::TriggerCallbacks), so the invalidation callback looks no further.
+constexpr uint32_t kUnwatchWindow = 4u << 20;
 constexpr uint32_t kViewHeapSize = 65536;
 constexpr uint32_t kSamplerHeapSize = 2048;
 // View heap: 0 shared memory SRV, 1 shared memory UAV, then the bindless table (descriptor
@@ -183,7 +195,8 @@ uint32_t GetNormalizedColorMask(const RegisterFile& regs, uint32_t ps_writes_col
 // GetHostViewportInfo with origin_bottom_left = true, x/y max = D3D12_VIEWPORT_BOUNDS_MAX, no
 // reverse Z, no float24 conversion, resolution scale 1 and half_pixel_offset on (the plugin's
 // settings), and full_float24_in_0_to_1 = false: the host depth buffers here are not shared
-// with EDRAM ownership transfers, so depth stays in 0...1 (the Clear values RenderTargets uses).
+// with EDRAM ownership transfers, so depth stays in 0...1 (the Clear values RenderTargets uses,
+// and the shader-written depth: the system flags never carry kSysFlag_DepthFloat24).
 void HostViewportInfo(const RegisterFile& regs, bool pixel_shader_writes_depth,
                          ViewportInfo& out) {
   auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
@@ -340,7 +353,8 @@ struct PipelineKey {
 };
 // Bump when PipelineKey's layout or the meaning of a field changes: keys are stored on disk
 // (PipelineStore) and an old file is then discarded.
-constexpr uint32_t kPipelineKeyVersion = 2;  // 2: depth bias zero with dynamic depth bias
+// 2: depth bias zero with dynamic depth bias; 3: pixel shaders specialized for unsigned textures
+constexpr uint32_t kPipelineKeyVersion = 3;
 
 enum class BlendFactor : uint8_t {
   kZero, kOne, kSrcColor, kInvSrcColor, kSrcAlpha, kInvSrcAlpha, kDestColor, kInvDestColor,
@@ -580,6 +594,13 @@ struct DrawRenderer::Impl {
   ComPtr<ID3D12Resource> shared;
   D3D12_RESOURCE_STATES shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
   D3D12_GPU_VIRTUAL_ADDRESS shared_gpu = 0;
+  // Reserved shared buffer: which chunks have memory (set under shared_map_mutex, read without
+  // it), and the tile heaps behind them. False: a committed buffer.
+  bool shared_tiled = false;
+  std::atomic<uint64_t> shared_mapped[kSharedChunkCount / 64] = {};
+  std::mutex shared_map_mutex;
+  std::vector<ComPtr<ID3D12Heap>> shared_heaps;
+  uint32_t shared_mapped_chunks = 0;
   std::unique_ptr<std::atomic<uint64_t>[]> valid;
   void* invalidation_handle = nullptr;
   using PendingCopy = VertexCopy;
@@ -591,6 +612,67 @@ struct DrawRenderer::Impl {
   // Render thread mode: vertex_upload belongs to the guest thread (Prepare/EndFramePrepare).
   bool threaded = false;
   uint64_t prep_upload_bytes = 0, prep_uploads = 0;
+  // Copy segments (DrawRenderer::Prepare): what the current segment's draws read. Watched
+  // ranges are copied in whole pages, so their reads are kept one bit per page, valid in the
+  // 64-page words whose epoch is the segment's. Unwatched ranges (inline vertices, packed
+  // back to back in the guest's command buffer and often several to a page) are copied to the
+  // byte, so their reads are kept as byte intervals.
+  struct Read {
+    uint32_t begin, end;
+    bool exact;
+  };
+  // This many exact intervals end the segment: the overlap test scans them all.
+  static constexpr size_t kSegmentExactLimit = 64;
+  uint32_t segment_epoch = 1;
+  std::unique_ptr<uint32_t[]> segment_word_epoch;
+  std::unique_ptr<uint64_t[]> segment_pages;
+  std::vector<std::pair<uint32_t, uint32_t>> segment_exact;
+  // The draw being prepared: its ranges, and whether one of its copies overwrites memory the
+  // segment reads.
+  std::vector<Read> draw_reads;
+  bool preparing = false, segment_conflict = false;
+  static uint64_t PageMask(uint32_t w, uint32_t first, uint32_t last) {
+    uint64_t m = ~0ull;
+    if (w == first >> 6) m &= ~0ull << (first & 63);
+    if (w == last >> 6) m &= ~0ull >> (63 - (last & 63));
+    return m;
+  }
+  void NewSegment() {
+    ++segment_epoch;
+    segment_exact.clear();
+  }
+  bool SegmentReads(uint32_t begin, uint32_t end) const {
+    for (const auto& [b, e] : segment_exact)
+      if (b < end && begin < e) return true;
+    const uint32_t first = begin >> kPageShift, last = (end - 1) >> kPageShift;
+    for (uint32_t w = first >> 6; w <= last >> 6; ++w)
+      if (segment_word_epoch[w] == segment_epoch && (segment_pages[w] & PageMask(w, first, last)))
+        return true;
+    return false;
+  }
+  void SegmentAdd(const Read& read) {
+    if (read.exact) {
+      // Successive inline blocks are separated by the draw packets and constant writes around
+      // them: the merged interval covers those too, which no draw copies.
+      constexpr uint32_t kMergeGap = 16 << 10;
+      if (!segment_exact.empty() && segment_exact.back().second + kMergeGap >= read.begin &&
+          read.end + kMergeGap >= segment_exact.back().first) {
+        auto& last = segment_exact.back();
+        last = {std::min(last.first, read.begin), std::max(last.second, read.end)};
+      } else {
+        segment_exact.push_back({read.begin, read.end});
+      }
+      return;
+    }
+    const uint32_t first = read.begin >> kPageShift, last = (read.end - 1) >> kPageShift;
+    for (uint32_t w = first >> 6; w <= last >> 6; ++w) {
+      if (segment_word_epoch[w] != segment_epoch) {
+        segment_word_epoch[w] = segment_epoch;
+        segment_pages[w] = 0;
+      }
+      segment_pages[w] |= PageMask(w, first, last);
+    }
+  }
 
   UploadPool vertex_upload{16u << 20};
   // CPU-cached: CachedCbv compares new constants with its last upload in place.
@@ -719,7 +801,9 @@ struct DrawRenderer::Impl {
     const DxbcShader* ps = nullptr;
     ShaderDrawRegs sdr;
     ShaderModifications mods;
+    uint32_t ps_textures = 0;  // fetch constants the pixel shader reads (bit per constant)
   } mods_memo;
+  const uint64_t signed_is_unsigned_formats = SignedViewIsUnsignedFormats();
   // Translation per shader, direct-mapped by shader: the last modification it was translated
   // with (valid translations only; they live as long as the shader cache).
   struct TranslationMemo {
@@ -742,6 +826,10 @@ struct DrawRenderer::Impl {
              pso_hits = 0, ranges = 0, range_runs = 0, range_pages = 0, unwatched = 0,
              flushes = 0;
     uint64_t cbv_uploads[16] = {}, cbv_bytes[16] = {};  // by root parameter
+    // Textures bound, by the fetch constant state the shaders read at run time: swizzled signs
+    // all unsigned, gamma RGB + unsigned A, all gamma, all signed, other; then exponent bias
+    // set, LOD bias set (any signs).
+    uint64_t fetch_classes[7] = {};
   } diag;
 
   // List state.
@@ -761,13 +849,36 @@ struct DrawRenderer::Impl {
   CachedCbv cb_system, cb_float_vs, cb_float_ps, cb_bool_loop, cb_fetch, cb_desc_vs, cb_desc_ps;
 
   // Logged once.
-  // Oracle toggles from <capture dir>\draw-debug.txt ("<mask> [max_draws]"), read every 15
-  // frames: 1 depth/stencil off, 2 culling off, 4 blending off, 8 alpha test off; max_draws > 0
-  // issues only the first N draws of a frame.
+  // Oracle toggles from <capture dir>\draw-debug.txt
+  // ("<mask> [max_draws] [skip_from] [skip_to] [shader hash]..."), read every 15 frames:
+  // 1 depth/stencil off, 2 culling off, 4 blending off, 8 alpha test off, 16 log the next frame's
+  // draws, 32 upload every draw, 64 polygon offset off, 128 issue only the draws the hashes
+  // select, 256 snapshots (below). max_draws > 0 issues only the first N draws of a frame;
+  // draws whose vertex or pixel shader ucode hash is listed are skipped (selected with 128).
+  // Hashes stay stable across frames where draw indices do not.
   uint32_t debug_mask = 0, debug_max_draws = 0, frame_draws = 0, debug_poll = 0;
   uint32_t debug_skip_from = 0, debug_skip_to = 0;
+  std::array<uint64_t, 8> debug_hashes{};
+  uint32_t debug_hash_count = 0;
   bool draw_log_pending = false;
   std::FILE* draw_log = nullptr;
+  // 256: snapshots instead of skips. After the first draw of the next frame that uses each
+  // listed hash (or, with none listed, after draw skip_from), the draw's bound single-sampled
+  // targets are read back to <capture dir>\snap-f<frame>-d<draw>-{depth,c<i>}.bin, each with a
+  // .txt holding "width height row_bytes dxgi_format".
+  struct Snap {
+    std::string stem;
+    ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+    uint32_t rows = 0;
+    uint64_t row_bytes = 0;
+  };
+  std::vector<Snap> snaps;
+  uint64_t snap_fence = 0;
+  uint32_t snap_pending = 0;  // bit i: listed hash i (bit 31: draw skip_from) still to snapshot
+  void SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets, uint32_t draw_index);
+  void Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem);
+  void WriteSnapshots(uint64_t completed_fence);
   bool log_memexport = false, log_tess = false, log_reset = false, log_prim = false,
        log_vfetch = false, log_pso = false, log_rt = false, log_upload = false,
        log_shader = false, log_heap = false, log_index = false;
@@ -785,6 +896,10 @@ struct DrawRenderer::Impl {
     }
     if (invalidation_handle && memory)
       memory->UnregisterPhysicalMemoryInvalidationCallback(invalidation_handle);
+    if (trace.file) {
+      trace.Flush();
+      std::fclose(trace.file);
+    }
   }
 
   bool Initialize();
@@ -799,6 +914,9 @@ struct DrawRenderer::Impl {
   void WriteFanIndices(const DrawState& s, uint32_t count, bool wide, uint8_t* out) const;
   void ResetListState();
   bool RequestRange(uint32_t start, uint32_t length, bool watch, std::vector<PendingCopy>& out);
+  // Gives the shared buffer memory under [start, start + length) if it is reserved. Any thread;
+  // the tile mappings are queued ahead of the copies the caller records afterwards.
+  bool MapShared(uint32_t start, uint32_t length);
   void FlushCopies(ID3D12GraphicsCommandList* list);
   void TransitionShared(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES to);
   // Uploads cb.size bytes of `data` unless cb.gpu is current, and binds it at `root_index`.
@@ -824,16 +942,120 @@ struct DrawRenderer::Impl {
   // Per frame: translates and queues stored pipelines from earlier runs for up to ~2 ms.
   void Prewarm();
 
+  // A watched page may be unwatched once its valid bit is clear: the next request copies it
+  // again and re-arms the watch. Unless the range must be exact, the pages around it that hold
+  // no valid copy are offered for unwatching too (InvalidRunAround). Valid neighbours stay
+  // watched: unwatching them too (one fault per 256 KB block instead of per 4 KB page) tripled
+  // the bytes re-copied per frame.
   static std::pair<uint32_t, uint32_t> InvalidationThunk(void* context, uint32_t start,
-                                                         uint32_t length, bool) {
+                                                         uint32_t length, bool exact) {
     auto* self = static_cast<Impl*>(context);
-    if (start < kSharedMemorySize && length) {
-      uint32_t end = std::min(kSharedMemorySize, start + length);
-      for (uint32_t p = start >> kPageShift; p <= (end - 1) >> kPageShift; ++p)
-        self->valid[p >> 6].fetch_and(~(1ull << (p & 63)), std::memory_order_relaxed);
+    self->watch_faults.fetch_add(1, std::memory_order_relaxed);
+    if (start >= kSharedMemorySize || !length) return {start, length};
+    const uint32_t end = std::min(kSharedMemorySize, start + length);
+    const uint32_t first = start >> kPageShift, last = (end - 1) >> kPageShift;
+    const uint32_t frame = self->watch_frame.load(std::memory_order_relaxed);
+    for (uint32_t p = first; p <= last; ++p) {
+      const uint64_t bit = 1ull << (p & 63);
+      std::atomic<uint64_t>& valid_word = self->valid[p >> 6];
+      const bool was_valid = valid_word.fetch_and(~bit, std::memory_order_relaxed) & bit;
+      if (self->trace.file)
+        self->trace.Add(was_valid ? WatchTrace::kFaultValid : WatchTrace::kFaultOther, p, 1, 0);
+      if (!was_valid) continue;
+      std::atomic<uint8_t>& quick = self->quick_rewrites[p];
+      uint8_t n = quick.load(std::memory_order_relaxed);
+      n = frame - self->armed_frame[p].load(std::memory_order_relaxed) > kHotRewriteFrames
+              ? 0
+              : std::min<uint8_t>(n + 1, 2);
+      quick.store(n, std::memory_order_relaxed);
+      if (n == 2) self->hot[p >> 6].fetch_or(bit, std::memory_order_relaxed);
+      // The page after one written since the previous frame: a buffer being filled in order.
+      // Its valid pages ahead, to the end of the 256 KB block (the widest range the Xenos
+      // plugin's callbacks let the memory unwatch), are invalidated with it, so the fill faults
+      // about once per block instead of once per page. In the race this cut the faults on valid
+      // pages 4x, and under 1 % of the pages invalidated ahead went unwritten.
+      const uint32_t previous = p ? self->write_frame[p - 1].load(std::memory_order_relaxed) : 0;
+      self->write_frame[p].store(frame + 1, std::memory_order_relaxed);
+      const uint32_t shift = (p & 63) + 1;
+      if (!previous || frame + 1 - previous > 1 || shift == 64) continue;
+      const uint32_t ahead =
+          uint32_t(std::countr_one(valid_word.load(std::memory_order_relaxed) >> shift));
+      if (!ahead) continue;
+      valid_word.fetch_and(~(((1ull << ahead) - 1) << shift), std::memory_order_relaxed);
+      // Counted as written, so a fault on the next block's first page continues the sequence.
+      for (uint32_t q = p + 1; q <= p + ahead; ++q)
+        self->write_frame[q].store(frame + 1, std::memory_order_relaxed);
+      if (self->trace.file) self->trace.Add(WatchTrace::kAhead, p + 1, ahead, 0);
     }
-    return {start, length};
+    return exact ? std::pair{start, length} : self->InvalidRunAround(first, last);
   }
+  // Pages [first, last] widened to the nearest valid page on each side within the
+  // kUnwatchWindow block, as a byte range. Pages without a valid copy lose nothing by being
+  // unwatched (the next request copies and re-arms them). The memory unwatches only the
+  // intersection of every callback's range, so with exact ranges a texture or buffer being
+  // filled faulted once per 4 KB page although no consumer still watched its other pages (the
+  // race's write faults came in runs of about 10 adjacent pages). A page made valid meanwhile is
+  // re-armed after the unwatch: both hold the global lock.
+  std::pair<uint32_t, uint32_t> InvalidRunAround(uint32_t first, uint32_t last) const {
+    constexpr uint32_t kWindowPages = kUnwatchWindow >> kPageShift;
+    const uint32_t window_first = first & ~(kWindowPages - 1);
+    const uint32_t window_last = last | (kWindowPages - 1);
+    uint32_t w = first >> 6;
+    uint64_t bits = valid[w].load(std::memory_order_relaxed) & ((1ull << (first & 63)) - 1);
+    while (!bits && w > window_first >> 6) bits = valid[--w].load(std::memory_order_relaxed);
+    const uint32_t lo = bits ? (w << 6) + 64 - uint32_t(std::countl_zero(bits)) : window_first;
+    w = last >> 6;
+    bits = valid[w].load(std::memory_order_relaxed) & ~((2ull << (last & 63)) - 1);
+    while (!bits && w < window_last >> 6) bits = valid[++w].load(std::memory_order_relaxed);
+    const uint32_t end = bits ? (w << 6) + uint32_t(std::countr_zero(bits)) : window_last + 1;
+    return {lo << kPageShift, (end - lo) << kPageShift};
+  }
+  // Dynamic vertex data. A valid page written again within kHotRewriteFrames of being armed,
+  // twice in a row (once is more often a buffer being reused), becomes hot: data the game
+  // rewrites every few frames, where each write fault and re-arm (a protection change, and a
+  // TLB shootdown across the process's threads: tens of µs each under Wine) costs far more than
+  // hashing the page. Hot pages are not watched: each request hashes them (about 0.1 µs) and
+  // copies those whose content changed since the last copy. A hot page hashed kHotMaxHashes
+  // times without a change (a large buffer that many draws read whole) is watched again, which
+  // then costs less. Frames are counted by watch_frame on the thread that calls RequestRange.
+  static constexpr uint32_t kHotRewriteFrames = 16;
+  static constexpr uint16_t kHotMaxHashes = 64;
+  std::unique_ptr<std::atomic<uint64_t>[]> hot;          // one bit per page
+  std::unique_ptr<std::atomic<uint32_t>[]> armed_frame;  // watch_frame of the last arm
+  std::unique_ptr<std::atomic<uint8_t>[]> quick_rewrites;  // quick rewrites in a row (to 2)
+  std::unique_ptr<uint64_t[]> hot_hash;     // XXH3 | 1 of the content last copied, 0: none
+  std::unique_ptr<uint16_t[]> hot_hashes;   // hashes since the content last changed
+  std::unique_ptr<std::atomic<uint32_t>[]> write_frame;  // watch_frame + 1 of the last write, 0: none
+  std::atomic<uint32_t> watch_frame{0};
+  // Hot pages hashed and copied (content changed) since the last EndFrame.
+  std::atomic<uint64_t> hash_pages{0}, hash_copies{0};
+  // Write-watch faults (InvalidationThunk calls) since the last EndFrame; any guest thread.
+  std::atomic<uint64_t> watch_faults{0};
+  // RequestRange's EnablePhysicalMemoryAccessCallbacks calls and their pages since EndFrame.
+  std::atomic<uint64_t> watch_arms{0}, watch_arm_pages{0};
+
+  // --pgr4_native_watch_trace. Record: type (2 bits) << 62 | frame (22) << 40 | page (17) << 23
+  // | pages (9, saturated) << 14 | request (14): arms of one RequestRange call share the request
+  // number. Faults come from any guest thread, hence the mutex.
+  struct WatchTrace {
+    enum Type : uint64_t { kArm, kFaultValid, kFaultOther, kAhead };
+    std::mutex mutex;
+    std::vector<uint64_t> records;
+    std::FILE* file = nullptr;
+    uint32_t frame = 0;
+    std::atomic<uint32_t> request{0};
+    void Add(Type type, uint32_t page, uint32_t pages, uint32_t req) {
+      std::lock_guard<std::mutex> lock(mutex);
+      records.push_back(uint64_t(type) << 62 | uint64_t(frame & 0x3FFFFF) << 40 |
+                        uint64_t(page & 0x1FFFF) << 23 | uint64_t(std::min(pages, 511u)) << 14 |
+                        (req & 0x3FFF));
+    }
+    void Flush() {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (file && !records.empty()) std::fwrite(records.data(), 8, records.size(), file);
+      records.clear();
+    }
+  } trace;
 };
 
 bool DrawRenderer::Impl::Initialize() {
@@ -861,15 +1083,38 @@ bool DrawRenderer::Impl::Initialize() {
   rd.SampleDesc.Count = 1;
   rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&shared)),
-             "shared memory buffer (512 MB)"))
-    return false;
+  // Tier 2: reads of chunks without memory return zero, as in a committed buffer never written.
+  D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+  shared_tiled = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
+                                                       sizeof(options))) &&
+                 options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2 &&
+                 SUCCEEDED(device->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                          nullptr, IID_PPV_ARGS(&shared)));
+  if (!shared_tiled) {
+    if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&shared)),
+               "shared memory buffer (512 MB)"))
+      return false;
+  }
   shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
   shared_gpu = shared->GetGPUVirtualAddress();
   valid.reset(new std::atomic<uint64_t>[kPageCount / 64]);
   for (uint32_t i = 0; i < kPageCount / 64; ++i) valid[i].store(0, std::memory_order_relaxed);
+  hot.reset(new std::atomic<uint64_t>[kPageCount / 64]);
+  for (uint32_t i = 0; i < kPageCount / 64; ++i) hot[i].store(0, std::memory_order_relaxed);
+  armed_frame.reset(new std::atomic<uint32_t>[kPageCount]);
+  for (uint32_t i = 0; i < kPageCount; ++i) armed_frame[i].store(0, std::memory_order_relaxed);
+  write_frame.reset(new std::atomic<uint32_t>[kPageCount]);
+  for (uint32_t i = 0; i < kPageCount; ++i) write_frame[i].store(0, std::memory_order_relaxed);
+  quick_rewrites.reset(new std::atomic<uint8_t>[kPageCount]);
+  for (uint32_t i = 0; i < kPageCount; ++i) quick_rewrites[i].store(0, std::memory_order_relaxed);
+  hot_hash.reset(new uint64_t[kPageCount]());
+  hot_hashes.reset(new uint16_t[kPageCount]());
+  segment_word_epoch.reset(new uint32_t[kPageCount / 64]());
+  segment_pages.reset(new uint64_t[kPageCount / 64]());
+  if (const std::string& path = REXCVAR_GET(pgr4_native_watch_trace); !path.empty())
+    trace.file = std::fopen(path.c_str(), "wb");
   invalidation_handle = memory->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
 
   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewHeapSize,
@@ -926,8 +1171,8 @@ bool DrawRenderer::Impl::Initialize() {
   nd.TextureCube.MipLevels = 1;
   device->CreateShaderResourceView(nullptr, &nd, view_at(kViewTableStart + kNullCube));
   views_allocated = kViewTableStart + kFirstTexture;
-  REXLOG_INFO("PGR4 native draw: up (shared memory 512 MB, bindless heaps {} views / {} samplers)",
-              kViewHeapSize, kSamplerHeapSize);
+  REXLOG_INFO("PGR4 native draw: up (shared memory 512 MB {}, bindless heaps {} views / {} samplers)",
+              shared_tiled ? "reserved" : "committed", kViewHeapSize, kSamplerHeapSize);
   D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16 = {};
   dynamic_depth_bias = REXCVAR_GET(pgr4_native_dynamic_depth_bias) &&
                        SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16,
@@ -1033,8 +1278,12 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
                   start, length);
     return false;
   }
+  const bool exact = !watch || (debug_mask & 32);  // 32: upload every draw
+  if (preparing) draw_reads.push_back({start, start + length, exact});
   const uint64_t fence = upload_fence;
   auto copy = [&](uint32_t from, uint32_t size) {
+    if (preparing && !segment_conflict) segment_conflict = SegmentReads(from, from + size);
+    if (!MapShared(from, size)) return false;
     UploadPool::Alloc a;
     if (!vertex_upload.Allocate(size, 16, fence, &a)) return false;
     std::memcpy(a.cpu, membase + from, size);
@@ -1048,27 +1297,69 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     }
     return true;
   };
-  if (!watch || (debug_mask & 32)) {  // 32: upload every draw
+  if (exact) {
     ++diag.unwatched;
     return copy(start, length);
   }
   ++diag.ranges;
   const uint32_t first = start >> kPageShift, last = (start + length - 1) >> kPageShift;
   diag.range_pages += last - first + 1;
+  const uint32_t trace_request =
+      trace.file ? trace.request.fetch_add(1, std::memory_order_relaxed) : 0;
+  const uint32_t frame = watch_frame.load(std::memory_order_relaxed);
+  // Hot pages whose content changed, copied in runs of adjacent pages.
+  uint32_t changed_first = 0, changed_end = 0;
+  auto copy_changed = [&] {
+    return changed_first == changed_end ||
+           copy(changed_first << kPageShift, (changed_end - changed_first) << kPageShift);
+  };
+  uint64_t hashed = 0, changed = 0;
   uint32_t p = first;
   while (p <= last) {
-    // Skip valid pages a 64-page word at a time (whole vertex buffers are requested per draw).
-    const uint64_t invalid = ~valid[p >> 6].load(std::memory_order_relaxed) >> (p & 63);
-    if (!invalid) {
-      p = (p | 63) + 1;
+    // Skip valid pages that are not hot a 64-page word at a time (whole vertex buffers are
+    // requested per draw).
+    const uint32_t w = p >> 6;
+    const uint64_t hot_bits = hot[w].load(std::memory_order_relaxed);
+    uint64_t work = (~valid[w].load(std::memory_order_relaxed) | hot_bits) & (~0ull << (p & 63));
+    if (w == last >> 6) work &= ~0ull >> (63 - (last & 63));
+    if (!work) {
+      p = (w + 1) << 6;
       continue;
     }
-    p += uint32_t(std::countr_zero(invalid));
-    if (p > last) break;
+    p = (w << 6) + uint32_t(std::countr_zero(work));
+    const uint64_t bit = 1ull << (p & 63);
+    if (hot_bits & bit) {
+      ++hashed;
+      const uint64_t hash = XXH3_64bits(membase + (size_t(p) << kPageShift), 1u << kPageShift) | 1;
+      if (hash != hot_hash[p]) {
+        hot_hash[p] = hash;
+        hot_hashes[p] = 0;
+        ++changed;
+        if (changed_end != p) {
+          if (!copy_changed()) return false;
+          changed_first = p;
+        }
+        changed_end = p + 1;
+        ++p;
+        continue;
+      }
+      if (++hot_hashes[p] < kHotMaxHashes) {
+        ++p;
+        continue;
+      }
+      // Read far more often than written: watched again, starting a run of invalid pages.
+      hot[w].fetch_and(~bit, std::memory_order_relaxed);
+      hot_hash[p] = 0;
+      quick_rewrites[p].store(0, std::memory_order_relaxed);
+    }
     uint32_t run_end = p + 1;
-    while (run_end <= last &&
-           !(valid[run_end >> 6].load(std::memory_order_relaxed) & (1ull << (run_end & 63))))
+    while (run_end <= last) {
+      const uint64_t b = 1ull << (run_end & 63);
+      if ((valid[run_end >> 6].load(std::memory_order_relaxed) |
+           hot[run_end >> 6].load(std::memory_order_relaxed)) & b)
+        break;
       ++run_end;
+    }
     // Valid and watched before reading, so a write during the copy invalidates again.
     for (uint32_t q = p; q < run_end;) {
       const uint32_t word_end = std::min(run_end, (q | 63) + 1);
@@ -1077,11 +1368,68 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
       valid[q >> 6].fetch_or(mask, std::memory_order_relaxed);
       q = word_end;
     }
+    for (uint32_t q = p; q < run_end; ++q) armed_frame[q].store(frame, std::memory_order_relaxed);
     const uint32_t from = p << kPageShift, size = (run_end - p) << kPageShift;
-    memory->EnablePhysicalMemoryAccessCallbacks(from, size, true, false);
+    {
+      profile::Scope scope(profile::kCapWatch);
+      memory->EnablePhysicalMemoryAccessCallbacks(from, size, true, false);
+    }
+    watch_arms.fetch_add(1, std::memory_order_relaxed);
+    watch_arm_pages.fetch_add(run_end - p, std::memory_order_relaxed);
+    if (trace.file) trace.Add(WatchTrace::kArm, p, run_end - p, trace_request);
     ++diag.range_runs;
     if (!copy(from, size)) return false;
     p = run_end;
+  }
+  if (hashed) {
+    hash_pages.fetch_add(hashed, std::memory_order_relaxed);
+    hash_copies.fetch_add(changed, std::memory_order_relaxed);
+  }
+  return copy_changed();
+}
+
+bool DrawRenderer::Impl::MapShared(uint32_t start, uint32_t length) {
+  if (!shared_tiled) return true;
+  const uint32_t first = start >> kSharedChunkShift;
+  const uint32_t last = (start + length - 1) >> kSharedChunkShift;
+  auto mapped = [&](uint32_t c) {
+    return (shared_mapped[c >> 6].load(std::memory_order_acquire) >> (c & 63)) & 1;
+  };
+  bool all = true;
+  for (uint32_t c = first; c <= last && all; ++c) all = mapped(c);
+  if (all) return true;
+
+  std::lock_guard<std::mutex> lock(shared_map_mutex);
+  for (uint32_t c = first; c <= last; ++c) {
+    if (mapped(c)) continue;
+    uint32_t end = c + 1;
+    while (end <= last && !mapped(end)) ++end;
+    const uint32_t chunks = end - c;
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = uint64_t(chunks) << kSharedChunkShift;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    ComPtr<ID3D12Heap> heap;
+    if (Failed(device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "shared memory tile heap"))
+      return false;
+    D3D12_TILED_RESOURCE_COORDINATE coord = {};
+    coord.X = UINT(uint64_t(c) << kSharedChunkShift) / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+    D3D12_TILE_REGION_SIZE size = {};
+    size.NumTiles = UINT(hd.SizeInBytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
+    const D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT heap_offset = 0;
+    r.queue()->UpdateTileMappings(shared.Get(), 1, &coord, &size, heap.Get(), 1, &flags,
+                                  &heap_offset, &size.NumTiles, D3D12_TILE_MAPPING_FLAG_NONE);
+    shared_heaps.push_back(std::move(heap));
+    for (uint32_t m = c; m < end; ++m)
+      shared_mapped[m >> 6].fetch_or(1ull << (m & 63), std::memory_order_release);
+    const uint32_t before = shared_mapped_chunks;
+    shared_mapped_chunks += chunks;
+    // Logged per 64 MB.
+    if ((before >> 4) != (shared_mapped_chunks >> 4))
+      REXLOG_INFO("PGR4 native draw: shared memory {} MB mapped",
+                  shared_mapped_chunks << (kSharedChunkShift - 20));
+    c = end - 1;
   }
   return true;
 }
@@ -1092,6 +1440,7 @@ void DrawRenderer::Impl::FlushCopies(ID3D12GraphicsCommandList* list) {
     return;
   }
   ++diag.flushes;
+  ++stats.copy_batches;
   TransitionShared(list, D3D12_RESOURCE_STATE_COPY_DEST);
   for (const PendingCopy& c : copies)
     list->CopyBufferRegion(shared.Get(), c.dst, c.src, c.src_offset, c.size);
@@ -1441,7 +1790,16 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
   const bool indexed_ok = !s.indexed || s.index_address;
   // Straight into the batch: copies made before a failed range still go out (their pages
   // are marked valid already).
+  preparing = true;
+  segment_conflict = false;
+  draw_reads.clear();
   prep->upload_ok = indexed_ok && RequestVertices(s, *prep->vs, *out);
+  preparing = false;
+  if (segment_conflict || segment_exact.size() >= kSegmentExactLimit) {
+    NewSegment();
+    prep->copy_segment = true;
+  }
+  for (const Read& read : draw_reads) SegmentAdd(read);
   // Triangle fans: host indices from the guest's now (Draw reads them from here).
   const uint32_t count = s.count;
   if (prep->upload_ok && xenos::PrimitiveType(s.primitive) == xenos::PrimitiveType::kTriangleFan &&
@@ -1474,6 +1832,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     // The guest thread copied the ranges (and marked their pages valid): they go into shared
     // memory whether or not the draw is issued.
     if (prep->copy_count) {
+      ++stats.copy_batches;
       TransitionShared(list, D3D12_RESOURCE_STATE_COPY_DEST);
       for (uint32_t i = 0; i < prep->copy_count; ++i) {
         const VertexCopy& c = prep->copies[i];
@@ -1537,8 +1896,14 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     mods_memo.ps = ps;
     mods_memo.sdr = sdr;
     mods_memo.mods = SelectModifications(shaders.translator(), *vs, ps, sdr);
+    mods_memo.ps_textures = 0;
+    if (mods_memo.mods.pixel_shader_used)
+      for (const auto& tb : ps->texture_bindings()) mods_memo.ps_textures |= 1u << tb.fetch_constant;
   }
-  const ShaderModifications mods = mods_memo.mods;
+  ShaderModifications mods = mods_memo.mods;
+  mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
+                                       signed_is_unsigned_formats);
+
   if (!mods.draw) {
     ++stats.skipped;
     return;
@@ -1785,9 +2150,25 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   if (debug_mask & 2) key.cull = uint8_t(D3D12_CULL_MODE_NONE);
   if (debug_mask & 4)
     for (auto& rt : key.rt) rt.blend = 0;
+  if (debug_mask & 64) {
+    key.depth_bias = 0;
+    key.slope_scaled_depth_bias = 0;
+  }
   const uint32_t draw_index = frame_draws++;
-  if ((debug_max_draws && draw_index >= debug_max_draws) ||
-      (draw_index >= debug_skip_from && draw_index < debug_skip_to)) {
+  bool debug_skip = (debug_max_draws && draw_index >= debug_max_draws) ||
+                    (draw_index >= debug_skip_from && draw_index < debug_skip_to);
+  uint32_t snap_now = 0;
+  if (debug_hash_count) {
+    const uint64_t vs_hash = vs->ucode_data_hash(), ps_hash = ps ? ps->ucode_data_hash() : 0;
+    uint32_t listed = 0;
+    for (uint32_t i = 0; i < debug_hash_count; ++i)
+      if (debug_hashes[i] == vs_hash || (ps && debug_hashes[i] == ps_hash)) listed |= 1u << i;
+    if (debug_mask & 256) snap_now = listed & snap_pending;
+    else debug_skip |= bool(listed) != bool(debug_mask & 128);
+  } else if ((snap_pending >> 31) && draw_index == debug_skip_from) {
+    snap_now = 1u << 31;
+  }
+  if (debug_skip) {
     ++stats.skipped;
     return;
   }
@@ -1796,7 +2177,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
                  "%u fn=%08X prim=%u n=%u idx=%u vs=%016llX:%llX ps=%016llX:%llX rt=%u:%d,%d dsv=%d "
                  "z=%u/%u/%u st=%u cull=%u blend=%u:%u/%u/%u,%u/%u/%u mask=%X bc=%08X cc=%08X "
                  "f=%.2f,%.2f,%.2f,%.2f samples=%u vp=%u,%u,%u,%u z=%.3f-%.3f sc=%u,%u,%u,%u "
-                 "tex=%zu ci=%08X\n",
+                 "tex=%zu ci=%08X si=%08X di=%08X su=%08X dc=%08X po=%g/%g,%g/%g bias=%d/%g\n",
                  draw_index, uint32_t(s.fn), s.primitive, count, uint32_t(s.indexed),
                  (unsigned long long)vs->ucode_data_hash(), (unsigned long long)mods.vertex,
                  ps ? (unsigned long long)ps->ucode_data_hash() : 0ull,
@@ -1811,7 +2192,14 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
                  vp.z_min, vp.z_max, scissor.offset[0], scissor.offset[1], scissor.extent[0],
                  scissor.extent[1],
                  ps ? ps->GetTextureBindingsAfterTranslation().size() : size_t(0),
-                 regs[XE_GPU_REG_RB_COLOR_INFO]);
+                 regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
+                 regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+                 regs[XE_GPU_REG_RB_DEPTHCONTROL],
+                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
+                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
+                 key.slope_scaled_depth_bias);
   }
   // With dynamic depth bias the polygon offset is not part of the pipeline.
   const float depth_bias = float(key.depth_bias);
@@ -1872,7 +2260,8 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     // The memo entry for (shader, the fetch constants it reads); null if not memoizable.
     BindMemo* bm = nullptr;
     const uint64_t epoch = texture_cache.change_epoch();
-    if (ss.count <= BindMemo::kMaxSlots && tex.size() <= BindMemo::kMaxBound) {
+    // While the draw log records, every binding goes through Get so each one is logged.
+    if (!draw_log && ss.count <= BindMemo::kMaxSlots && tex.size() <= BindMemo::kMaxBound) {
       auto same_fetch = [&](const BindMemo& e) {
         if (e.shader != &shader) return false;
         const uint32_t* stored = e.data;
@@ -1945,6 +2334,12 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
         profile::Scope get_scope(profile::kTexGet);
         got = texture_cache.Get(fetch, list, r.frame_fence(), &b) && b.resource;
       }
+      if (draw_log)
+        std::fprintf(draw_log, "  tf%u %08X fmt=%u %ux%ux%u dim=%u tiled=%u mips=%u%s%s\n",
+                     tb.fetch_constant, b.key.base_page << 12, uint32_t(b.key.format), b.key.width,
+                     b.key.height, b.key.depth_or_array_size, uint32_t(b.key.dimension),
+                     uint32_t(b.key.tiled), b.key.mip_levels(), got ? "" : " missing",
+                     got && b.aliased ? " alias" : "");
       if (got) {
         profile::Scope srv_scope(profile::kTexSrv);
         const uint32_t mapping = b.srv.Shader4ComponentMapping;
@@ -2037,8 +2432,10 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     if (polygonal) flags |= DxbcShaderTranslator::kSysFlag_PrimitivePolygonal;
     if (rex::graphics::draw_util::IsPrimitiveLine(false, prim))
       flags |= DxbcShaderTranslator::kSysFlag_PrimitiveLine;
-    if (regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8)
-      flags |= DxbcShaderTranslator::kSysFlag_DepthFloat24;
+    // No kSysFlag_DepthFloat24: without float24 conversion in the shader, its only effect is to
+    // scale oDepth into the plugin's host 0...0.5 float24 range, while viewports, clears and
+    // resolves here keep D24FS8 in 0...1 (HostViewportInfo). Setting it halves the depth that
+    // depth-restoring passes write.
     xenos::CompareFunction alpha_func =
         colorcontrol.alpha_test_enable ? colorcontrol.alpha_func : xenos::CompareFunction::kAlways;
     flags |= uint32_t(alpha_func) << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
@@ -2083,6 +2480,13 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
       uint32_t i = uint32_t(std::countr_zero(remaining));
       remaining &= remaining - 1;
       sys.texture_swizzled_signs[i >> 2] |= uint32_t(signs[i]) << ((i & 3) * 8);
+      if (profile::g.on) {
+        const uint32_t* f = s.fetch(i);
+        const uint8_t sg = signs[i];
+        ++diag.fetch_classes[sg == 0 ? 0 : sg == 0x3F ? 1 : sg == 0xFF ? 2 : sg == 0x55 ? 3 : 4];
+        if ((f[3] >> 13) & 0x3F) ++diag.fetch_classes[5];
+        if ((f[4] >> 12) & 0x3FF) ++diag.fetch_classes[6];
+      }
     }
     sys.textures_resolution_scaled = 0;
     sys.sample_count_log2[0] = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
@@ -2270,7 +2674,81 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   }
   ++stats.draws;
   ++diag.draws;
+  if (snap_now) {
+    snap_pending &= ~snap_now;
+    SnapshotTargets(list, targets, draw_index);
+  }
   profile::Mark(profile::kRecord);
+}
+
+void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets,
+                                         uint32_t draw_index) {
+  const std::string stem = "C:\\recomp\\logs\\pgr4-native-captures\\snap-f" + std::to_string(r.frame_index()) +
+                           "-d" + std::to_string(draw_index);
+  for (uint32_t i = 0; i < targets.color_count; ++i) Snapshot(list, targets.color[i], stem + "-c" + std::to_string(i));
+  Snapshot(list, targets.depth, stem + "-depth");
+  snap_fence = r.frame_fence();
+  REXLOG_INFO("PGR4 native draw: snapshot of draw {} ({} targets) to {}-*", draw_index, snaps.size(), stem);
+  ResetListState();  // the barriers moved the targets out of their bound states
+}
+
+void DrawRenderer::Impl::Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem) {
+  if (!rt || rt->samples != 1) return;
+  const D3D12_RESOURCE_DESC desc = rt->resource->GetDesc();
+  Snap s;
+  s.stem = stem;
+  uint64_t total = 0;
+  // Subresource 0: the color target, or a depth target's depth plane.
+  device->GetCopyableFootprints(&desc, 0, 1, 0, &s.layout, &s.rows, &s.row_bytes, &total);
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC bd = {};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = total;
+  bd.Height = 1;
+  bd.DepthOrArraySize = 1;
+  bd.MipLevels = 1;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&s.readback))))
+    return;
+  const D3D12_RESOURCE_STATES state = rt->state;
+  RenderTargets::Transition(list, rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+  src.pResource = rt->resource.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = 0;
+  dst.pResource = s.readback.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint = s.layout;
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  RenderTargets::Transition(list, rt, state);
+  snaps.push_back(std::move(s));
+}
+
+void DrawRenderer::Impl::WriteSnapshots(uint64_t completed_fence) {
+  if (snaps.empty() || completed_fence < snap_fence) return;
+  for (Snap& s : snaps) {
+    void* data = nullptr;
+    const D3D12_RANGE range = {0, size_t(s.layout.Footprint.RowPitch) * s.rows};
+    if (FAILED(s.readback->Map(0, &range, &data))) continue;
+    if (std::FILE* f = std::fopen((s.stem + ".bin").c_str(), "wb")) {
+      for (uint32_t y = 0; y < s.rows; ++y)
+        std::fwrite(static_cast<const uint8_t*>(data) + size_t(y) * s.layout.Footprint.RowPitch, 1,
+                    size_t(s.row_bytes), f);
+      std::fclose(f);
+    }
+    const D3D12_RANGE none = {0, 0};
+    s.readback->Unmap(0, &none);
+    if (std::FILE* f = std::fopen((s.stem + ".txt").c_str(), "w")) {
+      std::fprintf(f, "%u %u %llu %u\n", s.layout.Footprint.Width, s.rows, (unsigned long long)s.row_bytes,
+                   uint32_t(s.layout.Footprint.Format));
+      std::fclose(f);
+    }
+  }
+  REXLOG_INFO("PGR4 native draw: wrote {} snapshot targets", snaps.size());
+  snaps.clear();
 }
 
 DrawRenderer::DrawRenderer(NativeRenderer& renderer)
@@ -2288,7 +2766,10 @@ void DrawRenderer::Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep
   impl_->Prepare(state, upload_tag, prep, copies);
 }
 
+void DrawRenderer::BeginCopySegment() { impl_->NewSegment(); }
+
 void DrawRenderer::EndFramePrepare(uint64_t done, uint64_t* upload_bytes, uint64_t* uploads) {
+  impl_->watch_frame.fetch_add(1, std::memory_order_relaxed);
   impl_->vertex_upload.EndFrame(done);
   *upload_bytes = impl_->prep_upload_bytes;
   *uploads = impl_->prep_uploads;
@@ -2300,12 +2781,48 @@ void DrawRenderer::InvalidateListState() {
   if (impl_->draw_log) std::fprintf(impl_->draw_log, "resolve (after draw %u)\n", impl_->frame_draws);
 }
 
+std::pair<uint64_t, uint64_t> DrawRenderer::ShaderHashes(const DrawPrep& prep) {
+  return {prep.vs ? prep.vs->ucode_data_hash() : 0, prep.ps ? prep.ps->ucode_data_hash() : 0};
+}
+
+std::string DrawRenderer::ShaderDisassembly(uint64_t hash) const {
+  const DxbcShader* shader = impl_->shaders.Find(hash);
+  return shader ? shader->ucode_disassembly() : std::string();
+}
+
+void DrawRenderer::LogClear(const ClearCall& c) {
+  std::FILE* f = impl_->draw_log;
+  if (!f) return;
+  std::fprintf(f, "clear (after draw %u) flags=%X colors=%X depth_bound=%d z=%g stencil=%u height=%u si=%08X "
+               "ci0=%08X di=%08X rects", impl_->frame_draws, c.p.flags, c.bound_colors, int(c.depth_bound),
+               c.p.depth, uint32_t(c.p.stencil), c.height, c.regs.surface_info, c.regs.color_info[0],
+               c.regs.depth_info);
+  for (const D3D12_RECT& r : c.p.rects) std::fprintf(f, " %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom);
+  std::fprintf(f, " edram");
+  for (const D3D12_RECT& r : c.p.edram_rects) std::fprintf(f, " %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom);
+  std::fprintf(f, "\n");
+}
+
 void DrawRenderer::EndFrame(uint64_t completed_fence) {
+  stats_.watch_faults = impl_->watch_faults.exchange(0, std::memory_order_relaxed);
+  stats_.watch_arms = impl_->watch_arms.exchange(0, std::memory_order_relaxed);
+  stats_.watch_arm_pages = impl_->watch_arm_pages.exchange(0, std::memory_order_relaxed);
+  stats_.hash_pages = impl_->hash_pages.exchange(0, std::memory_order_relaxed);
+  stats_.hash_copies = impl_->hash_copies.exchange(0, std::memory_order_relaxed);
+  if (!impl_->threaded) impl_->watch_frame.fetch_add(1, std::memory_order_relaxed);
+  if (impl_->trace.file) {
+    {
+      std::lock_guard<std::mutex> lock(impl_->trace.mutex);
+      ++impl_->trace.frame;
+    }
+    if ((impl_->trace.frame & 255) == 0) impl_->trace.Flush();
+  }
   if (!impl_->threaded) impl_->vertex_upload.EndFrame(completed_fence);
   impl_->constant_upload.EndFrame(completed_fence);
   impl_->Prewarm();
   impl_->store.Flush();
   impl_->frame_draws = 0;
+  impl_->WriteSnapshots(completed_fence);
   if (profile::g.on && ++impl_->diag.frames >= 300) {
     Impl::Diag& d = impl_->diag;
     const double n = double(std::max<uint64_t>(d.draws, 1));
@@ -2326,21 +2843,33 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
       cbv += part;
     }
     REXLOG_INFO("PGR4 native draw diag: cbv uploads per draw / bytes per upload:{}", cbv);
+    const uint64_t* fc = d.fetch_classes;
+    REXLOG_INFO("PGR4 native draw diag: textures per draw by signs: unsigned {:.3f}, gamma rgb "
+                "{:.3f}, gamma {:.3f}, signed {:.3f}, other {:.3f}; exp bias {:.3f}, lod bias {:.3f}",
+                per(fc[0]), per(fc[1]), per(fc[2]), per(fc[3]), per(fc[4]), per(fc[5]), per(fc[6]));
     d = Impl::Diag{};
   }
   if (++impl_->debug_poll >= 15) {
     impl_->debug_poll = 0;
-    uint32_t mask = 0, max_draws = 0, skip_from = 0, skip_to = 0;
+    uint32_t mask = 0, max_draws = 0, skip_from = 0, skip_to = 0, hash_count = 0;
+    std::array<uint64_t, 8> hashes{};
     if (std::FILE* f = std::fopen("C:\\recomp\\logs\\pgr4-native-captures\\draw-debug.txt", "r")) {
       if (std::fscanf(f, "%u %u %u %u", &mask, &max_draws, &skip_from, &skip_to) < 1) mask = 0;
+      unsigned long long h;
+      while (hash_count < hashes.size() && std::fscanf(f, "%llx", &h) == 1) hashes[hash_count++] = h;
       std::fclose(f);
     }
     if (mask != impl_->debug_mask || max_draws != impl_->debug_max_draws ||
-        skip_from != impl_->debug_skip_from || skip_to != impl_->debug_skip_to)
-      REXLOG_INFO("PGR4 native draw: debug mask {} max draws {} skip [{}, {})", mask, max_draws,
-                  skip_from, skip_to);
+        skip_from != impl_->debug_skip_from || skip_to != impl_->debug_skip_to ||
+        hash_count != impl_->debug_hash_count || hashes != impl_->debug_hashes)
+      REXLOG_INFO("PGR4 native draw: debug mask {} max draws {} skip [{}, {}), {} shader hashes",
+                  mask, max_draws, skip_from, skip_to, hash_count);
+    impl_->debug_hashes = hashes;
+    impl_->debug_hash_count = hash_count;
     // Bit 16: log the next frame's draws once (to <capture dir>\draws-f<frame>.txt).
     if ((mask & 16) && !(impl_->debug_mask & 16)) impl_->draw_log_pending = true;
+    if ((mask & 256) && !(impl_->debug_mask & 256))
+      impl_->snap_pending = hash_count ? (1u << hash_count) - 1 : 1u << 31;
     impl_->debug_mask = mask;
     impl_->debug_max_draws = max_draws;
     impl_->debug_skip_from = skip_from;

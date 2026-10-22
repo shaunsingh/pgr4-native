@@ -39,6 +39,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace rex::graphics {
@@ -48,6 +50,7 @@ class DxbcShader;
 namespace pgr4::native {
 
 class NativeRenderer;
+struct ClearCall;
 
 // Guest memory copied into upload memory, to be copied into shared memory at `dst`.
 struct VertexCopy {
@@ -63,6 +66,7 @@ struct DrawPrep {
   bool upload_ok = true;                    // every vertex/index range was copied
   const VertexCopy* copies = nullptr;       // set by the render side before OnDraw
   uint32_t copy_count = 0;
+  bool copy_segment = false;                // Prepare: the draw's copies start a copy segment
   // Triangle fans: the converted host indices in upload memory.
   D3D12_GPU_VIRTUAL_ADDRESS fan_indices = 0;
   uint32_t fan_count = 0;
@@ -83,6 +87,10 @@ class DrawRenderer {
     uint64_t textures = 0, textures_missing = 0;  // bindings; missing = null SRV bound
     uint64_t srv_lookups = 0, srv_created = 0, samplers_created = 0;
     uint64_t bind_memo_hits = 0, bind_memo_misses = 0;  // whole-shader texture binding memo
+    uint64_t watch_faults = 0;    // guest writes caught by a page watch (any watcher), per frame
+    uint64_t copy_batches = 0;    // groups of shared-memory copies, each between two barriers
+    uint64_t watch_arms = 0, watch_arm_pages = 0;  // vertex/index watches armed (calls, pages)
+    uint64_t hash_pages = 0, hash_copies = 0;  // hot pages hashed, and copied as they changed
   };
 
   explicit DrawRenderer(NativeRenderer& renderer);
@@ -101,8 +109,15 @@ class DrawRenderer {
   // Guest thread, render thread mode: shader lookup and vertex/index copies for `state` (whose
   // regs are the tracker's, current). Copies go to the end of `copies`; upload memory is
   // tagged with `upload_tag` (EndFramePrepare's units).
+  //
+  // Copy segments: the render thread records all copies of a segment ahead of the segment's
+  // first draw that needs them, so a segment costs one pair of shared-memory barriers instead
+  // of one pair per uploading draw. A draw starts a new segment (prep->copy_segment) when one
+  // of its copies would overwrite a page an earlier draw of the segment reads: that draw must
+  // still see the old bytes. BeginCopySegment starts one unconditionally (a new batch).
   void Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep* prep,
                std::vector<VertexCopy>* copies);
+  void BeginCopySegment();
   // Guest thread, once per Swap: recycles vertex upload memory with tags <= `done`. Returns
   // Prepare's upload counters since the previous call (added to stats() by AddUploads).
   void EndFramePrepare(uint64_t done, uint64_t* upload_bytes, uint64_t* uploads);
@@ -115,12 +130,19 @@ class DrawRenderer {
   // Resolver does): set everything again at the next draw. A new frame's list is detected
   // without this call.
   void InvalidateListState();
+  // Writes the clear into the draw log while one is open (draw-debug.txt bit 16).
+  void LogClear(const ClearCall& c);
 
   // Per frame, with the fence values of NativeRenderer (once per Swap, after EndFrame).
   void EndFrame(uint64_t completed_fence);
 
   const Stats& stats() const { return stats_; }
   void ResetStats() { stats_ = Stats{}; }
+
+  // Ucode hashes of a prepared draw's (vertex, pixel) shaders, 0 where there is none.
+  static std::pair<uint64_t, uint64_t> ShaderHashes(const DrawPrep& prep);
+  // The ucode disassembly of a loaded shader; empty when no loaded shader has the hash.
+  std::string ShaderDisassembly(uint64_t hash) const;
 
  private:
   struct Impl;

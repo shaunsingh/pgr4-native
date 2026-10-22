@@ -866,6 +866,19 @@ thread_local uint32_t t_native_depth = 0;  // active draw/clear/resolve/Swap cal
 thread_local bool t_pending_vertices = false;
 thread_local pgr4::native::HookArgs t_pending_args;
 thread_local uint32_t t_original_depth = 0;  // hooked originals running on this thread
+thread_local pgr4::native::TilingCall t_tiling_call = pgr4::native::TilingCall::kNone;
+
+// Hooked functions that neither the renderer nor the state tracker needs to see: no draw,
+// clear, resolve or Swap, no state flush (d3d_state.h IsStateFlushingFn: these plus
+// fn_826A10A8), not the tiling bracket and not CreateDevice. Without the tap they run
+// straight through.
+constexpr bool IsPassThrough(FnId id) {
+  if (NativeClassOf(kFns[id].cat) != kNatNone) return false;
+  switch (kFns[id].addr) {
+    case 0x826A10A8u: case 0x8269C6D0u: case 0x8269CB68u: case 0x82697D08u: return false;
+    default: return true;
+  }
+}
 
 // Runs a hooked guest D3D function. The outermost one is timed as profile::kGuestD3d (nested
 // hooked calls and their tracking are inside that time).
@@ -889,6 +902,14 @@ template <typename F>
 inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   namespace nat = pgr4::native;
   nat::NativeRenderer* r = nat::NativeRenderer::Get();
+  if (IsPassThrough(id) && !g_tap.enabled) {
+    if (t_pending_vertices && r) {
+      t_pending_vertices = false;
+      r->OnDraw(base, t_pending_args);
+    }
+    RunOriginal(original, ctx, base);
+    return;
+  }
   const bool track = r || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap);
   // --pgr4_native_replace_draws: native/guest_d3d.h replaces DrawIndexedVertices' body.
   auto body = [id, original](PPCContext& c, uint8_t* b) {
@@ -923,7 +944,11 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   }
   const NativeClass cls = NativeClassOf(kFns[id].cat);
   if (cls == kNatNone) {
+    const nat::TilingCall outer = t_tiling_call;
+    if (id == kFn_8269C6D0) t_tiling_call = nat::TilingCall::kBegin;
+    else if (id == kFn_8269CB68) t_tiling_call = nat::TilingCall::kEnd;
     OnCall(id, ctx, base, run);
+    t_tiling_call = outer;
     return;
   }
   nat::HookArgs a;
@@ -933,6 +958,7 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   a.r[4] = ctx.r7.u32; a.r[5] = ctx.r8.u32; a.r[6] = ctx.r9.u32; a.r[7] = ctx.r10.u32;
   a.sp = ctx.r1.u32;
   a.f[0] = ctx.f1.f64; a.f[1] = ctx.f2.f64; a.f[2] = ctx.f3.f64; a.f[3] = ctx.f4.f64;
+  a.tiling = t_tiling_call;
   ++t_native_depth;
   OnCall(id, ctx, base, run);
   if (--t_native_depth) return;

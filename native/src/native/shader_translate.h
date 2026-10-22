@@ -16,6 +16,7 @@
 //   draw (SelectModifications below), the same values the Xenos plugin uses.
 #pragma once
 
+#include <bit>
 #include <cstdint>
 
 #include <d3d12.h>
@@ -71,6 +72,28 @@ ShaderModifications SelectModifications(const DxbcShaderTranslator& translator,
                                         const DxbcShader& vs, const DxbcShader* ps,
                                         const ShaderDrawRegs& regs);
 
+// The pixel shader modification specialized for the draw's texture fetch constants: sets
+// Modification::pixel.textures_unsigned when every fetch constant in `textures` (bit i: fetch
+// constant i) has no exponent adjustment and components that fetch as unsigned: sign_x..sign_w
+// all unsigned, or unsigned and signed on a format in `signed_is_unsigned_formats`
+// (SignedViewIsUnsignedFormats: the signed view is the unsigned one, and kSigned applies no
+// conversion of its own). `fetch` is the first of the 32 six-dword texture fetch constants.
+// Signs and exponent adjustment change per draw, so this stays outside SelectModifications and
+// its memo.
+inline uint64_t SpecializePixelTextures(uint64_t pixel, const uint32_t* fetch, uint32_t textures,
+                                        uint64_t signed_is_unsigned_formats) {
+  if (!textures) return pixel;
+  for (; textures; textures &= textures - 1) {
+    const uint32_t* f = fetch + std::countr_zero(textures) * 6;
+    const uint32_t signs = f[0] & 0x3FCu;  // 2 bits per component: 0 unsigned, 1 signed
+    if (f[3] & 0x7E000u) return pixel;
+    if (signs && ((signs & 0x2A8u) || !((signed_is_unsigned_formats >> (f[1] & 63)) & 1)))
+      return pixel;
+  }
+  DxbcShaderTranslator::Modification m(pixel);
+  m.pixel.textures_unsigned = 1;
+  return m.value;
+}
 // Root parameter indices of the bindless root signature (the plugin's order).
 enum BindlessRootParameter : uint32_t {
   kBindlessRoot_FetchConstants,

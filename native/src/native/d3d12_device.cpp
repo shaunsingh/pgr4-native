@@ -1,6 +1,9 @@
 // pgr4-native PGR4 native renderer: D3D12 device, frame command lists and the debug window.
 #include "d3d12_device.h"
 
+#include "gpu_timer.h"
+#include "renderer.h"  // NowNs
+
 #include <rex/logging.h>
 
 #include <algorithm>
@@ -238,6 +241,13 @@ bool D3D12Device::FollowParentSize() {
   return GetBackBuffers();
 }
 
+void D3D12Device::SetShown(bool shown) {
+  if (!parent_ || shown == shown_) return;
+  shown_ = shown;
+  if (HWND hwnd = hwnd_.load()) ShowWindowAsync(hwnd, shown ? SW_SHOWNA : SW_HIDE);
+  REXLOG_INFO("PGR4 native: window {}", shown ? "shown again" : "hidden for an SDK dialog");
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {
   D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
   h.ptr += size_t(back_index_) * rtv_stride_;
@@ -255,18 +265,37 @@ void D3D12Device::WaitIdle() {
   if (SUCCEEDED(queue_->Signal(fence_.Get(), v))) WaitFence(v);
 }
 
+bool D3D12Device::EnableGpuTimer() {
+  auto timer = std::make_unique<GpuTimer>();
+  if (!timer->Initialize(device_.Get(), queue_.Get(), kFramesInFlight)) return false;
+  timer->BeginFrame(list_.Get(), slot_);
+  gpu_timer_ = std::move(timer);
+  return true;
+}
+
 bool D3D12Device::OpenList() {
+  const uint64_t t0 = NowNs();
   WaitFence(slot_fence_[slot_]);
-  return !Failed(allocators_[slot_]->Reset(), "CommandAllocator::Reset") &&
-         !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
+  end_frame_times_.fence_ns = NowNs() - t0;
+  if (Failed(allocators_[slot_]->Reset(), "CommandAllocator::Reset") ||
+      Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
+    return false;
+  if (gpu_timer_) gpu_timer_->BeginFrame(list_.Get(), slot_);
+  return true;
 }
 
 bool D3D12Device::EndFrame() {
+  const uint64_t t0 = NowNs();
+  if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
   if (Failed(list_->Close(), "CommandList::Close")) return false;
   ID3D12CommandList* lists[] = {list_.Get()};
   queue_->ExecuteCommandLists(1, lists);
-  HRESULT hr = vsync_ ? swapchain_->Present(1, 0)
-                      : swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  const uint64_t t1 = NowNs();
+  HRESULT hr = !shown_ ? S_OK
+               : vsync_ ? swapchain_->Present(1, 0)
+                        : swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  end_frame_times_.submit_ns = t1 - t0;
+  end_frame_times_.present_ns = NowNs() - t1;
   if (Failed(hr, "Present")) {
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
       Failed(device_->GetDeviceRemovedReason(), "device removed, reason");

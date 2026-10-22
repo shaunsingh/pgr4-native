@@ -7,3 +7,5 @@ __pycache__/
 # lab CLI: dependencies and files copied back from the build host
 node_modules/
 .cache/
+# Source archives of other ports, read for prior art
+references/

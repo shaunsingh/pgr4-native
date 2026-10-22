@@ -50,6 +50,68 @@ uint32_t EdramRows(uint32_t base, uint32_t pitch, uint32_t samples, bool wide) {
   return (free_tiles / tiles_x) * 16 / sy;
 }
 
+// A surface's EDRAM layout: tiles of 80 dwords x 16 sample rows; a pixel takes 2 x 2 samples
+// with 4x MSAA and 1 x 2 with 2x, and a 64bpp sample takes 2 dwords.
+struct EdramGrid {
+  uint32_t base;   // tile
+  uint32_t pitch;  // tiles per row
+  uint32_t dx;     // dwords per pixel
+  uint32_t dy;     // sample rows per pixel
+};
+
+EdramGrid GridOf(const RenderTarget& rt) {
+  EdramGrid g;
+  g.base = rt.edram_base;
+  g.dx = (rt.samples >= 4 ? 2 : 1) * (!rt.depth && Is64bpp(rt.guest_format) ? 2 : 1);
+  g.dy = rt.samples >= 2 ? 2 : 1;
+  g.pitch = std::max(1u, (rt.pitch * g.dx + 79) / 80);
+  return g;
+}
+
+// Tiles [base, end) under a surface's first `rows` rows of pixels.
+uint32_t GridEnd(const EdramGrid& g, uint32_t rows) { return g.base + (rows * g.dy + 15) / 16 * g.pitch; }
+
+// The EDRAM format a color format stores as (the _AS_ formats only change blending).
+uint32_t StorageFormat(uint32_t color_format) {
+  return color_format == 10 ? 2u : color_format == 12 ? 3u : color_format;
+}
+
+// Dword columns and sample rows on a tile grid (an EDRAM fill's rectangle, render_targets.h).
+struct GridSpan {
+  int64_t x0, x1, y0, y1;
+};
+
+// The spans of grid `g` that `s` on the grid at tile `base` with `pitch` covers: one on the
+// same pitch at a whole number of rows from g's base, up to three (a row's tail, whole rows, a
+// row's head) for whole tile rows on another pitch. 0 when it covers nothing of g, -1 when its
+// shape does not map (part of a row on another pitch).
+int32_t MapSpan(uint32_t base, uint32_t pitch, const GridSpan& s, const EdramGrid& g, GridSpan* out) {
+  const int64_t d = int64_t(base) - int64_t(g.base);  // tiles
+  const int64_t p = g.pitch;
+  if (pitch == g.pitch && d % p == 0) {
+    out[0] = {s.x0, s.x1, s.y0 + d / p * 16, s.y1 + d / p * 16};
+    return 1;
+  }
+  if (s.x0 != 0 || s.x1 != int64_t(pitch) * 80 || s.y0 % 16 || s.y1 % 16) return -1;
+  const int64_t a = std::max<int64_t>(d + s.y0 / 16 * pitch, 0);
+  const int64_t b = d + s.y1 / 16 * pitch;
+  if (b <= a) return 0;
+  const int64_t ra = a / p, rb = b / p;
+  if (ra == rb) {
+    out[0] = {a % p * 80, b % p * 80, ra * 16, ra * 16 + 16};
+    return 1;
+  }
+  int32_t n = 0;
+  int64_t full = ra;
+  if (a % p) {
+    out[n++] = {a % p * 80, p * 80, ra * 16, ra * 16 + 16};
+    ++full;
+  }
+  if (rb > full) out[n++] = {0, p * 80, full * 16, rb * 16};
+  if (b % p) out[n++] = {0, b % p * 80, rb * 16, rb * 16 + 16};
+  return n;
+}
+
 D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* r, D3D12_RESOURCE_STATES before,
                                          D3D12_RESOURCE_STATES after) {
   D3D12_RESOURCE_BARRIER b = {};
@@ -316,6 +378,7 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
     RenderTarget* rt = GetColor(regs, i, height);
     if (!rt) return false;
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (rt->fill_seq != fill_seq_) SyncEdram(list, rt);
     out->color[i] = rt;
     out->rtv[i] = rt->view;
     out->color_count = i + 1;
@@ -332,6 +395,12 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
     out->height = std::min(out->height, rt->height);
   }
   if (out->width == UINT32_MAX) out->width = out->height = 0;
+  // The draw renders over these tiles (conservatively: its targets' rows above `height`).
+  if (!fills_.empty()) {
+    for (uint32_t i = 0; i < out->color_count; ++i)
+      if (out->color[i]) DropFills(*out->color[i], height);
+    if (out->depth) DropFills(*out->depth, height);
+  }
   return true;
 }
 
@@ -352,7 +421,8 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
     if (r.right > r.left && r.bottom > r.top) p.rects.push_back(r);
   };
   if (args.fn == HookFn::kClear) {
-    // Clear(dev, Count r4, pRects r5, Flags r6, Color r7, Z f1, Stencil r8)
+    // Clear(dev, Count r4, pRects r5, Flags r6, Color r7, Z f1, Stencil r9): Z takes r8's
+    // argument slot (sub_8269C4A0 passes r9 on to ClearF as its stencil).
     const uint32_t count = args.r[1], rects = args.r[2], color = args.r[4];
     p.flags = args.r[3];
     p.color[0] = float((color >> 16) & 0xFF) / 255.0f;
@@ -360,21 +430,33 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
     p.color[2] = float(color & 0xFF) / 255.0f;
     p.color[3] = float(color >> 24) / 255.0f;
     p.depth = float(args.f[0]);
-    p.stencil = uint8_t(args.r[5]);
+    p.stencil = uint8_t(args.r[6]);
     if (rects)
       for (uint32_t i = 0; i < count && i < 64; ++i) read_rect(rects + i * 16);
     if (rects && count && p.rects.empty()) return false;  // only empty rectangles
   } else if (args.fn == HookFn::kClearF) {
-    // ClearF(dev, Flags r4, pRect r5, pColor r6 (D3DVECTOR4), Z f1, Stencil r7). Also reached
-    // from inside BeginTiling (fn_8269C6D0), which clears the tiled scene surfaces through it.
+    // ClearF(dev, Flags r4, pRect r5, pColor r6 (D3DVECTOR4), Z f1, Stencil r8): Z takes r7's
+    // argument slot (sub_8269BCE8 reads the stencil from r8).
     p.flags = args.r[1];
     if (args.r[3])
       for (int i = 0; i < 4; ++i) p.color[i] = LoadF(base, args.r[3] + 4 * i);
     p.depth = float(args.f[0]);
-    p.stencil = uint8_t(args.r[4]);
+    p.stencil = uint8_t(args.r[5]);
     if (args.r[2]) {
       read_rect(args.r[2]);
       if (p.rects.empty()) return false;
+    }
+    // Inside BeginTiling (fn_8269C6D0) the rectangle is the largest tile's extent at the EDRAM
+    // base. Every tile starts from these values: the first from this clear, each later one
+    // from the previous tile's resolve, which EndTiling clears with BeginTiling's color, Z and
+    // stencil. The host surface holds all tiles, so it clears each of them.
+    if (args.tiling == TilingCall::kBegin && !p.rects.empty()) {
+      const uint32_t tiles = std::min(Load32(base, args.device + kDevTileCount), kMaxTiles);
+      if (tiles) {
+        p.edram_rects = std::move(p.rects);
+        p.rects.clear();
+        for (uint32_t i = 0; i < tiles; ++i) read_rect(args.device + kDevTileRects + 16 * i);
+      }
     }
   } else {
     return false;
@@ -401,12 +483,29 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
                           bool depth_bound, uint32_t height, const ClearParams& p) {
   const UINT nrects = UINT(p.rects.size());
   const D3D12_RECT* rects = nrects ? p.rects.data() : nullptr;
+  // What the clear leaves in the EDRAM, in pixels from the surface's base. A whole-surface
+  // clear covers the rows of the call's height hint (the target itself may be taller).
+  const std::vector<D3D12_RECT>& edram = p.edram_rects.empty() ? p.rects : p.edram_rects;
+  auto edram_rows = [&](const RenderTarget& rt) {
+    if (edram.empty()) return height ? std::min(height, rt.height) : rt.height;
+    uint32_t rows = 0;
+    for (const D3D12_RECT& r : edram) rows = std::max(rows, uint32_t(std::max<LONG>(r.bottom, 0)));
+    return rows;
+  };
   for (uint32_t i = 0; i < 4; ++i) {
     if (!(p.flags >> i & 1) || !(bound_colors >> i & 1)) continue;
     RenderTarget* rt = GetColor(regs, i, height);
     if (!rt) continue;
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // Outside the rectangles the target shows what the EDRAM holds there.
+    if (nrects && rt->fill_seq != fill_seq_) SyncEdram(list, rt);
     list->ClearRenderTargetView(rt->view, p.color, nrects, rects);
+    if (edram.empty()) {
+      RecordFill(*rt, {0, 0, LONG(rt->pitch), LONG(edram_rows(*rt))}, p.color);
+    } else {
+      for (const D3D12_RECT& r : edram) RecordFill(*rt, r, p.color);
+    }
+    rt->fill_seq = fill_seq_;
   }
   D3D12_CLEAR_FLAGS df = D3D12_CLEAR_FLAGS(0);
   if (p.flags & 0x10) df |= D3D12_CLEAR_FLAG_DEPTH;
@@ -416,7 +515,85 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
     if (rt) {
       Transition(list, rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
       list->ClearDepthStencilView(rt->view, df, std::clamp(p.depth, 0.0f, 1.0f), p.stencil, nrects, rects);
+      if (!fills_.empty()) DropFills(*rt, edram_rows(*rt));
     }
+  }
+}
+
+void RenderTargets::RecordFill(const RenderTarget& rt, const D3D12_RECT& r, const float color[4]) {
+  const EdramGrid g = GridOf(rt);
+  EdramFill f;
+  f.base = g.base;
+  f.pitch = g.pitch;
+  f.x0 = uint32_t(std::max<LONG>(r.left, 0)) * g.dx;
+  f.x1 = std::min(uint32_t(std::max<LONG>(r.right, 0)) * g.dx, g.pitch * 80);
+  f.y0 = uint32_t(std::max<LONG>(r.top, 0)) * g.dy;
+  f.y1 = uint32_t(std::max<LONG>(r.bottom, 0)) * g.dy;
+  if (f.x1 <= f.x0 || f.y1 <= f.y0) return;
+  f.format = StorageFormat(rt.guest_format);
+  std::memcpy(f.color, color, sizeof(f.color));
+  // Older fills inside this one are gone from the EDRAM: on the same grid, or anywhere in its
+  // run of tiles when it covers whole tile rows.
+  const bool whole_rows = f.x0 == 0 && f.x1 == f.pitch * 80 && f.y0 % 16 == 0 && f.y1 % 16 == 0;
+  auto covered = [&](const EdramFill& o) {
+    if (o.base == f.base && o.pitch == f.pitch)
+      return o.x0 >= f.x0 && o.x1 <= f.x1 && o.y0 >= f.y0 && o.y1 <= f.y1;
+    return whole_rows && o.first_tile() >= f.first_tile() && o.end_tile() <= f.end_tile();
+  };
+  fills_.erase(std::remove_if(fills_.begin(), fills_.end(), covered), fills_.end());
+  if (fills_.size() >= kMaxFills) fills_.erase(fills_.begin());
+  f.seq = ++fill_seq_;
+  fills_.push_back(f);
+}
+
+void RenderTargets::DropFills(const RenderTarget& rt, uint32_t rows) {
+  const EdramGrid g = GridOf(rt);
+  const uint32_t begin = g.base, end = GridEnd(g, rows);
+  fills_.erase(std::remove_if(fills_.begin(), fills_.end(),
+                              [&](const EdramFill& f) { return f.first_tile() < end && f.end_tile() > begin; }),
+               fills_.end());
+}
+
+void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
+  static uint32_t log_applied = 0, log_format = 0, log_shape = 0;
+  const uint64_t since = rt->fill_seq;
+  rt->fill_seq = fill_seq_;
+  if (rt->depth || since == fill_seq_) return;
+  const EdramGrid g = GridOf(*rt);
+  const uint32_t end = GridEnd(g, rt->height);
+  const uint32_t format = StorageFormat(rt->guest_format);
+  for (const EdramFill& f : fills_) {
+    if (f.seq <= since || f.first_tile() >= end || f.end_tile() <= g.base) continue;
+    GridSpan spans[3];
+    const int32_t n = MapSpan(f.base, f.pitch, {f.x0, f.x1, f.y0, f.y1}, g, spans);
+    if (n < 0) {
+      if (log_shape++ < 4)
+        REXLOG_INFO("PGR4 native RT: EDRAM fill at tile {} pitch {} ({}x{} dwords x rows) does not map onto base {} "
+                    "pitch {}", f.base, f.pitch, f.x1 - f.x0, f.y1 - f.y0, g.base, g.pitch);
+      continue;
+    }
+    // The whole pixels inside each span, clipped to the target.
+    D3D12_RECT rects[3];
+    UINT nr = 0;
+    for (int32_t i = 0; i < n; ++i) {
+      const GridSpan& s = spans[i];
+      const int64_t x0 = (s.x0 + g.dx - 1) / g.dx, x1 = std::min<int64_t>(s.x1 / g.dx, rt->width);
+      const int64_t y0 = (std::max<int64_t>(s.y0, 0) + g.dy - 1) / g.dy;
+      const int64_t y1 = std::min<int64_t>(s.y1 / g.dy, rt->height);
+      if (x1 > x0 && y1 > y0) rects[nr++] = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
+    }
+    if (!nr) continue;
+    if (f.format != format) {
+      if (log_format++ < 4)
+        REXLOG_INFO("PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at base {}", f.format,
+                    f.base, format, g.base);
+      continue;
+    }
+    Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list->ClearRenderTargetView(rt->view, f.color, nr, rects);
+    if (log_applied++ < 4)
+      REXLOG_INFO("PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} pitch {} x{} rows "
+                  "{}-{}", f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom);
   }
 }
 

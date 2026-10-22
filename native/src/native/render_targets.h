@@ -10,9 +10,16 @@
 // the 1x post chain, 80-pitch luminance reductions, the UI), and the 256x256 4x cube faces
 // sit at color base 224 over depth base 0. Every surface use starts with a Clear/ClearF of
 // that surface (BeginTiling's ClearF for the scene), a Resolve with clear flags on the same
-// surface, or a full-screen draw that overwrites it; no pass reads EDRAM another surface
-// left behind. So surfaces at the same base are independent host targets, and no data moves
-// between them. The only format aliasing that must share storage is 2_10_10_10_FLOAT vs
+// surface, or a full-screen draw that overwrites its color, so surfaces at the same base are
+// separate host targets and rendered data never moves between them. Cleared values do: the
+// post chain's first 1x pass writes RGB only and keeps the alpha EndTiling's resolve clears
+// left in the EDRAM (the motion blur mask: every tile is rendered at the base, so the 1x
+// surface's rows 0-479 hold the last tile's clear, alpha 0, and rows 480-719 the first
+// tile's, alpha 1). Clears
+// are therefore also recorded as EDRAM fills that other surfaces over the same tiles take
+// over when they are next used (EdramFill below).
+//
+// The only format aliasing that must share storage is 2_10_10_10_FLOAT vs
 // 2_10_10_10_FLOAT_AS_16_16_16_16 (PGR4 flips between them inside one pass for blending
 // precision); both map to one R16G16B16A16_FLOAT target, as in ReXGlue's host RT path.
 // The D3D's own clear quads at half pitch with 4x MSAA (inside Clear/ClearF) are not game
@@ -49,6 +56,13 @@ constexpr uint32_t kDevShadow2000 = 10368;     // registers 0x2000..0x2012
 constexpr uint32_t kDevShadow2100 = 10444;     // registers 0x2100..0x2114
 constexpr uint32_t kDevColorSurfaces = 12432;  // 4 x guest D3D surface object
 constexpr uint32_t kDevDepthSurface = 12448;
+// Predicated tiling, as BeginTiling (fn_8269C6D0) stores it: the tile count, each tile's
+// rectangle in surface pixels {x1, y1, x2, y2} (16 bytes), and each tile's origin rounded down
+// to 32 pixels {x, y} (8 bytes), the surface pixel the guest renders at the EDRAM base.
+constexpr uint32_t kDevTileCount = 12740;
+constexpr uint32_t kDevTileRects = 12744;
+constexpr uint32_t kDevTileOrigins = 12984;
+constexpr uint32_t kMaxTiles = 15;
 
 // One host render target.
 struct RenderTarget {
@@ -68,6 +82,7 @@ struct RenderTarget {
   D3D12_CPU_DESCRIPTOR_HANDLE view{};  // RTV or DSV
   uint32_t view_index = 0;
   uint64_t last_frame = 0;  // frame of the last use, for eviction
+  uint64_t fill_seq = 0;    // EDRAM fills up to this sequence are applied (SyncEdram)
 };
 
 // Host targets for one draw.
@@ -87,7 +102,12 @@ struct ClearParams {
   float color[4] = {};         // RGBA
   float depth = 1.0f;
   uint8_t stencil = 0;
-  std::vector<D3D12_RECT> rects;  // empty: whole surface
+  std::vector<D3D12_RECT> rects;  // surface pixels; empty: whole surface
+  // The EDRAM the guest clears, in pixels from the surface's EDRAM base, where it is not
+  // `rects`: under predicated tiling every tile is rendered at the base, so BeginTiling's
+  // ClearF clears the largest tile's extent there once (and `rects` holds every tile), and
+  // EndTiling's resolve clears land at the base whatever the tile's position.
+  std::vector<D3D12_RECT> edram_rects;
 };
 
 // One Clear / ClearF call, decoded from its arguments and the device (guest memory).
@@ -125,6 +145,10 @@ class RenderTargets {
   RenderTarget* GetColor(const SurfaceRegs& regs, uint32_t index, uint32_t height);
   RenderTarget* GetDepth(const SurfaceRegs& regs, uint32_t height);
 
+  // Clears color target `rt` to the EDRAM fills recorded over its tiles since its last use.
+  // Bind and Clear do this; other readers of a target (resolve sources) call it first.
+  void SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt);
+
   static void Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt,
                          D3D12_RESOURCE_STATES state);
 
@@ -141,6 +165,27 @@ class RenderTargets {
   static DXGI_FORMAT ColorFormat(uint32_t color_format);
 
  private:
+  // EDRAM residue. A color clear leaves one value in the EDRAM tiles it covers, and another
+  // surface of the same storage format over those tiles reads it until something renders
+  // there. A fill is one cleared rectangle in EDRAM terms: dword columns and sample rows on the
+  // cleared surface's tile grid (tiles of 80 dwords x 16 sample rows, `pitch` tiles per row
+  // from tile `base`). A draw or a depth clear over any of its tiles drops a fill whole.
+  struct EdramFill {
+    uint64_t seq = 0;
+    uint32_t base = 0, pitch = 1;  // tiles
+    uint32_t x0 = 0, x1 = 0;       // dword columns within a tile row
+    uint32_t y0 = 0, y1 = 0;       // sample rows from base's tile row
+    uint32_t format = 0;           // xenos color format as stored (the _AS_ variants folded)
+    float color[4] = {};
+    uint32_t first_tile() const { return base + y0 / 16 * pitch + x0 / 80; }
+    uint32_t end_tile() const { return base + (y1 - 1) / 16 * pitch + (x1 - 1) / 80 + 1; }
+  };
+  static constexpr size_t kMaxFills = 32;
+  // `r`: pixels from rt's EDRAM base.
+  void RecordFill(const RenderTarget& rt, const D3D12_RECT& r, const float color[4]);
+  // Drops the fills over rt's first `rows` rows of pixels.
+  void DropFills(const RenderTarget& rt, uint32_t rows);
+
   RenderTarget* Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height);
   void Retire(ComPtr<ID3D12Resource> resource);
   bool Create(RenderTarget* rt, uint32_t height);
@@ -166,6 +211,8 @@ class RenderTargets {
   std::vector<Retired> retired_;
   uint64_t recreated_ = 0;
   uint64_t frame_ = 0, frame_fence_ = 0;
+  std::vector<EdramFill> fills_;  // oldest first
+  uint64_t fill_seq_ = 0;
 };
 
 }  // namespace pgr4::native

@@ -170,11 +170,17 @@ class GuestStateTracker {
     Mark(reg);
   }
   void Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count);
+  // The block registers whose bit is set in `dirty` (masks +0..+40, host order).
+  void CopyDirty(const uint8_t* base, uint32_t device, const uint64_t dirty[6]);
+  // --pgr4_native_track_verify: logs block registers whose shadow differs from regs_.
+  void Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr);
   void LoadLiterals(const uint8_t* base, uint32_t table, uint32_t data);
 
   uint32_t device_ = 0;
   ShaderRef vs_, ps_;
   uint32_t inline_vertices_ = 0, inline_bytes_ = 0;
+  // Vertex fetch 31 holds BeginVertices' inline buffer, not the shadow's value.
+  bool inline_fetch_ = false;
   // Immediate VS loads: the one made during the current flushing call (pending) and the one
   // the GPU holds (vs_ points into it while vs_.immediate is set).
   std::vector<uint32_t> vs_imm_pending_, vs_imm_;

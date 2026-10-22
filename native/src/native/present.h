@@ -3,8 +3,8 @@
 // OnSwap reads the front buffer texture of the guest Swap (r4, a D3DBaseTexture; fetch
 // constant at +28, the same object the frame's last Resolve wrote), finds its host image in the
 // Resolver (RTResolve) and draws it into the debug window's back buffer with the fetch
-// constant's swizzle (no gamma ramp: the window shows the front buffer as resolved). Without a
-// resolved image the back buffer is cleared to magenta.
+// constant's swizzle and the display controller's gamma ramp (present.cpp). Without a
+// resolved image the back buffer is cleared to black.
 //
 // Captures (oracle for M2): --pgr4_native_capture_dir (default
 // C:\recomp\logs\pgr4-native-captures) and either the file <dir>\capture.request (deleted

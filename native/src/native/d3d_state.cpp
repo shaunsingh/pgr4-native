@@ -3,11 +3,16 @@
 // generated code, M1 trace comparisons) is in the development notes, "Renderer decision".
 #include "d3d_state.h"
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include <emmintrin.h>
 
 #include <cstring>
+
+REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
+                    "After each game draw, compare the guest register shadow with the tracked "
+                    "registers and log the ones that differ (state tracker check)");
 
 namespace pgr4::native {
 namespace {
@@ -37,23 +42,36 @@ inline uint32_t GpuAddress(uint32_t a) {
 }
 
 // Register blocks the draw functions flush with sub_826A8720, (device offset, first register,
-// registers). The counts are the dirty-mask widths in sub_8269ADD8 (the shadow areas between
-// the offsets are longer for 0x2000: 19 dwords, of which only 16 are ever flushed).
+// registers, dirty mask (device + 8 * mask), the mask bit of the first register, registers per
+// bit). The counts are the dirty-mask widths in sub_8269ADD8 (the shadow areas between the
+// offsets are longer for 0x2000: 19 dwords, of which only 16 are ever flushed). The flush
+// functions shift a block's bits to the top of the word and walk them with count-leading-zeros,
+// so bit `top - k` covers the k-th group of `per` registers.
 struct Block {
   uint32_t offset, reg, count;
+  uint8_t mask, top, per;
 };
 constexpr Block kRegisterBlocks[] = {
-    {10368, 0x2000, 16},  // mask +16 bits 57..42
-    {10444, 0x2100, 21},  // mask +16 bits 41..21
-    {10528, 0x2180, 5},   // mask +16 bits 16..12
-    {10548, 0x2200, 12},  // mask +16 bits 11..0
-    {10596, 0x2280, 21},  // mask +24 bits 54..34
-    {10680, 0x2300, 38},  // mask +32 bits 37..0
-    {10832, 0x2380, 8},   // mask +32 bits 45..38
-    {dev::kClipPlanes, 0x2388, 24},       // mask +32 bits 54..49, sub_826A87E0
-    {dev::kFetchConstants, 0x4800, 192},  // mask +24 bits 31..0, sub_826A8960
-    {dev::kBoolLoop, 0x4900, 40},         // mask +32 bit 56
+    {10368, 0x2000, 16, 2, 57, 1},                  // mask +16 bits 57..42
+    {10444, 0x2100, 21, 2, 41, 1},                  // mask +16 bits 41..21
+    {10528, 0x2180, 5, 2, 16, 1},                   // mask +16 bits 16..12
+    {10548, 0x2200, 12, 2, 11, 1},                  // mask +16 bits 11..0
+    {10596, 0x2280, 21, 3, 54, 1},                  // mask +24 bits 54..34
+    {10680, 0x2300, 38, 4, 37, 1},                  // mask +32 bits 37..0
+    {10832, 0x2380, 8, 4, 45, 1},                   // mask +32 bits 45..38
+    {dev::kClipPlanes, 0x2388, 24, 4, 54, 4},       // mask +32 bits 54..49, sub_826A87E0
+    {dev::kFetchConstants, 0x4800, 192, 3, 31, 6},  // mask +24 bits 31..0, sub_826A8960
+    {dev::kBoolLoop, 0x4900, 40, 4, 56, 40},        // mask +32 bit 56
 };
+
+// Mask +16 bits 17..20 make a draw call the shader load sub_826A9858 (bit 19 = vertex shader,
+// 20 = pixel shader). Besides the stream, it writes registers of the 0x2000, 0x2180 and 0x2200
+// blocks into the shadow (0x2001, 0x2180-0x2182 and, through sub_826A8188, 0x2203, 0x2208)
+// and the draw flushes them in the same call, so their dirty bits are not set at its entry.
+constexpr uint64_t kShaderLoadBits = 0x1E0000ull;
+constexpr uint64_t kShaderLoadBlocks = (0xFFFFull << 42) | (0x1Full << 12) | 0xFFFull;  // mask +16
+// Vertex fetch constant 31 (mask +24 bit 0): BeginVertices' inline vertex buffer.
+constexpr uint64_t kFetch31 = 1ull;
 
 constexpr uint32_t kFnBeginVertices = 0x8269A4F8, kFnDrawVerticesUP = 0x8269A9A8,
                    kFnDrawVertices = 0x8269A9F0, kFnDrawIndexed = 0x8269ADD8,
@@ -94,6 +112,49 @@ void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, ui
     for (uint32_t k = 0; k < 4; ++k) put_raw(i + k);
   }
   for (; i < count; ++i) put_raw(i);
+}
+
+void GuestStateTracker::CopyDirty(const uint8_t* base, uint32_t device, const uint64_t dirty[6]) {
+  for (const Block& b : kRegisterBlocks) {
+    const uint32_t groups = b.count / b.per;
+    uint64_t m = (dirty[b.mask] << (63 - b.top)) & ~(~0ull >> groups);  // group g at bit 63 - g
+    uint32_t g = 0;
+    while (m) {
+      const uint32_t skip = uint32_t(__builtin_clzll(m));
+      m <<= skip;
+      g += skip;
+      const uint32_t run = ~m ? uint32_t(__builtin_clzll(~m)) : 64;
+      Copy(b.reg + g * b.per, base, device + b.offset + g * b.per * 4, run * b.per);
+      g += run;
+      m = run < 64 ? m << run : 0;
+    }
+  }
+}
+
+void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr) {
+  static uint64_t checks = 0, differing = 0;
+  static uint32_t reported = 0;
+  static bool seen[kGuestRegisterCount] = {};
+  ++checks;
+  for (const Block& b : kRegisterBlocks) {
+    const uint8_t* p = Host(base, device + b.offset);
+    for (uint32_t i = 0; i < b.count; ++i) {
+      const uint32_t reg = b.reg + i;
+      uint32_t v;
+      std::memcpy(&v, p + i * 4, 4);
+      if (v == raw_[reg] || reg == 0x2102) continue;  // VGT_INDX_OFFSET: per draw, not the shadow
+      ++differing;
+      if (!seen[reg] && reported < 64) {
+        seen[reg] = true;
+        ++reported;
+        REXLOG_INFO("PGR4 native state verify: register {:04X} shadow {:08X} tracked {:08X} after {:08X}",
+                    reg, __builtin_bswap32(v), regs_[reg], fn_addr);
+      }
+    }
+  }
+  if (checks >= 1024 && (checks & (checks - 1)) == 0)
+    REXLOG_INFO("PGR4 native state verify: {} draws checked, {} differing register values", checks,
+                differing);
 }
 
 void GuestStateTracker::TakeChanges(std::vector<RegWrite>* out) {
@@ -199,8 +260,24 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   // Register blocks, clip planes, fetch and bool/loop constants: at the end of every flushing
   // call the shadow equals what the GPU has for these (the M1 traces show no other
   // differences: the draw flushes whatever is dirty, and Clear/Resolve re-dirty what they
-  // overwrite in the stream, so the next draw restores it).
-  for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
+  // overwrite in the stream, so the next draw restores it). A game draw changes only what was
+  // dirty at its entry and what its shader load wrote; Clear, Resolve, Swap and the D3D's own
+  // draws may write the shadow themselves, so after them every block is compared.
+  const bool game_draw =
+      fn_addr == kFnDrawIndexed || fn_addr == kFnDrawVertices || fn_addr == kFnBeginVertices;
+  const bool stride_changed =
+      fn_addr == kFnBeginVertices && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords;
+  if (game_draw) {
+    uint64_t dirty[6];
+    std::memcpy(dirty, e.dirty, sizeof(dirty));
+    if ((dirty[2] & kShaderLoadBits) || stride_changed) dirty[2] |= kShaderLoadBlocks;
+    if (inline_fetch_) dirty[3] |= kFetch31;
+    CopyDirty(base, device, dirty);
+    if (REXCVAR_GET(pgr4_native_track_verify)) Verify(base, device, fn_addr);
+  } else {
+    for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
+  }
+  inline_fetch_ = false;
 
   // Window scissor: sub_8268DEB0 writes PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR straight into the
   // stream from the rectangle SetScissorRect (fn_826904C8) keeps at device+10436/+10440 (15-bit
@@ -223,8 +300,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     uint32_t vs = Load32(base, device + dev::kVertexShader);
     uint32_t ps = Load32(base, device + dev::kPixelShader);
     uint64_t rebind = e.dirty[2];
-    if (fn_addr == kFnBeginVertices && vs && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords)
-      rebind |= kVsRebind;  // BeginVertices sets it itself when the stride changes
+    if (stride_changed && vs) rebind |= kVsRebind;  // BeginVertices sets it itself
     if (vs) {
       if (vs_imm_new) {
         // sub_826A9508 ran inside this draw: the GPU now holds the patched copy.
@@ -276,6 +352,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
       Put(f + 3, 0);
       Put(f + 4, GpuAddress(p) | 3);
       Put(f + 5, 0x10000002u | (((bytes >> 2) & 0xFFFFFFu) << 2));
+      inline_fetch_ = true;
       inline_vertices_ = GpuAddress(p);
       inline_bytes_ = bytes;
       break;

@@ -6,10 +6,11 @@
 // and optionally clears the source surfaces afterwards. Here every resolve destination
 // (guest physical address of the level/slice) gets a host Texture2D that holds exactly the
 // texels the Xenos plugin writes into guest memory, untiled and endian-unswapped, in
-// GetHostFormat(dest format)->resource (texture_layout.h), so the texture cache can copy it
-// into its own textures in place of the guest-memory upload. The copy runs as a compute
-// shader (format packing as ReXGlue's resolve shaders do it) into a linear scratch buffer,
-// then CopyTextureRegion into the destination.
+// the typeless family of GetHostFormat(dest format)->resource (texture_layout.h), so the
+// texture cache can bind it in place of its own texture (or copy it into one) instead of the
+// guest-memory upload. A compute shader (format packing as ReXGlue's resolve shaders do it)
+// writes the texels straight into the image through a UINT view. Images persist per
+// destination address, format and size, so their resources and views stay valid.
 //
 // Arguments are decoded the way the guest D3D does it (read from its generated code,
 // sub_82696978): NULL source rect = the destination level's size, right/bottom rounded up to
@@ -45,12 +46,15 @@
 
 namespace pgr4::native {
 
+class GpuTimer;
+
 // What the texture cache needs to use a resolve result (TextureMod contract).
+// The resources live as long as the Resolver.
 struct ResolvedImage {
   uint32_t guest_base = 0;  // physical address of the destination level/slice
   rex::graphics::xenos::TextureFormat format{};  // destination format (RB_COPY_DEST_INFO)
   uint32_t width = 0, height = 0;  // texels written from (0, 0), dest point included
-  ID3D12Resource* texture = nullptr;  // state: COPY_SOURCE | ALL_SHADER_RESOURCE
+  ID3D12Resource* texture = nullptr;  // state: COPY_SOURCE | ALL_SHADER_RESOURCE; typeless
   // Depth resolves only: R32_FLOAT = float20e4(d >> 8) (or unorm24 for D24S8), what the
   // texture cache's k_24_8(_FLOAT) conversion gives when the game samples the k_8_8_8_8
   // destination as depth. Same size and state as `texture`.
@@ -78,7 +82,10 @@ struct ResolveParams {
   uint32_t dest_pitch_blocks = 0;  // row pitch in texels (tiled: 32-aligned)
   uint32_t dest_extent_bytes = 0;  // guest memory the level/slice occupies
   // Clears after the copy (Flags 0x100 color, 0x200 depth+stencil) over the source rect.
+  // Inside EndTiling the rect is one tile, which the guest rendered with its origin (edram_x,
+  // edram_y) at the surface's EDRAM base, so that is where the clear lands in the EDRAM.
   uint32_t clear_flags = 0;
+  int32_t edram_x = 0, edram_y = 0;
   float clear_color[4] = {};
   float clear_depth = 1.0f;
   uint8_t clear_stencil = 0;
@@ -122,6 +129,8 @@ class Resolver {
   // resolved into, created, replaced or erased), so a cache can recheck only the textures
   // that sample that address.
   void SetChangedCallback(std::function<void(uint32_t guest_phys_base)> f) { changed_ = std::move(f); }
+  // With GPU timing: Resolve marks its phases (GpuTimer::ResolvePhase).
+  void set_gpu_timer(GpuTimer* timer) { timer_ = timer; }
 
   uint64_t resolves() const { return resolves_; }
   uint64_t failures() const { return failures_; }
@@ -135,10 +144,17 @@ class Resolver {
 
  private:
   struct Image;
+  // Every image resolved into one guest address, one per format and size. Images are never
+  // destroyed: the texture cache binds them in place of its own textures and the draws keep
+  // descriptors of them, and an address that alternates between formats or sizes reuses its
+  // images instead of recreating one per resolve.
+  struct Destination {
+    std::vector<std::unique_ptr<Image>> images;
+    Image* current = nullptr;  // the last one written (Find)
+  };
   struct Dump;
   bool CreatePipelines();
-  Image* GetImage(const ResolveParams& p, uint32_t width, uint32_t height);
-  bool EnsureScratch(uint64_t bytes);
+  Image* GetImage(const ResolveParams& p);
   void CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParams& p);
   void DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, Image* img,
                   uint32_t width, uint32_t height);
@@ -146,24 +162,19 @@ class Resolver {
 
   ID3D12Device* device_ = nullptr;
   RenderTargets* targets_ = nullptr;
-  ComPtr<ID3D12RootSignature> root_signature_;
-  ComPtr<ID3D12PipelineState> pso_[4];  // [depth][msaa]
-  ComPtr<ID3D12DescriptorHeap> heap_;   // shader visible: per-frame rings of SRV pairs
+  struct Pipelines;
+  std::unique_ptr<Pipelines> pipelines_;
+  ComPtr<ID3D12DescriptorHeap> heap_;   // shader visible: per-frame rings of view tables
   uint32_t heap_stride_ = 0;
   uint32_t heap_next_ = 0;
-  ComPtr<ID3D12Resource> scratch_;
-  uint64_t scratch_size_ = 0;
-  D3D12_RESOURCE_STATES scratch_state_ = D3D12_RESOURCE_STATE_COMMON;
-  std::unordered_map<uint32_t, std::unique_ptr<Image>> images_;
-  struct Retired {
-    ComPtr<ID3D12Resource> resource;
-    uint64_t fence;
-  };
-  std::vector<Retired> retired_;
+  bool b5g6r5_store_ = false;  // typed UAV store of B5G6R5_UNORM (k_5_6_5 / k_6_5_5 images)
+  std::unordered_map<uint32_t, Destination> destinations_;
+  size_t image_count_ = 0;
   uint64_t frame_ = 0, frame_fence_ = 0;
   uint64_t resolves_ = 0, failures_ = 0, shadow_mismatches_ = 0, seq_ = 0;
   std::function<void(uint32_t)> changed_;
   std::unique_ptr<Dump> dump_;
+  GpuTimer* timer_ = nullptr;
 };
 
 }  // namespace pgr4::native

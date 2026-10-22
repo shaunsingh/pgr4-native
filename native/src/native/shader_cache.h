@@ -41,6 +41,9 @@ class ShaderCache {
   // invalid (counted in stats().failures and logged once).
   DxbcShader::Translation* Translate(DxbcShader& shader, uint64_t modification);
 
+  // The loaded shader with ucode hash `hash`, or nullptr.
+  const DxbcShader* Find(uint64_t hash);
+
   const ShaderCacheStats& stats() const { return stats_; }
 
  private:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replays a timed key script into the game under Proton on Hyprland, through a uinput keyboard.
+"""Replays a timed key script into the game under Proton on Linux, through a uinput keyboard.
 
 Linux counterpart of ../run/input-player.ps1, same script format and same log lines, so the
 Windows tools (co_run's mark wait, ab_compare.py, perf_fps.py) read its log unchanged:
@@ -9,11 +9,16 @@ Windows tools (co_run's mark wait, ab_compare.py, perf_fps.py) read its log unch
 Time zero is when the game's window first exists. Keys: return, space, escape, backspace, tab,
 up/down/left/right, a letter or digit, chords like shift+e.
 
-Needs write access to /dev/uinput (run.sh grants it with setfacl) and the Hyprland session's
-hyprctl (focus checks). No Python packages: the uinput device is set up with raw ioctls.
+Keys go through a uinput keyboard, which needs write access to /dev/uinput (SteamOS grants it to
+the desktop user; elsewhere run sudo setfacl -m u:$USER:rw /dev/uinput), or with --input xtest
+through the X server in $DISPLAY (xdotool), as for a headless gamescope. Focus checks go through
+hyprctl on Hyprland and through xdotool on X11 or XWayland (KDE Plasma on SteamOS); gamescope
+manages focus itself, and --wm none turns them off. No Python packages: the uinput device is set
+up with raw ioctls.
 
 usage: route_player.py --script route.keys --log input.log [--match pgr4_recompiled] [--timeout 120]
-                       [--width 1280 --height 720]
+                       [--width 1280 --height 720] [--wm auto|hyprland|x11|gamescope|none]
+                       [--input uinput|xtest] [--stretch 1.0]
 """
 import argparse
 import datetime as dt
@@ -22,6 +27,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import time
@@ -63,54 +69,177 @@ class Keyboard:
         os.close(self.fd)
 
 
-def hypr_env() -> dict:
-    env = dict(os.environ)
-    run = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    env["XDG_RUNTIME_DIR"] = run
-    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
-        socks = sorted(glob.glob(f"{run}/hypr/*/.socket.sock"), key=os.path.getmtime)
-        if socks:
-            env["HYPRLAND_INSTANCE_SIGNATURE"] = socks[-1].split("/")[-2]
-    return env
+class XTestKeyboard:
+    """Key events through the X server's XTEST extension (xdotool), for an X server that reads
+    no kernel input devices, such as the Xwayland of a headless gamescope."""
+
+    SYMS = {1: "Escape", 14: "BackSpace", 15: "Tab", 28: "Return", 57: "space", 42: "Shift_L",
+            29: "Control_L", 56: "Alt_L", 103: "Up", 105: "Left", 106: "Right", 108: "Down"}
+
+    def __init__(self) -> None:
+        self.syms = dict(self.SYMS)
+        for name, code in KEYS.items():
+            if len(name) == 1:
+                self.syms[code] = name
+
+    def send(self, code: int, down: bool) -> None:
+        subprocess.run(["xdotool", "keydown" if down else "keyup", self.syms[code]], timeout=10)
+
+    def close(self) -> None:
+        pass
 
 
-def hyprctl(*args: str):
-    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, env=hypr_env(), timeout=10).stdout
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
+class Hyprland:
+    """Window lookup and focus through hyprctl. Windows are identified by their address."""
+
+    def __init__(self) -> None:
+        env = dict(os.environ)
+        run = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        env["XDG_RUNTIME_DIR"] = run
+        if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            socks = sorted(glob.glob(f"{run}/hypr/*/.socket.sock"), key=os.path.getmtime)
+            if socks:
+                env["HYPRLAND_INSTANCE_SIGNATURE"] = socks[-1].split("/")[-2]
+        self.env = env
+
+    @staticmethod
+    def available() -> bool:
+        run = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        return shutil.which("hyprctl") is not None and bool(glob.glob(f"{run}/hypr/*/.socket.sock"))
+
+    def _ctl(self, *args: str):
+        out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, env=self.env, timeout=10).stdout
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            return None
+
+    def _dispatch(self, lua: str) -> None:
+        """Hyprland 0.56 with a Lua config takes dispatchers as Lua (hl.dsp.*), not as words."""
+        subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, env=self.env, timeout=10)
+
+    def find(self, match: str):
+        for c in self._ctl("clients") or []:
+            if re.search(match, f"{c.get('class', '')} {c.get('title', '')}", re.I) and c.get("mapped", True):
+                return c["address"], c.get("pid")
         return None
 
+    def focused(self, win: str) -> bool:
+        w = self._ctl("activewindow")
+        return bool(w) and w.get("address") == win
 
-def find_window(match: str):
-    for c in hyprctl("clients") or []:
-        if re.search(match, f"{c.get('class', '')} {c.get('title', '')}", re.I) and c.get("mapped", True):
-            return c
-    return None
+    def focus(self, win: str) -> bool:
+        self._dispatch(f'hl.dsp.focus({{ window = "address:{win}" }})')
+        time.sleep(0.2)
+        return self.focused(win)
 
-
-def focused(addr: str) -> bool:
-    w = hyprctl("activewindow")
-    return bool(w) and w.get("address") == addr
-
-
-def dispatch(lua: str) -> None:
-    """Hyprland 0.56 with a Lua config takes dispatchers as Lua (hl.dsp.*), not as words."""
-    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, env=hypr_env(), timeout=10)
-
-
-def focus(addr: str) -> bool:
-    dispatch(f'hl.dsp.focus({{ window = "address:{addr}" }})')
-    time.sleep(0.2)
-    return focused(addr)
+    def place(self, win: str, w: int, h: int) -> None:
+        """Float the game at its own size, centred, like the Windows runs (no tiling resize)."""
+        window = f'window = "address:{win}"'
+        self._dispatch(f'hl.dsp.window.float({{ {window}, action = "on" }})')
+        self._dispatch(f"hl.dsp.window.resize({{ {window}, x = {w}, y = {h} }})")
+        self._dispatch(f"hl.dsp.window.center({{ {window} }})")
 
 
-def place(addr: str, w: int, h: int) -> None:
-    """Float the game at its own size, centred, like the Windows runs (no tiling resize)."""
-    window = f'window = "address:{addr}"'
-    dispatch(f'hl.dsp.window.float({{ {window}, action = "on" }})')
-    dispatch(f"hl.dsp.window.resize({{ {window}, x = {w}, y = {h} }})")
-    dispatch(f"hl.dsp.window.center({{ {window} }})")
+class X11:
+    """Window lookup and focus through xdotool: Wine's windows are X11 clients, also under
+    XWayland (KDE Plasma's Wayland session on SteamOS). The game sizes its own window."""
+
+    @staticmethod
+    def available() -> bool:
+        return shutil.which("xdotool") is not None and bool(os.environ.get("DISPLAY"))
+
+    @staticmethod
+    def _xdo(*args: str) -> str:
+        r = subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def find(self, match: str):
+        # Wine names WM_CLASS after the executable, Proton outside Steam names it steam_proton;
+        # the SDK's window title carries the executable's name either way.
+        for field in ("--name", "--class"):
+            for wid in self._xdo("search", "--onlyvisible", field, match).split():
+                return wid, (self._xdo("getwindowpid", wid) or None)
+        return None
+
+    def windows(self) -> str:
+        """Every named window, mapped or not, for the log when none matched."""
+        ids = self._xdo("search", "--name", ".").split()
+        return "; ".join(f"{w} {self._xdo('getwindowname', w)!r}" for w in ids[:40])
+
+    def focused(self, win: str) -> bool:
+        return self._xdo("getactivewindow") == win
+
+    def focus(self, win: str) -> bool:
+        self._xdo("windowactivate", win)
+        time.sleep(0.2)
+        return self.focused(win)
+
+    def place(self, win: str, w: int, h: int) -> None:
+        pass
+
+
+class Gamescope(X11):
+    """gamescope sizes and focuses the game itself. In about one start in five the game's
+    top-level window is never mapped (seen with GE-Proton 11 and gamescope 3.16): gamescope then
+    has no window to focus, X focus stays None and XTEST keys are dropped. Windows are therefore
+    found mapped or not, and focusing maps the window first when it has to."""
+
+    def find(self, match: str):
+        for field in ("--name", "--class"):
+            for wid in self._xdo("search", field, match).split():
+                return wid, (self._xdo("getwindowpid", wid) or None)
+        return None
+
+    def focused(self, win: str) -> bool:
+        focus = self._xdo("getwindowfocus", "-f")
+        # Wine may focus a child X window of the game's top-level window.
+        return focus not in ("", "0", "1") and (focus == win or self._xdo("getwindowpid", focus) ==
+                                                self._xdo("getwindowpid", win) != "")
+
+    def focus(self, win: str) -> bool:
+        if win not in self._xdo("search", "--onlyvisible", "--name", ".").split():
+            self._xdo("windowmap", win)
+            time.sleep(0.5)
+        self._xdo("windowfocus", win)
+        time.sleep(0.1)
+        return self.focused(win)
+
+    def focus_name(self) -> str:
+        """The window XTEST keys go to, for the log."""
+        w = self._xdo("getwindowfocus", "-f")
+        return f"{w} {self._xdo('getwindowname', w)!r}" if w else "none"
+
+
+class NoWindowManager:
+    """No window manager control: the uinput keyboard types into whatever has focus."""
+
+    def __init__(self, match: str) -> None:
+        self.match = match
+
+    @staticmethod
+    def available() -> bool:
+        return True
+
+    def find(self, match: str):
+        r = subprocess.run(["pgrep", "-f", match], capture_output=True, text=True)
+        pids = r.stdout.split()
+        return ("process", pids[0]) if pids else None
+
+    def focused(self, win: str) -> bool:
+        return True
+
+    def focus(self, win: str) -> bool:
+        return True
+
+    def place(self, win: str, w: int, h: int) -> None:
+        pass
+
+
+def window_manager(kind: str, match: str):
+    if kind == "auto":
+        kind = "hyprland" if Hyprland.available() else "x11" if X11.available() else "none"
+    return {"hyprland": Hyprland, "x11": X11, "gamescope": Gamescope}.get(kind, lambda: NoWindowManager(match))()
 
 
 def parse(text: str):
@@ -140,6 +269,10 @@ def main() -> None:
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--wm", choices=("auto", "hyprland", "x11", "gamescope", "none"), default="auto")
+    ap.add_argument("--input", choices=("uinput", "xtest"), default="uinput")
+    # Scales every delay of the script, for machines that load slower than the one it was timed on.
+    ap.add_argument("--stretch", type=float, default=1.0)
     args = ap.parse_args()
     logf = open(args.log, "a", buffering=1)
 
@@ -147,22 +280,27 @@ def main() -> None:
         logf.write(f"{dt.datetime.now().astimezone().isoformat()} {msg}\n")
 
     events = parse(open(args.script).read())
-    kb = Keyboard()
+    for e in events:
+        e["at"] = round(e["at"] * args.stretch)
+    wm = window_manager(args.wm, args.match)
+    kb = XTestKeyboard() if args.input == "xtest" else Keyboard()
     held = []
     try:
         deadline = time.monotonic() + args.timeout
         win = None
         while not win:
-            win = find_window(args.match)
+            win = wm.find(args.match)
             if time.monotonic() > deadline:
-                say(f"error: no window matching {args.match} after {args.timeout} s")
+                seen = wm.windows() if hasattr(wm, "windows") else ""
+                say(f"error: no window matching {args.match} after {args.timeout} s"
+                    f" (DISPLAY={os.environ.get('DISPLAY', '')}; windows: {seen or 'none'})")
                 raise SystemExit(1)
             time.sleep(0.1)
         t0 = time.monotonic()
         clock = lambda: int((time.monotonic() - t0) * 1000)
-        addr = win["address"]
-        place(addr, args.width, args.height)
-        say(f"start pid={win.get('pid')} window={addr} events={len(events)} script={args.script}")
+        addr, pid = win
+        wm.place(addr, args.width, args.height)
+        say(f"start pid={pid} window={addr} wm={type(wm).__name__} events={len(events)} script={args.script}")
         actions = []
         for n, e in enumerate(events):
             if "mark" in e:
@@ -173,8 +311,8 @@ def main() -> None:
         for at, _, _, kind, e in sorted(actions, key=lambda a: a[:3]):
             while (wait := at - clock()) > 0:
                 time.sleep(min(wait, 500) / 1000)
-                if not focused(addr):
-                    ok = focus(addr)
+                if not wm.focused(addr):
+                    ok = wm.focus(addr)
                     if ok:
                         for h in held:
                             for c in h["codes"]:
@@ -186,20 +324,21 @@ def main() -> None:
                 if e in held:
                     held.remove(e)
                 continue
-            if not find_window(args.match):
+            if not wm.find(args.match):
                 say(f"error: game window gone at {clock()} ms")
                 raise SystemExit(1)
             if kind == "mark":
                 say(f"mark {e['mark']} t={clock()}")
                 continue
-            if not focused(addr) and not focus(addr):
+            if not wm.focused(addr) and not wm.focus(addr):
                 say(f"error: could not focus the game for {e['keys']} at {clock()} ms")
                 raise SystemExit(1)
             late = clock() - e["at"]
             for c in e["codes"]:
                 kb.send(c, True)
             held.append(e)
-            say(f"key {e['keys']} hold={e['hold']} at={e['at']} late={late}")
+            focus = f" focus={wm.focus_name()}" if hasattr(wm, "focus_name") else ""
+            say(f"key {e['keys']} hold={e['hold']} at={e['at']} late={late}{focus}")
         say("done")
     finally:
         for e in held:

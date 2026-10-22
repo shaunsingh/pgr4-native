@@ -46,6 +46,7 @@ namespace pgr4::native {
 
 class D3D12Device;
 class DrawRenderer;
+class GpuTimer;
 class Presenter;
 class RenderTargets;
 class Resolver;
@@ -71,6 +72,12 @@ enum class HookFn : uint32_t {
   kSwap = 0x82695BE0,
 };
 
+// The guest D3D's predicated tiling calls a hooked call can be nested in. BeginTiling
+// (fn_8269C6D0) clears through ClearF with the largest tile's extent at the EDRAM base, meaning
+// every tile; EndTiling (fn_8269CB68) resolves each tile, its rectangle in surface pixels and
+// the EDRAM holding the tile from its origin (the tile list at device+12740, render_targets.h).
+enum class TilingCall : uint8_t { kNone, kBegin, kEnd };
+
 // Raw PPC arguments of one hooked call. Integer arguments in r3..r10 and float arguments in
 // f1..f4 are captured at entry, before the guest function runs (it clobbers them).
 // Argument meaning follows the XDK D3DDevice_* signatures [INFERENCE, check against the
@@ -79,7 +86,9 @@ enum class HookFn : uint32_t {
 //   DrawVertices(dev, prim, start_vertex, vertex_count)
 //   DrawVerticesUP(dev, prim, vertex_count, data_ptr, stride)
 //   BeginVertices(dev, prim, vertex_count, stride) -> r3 = pointer the game writes into
-//   Clear(dev, count, rects_ptr, flags, color; z in f1, stencil)
+//   Clear(dev, count, rects_ptr, flags, color; z in f1, stencil in r9)
+//   ClearF(dev, flags, rect_ptr, color_ptr; z in f1, stencil in r8)
+//   (a float argument takes the next integer register's slot)
 //   Resolve(dev, flags, src_rect_ptr, dest_texture, dest_point_ptr, level, slice,
 //           clear_color_ptr; clear_z in f1, clear_stencil, params_ptr)
 //   Swap(dev, front_buffer_texture, scaler_params_ptr)
@@ -91,6 +100,7 @@ struct HookArgs {
                     // ClearStencil and pParameters; offsets in resolve.h)
   double f[4];      // f1..f4 at entry
   uint64_t ret;     // r3 after the guest function returned
+  TilingCall tiling = TilingCall::kNone;  // the tiling call this one is nested in
 };
 
 // Per-frame counters of the native path (also the frame CSV's columns).
@@ -102,7 +112,10 @@ struct FrameStats {
   // Guest thread: time in the On* calls (render thread mode: capturing and queueing) and the
   // part of it spent waiting for the render thread.
   uint64_t hook_ns = 0, hook_wait_ns = 0;
-  uint64_t reg_writes = 0;  // render thread mode: register values replayed
+  uint64_t hook_max_ns = 0;  // render thread mode: the longest single On* call, without waits
+  uint64_t reg_writes = 0;   // render thread mode: register values replayed
+  // Parts of swap_ns: waiting for the texture untile workers, then D3D12Device::EndFrameTimes.
+  uint64_t swap_untile_ns = 0, swap_submit_ns = 0, swap_present_ns = 0, swap_fence_ns = 0;
 };
 
 class NativeRenderer {
@@ -168,6 +181,7 @@ class NativeRenderer {
   std::unique_ptr<TextureCache> textures_;
   std::unique_ptr<DrawRenderer> draw_;   // draw.h (DrawPresent)
   std::unique_ptr<Presenter> present_;   // present.h (DrawPresent)
+  GpuTimer* gpu_timer_ = nullptr;        // device_'s, with --pgr4_native_gpu_timing
   bool frame_begun_ = false;
   uint64_t frame_index_ = 0;
   uint64_t frame_start_ns_ = 0;
@@ -176,7 +190,7 @@ class NativeRenderer {
   std::unique_ptr<Csv> csv_;
 };
 
-// Monotonic CPU time in nanoseconds (QueryPerformanceCounter).
+// Monotonic CPU time in nanoseconds (RDTSC calibrated against QueryPerformanceCounter).
 uint64_t NowNs();
 
 }  // namespace pgr4::native

@@ -1,0 +1,1622 @@
+diff --git b/include/rex/audio/wma_file.h b/include/rex/audio/wma_file.h
+new file mode 100644
+index 0000000..e173caa
+--- /dev/null
++++ b/include/rex/audio/wma_file.h
+@@ -0,0 +1,46 @@
++/**
++ * @file        audio/wma_file.h
++ * @brief       Incremental decoder for WMA music files
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++#pragma once
++
++#include <cstddef>
++#include <filesystem>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace rex::audio {
++
++// Decodes a Windows Media Audio (version 1 or 2) file to interleaved 32-bit float PCM as it is
++// read. The ASF reader covers what audio-only encoders write: one audio stream in fixed-size data
++// packets, single or multiple payloads, media objects fragmented across packets. It rejects
++// compressed payloads and scrambled (audio spread) streams.
++class WmaFileDecoder {
++ public:
++  WmaFileDecoder();
++  ~WmaFileDecoder();
++  WmaFileDecoder(const WmaFileDecoder&) = delete;
++  WmaFileDecoder& operator=(const WmaFileDecoder&) = delete;
++
++  // Reads the headers and opens the codec. False, with error() set, on failure.
++  bool Open(const std::filesystem::path& path);
++
++  // Appends samples to `out` until it holds at least `samples` (counting every channel) or the
++  // file ends. False, with error() set, on a failure.
++  bool Decode(size_t samples, std::vector<float>& out);
++
++  int sample_rate() const;
++  int channels() const;
++  bool ended() const;
++  const std::string& error() const;
++
++ private:
++  struct State;
++  std::unique_ptr<State> state_;
++};
++
++}  // namespace rex::audio
+diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
+index 00a5db7..f02f058 100644
+--- a/include/rex/kernel/xam/apps/xmp_app.h
++++ b/include/rex/kernel/xam/apps/xmp_app.h
+@@ -112,6 +112,9 @@ class XmpApp : public system::xam::App {
+   void StopMusic();
+   void AdvanceIfEnded();
+   void ApplyMusicGain();
++#ifdef _WIN32
++  void MusicThread();
++#endif
+ 
+   State state_;
+   PlaybackClient playback_client_;
+@@ -128,10 +131,8 @@ class XmpApp : public system::xam::App {
+   uint32_t next_song_handle_;
+ #ifdef _WIN32
+   std::shared_ptr<MusicPlaybackState> music_playback_;
+-  std::vector<std::thread> music_workers_;
+   std::mutex music_state_mutex_;
+-  std::atomic<bool> stop_music_monitor_{false};
+-  std::thread music_monitor_;
++  std::thread music_thread_;  // decodes and streams the playing song (MusicThread)
+   bool music_audio_initialized_ = false;
+ #endif
+ };
+diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
+index 3821115..fa6f785 100644
+--- a/src/audio/CMakeLists.txt
++++ b/src/audio/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_library(rexaudio OBJECT
+     audio_driver.cpp
+     audio_system.cpp
+     downmix.cpp
++    wma_file.cpp
+     xma_context.cpp
+     xma_decoder.cpp
+     xma_register_file.cpp
+diff --git b/src/audio/wma_file.cpp b/src/audio/wma_file.cpp
+new file mode 100644
+index 0000000..ec7a53a
+--- /dev/null
++++ b/src/audio/wma_file.cpp
+@@ -0,0 +1,481 @@
++/**
++ * @file        audio/wma_file.cpp
++ * @brief       Incremental decoder for WMA music files: a minimal ASF reader feeding FFmpeg
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++#include <rex/audio/wma_file.h>
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <deque>
++#include <fstream>
++#include <limits>
++#include <span>
++
++extern "C" {
++#if defined(_MSC_VER)
++#pragma warning(push)
++#pragma warning(disable : 4244)
++#endif
++#include "libavcodec/avcodec.h"
++#include "libavutil/error.h"
++#include "libavutil/mem.h"
++#if defined(_MSC_VER)
++#pragma warning(pop)
++#endif
++}  // extern "C"
++
++namespace rex::audio {
++namespace {
++
++static_assert(std::endian::native == std::endian::little, "ASF fields are read in place");
++
++using Guid = std::array<uint8_t, 16>;
++
++// GUIDs as stored in the file: the first three fields little-endian.
++constexpr Guid kHeaderObject{0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
++                             0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
++constexpr Guid kDataObject{0x36, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
++                           0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C};
++constexpr Guid kFilePropertiesObject{0xA1, 0xDC, 0xAB, 0x8C, 0x47, 0xA9, 0xCF, 0x11,
++                                     0x8E, 0xE4, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65};
++constexpr Guid kStreamPropertiesObject{0x91, 0x07, 0xDC, 0xB7, 0xB7, 0xA9, 0xCF, 0x11,
++                                       0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65};
++constexpr Guid kAudioMedia{0x40, 0x9E, 0x69, 0xF8, 0x4D, 0x5B, 0xCF, 0x11,
++                           0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44, 0x2B};
++constexpr Guid kAudioSpread{0x50, 0xCD, 0xC3, 0xBF, 0x8F, 0x61, 0xCF, 0x11,
++                            0x8B, 0xB2, 0x00, 0xAA, 0x00, 0xB4, 0xE2, 0x20};
++
++constexpr size_t kObjectHeaderSize = 24;        // GUID, size
++constexpr size_t kHeaderObjectSize = 30;        // + object count, two reserved bytes
++constexpr size_t kDataObjectSize = 50;          // + file ID, packet count, reserved
++constexpr uint64_t kMaxHeaderSize = 1u << 20;
++constexpr uint32_t kMaxPacketSize = 1u << 20;
++constexpr uint32_t kMaxMediaObjectSize = 1u << 24;
++
++constexpr uint16_t kFormatWmaV1 = 0x0160;
++constexpr uint16_t kFormatWmaV2 = 0x0161;
++
++// Bounds-checked little-endian reader. A read past the end yields zeros and clears ok().
++class Reader {
++ public:
++  explicit Reader(std::span<const uint8_t> data) : data_(data) {}
++
++  bool ok() const { return ok_; }
++  size_t position() const { return position_; }
++  size_t remaining() const { return data_.size() - position_; }
++
++  std::span<const uint8_t> Bytes(size_t count) {
++    if (count > remaining()) {
++      ok_ = false;
++      position_ = data_.size();
++      return {};
++    }
++    const auto bytes = data_.subspan(position_, count);
++    position_ += count;
++    return bytes;
++  }
++
++  void Skip(size_t count) { Bytes(count); }
++
++  template <typename T>
++  T Read() {
++    T value{};
++    if (const auto bytes = Bytes(sizeof(T)); !bytes.empty()) {
++      std::memcpy(&value, bytes.data(), sizeof(T));
++    }
++    return value;
++  }
++
++  Guid ReadGuid() { return Read<Guid>(); }
++
++  // An ASF field whose size is a 2-bit length type: absent, BYTE, WORD or DWORD.
++  uint32_t ReadField(unsigned length_type) {
++    switch (length_type & 3) {
++      case 1:
++        return Read<uint8_t>();
++      case 2:
++        return Read<uint16_t>();
++      case 3:
++        return Read<uint32_t>();
++      default:
++        return 0;
++    }
++  }
++
++ private:
++  std::span<const uint8_t> data_;
++  size_t position_ = 0;
++  bool ok_ = true;
++};
++
++// Samples per channel in one WMA v1/v2 frame, as the decoder chooses it from the sample rate.
++int WmaFrameLength(uint16_t format_tag, int sample_rate) {
++  if (sample_rate <= 16000) return 512;
++  if (sample_rate <= 22050 || (sample_rate <= 32000 && format_tag == kFormatWmaV1)) return 1024;
++  return 2048;
++}
++
++std::string AvErrorString(int error) {
++  char buffer[AV_ERROR_MAX_STRING_SIZE] = {};
++  av_strerror(error, buffer, sizeof(buffer));
++  return buffer;
++}
++
++}  // namespace
++
++struct WmaFileDecoder::State {
++  ~State() {
++    for (AVPacket* object : ready) av_packet_free(&object);
++    av_packet_free(&object);
++    av_frame_free(&frame);
++    avcodec_free_context(&codec);
++  }
++
++  bool Fail(std::string message) {
++    error = std::move(message);
++    return false;
++  }
++
++  bool ReadHeaders();
++  bool OpenCodec();
++  bool ReadPacket();
++  bool ParsePacket();
++  void AddFragment(uint32_t object_number, uint32_t offset, uint32_t object_size,
++                   std::span<const uint8_t> data);
++  AVPacket* NextObject();
++  bool AppendFrame(std::vector<float>& out);
++
++  std::ifstream file;
++  std::vector<uint8_t> packet;
++  uint64_t packets_left = 0;
++  unsigned stream_number = 0;
++
++  uint16_t format_tag = 0;
++  int channel_count = 0;
++  int sample_rate = 0;
++  uint32_t bytes_per_second = 0;
++  uint16_t block_align = 0;
++  uint16_t bits_per_sample = 0;
++  std::vector<uint8_t> codec_data;
++
++  AVCodecContext* codec = nullptr;
++  AVPacket* object = nullptr;  // the media object being assembled
++  uint32_t object_number = 0;
++  size_t object_filled = 0;
++  std::deque<AVPacket*> ready;  // complete media objects, in order
++  AVFrame* frame = nullptr;
++  size_t priming_frames = 0;  // of decoder output still to drop
++  bool flushed = false;
++  bool ended = false;
++  std::string error;
++};
++
++bool WmaFileDecoder::State::ReadHeaders() {
++  std::array<uint8_t, kHeaderObjectSize> top;
++  if (!file.read(reinterpret_cast<char*>(top.data()), top.size())) return Fail("not an ASF file");
++  Reader top_reader(top);
++  const Guid top_id = top_reader.ReadGuid();
++  const uint64_t header_size = top_reader.Read<uint64_t>();
++  const uint32_t object_count = top_reader.Read<uint32_t>();
++  if (top_id != kHeaderObject || header_size < kHeaderObjectSize || header_size > kMaxHeaderSize)
++    return Fail("not an ASF file");
++
++  std::vector<uint8_t> header(size_t(header_size - kHeaderObjectSize));
++  if (!file.read(reinterpret_cast<char*>(header.data()), std::streamsize(header.size())))
++    return Fail("truncated ASF header");
++
++  uint32_t min_packet_size = 0;
++  uint32_t max_packet_size = 0;
++  bool scrambled = false;
++  Reader objects(header);
++  for (uint32_t i = 0; i < object_count; ++i) {
++    const Guid id = objects.ReadGuid();
++    const uint64_t size = objects.Read<uint64_t>();
++    if (!objects.ok() || size < kObjectHeaderSize || size - kObjectHeaderSize > objects.remaining())
++      return Fail("malformed ASF header");
++    Reader body(objects.Bytes(size_t(size - kObjectHeaderSize)));
++    if (id == kFilePropertiesObject) {
++      // File ID, file size, creation date, packet count, play and send duration, preroll, flags.
++      body.Skip(16 + 8 * 6 + 4);
++      min_packet_size = body.Read<uint32_t>();
++      max_packet_size = body.Read<uint32_t>();
++    } else if (id == kStreamPropertiesObject && !stream_number) {
++      const Guid stream_type = body.ReadGuid();
++      const Guid correction_type = body.ReadGuid();
++      body.Skip(8);  // time offset
++      const uint32_t type_length = body.Read<uint32_t>();
++      const uint32_t correction_length = body.Read<uint32_t>();
++      const uint16_t flags = body.Read<uint16_t>();
++      body.Skip(4);
++      Reader format(body.Bytes(type_length));
++      const auto correction = body.Bytes(correction_length);
++      if (!body.ok() || stream_type != kAudioMedia) continue;
++      // An audio spread span above 1 interleaves the stream's bytes across packets.
++      scrambled = correction_type == kAudioSpread && !correction.empty() && correction[0] > 1;
++      format_tag = format.Read<uint16_t>();
++      channel_count = format.Read<uint16_t>();
++      sample_rate = int(format.Read<uint32_t>());
++      bytes_per_second = format.Read<uint32_t>();
++      block_align = format.Read<uint16_t>();
++      bits_per_sample = format.Read<uint16_t>();
++      if (!format.ok()) return Fail("malformed audio format");
++      if (format.remaining() >= 2) {
++        const uint16_t extra_size = format.Read<uint16_t>();
++        const auto extra = format.Bytes(std::min<size_t>(extra_size, format.remaining()));
++        codec_data.assign(extra.begin(), extra.end());
++      }
++      stream_number = flags & 0x7F;
++    }
++  }
++  if (!stream_number) return Fail("no audio stream");
++  if (scrambled) return Fail("scrambled audio streams are not supported");
++  if (!min_packet_size || min_packet_size != max_packet_size || min_packet_size > kMaxPacketSize)
++    return Fail("unsupported ASF packet size");
++
++  std::array<uint8_t, kDataObjectSize> data_header;
++  if (!file.read(reinterpret_cast<char*>(data_header.data()), data_header.size()))
++    return Fail("no ASF data");
++  Reader data_reader(data_header);
++  const Guid data_id = data_reader.ReadGuid();
++  const uint64_t data_size = data_reader.Read<uint64_t>();
++  data_reader.Skip(16);  // file ID
++  packets_left = data_reader.Read<uint64_t>();
++  if (data_id != kDataObject) return Fail("no ASF data");
++  // Files written as a broadcast leave the packet count, and maybe the size, unset.
++  if (!packets_left) {
++    packets_left = data_size > kDataObjectSize ? (data_size - kDataObjectSize) / min_packet_size
++                                               : std::numeric_limits<uint64_t>::max();
++  }
++  packet.resize(min_packet_size);
++  return true;
++}
++
++bool WmaFileDecoder::State::OpenCodec() {
++  const AVCodecID codec_id = format_tag == kFormatWmaV1   ? AV_CODEC_ID_WMAV1
++                             : format_tag == kFormatWmaV2 ? AV_CODEC_ID_WMAV2
++                                                          : AV_CODEC_ID_NONE;
++  const AVCodec* decoder = codec_id != AV_CODEC_ID_NONE ? avcodec_find_decoder(codec_id) : nullptr;
++  if (!decoder) {
++    char message[48];
++    std::snprintf(message, sizeof(message), "unsupported audio format 0x%04X", format_tag);
++    return Fail(message);
++  }
++  if (channel_count < 1 || channel_count > 8 || sample_rate <= 0 || !block_align)
++    return Fail("invalid audio format");
++
++  codec = avcodec_alloc_context3(decoder);
++  object = av_packet_alloc();
++  frame = av_frame_alloc();
++  if (!codec || !object || !frame) return Fail("out of memory");
++  codec->sample_rate = sample_rate;
++  codec->channels = channel_count;
++  codec->bit_rate = int64_t(bytes_per_second) * 8;
++  codec->block_align = block_align;
++  codec->bits_per_coded_sample = bits_per_sample;
++  if (!codec_data.empty()) {
++    codec->extradata =
++        static_cast<uint8_t*>(av_mallocz(codec_data.size() + AV_INPUT_BUFFER_PADDING_SIZE));
++    if (!codec->extradata) return Fail("out of memory");
++    std::memcpy(codec->extradata, codec_data.data(), codec_data.size());
++    codec->extradata_size = int(codec_data.size());
++  }
++  if (const int result = avcodec_open2(codec, decoder, nullptr); result < 0)
++    return Fail("cannot open the decoder: " + AvErrorString(result));
++  // The output lags the stream by two frames: one of zeros, then the ramp of the first
++  // overlap-add. Later FFmpeg releases drop them (skip_samples); this one leaves that to us.
++  priming_frames = 2 * size_t(WmaFrameLength(format_tag, sample_rate));
++  return true;
++}
++
++bool WmaFileDecoder::State::ReadPacket() {
++  if (!packets_left) return false;
++  if (!file.read(reinterpret_cast<char*>(packet.data()), std::streamsize(packet.size())))
++    return false;
++  --packets_left;
++  return true;
++}
++
++// Queues the media objects of the audio stream that the packet completes. A malformed packet is
++// dropped, as is a media object that misses a fragment. False, with error set, on content this
++// reader does not support.
++bool WmaFileDecoder::State::ParsePacket() {
++  Reader reader(packet);
++  uint8_t length_flags = reader.Read<uint8_t>();
++  if (length_flags & 0x80) {
++    // Error correction data, of the length in the low 4 bits when the length type is 0.
++    if (length_flags & 0x60) return true;
++    reader.Skip(length_flags & 0x0F);
++    length_flags = reader.Read<uint8_t>();
++  }
++  const uint8_t property_flags = reader.Read<uint8_t>();
++  size_t packet_length = reader.ReadField(length_flags >> 5);
++  reader.ReadField(length_flags >> 1);  // sequence
++  const size_t padding_length = reader.ReadField(length_flags >> 3);
++  reader.Skip(6);  // send time, duration
++  // A packet shorter than the fixed size is padded to it.
++  if (!packet_length || packet_length > packet.size()) packet_length = packet.size();
++  if (!reader.ok() || reader.position() > packet_length ||
++      padding_length > packet_length - reader.position())
++    return true;
++  const size_t payload_end = packet_length - padding_length;
++
++  const unsigned replicated_length_type = property_flags & 3;
++  const unsigned offset_type = (property_flags >> 2) & 3;
++  const unsigned object_number_type = (property_flags >> 4) & 3;
++  const bool multiple_payloads = length_flags & 1;
++  unsigned payload_count = 1;
++  unsigned payload_length_type = 0;
++  if (multiple_payloads) {
++    const uint8_t payload_flags = reader.Read<uint8_t>();
++    payload_count = payload_flags & 0x3F;
++    payload_length_type = payload_flags >> 6;
++  }
++  for (unsigned i = 0; i < payload_count; ++i) {
++    const unsigned stream = reader.Read<uint8_t>() & 0x7F;
++    const uint32_t number = reader.ReadField(object_number_type);
++    const uint32_t offset = reader.ReadField(offset_type);
++    const uint32_t replicated_length = reader.ReadField(replicated_length_type);
++    const auto replicated = reader.Bytes(replicated_length);
++    size_t length = 0;
++    if (multiple_payloads) {
++      length = reader.ReadField(payload_length_type);
++    } else if (reader.position() < payload_end) {
++      length = payload_end - reader.position();
++    }
++    const auto data = reader.Bytes(length);
++    if (!reader.ok() || reader.position() > payload_end) return true;
++    if (stream != stream_number) continue;
++    // A replicated data length of 1 marks a compressed payload: several small media objects
++    // without fragment offsets. Audio encoders do not write them.
++    if (replicated_length == 1) return Fail("compressed ASF payloads are not supported");
++    uint32_t object_size = uint32_t(length);
++    if (replicated.size() >= 4) std::memcpy(&object_size, replicated.data(), 4);
++    AddFragment(number, offset, object_size, data);
++  }
++  return true;
++}
++
++void WmaFileDecoder::State::AddFragment(uint32_t number, uint32_t offset, uint32_t object_size,
++                                        std::span<const uint8_t> data) {
++  if (!offset) {
++    av_packet_unref(object);
++    if (!object_size || object_size > kMaxMediaObjectSize ||
++        av_new_packet(object, int(object_size)) < 0)
++      return;
++    object_number = number;
++    object_filled = 0;
++  } else if (!object->data || number != object_number || offset != object_filled) {
++    av_packet_unref(object);
++    return;
++  }
++  if (data.size() > size_t(object->size) - object_filled) {
++    av_packet_unref(object);
++    return;
++  }
++  std::memcpy(object->data + object_filled, data.data(), data.size());
++  object_filled += data.size();
++  if (object_filled < size_t(object->size)) return;
++  AVPacket* complete = av_packet_alloc();
++  if (!complete) {
++    av_packet_unref(object);
++    return;
++  }
++  av_packet_move_ref(complete, object);
++  ready.push_back(complete);
++}
++
++// The next complete media object, owned by the caller; null at the end of the data or, with
++// error set, on a failure.
++AVPacket* WmaFileDecoder::State::NextObject() {
++  while (ready.empty()) {
++    if (!ReadPacket() || !ParsePacket()) return nullptr;
++  }
++  AVPacket* next = ready.front();
++  ready.pop_front();
++  return next;
++}
++
++bool WmaFileDecoder::State::AppendFrame(std::vector<float>& out) {
++  const size_t first = std::min(priming_frames, size_t(frame->nb_samples));
++  priming_frames -= first;
++  const size_t frames = size_t(frame->nb_samples) - first;
++  const size_t channels = size_t(channel_count);
++  const size_t base = out.size();
++  if (frame->format == AV_SAMPLE_FMT_FLTP) {
++    out.resize(base + frames * channels);
++    float* destination = out.data() + base;
++    for (size_t c = 0; c < channels; ++c) {
++      const auto* source = reinterpret_cast<const float*>(frame->extended_data[c]) + first;
++      for (size_t i = 0; i < frames; ++i) destination[i * channels + c] = source[i];
++    }
++  } else if (frame->format == AV_SAMPLE_FMT_FLT) {
++    const auto* source = reinterpret_cast<const float*>(frame->extended_data[0]) + first * channels;
++    out.insert(out.end(), source, source + frames * channels);
++  } else {
++    return Fail("unexpected decoder sample format");
++  }
++  av_frame_unref(frame);
++  return true;
++}
++
++WmaFileDecoder::WmaFileDecoder() : state_(std::make_unique<State>()) {}
++
++WmaFileDecoder::~WmaFileDecoder() = default;
++
++bool WmaFileDecoder::Open(const std::filesystem::path& path) {
++  state_ = std::make_unique<State>();
++  State& state = *state_;
++  state.file.open(path, std::ios::binary);
++  if (!state.file) return state.Fail("cannot open the file");
++  return state.ReadHeaders() && state.OpenCodec();
++}
++
++bool WmaFileDecoder::Decode(size_t samples, std::vector<float>& out) {
++  State& state = *state_;
++  if (!state.codec) return state.Fail("not open");
++  while (!state.ended && out.size() < samples) {
++    int result = avcodec_receive_frame(state.codec, state.frame);
++    if (result == 0) {
++      if (!state.AppendFrame(out)) return false;
++      continue;
++    }
++    if (result == AVERROR_EOF) {
++      state.ended = true;
++      break;
++    }
++    // A damaged block costs its samples, not the song.
++    if (result == AVERROR_INVALIDDATA) continue;
++    if (result != AVERROR(EAGAIN)) return state.Fail("decoding failed: " + AvErrorString(result));
++
++    // Null at the end of the data, which drains the decoder.
++    AVPacket* next = state.NextObject();
++    if (!state.error.empty()) return false;
++    if (!next && state.flushed) {
++      state.ended = true;
++      break;
++    }
++    result = avcodec_send_packet(state.codec, next);
++    state.flushed = !next;
++    av_packet_free(&next);
++    if (result < 0 && result != AVERROR_INVALIDDATA && result != AVERROR_EOF)
++      return state.Fail("decoding failed: " + AvErrorString(result));
++  }
++  return true;
++}
++
++int WmaFileDecoder::sample_rate() const { return state_->sample_rate; }
++
++int WmaFileDecoder::channels() const { return state_->channel_count; }
++
++bool WmaFileDecoder::ended() const { return state_->ended; }
++
++const std::string& WmaFileDecoder::error() const { return state_->error; }
++
++}  // namespace rex::audio
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..59c9fbd 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -10,23 +10,71 @@
+  */
+ 
+ #include <algorithm>
++#include <condition_variable>
+ #include <forward_list>
++#include <mutex>
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
++#include <rex/platform.h>
+ #include <rex/thread.h>
+ #include <rex/thread/timer_queue.h>
+ 
++#if REX_PLATFORM_WIN32
++#include <windows.h>
++#include <timeapi.h>
++#pragma comment(lib, "winmm.lib")
++#endif
++
+ namespace dp = disruptorplus;
+ 
+ namespace rex::thread {
+ 
+ using WaitItem = TimerQueueWaitItem;
+ 
++// A disruptorplus wait strategy that blocks on a condition variable. disruptorplus ships one
++// (blocking_wait_strategy), but its timed waits pass the predicate before the timeout to
++// std::condition_variable and do not compile.
++class BlockingWaitStrategy {
++ public:
++  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
++                                      const std::atomic<dp::sequence_t>* const sequences[]) {
++    dp::sequence_t result;
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.wait(lock, [&] {
++      result = dp::minimum_sequence_after(sequence, count, sequences);
++      return dp::difference(result, sequence) >= 0;
++    });
++    return result;
++  }
++
++  template <typename Clock, typename Duration>
++  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
++                                      const std::atomic<dp::sequence_t>* const sequences[],
++                                      const std::chrono::time_point<Clock, Duration>& timeout) {
++    dp::sequence_t result;
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.wait_until(lock, timeout, [&] {
++      result = dp::minimum_sequence_after(sequence, count, sequences);
++      return dp::difference(result, sequence) >= 0;
++    });
++    return result;
++  }
++
++  void signal_all_when_blocking() {
++    // Under the mutex, so a waiter between its check and its wait cannot miss the signal.
++    std::lock_guard<std::mutex> lock(mutex_);
++    cv_.notify_all();
++  }
++
++ private:
++  std::mutex mutex_;
++  std::condition_variable cv_;
++};
++
+ class TimerQueue {
+  public:
+   using clock = WaitItem::clock;
+@@ -38,6 +86,11 @@ class TimerQueue {
+         wait_strategy_(),
+         claim_strategy_(kWaitCount, wait_strategy_),
+         consumed_(wait_strategy_) {
++#if REX_PLATFORM_WIN32
++    // The dispatch thread sleeps on a condition variable, whose timeouts Windows rounds up to
++    // the system timer period (15.6 ms by default). The 1 ms KeTimeStampBundle timer needs 1 ms.
++    timer_period_set_ = timeBeginPeriod(1) == TIMERR_NOERROR;
++#endif
+     claim_strategy_.add_claim_barrier(consumed_);
+     dispatch_thread_ =
+         std::jthread([this](std::stop_token stop_token) { TimerThreadMain(stop_token); });
+@@ -51,8 +104,13 @@ class TimerQueue {
+                                                 clock::duration::zero());
+     wait_item->Disarm();
+     QueueTimer(std::move(wait_item));
++    dispatch_thread_.join();
+ 
+-    // std::jthread auto-joins on destruction
++#if REX_PLATFORM_WIN32
++    if (timer_period_set_) {
++      timeEndPeriod(1);
++    }
++#endif
+   }
+ 
+   void TimerThreadMain(std::stop_token stop_token) {
+@@ -66,10 +124,13 @@ class TimerQueue {
+ 
+     while (!stop_token.stop_requested()) {
+       {
+-        // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++        // Sleep until the earliest timer is due or a new one is queued, then add new wait
++        // items to the sorted wait queue.
++        dp::sequence_t available =
++            wait_queue_.empty()
++                ? claim_strategy_.wait_until_published(next_sequence, next_sequence - 1)
++                : claim_strategy_.wait_until_published(next_sequence, next_sequence - 1,
++                                                       wait_queue_.front()->due_);
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+@@ -142,9 +203,14 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Blocking rather than spinning: the queue holds a few timers firing at most every 1 ms, and
++  // a spinning dispatch thread keeps a host core busy for nothing.
++  BlockingWaitStrategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<BlockingWaitStrategy> claim_strategy_;
++  dp::sequence_barrier<BlockingWaitStrategy> consumed_;
++#if REX_PLATFORM_WIN32
++  bool timer_period_set_ = false;
++#endif
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index c80303e..b79f2c6 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -21,20 +21,20 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstring>
+ #include <filesystem>
+-#include <limits>
++#include <memory>
+ #include <mutex>
++#include <optional>
+ #include <string_view>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ #ifdef _WIN32
+ #include <SDL3/SDL.h>
+-#include <mfapi.h>
+-#include <mfidl.h>
+-#include <mfreadwrite.h>
+-#include <wrl/client.h>
++#include <rex/audio/wma_file.h>
+ #endif
+ 
+ REXCVAR_DEFINE_DOUBLE(xmp_music_gain, 0.35, "Audio",
+@@ -51,80 +51,26 @@ REXCVAR_DEFINE_BOOL(xmp_xenia_playlist_notify, false, "Audio",
+ #ifdef _WIN32
+ namespace {
+ 
+-struct DecodedMusic {
+-  std::vector<uint8_t> pcm;
+-  int sample_rate = 0;
+-  int channels = 0;
+-};
++// Race music is decoded as it plays: the music thread keeps 1-2 s of PCM in the SDL stream.
++// Decoded whole, a 4-minute song is 85 MB of float PCM (copied once more into the stream) and
++// up to a second of one core spent the moment the song starts, which is a race's countdown.
++constexpr std::chrono::milliseconds kMusicQueueLow{1000};
++constexpr std::chrono::milliseconds kMusicQueueHigh{2000};
++constexpr std::chrono::milliseconds kMusicPollInterval{100};
+ 
+-bool DecodeMusic(const std::filesystem::path& path, DecodedMusic& output,
+-                 const std::atomic<uint64_t>* generation = nullptr,
+-                 uint64_t expected_generation = 0) {
+-  const HRESULT com_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+-  const bool release_com = SUCCEEDED(com_result);
+-  if (FAILED(com_result) && com_result != RPC_E_CHANGED_MODE) {
+-    return false;
+-  }
+-  const HRESULT startup_result = MFStartup(MF_VERSION);
+-  if (FAILED(startup_result)) {
+-    if (release_com) CoUninitialize();
+-    return false;
+-  }
++// The decoder is FFmpeg's, not Media Foundation's: under Wine, Media Foundation's source reader
++// mapped a new 15 MB region about every second of playback and never released them (16 MB of
++// address space and 1.6 MB of memory a second).
++using MusicDecoder = rex::audio::WmaFileDecoder;
+ 
+-  bool success = false;
+-  do {
+-    Microsoft::WRL::ComPtr<IMFSourceReader> reader;
+-    if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader))) break;
+-    if (FAILED(reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE))) break;
+-    if (FAILED(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE))) break;
+-
+-    Microsoft::WRL::ComPtr<IMFMediaType> requested_type;
+-    if (FAILED(MFCreateMediaType(&requested_type))) break;
+-    if (FAILED(requested_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio))) break;
+-    if (FAILED(requested_type->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_Float))) break;
+-    if (FAILED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr,
+-                                           requested_type.Get()))) break;
+-
+-    Microsoft::WRL::ComPtr<IMFMediaType> actual_type;
+-    if (FAILED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+-                                            &actual_type))) break;
+-    UINT32 sample_rate = 0;
+-    UINT32 channels = 0;
+-    if (FAILED(actual_type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &sample_rate)) ||
+-        FAILED(actual_type->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels)) ||
+-        sample_rate == 0 || channels == 0 || channels > 8) break;
+-    output.sample_rate = static_cast<int>(sample_rate);
+-    output.channels = static_cast<int>(channels);
+-
+-    for (;;) {
+-      if (generation && generation->load() != expected_generation) break;
+-      DWORD flags = 0;
+-      Microsoft::WRL::ComPtr<IMFSample> sample;
+-      if (FAILED(reader->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, nullptr,
+-                                    &flags, nullptr, &sample))) break;
+-      if (sample) {
+-        Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+-        if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) break;
+-        BYTE* bytes = nullptr;
+-        DWORD length = 0;
+-        if (FAILED(buffer->Lock(&bytes, nullptr, &length))) break;
+-        if (output.pcm.size() + length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+-          buffer->Unlock();
+-          break;
+-        }
+-        output.pcm.insert(output.pcm.end(), bytes, bytes + length);
+-        buffer->Unlock();
+-      }
+-      if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+-        success = !output.pcm.empty();
+-        break;
+-      }
+-    }
+-  } while (false);
++uint64_t BytesPerSecond(const MusicDecoder& decoder) {
++  return uint64_t(decoder.channels()) * sizeof(float) * uint64_t(decoder.sample_rate());
++}
+ 
+-  MFShutdown();
+-  if (release_com) CoUninitialize();
+-  return success;
++// Samples, counting every channel, in `duration` of the decoder's output.
++size_t SamplesFor(const MusicDecoder& decoder, std::chrono::milliseconds duration) {
++  return size_t(uint64_t(decoder.channels()) * uint64_t(decoder.sample_rate()) *
++                uint64_t(duration.count()) / 1000);
+ }
+ 
+ }  // namespace
+@@ -139,19 +85,127 @@ namespace apps {
+ using namespace rex::system;
+ 
+ #ifdef _WIN32
++struct MusicRequest {
++  uint64_t generation = 0;
++  std::filesystem::path host_path;
++  std::string guest_path;
++  std::string title;
++  std::string artist;
++  uint32_t song_handle = 0;
++  int song_index = 0;
++};
++
++// Shared by the guest's XMP calls and the music thread, under `mutex`.
+ struct MusicPlaybackState {
+   std::mutex mutex;
+-  std::atomic<uint64_t> generation{0};
++  std::condition_variable wake;          // a request, or stop
++  bool stop = false;                     // the music thread is to exit
++  std::optional<MusicRequest> request;   // the song the music thread is to start
++  uint64_t generation = 0;               // incremented by StopMusic
+   SDL_AudioStream* stream = nullptr;
+   float gain = 1.0f;
+   bool loading = false;
+   bool paused = false;
+   bool failed = false;
++  bool decoded_all = false;  // the whole song has been put into `stream`
++  uint64_t decoded_bytes = 0;
++  uint64_t bytes_per_second = 0;
+   std::chrono::steady_clock::time_point started_at{};
+   std::chrono::steady_clock::time_point paused_at{};
+   std::chrono::nanoseconds paused_duration{0};
+-  std::chrono::nanoseconds decoded_duration{0};
+ };
++
++namespace {
++
++// Opens the requested song and starts its stream with the first kMusicQueueHigh of PCM. Returns
++// the decoder for the rest of the song, or null when there is no rest: the song is decoded
++// whole, failed or was stopped meanwhile.
++std::unique_ptr<MusicDecoder> StartSong(MusicPlaybackState& playback, const MusicRequest& request,
++                                        std::vector<float>& pcm) {
++  auto decoder = std::make_unique<MusicDecoder>();
++  SDL_AudioStream* stream = nullptr;
++  pcm.clear();
++  if (!decoder->Open(request.host_path) ||
++      !decoder->Decode(SamplesFor(*decoder, kMusicQueueHigh), pcm) || pcm.empty()) {
++    REXKRNL_WARN("XMP: cannot decode music file '{}': {}", request.guest_path,
++                 decoder->error().empty() ? "no audio" : decoder->error());
++  } else {
++    const SDL_AudioSpec spec{SDL_AUDIO_F32LE, decoder->channels(), decoder->sample_rate()};
++    stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
++    if (!stream) {
++      REXKRNL_WARN("XMP: music stream open failed: {}", SDL_GetError());
++    } else if (!SDL_PutAudioStreamData(stream, pcm.data(),
++                                       static_cast<int>(pcm.size() * sizeof(float))) ||
++               (decoder->ended() && !SDL_FlushAudioStream(stream))) {
++      REXKRNL_WARN("XMP: music playback setup failed: {}", SDL_GetError());
++      SDL_DestroyAudioStream(stream);
++      stream = nullptr;
++    }
++  }
++  {
++    std::lock_guard lock(playback.mutex);
++    if (playback.generation != request.generation) {
++      if (stream) SDL_DestroyAudioStream(stream);
++      return nullptr;
++    }
++    playback.loading = false;
++    playback.failed = stream == nullptr;
++    if (!stream) return nullptr;
++    playback.stream = stream;
++    playback.started_at = std::chrono::steady_clock::now();
++    playback.paused_duration = {};
++    playback.paused_at =
++        playback.paused ? playback.started_at : std::chrono::steady_clock::time_point{};
++    playback.decoded_all = decoder->ended();
++    playback.decoded_bytes = pcm.size() * sizeof(float);
++    playback.bytes_per_second = BytesPerSecond(*decoder);
++    SDL_SetAudioStreamGain(stream, playback.gain);
++    if (!playback.paused) SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(stream));
++  }
++  REXKRNL_INFO("XMP: playing '{}' title='{}' artist='{}' handle={:08X} index={} ({} Hz, {} channels)",
++               request.guest_path, request.title, request.artist, request.song_handle,
++               request.song_index, decoder->sample_rate(), decoder->channels());
++  if (decoder->ended()) return nullptr;
++  return decoder;
++}
++
++// Tops the stream of song `generation` up to kMusicQueueHigh once it holds less than
++// kMusicQueueLow. False when the decoder is done: the song is decoded whole, failed or was
++// stopped.
++bool FeedSong(MusicPlaybackState& playback, uint64_t generation, MusicDecoder& decoder,
++              std::vector<float>& pcm) {
++  size_t want = 0;
++  {
++    std::lock_guard lock(playback.mutex);
++    if (playback.generation != generation || !playback.stream) return false;
++    const size_t queued =
++        size_t(std::max(SDL_GetAudioStreamQueued(playback.stream), 0)) / sizeof(float);
++    if (queued >= SamplesFor(decoder, kMusicQueueLow)) return true;
++    want = SamplesFor(decoder, kMusicQueueHigh) - queued;
++  }
++  pcm.clear();
++  const bool decoded = decoder.Decode(want, pcm);
++  if (!decoded) REXKRNL_WARN("XMP: music decoding stopped: {}", decoder.error());
++  bool done = !decoded || decoder.ended();
++  std::lock_guard lock(playback.mutex);
++  if (playback.generation != generation || !playback.stream) return false;
++  if (!pcm.empty()) {
++    const size_t bytes = pcm.size() * sizeof(float);
++    if (SDL_PutAudioStreamData(playback.stream, pcm.data(), static_cast<int>(bytes))) {
++      playback.decoded_bytes += bytes;
++    } else {
++      REXKRNL_WARN("XMP: music stream write failed: {}", SDL_GetError());
++      done = true;
++    }
++  }
++  if (done) {
++    SDL_FlushAudioStream(playback.stream);
++    playback.decoded_all = true;
++  }
++  return !done;
++}
++
++}  // namespace
+ #endif
+ 
+ namespace {
+@@ -218,43 +272,67 @@ XmpApp::XmpApp(KernelState* kernel_state)
+       next_song_handle_(1) {
+ #ifdef _WIN32
+   music_playback_ = std::make_shared<MusicPlaybackState>();
+-  music_monitor_ = std::thread([this] {
+-    while (!stop_music_monitor_.load(std::memory_order_acquire)) {
+-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-      if (stop_music_monitor_.load(std::memory_order_acquire)) break;
+-      std::lock_guard lock(music_state_mutex_);
+-      AdvanceIfEnded();
+-    }
+-  });
++  music_thread_ = std::thread([this] { MusicThread(); });
+ #endif
+ }
+ 
+ XmpApp::~XmpApp() {
+ #ifdef _WIN32
+-  stop_music_monitor_.store(true, std::memory_order_release);
+-  if (music_monitor_.joinable()) music_monitor_.join();
++  {
++    std::lock_guard lock(music_playback_->mutex);
++    music_playback_->stop = true;
++  }
++  music_playback_->wake.notify_one();
++  if (music_thread_.joinable()) music_thread_.join();
+ #endif
+   StopMusic();
+ #ifdef _WIN32
+-  for (auto& worker : music_workers_) {
+-    if (worker.joinable()) worker.join();
+-  }
+   if (music_audio_initialized_) SDL_QuitSubSystem(SDL_INIT_AUDIO);
+ #endif
+ }
+ 
++#ifdef _WIN32
++// Starts the requested songs, keeps the playing song's stream topped up and moves on at the end
++// of a song.
++void XmpApp::MusicThread() {
++  auto& playback = *music_playback_;
++  std::unique_ptr<MusicDecoder> decoder;
++  uint64_t generation = 0;  // of the song `decoder` decodes
++  std::vector<float> pcm;
++  for (;;) {
++    std::optional<MusicRequest> request;
++    {
++      std::unique_lock lock(playback.mutex);
++      playback.wake.wait_for(lock, kMusicPollInterval,
++                             [&] { return playback.stop || playback.request.has_value(); });
++      if (playback.stop) break;
++      request = std::exchange(playback.request, std::nullopt);
++    }
++    if (request) {
++      generation = request->generation;
++      decoder = StartSong(playback, *request, pcm);
++    } else if (decoder && !FeedSong(playback, generation, *decoder, pcm)) {
++      decoder.reset();
++    }
++    std::lock_guard state_lock(music_state_mutex_);
++    AdvanceIfEnded();
++  }
++}
++#endif
++
+ void XmpApp::StopMusic() {
+ #ifdef _WIN32
+   auto& playback = *music_playback_;
+   std::lock_guard lock(playback.mutex);
+   ++playback.generation;
++  playback.request.reset();
+   playback.loading = false;
+   playback.failed = false;
+   playback.paused = false;
++  playback.decoded_all = false;
+   playback.started_at = {};
+   playback.paused_at = {};
+   playback.paused_duration = {};
+-  playback.decoded_duration = {};
+   if (playback.stream) {
+     SDL_DestroyAudioStream(playback.stream);
+     playback.stream = nullptr;
+@@ -298,72 +376,20 @@ bool XmpApp::StartActiveSong() {
+     music_audio_initialized_ = true;
+   }
+   ApplyMusicGain();
+-  auto playback = music_playback_;
+-  const uint64_t generation = playback->generation.load();
++  auto& playback = *music_playback_;
+   {
+-    std::lock_guard lock(playback->mutex);
+-    playback->loading = true;
+-    playback->failed = false;
+-  }
+-  const auto host_path = host_entry->host_path();
+-  const auto title = rex::string::to_utf8(song->name);
+-  const auto artist = rex::string::to_utf8(song->artist);
+-  const uint32_t song_handle = song->handle;
+-  const int song_index = active_song_index_;
+-  music_workers_.emplace_back([playback, generation, host_path, guest_path, title, artist,
+-                               song_handle, song_index] {
+-    DecodedMusic decoded;
+-    if (!DecodeMusic(host_path, decoded, &playback->generation, generation)) {
+-      if (playback->generation.load() == generation) {
+-        REXKRNL_WARN("XMP: cannot decode music file '{}'", guest_path);
+-        std::lock_guard lock(playback->mutex);
+-        playback->loading = false;
+-        playback->failed = true;
+-      }
+-      return;
+-    }
+-    if (playback->generation.load() != generation) return;
+-    const SDL_AudioSpec spec{SDL_AUDIO_F32LE, decoded.channels, decoded.sample_rate};
+-    SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+-                                                        &spec, nullptr, nullptr);
+-    if (!stream) {
+-      REXKRNL_WARN("XMP: music stream open failed: {}", SDL_GetError());
+-    } else if (!SDL_PutAudioStreamData(stream, decoded.pcm.data(),
+-                                       static_cast<int>(decoded.pcm.size())) ||
+-               !SDL_FlushAudioStream(stream)) {
+-      REXKRNL_WARN("XMP: music playback setup failed: {}", SDL_GetError());
+-      SDL_DestroyAudioStream(stream);
+-      stream = nullptr;
+-    }
+-    {
+-      std::lock_guard lock(playback->mutex);
+-      if (playback->generation.load() != generation) {
+-        if (stream) SDL_DestroyAudioStream(stream);
+-        return;
+-      }
+-      playback->loading = false;
+-      playback->failed = stream == nullptr;
+-      if (!stream) return;
+-      playback->stream = stream;
+-      playback->started_at = std::chrono::steady_clock::now();
+-      playback->paused_duration = {};
+-      playback->paused_at = playback->paused ? playback->started_at
+-                                             : std::chrono::steady_clock::time_point{};
+-      const uint64_t bytes_per_second =
+-          uint64_t(decoded.channels) * sizeof(float) * uint64_t(decoded.sample_rate);
+-      playback->decoded_duration = std::chrono::nanoseconds(
+-          uint64_t(decoded.pcm.size()) * UINT64_C(1000000000) / bytes_per_second);
+-      int test_duration_seconds = REXCVAR_GET(xmp_test_song_duration_seconds);
+-      if (test_duration_seconds > 0) {
+-        playback->decoded_duration = std::chrono::seconds(test_duration_seconds);
+-      }
+-      SDL_SetAudioStreamGain(stream, playback->gain);
+-      if (!playback->paused) SDL_ResumeAudioDevice(SDL_GetAudioStreamDevice(stream));
+-    }
+-    REXKRNL_INFO("XMP: playing '{}' title='{}' artist='{}' handle={:08X} index={} ({} Hz, {} channels)",
+-                 guest_path, title, artist, song_handle, song_index,
+-                 decoded.sample_rate, decoded.channels);
+-  });
++    std::lock_guard lock(playback.mutex);
++    playback.loading = true;
++    playback.failed = false;
++    playback.request = MusicRequest{playback.generation,
++                                    host_entry->host_path(),
++                                    guest_path,
++                                    rex::string::to_utf8(song->name),
++                                    rex::string::to_utf8(song->artist),
++                                    song->handle,
++                                    active_song_index_};
++  }
++  playback.wake.notify_one();
+   return true;
+ #else
+   return false;
+@@ -385,20 +411,27 @@ void XmpApp::AdvanceIfEnded() {
+   std::chrono::nanoseconds played_duration{0};
+   std::chrono::nanoseconds decoded_duration{0};
+   {
+-    std::lock_guard lock(music_playback_->mutex);
+-    failed = music_playback_->failed;
+-    if (!failed && (music_playback_->loading || !music_playback_->stream)) return;
++    auto& playback = *music_playback_;
++    std::lock_guard lock(playback.mutex);
++    failed = playback.failed;
++    if (!failed && (playback.loading || !playback.stream)) return;
+     if (!failed) {
+-      queued_bytes = SDL_GetAudioStreamQueued(music_playback_->stream);
+-      decoded_duration = music_playback_->decoded_duration;
+-      played_duration = std::chrono::steady_clock::now() - music_playback_->started_at -
+-                        music_playback_->paused_duration;
++      const int test_duration_seconds = REXCVAR_GET(xmp_test_song_duration_seconds);
++      if (test_duration_seconds > 0) {
++        decoded_duration = std::chrono::seconds(test_duration_seconds);
++      } else if (!playback.decoded_all || !playback.bytes_per_second) {
++        return;
++      } else {
++        decoded_duration = std::chrono::nanoseconds(playback.decoded_bytes * UINT64_C(1000000000) /
++                                                    playback.bytes_per_second);
++      }
++      queued_bytes = SDL_GetAudioStreamQueued(playback.stream);
++      played_duration =
++          std::chrono::steady_clock::now() - playback.started_at - playback.paused_duration;
+       // The SDL input queue can still report data after the audible end. Use
+       // decoded PCM duration as a fallback, accounting for XMPPause.
+-      ended = decoded_duration.count() > 0 &&
+-              (played_duration >= decoded_duration + std::chrono::milliseconds(250) ||
+-               (queued_bytes == 0 &&
+-                played_duration + std::chrono::milliseconds(100) >= decoded_duration));
++      ended = played_duration >= decoded_duration + std::chrono::milliseconds(250) ||
++              (queued_bytes == 0 && played_duration + std::chrono::milliseconds(100) >= decoded_duration);
+       if (!ended) return;
+     }
+   }
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..b6d7859 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -402,23 +402,15 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     }
+   }
+   if (!range) {
+-    // Recheck if the pages are still protected (race condition - another thread
+-    // clears the watch we just hit).
+-    // Do this under the lock so we don't introduce another race condition.
+-    auto lock = global_critical_region_.Acquire();
+-    memory::PageAccess cur_access;
+-    size_t page_length = memory::page_size();
+-    memory::QueryProtect(fault_host_address, page_length, cur_access);
+-    if (cur_access != memory::PageAccess::kNoAccess &&
+-        (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
+-      // Another thread has cleared this watch. Abort.
+-      return true;
+-    }
+     // The address is not found within any range, so either a write watch or an
+-    // actual access violation.
++    // actual access violation. The callback handles the race where another
++    // thread clears the watch we just hit: querying host protection here, on
++    // every write-watch fault, is expensive (VirtualQuery walks the whole view
++    // under Wine).
+     if (access_violation_callback_) {
+-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+-                                        fault_host_address, is_write);
++      return access_violation_callback_(global_critical_region_.Acquire(),
++                                        access_violation_callback_context_, fault_host_address,
++                                        is_write);
+     }
+     return false;
+   }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -126,28 +126,37 @@
+   heaps_.vE0000000.Dispose();
+   heaps_.physical.Dispose();
+ 
+-  // Unmap all views and close mapping.
++  // Unmap all views and close the mappings.
+   if (mapping_ != rex::memory::kFileMappingHandleInvalid) {
+     UnmapViews();
+     rex::memory::CloseFileMappingHandle(mapping_, file_name_);
+     mapping_base_ = nullptr;
+     mapping_ = rex::memory::kFileMappingHandleInvalid;
+   }
++  if (physical_mapping_ != rex::memory::kFileMappingHandleInvalid) {
++    rex::memory::CloseFileMappingHandle(physical_mapping_, physical_file_name_);
++    physical_mapping_ = rex::memory::kFileMappingHandleInvalid;
++  }
+ 
+   virtual_membase_ = nullptr;
+   physical_membase_ = nullptr;
+ }
+ 
+-bool Memory::Initialize() {
+-  file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
++// Where guest physical memory starts in map_info's target addresses. It has a section of its
++// own, physical_mapping_, which is committed when it is created: the heaps never decommit it,
++// and on a section that commits on demand every protection change on a view costs a wineserver
++// round trip under Wine (5-7 times the cost of the call otherwise), which the GPU's write
++// watches on physical memory make thousands of times a second.
++constexpr uint64_t kPhysicalTargetBase = 0x100000000ull;
+ 
+-  // Create main page file-backed mapping. This is all reserved but
+-  // uncommitted (so it shouldn't expand page file).
+-  // Round up to allocation granularity to accommodate platforms with large pages.
+-  const size_t mapping_size =
+-      rex::round_up(static_cast<size_t>(0x120000000ull) + system_allocation_granularity_,
+-                    static_cast<size_t>(system_allocation_granularity_));
+-  mapping_ = rex::memory::CreateFileMappingHandle(file_name_, mapping_size,
++bool Memory::Initialize() {
++  const uint64_t tick = chrono::Clock::QueryHostTickCount();
++  file_name_ = fmt::format("xenia_memory_{}", tick);
++  physical_file_name_ = fmt::format("xenia_memory_{}_physical", tick);
++
++  // Guest virtual memory: page file-backed, reserved but uncommitted (so it shouldn't expand
++  // the page file). The heaps commit it on demand.
++  mapping_ = rex::memory::CreateFileMappingHandle(file_name_, kPhysicalTargetBase,
+                                                   rex::memory::PageAccess::kReadWrite, false);
+   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
+     REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
+@@ -155,6 +164,20 @@
+     return false;
+   }
+ 
++  // Guest physical memory, committed up front so the GPU can access it without page faults
++  // (reference: xenia-canary 5f5be0668). Rounded up to the allocation granularity for the
++  // 0xE0000000 view's 4 KB offset on platforms with large pages.
++  const size_t physical_mapping_size =
++      rex::round_up(static_cast<size_t>(0x20000000) + system_allocation_granularity_,
++                    static_cast<size_t>(system_allocation_granularity_));
++  physical_mapping_ = rex::memory::CreateFileMappingHandle(
++      physical_file_name_, physical_mapping_size, rex::memory::PageAccess::kReadWrite, true);
++  if (physical_mapping_ == rex::memory::kFileMappingHandleInvalid) {
++    REXSYS_ERROR("Unable to commit the 512mb guest physical memory.");
++    assert_always();
++    return false;
++  }
++
+ #if REX_PLATFORM_MAC
+   // On macOS, reserve a contiguous host range first, then carve guest views
+   // into it with MAP_SHARED|MAP_FIXED so all views share the same backing fd.
+@@ -223,12 +246,6 @@
+                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                               memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+ 
+-  // Pre-commit the physical memory range so the GPU can access it
+-  // without page faults. Reference: xenia-canary 5f5be0668.
+-  rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
+-                          rex::memory::AllocationType::kCommit,
+-                          rex::memory::PageAccess::kReadWrite);
+-
+   // Install MMIO handler for physical address translation and MMIO ranges
+   mmio_handler_ = runtime::MMIOHandler::Install(
+       virtual_membase_, physical_membase_, physical_membase_ + 0x1FFFFFFF, HostToGuestVirtualThunk,
+@@ -342,10 +359,11 @@
+   for (size_t n = 0; n < rex::countof(map_info); n++) {
+     size_t view_size = static_cast<size_t>(map_info[n].virtual_address_end -
+                                            map_info[n].virtual_address_start + 1);
+-    size_t file_offset = static_cast<size_t>(map_info[n].target_address & granularity_mask);
++    const auto [mapping, offset] = ViewSource(n);
++    size_t file_offset = static_cast<size_t>(offset & granularity_mask);
+     void* target_address = mapping_base + map_info[n].virtual_address_start;
+     void* result = mmap(target_address, view_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+-                        mapping_, file_offset);
++                        mapping, file_offset);
+     if (result == MAP_FAILED || result != target_address) {
+       int err = errno;
+       REXSYS_ERROR(
+@@ -365,16 +383,36 @@
+ }
+ #endif  // REX_PLATFORM_MAC
+ 
++std::pair<rex::memory::FileMappingHandle, uint64_t> Memory::ViewSource(size_t n) const {
++  const uint64_t target = map_info[n].target_address;
++  if (target >= kPhysicalTargetBase) {
++    return {physical_mapping_, target - kPhysicalTargetBase};
++  }
++  return {mapping_, target};
++}
++
++// Whether the view holding a guest virtual address maps guest physical memory.
++static bool MapsPhysicalMemory(uint32_t virtual_address) {
++  for (const auto& view : map_info) {
++    if (virtual_address >= view.virtual_address_start &&
++        virtual_address <= view.virtual_address_end) {
++      return view.target_address >= kPhysicalTargetBase;
++    }
++  }
++  return false;
++}
++
+ int Memory::MapViews(uint8_t* mapping_base) {
+   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
+   // side if system allocation granularity is bigger than 4 KB.
+   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+   for (size_t n = 0; n < rex::countof(map_info); n++) {
++    const auto [mapping, offset] = ViewSource(n);
+     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
+-        mapping_, mapping_base + map_info[n].virtual_address_start,
++        mapping, mapping_base + map_info[n].virtual_address_start,
+         map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1,
+-        rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
++        rex::memory::PageAccess::kReadWrite, offset & granularity_mask));
+     if (!views_.all_views[n]) {
+       // Failed, so bail and try again.
+       UnmapViews();
+@@ -388,7 +426,7 @@
+   for (size_t n = 0; n < rex::countof(views_.all_views); n++) {
+     if (views_.all_views[n]) {
+       size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
+-      rex::memory::UnmapFileView(mapping_, views_.all_views[n], length);
++      rex::memory::UnmapFileView(ViewSource(n).first, views_.all_views[n], length);
+     }
+   }
+ }
+@@ -523,8 +561,14 @@
+       reinterpret_cast<uintptr_t>(range_start) & ~(uintptr_t(host_page_size) - 1));
+   const size_t aligned_length =
+       rex::round_up(size_t(range_start - aligned_start) + size, host_page_size);
+-  if (!rex::memory::AllocFixed(aligned_start, aligned_length, rex::memory::AllocationType::kCommit,
+-                               rex::memory::PageAccess::kNoAccess)) {
++  // Guest physical memory, which holds the windows at 0x7F000000, is committed already.
++  const bool mapped =
++      MapsPhysicalMemory(virtual_address)
++          ? rex::memory::Protect(aligned_start, aligned_length, rex::memory::PageAccess::kNoAccess)
++          : rex::memory::AllocFixed(aligned_start, aligned_length,
++                                    rex::memory::AllocationType::kCommit,
++                                    rex::memory::PageAccess::kNoAccess) != nullptr;
++  if (!mapped) {
+     REXSYS_ERROR("Unable to map range; commit/protect failed");
+     return false;
+   }
+@@ -538,6 +582,20 @@
+   return mmio_handler_->LookupRange(virtual_address);
+ }
+ 
++// True if the host page now permits the access, meaning another thread changed
++// its protection (usually by handling the same write watch) after the fault and
++// the faulting instruction can simply be retried. Must be called with the
++// global critical region locked.
++static bool HostPageAllowsAccess(void* host_address, bool is_write) {
++  rex::memory::PageAccess access;
++  size_t length = rex::memory::page_size();
++  if (!rex::memory::QueryProtect(host_address, length, access)) {
++    return false;
++  }
++  return access != rex::memory::PageAccess::kNoAccess &&
++         (!is_write || access != rex::memory::PageAccess::kReadOnly);
++}
++
+ bool Memory::AccessViolationCallback(rex::thread::global_unique_lock_type global_lock_locked_once,
+                                      void* host_address, bool is_write) {
+   // Access via physical_membase_ is special, when need to bypass everything
+@@ -545,11 +603,14 @@
+   // triggering callbacks on virtual memory regions.
+   if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(virtual_membase_) ||
+       reinterpret_cast<size_t>(host_address) >= reinterpret_cast<size_t>(physical_membase_)) {
+-    return false;
++    return HostPageAllowsAccess(host_address, is_write);
+   }
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    if (HostPageAllowsAccess(host_address, is_write)) {
++      return true;
++    }
+     REXSYS_ERROR(
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+@@ -568,6 +629,12 @@
+     return true;
+   }
+ 
++  // No watch covers the page. TriggerCallbacks released the global lock.
++  auto global_lock = global_critical_region_.Acquire();
++  if (HostPageAllowsAccess(host_address, is_write)) {
++    return true;
++  }
++
+   // Recovery path for stale host protection state in physical memory:
+   // if guest metadata says the page is writable but host protection is still
+   // read-only / no-access, restore write access and resume execution.
+@@ -1063,6 +1130,15 @@
+   }
+ }
+ 
++bool BaseHeap::AllocHostPages(void* host_address, size_t length, rex::memory::AllocationType type,
++                              rex::memory::PageAccess access) {
++  if (heap_type_ != memory::HeapType::kGuestPhysical) {
++    return rex::memory::AllocFixed(host_address, length, type, access) != nullptr;
++  }
++  return type == rex::memory::AllocationType::kReserve ||
++         rex::memory::Protect(host_address, length, access, nullptr);
++}
++
+ void BaseHeap::DumpMap() {
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+   REXSYS_ERROR("------------------------------------------------------------------");
+@@ -1205,8 +1281,8 @@
+     if (!reconcile_host_pages) {
+       // Commit the memory if it isn't already. We do not need to reserve any
+       // memory, as the mapping has already taken care of that.
+-      rex::memory::AllocFixed(addr, page_size_, memory::AllocationType::kCommit,
+-                              memory::PageAccess::kReadWrite);
++      AllocHostPages(addr, page_size_, memory::AllocationType::kCommit,
++                     memory::PageAccess::kReadWrite);
+       // Read into memory with R/W protection, then restore the saved
+       // protection.
+       // TODO(DrChat): read compressed with snappy.
+@@ -1227,9 +1303,8 @@
+         uint32_t(((uint64_t(i) << page_size_shift_) + host_address_offset_) / host_page_size);
+     if (host_page != writable_host_page) {
+       uint8_t* host_page_pointer = membase_ + heap_base_ + size_t(host_page) * host_page_size;
+-      if (!rex::memory::AllocFixed(host_page_pointer, host_page_size,
+-                                   memory::AllocationType::kCommit,
+-                                   memory::PageAccess::kReadWrite)) {
++      if (!AllocHostPages(host_page_pointer, host_page_size, memory::AllocationType::kCommit,
++                          memory::PageAccess::kReadWrite)) {
+         REXSYS_ERROR("BaseHeap::Restore failed to make host page {} writable", host_page);
+         return false;
+       }
+@@ -1354,10 +1429,8 @@
+     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
+                           ? rex::memory::AllocationType::kCommit
+                           : rex::memory::AllocationType::kReserve;
+-    void* result =
+-        rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
+-                                page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
+-    if (!result) {
++    if (!AllocHostPages(TranslateRelative(start_page_number << page_size_shift_),
++                        page_count << page_size_shift_, alloc_type, ToPageAccess(protect))) {
+       REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
+       return false;
+     }
+@@ -1517,10 +1590,8 @@
+     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
+                           ? rex::memory::AllocationType::kCommit
+                           : rex::memory::AllocationType::kReserve;
+-    void* result =
+-        rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
+-                                page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
+-    if (!result) {
++    if (!AllocHostPages(TranslateRelative(start_page_number << page_size_shift_),
++                        page_count << page_size_shift_, alloc_type, ToPageAccess(protect))) {
+       REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
+       return false;
+     }
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -258,6 +258,11 @@
+   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
+                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
+ 
++  // rex::memory::AllocFixed for the heap's host pages. Guest physical memory is committed with
++  // its section (see Memory::Initialize), so there a commit only sets the protection.
++  bool AllocHostPages(void* host_address, size_t length, rex::memory::AllocationType type,
++                      rex::memory::PageAccess access);
++
+   memory::Memory* memory_;
+   uint8_t* membase_;
+   HeapType heap_type_;
+@@ -563,6 +568,8 @@
+ #endif
+   int MapViews(uint8_t* mapping_base);
+   void UnmapViews();
++  // The section and offset map_info entry n maps.
++  std::pair<rex::memory::FileMappingHandle, uint64_t> ViewSource(size_t n) const;
+ 
+   static uint32_t HostToGuestVirtualThunk(const void* context, const void* host_address);
+ 
+@@ -588,6 +595,8 @@
+   mutable std::mutex function_tables_mutex_;
+ 
+   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
++  std::filesystem::path physical_file_name_;
++  rex::memory::FileMappingHandle physical_mapping_ = rex::memory::kFileMappingHandleInvalid;
+   uint8_t* mapping_base_ = nullptr;
+   union {
+     struct {
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -254,6 +254,9 @@
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
++  // The worker is about to block on write_ptr_index_event_ (see WorkerThreadMain): only then
++  // does UpdateWritePointer signal it.
++  std::atomic<bool> worker_waiting_{false};
+   std::atomic<int64_t> write_ptr_update_ns_{0};
+   uint64_t slow_frame_wait_ns_ = 0;
+   uint64_t slow_frame_wait_max_ns_ = 0;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -16,6 +16,11 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <string_view>
++#if defined(_M_X64) || defined(__x86_64__)
++#include <immintrin.h>
++#else
++#include <thread>
++#endif
+ 
+ #include <rex/platform.h>
+ #if REX_PLATFORM_WIN32
+@@ -499,6 +504,7 @@
+     fn();
+   } else {
+     pending_fns_.push(std::move(fn));
++    write_ptr_index_event_->Set();
+   }
+ }
+ 
+@@ -584,21 +590,33 @@
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
+       PrepareForWait();
+-      uint32_t loop_count = 0;
+-      do {
+-        // If we spin around too much, revert to a "low-power" state.
+-        if (loop_count > 500) {
+-          const int wait_time_ms = fast_ring_wake ? 2 : 5;
+-          rex::thread::Wait(write_ptr_index_event_.get(), true,
+-                            std::chrono::milliseconds(wait_time_ms));
+-          if (!fast_ring_wake) rex::thread::MaybeYield();
+-        } else {
+-          rex::thread::MaybeYield();
+-        }
+-        loop_count++;
++      // Spin briefly for back-to-back kicks, then block until UpdateWritePointer, CallInThread
++      // or Shutdown sets the event. (Yielding in a loop instead costs a core's worth of
++      // sched_yield calls while the guest has nothing queued.)
++      const auto idle = [&] {
+         write_ptr_index = write_ptr_index_.load();
+-      } while (worker_running_ && pending_fns_.empty() &&
+-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
++        return worker_running_ && pending_fns_.empty() &&
++               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index);
++      };
++      constexpr auto kIdleSpin = std::chrono::microseconds(20);
++      const auto spin_start = std::chrono::steady_clock::now();
++      for (uint32_t spin = 1; idle(); ++spin) {
++#if defined(_M_X64) || defined(__x86_64__)
++        _mm_pause();
++#else
++        std::this_thread::yield();
++#endif
++        if (!(spin & 63) && std::chrono::steady_clock::now() - spin_start >= kIdleSpin) break;
++      }
++      const auto wait_time = std::chrono::milliseconds(fast_ring_wake ? 2 : 5);
++      while (idle()) {
++        // Sequentially consistent, like the write pointer's store and load in
++        // UpdateWritePointer: either idle() below sees the new write pointer, or
++        // UpdateWritePointer sees the flag and sets the event.
++        worker_waiting_.store(true);
++        if (idle()) rex::thread::Wait(write_ptr_index_event_.get(), true, wait_time);
++        worker_waiting_.store(false);
++      }
+       ReturnFromWait();
+       if (collect_stats && read_ptr_index_ != write_ptr_index) {
+         const int64_t updated_ns = write_ptr_update_ns_.load(std::memory_order_relaxed);
+@@ -722,6 +740,8 @@
+         std::memory_order_relaxed);
+   }
+   write_ptr_index_ = value;
++  // The worker reads the write pointer itself unless it is blocked (WorkerThreadMain).
++  if (!worker_waiting_.load()) return;
+ #if REX_PLATFORM_WIN32
+   SignalRingWriteEvent(write_ptr_index_event_.get(), REXCVAR_GET(gpu_ring_wake_fast));
+ #else

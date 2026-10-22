@@ -5,8 +5,9 @@
 // for a fetch constant, uploading it first when it is new or stale:
 //   - guest memory: untiled on the CPU (UntileTexture) into an upload buffer, copied on the
 //     frame's command list;
-//   - resolve destinations: copied from the resolve module's host image (ResolvedLookup)
-//     instead, per level/slice, when that image is newer than the texture's copy.
+//   - resolve destinations: the resolve module's host image (ResolvedLookup) instead. A 2D
+//     texture with one subresource that an image covers exactly binds the image itself;
+//     others copy it per level/slice when it is newer than the texture's copy.
 // Write tracking: the guest pages of every uploaded texture are watched with ReXGlue's
 // physical memory access callbacks (the mechanism the Xenos plugin's shared memory uses); a
 // CPU write to a watched page marks the textures on it stale.
@@ -54,12 +55,13 @@ struct TextureBinding {
   uint8_t swizzled_signs = 0;  // texture_util::SwizzleSigns (4 x 2-bit xenos::TextureSign)
   TextureKey key;
   const void* entry = nullptr;  // the cache's texture, for TextureCache::Unchanged
+  bool aliased = false;  // `resource` is a resolved image bound in place of the texture's own
 };
 
 class TextureCache {
  public:
   struct Stats {
-    uint64_t gets = 0, uploads = 0, upload_bytes = 0, resolved_copies = 0;
+    uint64_t gets = 0, uploads = 0, upload_bytes = 0, resolved_copies = 0, resolved_aliases = 0;
     uint64_t unsupported = 0, untile_ns = 0;
     // Profile counters (cumulative): memo misses, textures created, time in Create (resource
     // creation), Upload (buffer creation + untile + copies) and CopyResolved.
@@ -134,7 +136,9 @@ class TextureCache {
   void ArmWatch(uint32_t physical, uint32_t length);
   static std::pair<uint32_t, uint32_t> InvalidationThunk(void* context, uint32_t start,
                                                          uint32_t length, bool exact);
-  void Invalidate(uint32_t start, uint32_t length);
+  // Marks the textures on [start, start + length) stale and returns the range the memory may
+  // unwatch: unless exact, widened over the pages of stale textures around it.
+  std::pair<uint32_t, uint32_t> Invalidate(uint32_t start, uint32_t length, bool exact);
   struct UntileJob {
     TextureKey key;
     GuestTextureMemory guest;
@@ -169,8 +173,16 @@ class TextureCache {
   std::atomic<uint64_t> change_epoch_{1};
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKeyHasher> textures_;
-  std::mutex watch_mutex_;      // guards watches_ (callback vs render thread)
-  std::vector<Watch> watches_;  // textures are never destroyed while the cache lives
+  // The watched ranges of every texture, listed in each 64 KB bucket of guest physical memory
+  // they touch (textures are never destroyed while the cache lives).
+  static constexpr uint32_t kWatchBucketShift = 16;
+  static constexpr uint32_t kPageMask = 4095;
+  // The memory unwatches at most the 4 MB-aligned block around a write fault
+  // (PhysicalHeap::TriggerCallbacks).
+  static constexpr uint32_t kUnwatchWindow = 4u << 20;
+  static constexpr uint32_t kWatchBucketCount = (512u << 20) >> kWatchBucketShift;
+  std::mutex watch_mutex_;  // guards watch_buckets_ (callback vs render thread)
+  std::vector<std::vector<Watch>> watch_buckets_{kWatchBucketCount};
   // Guest physical address of every subresource CopyResolved looks up -> the textures there.
   std::unordered_map<uint32_t, std::vector<Texture*>> resolve_targets_;
   UploadPool upload_{32u << 20};  // untiled data, copied into the textures on the frame's list

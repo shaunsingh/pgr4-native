@@ -5,6 +5,7 @@
 // red/blue swap of RB_COPY_DEST_INFO and the sample selections of RB_COPY_CONTROL.
 #include "resolve.h"
 
+#include "gpu_timer.h"
 #include "renderer.h"
 #include "texture_layout.h"
 
@@ -15,16 +16,24 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 
 REXCVAR_DEFINE_STRING(pgr4_native_resolve_dump, "", "PGR4 native",
                       "Directory for resolve oracle dumps; create <dir>\\dump.request to dump the next frame");
 REXCVAR_DEFINE_BOOL(pgr4_native_resolve_selftest, false, "PGR4 native",
                     "Check the resolve shader's format packing against known encodings at start");
+REXCVAR_DEFINE_BOOL(pgr4_native_resolve_specialize, true, "PGR4 native",
+                    "Compile a copy shader per kind of resolve (formats, samples, swap, bias) on a "
+                    "worker thread; resolves use the generic shader until it is ready");
 REXCVAR_DECLARE(int32_t, pgr4_native_capture_hold_ms);
 
 namespace pgr4::native {
@@ -33,9 +42,9 @@ namespace {
 namespace xenos = rex::graphics::xenos;
 namespace texture_util = rex::graphics::texture_util;
 
-constexpr uint32_t kHeapPerFrame = 256;  // SRV descriptors per frame slot (2 per resolve)
-constexpr uint32_t kHeapSlots = 4;       // > frames in flight
-constexpr uint64_t kPlacement = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+constexpr uint32_t kViewsPerResolve = 4;  // t0 color/depth, t1 stencil, u0 texel bits, u1 floats
+constexpr uint32_t kHeapPerFrame = 128 * kViewsPerResolve;  // descriptors per frame slot
+constexpr uint32_t kHeapSlots = 4;                          // > frames in flight
 constexpr uint32_t kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 constexpr D3D12_RESOURCE_STATES kImageReadState =
     D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -58,23 +67,60 @@ inline float LoadF(const uint8_t* base, uint32_t a) {
     if ((counter)++ < 4) REXLOG_WARN(__VA_ARGS__); \
   } while (0)
 
+// How the shader writes a texel through the image's UAV (kShader's Store).
+enum DestLayout : uint32_t {
+  kR8, kR8G8, kR8G8B8A8, kR10G10B10A2, kR16, kR16G16, kR16G16B16A16,
+  kR32,          // one to four 32-bit components
+  kB5G6R5Unorm,  // no UINT view exists: unorm floats
+};
+
+// The host image of a copy destination format: the texture cache's host layout
+// (GetHostFormat) in its typeless family, so the shader writes the Xenos texel bits through a
+// UINT view and the cache binds or copies the image as its own format.
+struct DestStorage {
+  int32_t bpp_log2;
+  DXGI_FORMAT resource;
+  DXGI_FORMAT uav;
+  DestLayout layout;
+};
+
+// nullptr if the resolve can't write the format.
+const DestStorage* GetDestStorage(uint32_t f) {
+  static constexpr DestStorage k8{0, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UINT, kR8};
+  static constexpr DestStorage k8_8{1, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UINT, kR8G8};
+  // k_5_6_5 and k_6_5_5 share the B5G6R5 host layout (the texture cache's load conversions).
+  static constexpr DestStorage k565{1, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, kB5G6R5Unorm};
+  static constexpr DestStorage k16f{1, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UINT, kR16};
+  static constexpr DestStorage k8888{2, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UINT, kR8G8B8A8};
+  static constexpr DestStorage k2101010{2, DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UINT,
+                                        kR10G10B10A2};
+  static constexpr DestStorage k16_16f{2, DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UINT, kR16G16};
+  static constexpr DestStorage k32f{2, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, kR32};
+  static constexpr DestStorage k16x4f{3, DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UINT,
+                                      kR16G16B16A16};
+  static constexpr DestStorage k32_32f{3, DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_UINT, kR32};
+  static constexpr DestStorage k32x4f{4, DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32A32_UINT, kR32};
+  switch (xenos::TextureFormat(f)) {
+    case xenos::TextureFormat::k_8: return &k8;
+    case xenos::TextureFormat::k_8_8: return &k8_8;
+    case xenos::TextureFormat::k_5_6_5:
+    case xenos::TextureFormat::k_6_5_5: return &k565;
+    case xenos::TextureFormat::k_16_FLOAT: return &k16f;
+    case xenos::TextureFormat::k_8_8_8_8: return &k8888;
+    case xenos::TextureFormat::k_2_10_10_10: return &k2101010;
+    case xenos::TextureFormat::k_16_16_FLOAT: return &k16_16f;
+    case xenos::TextureFormat::k_32_FLOAT: return &k32f;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT: return &k16x4f;
+    case xenos::TextureFormat::k_32_32_FLOAT: return &k32_32f;
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT: return &k32x4f;
+    default: return nullptr;
+  }
+}
+
 // log2 of the bytes per texel of a copy destination format; -1 if the resolve can't write it.
 int DestBppLog2(uint32_t f) {
-  switch (xenos::TextureFormat(f)) {
-    case xenos::TextureFormat::k_8: return 0;
-    case xenos::TextureFormat::k_8_8:
-    case xenos::TextureFormat::k_5_6_5:
-    case xenos::TextureFormat::k_6_5_5:
-    case xenos::TextureFormat::k_16_FLOAT: return 1;
-    case xenos::TextureFormat::k_8_8_8_8:
-    case xenos::TextureFormat::k_2_10_10_10:
-    case xenos::TextureFormat::k_16_16_FLOAT:
-    case xenos::TextureFormat::k_32_FLOAT: return 2;
-    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
-    case xenos::TextureFormat::k_32_32_FLOAT: return 3;
-    case xenos::TextureFormat::k_32_32_32_32_FLOAT: return 4;
-    default: return -1;
-  }
+  const DestStorage* s = GetDestStorage(f);
+  return s ? s->bpp_log2 : -1;
 }
 
 // Bytes per pixel of a color render target format (raw copies keep the EDRAM bits).
@@ -110,17 +156,31 @@ bool IsFloatFormat(uint32_t f) {
 
 const char kShader[] = R"(
 cbuffer Params : register(b0) {
-  int2 src_origin;   // source rectangle origin in the render target
-  uint2 size;        // rectangle size
-  uint row_pitch;    // bytes per row in the output buffer
-  uint dest_format;  // xenos::TextureFormat
-  uint src_format;   // xenos::ColorRenderTargetFormat, or the depth format
-  uint flags;        // 0: convert, 1: swap, 4-6: sample select, 8-10: samples, 12-14: number
-  int exp_bias;
-  uint r32f_offset;  // depth: byte offset of the R32_FLOAT image
-  uint bpp_log2;
+  int2 src_origin;      // source rectangle origin in the render target
+  uint2 size;           // rectangle size
+  uint2 dest_origin;    // destination point in the image
+  uint cb_dest_format;  // xenos::TextureFormat
+  uint cb_src_format;   // xenos::ColorRenderTargetFormat, or the depth format
+  uint cb_flags;        // 0: convert, 1: swap, 4-6: sample select, 8-10: samples, 12-14: number
+  int cb_exp_bias;
+  uint cb_dest_layout;  // DestLayout of dst
   uint pad;
 };
+// A specialized variant has the parameters of one kind of resolve compiled in, so the compiler
+// drops the paths and conversions it does not take; the generic shader reads them above.
+#if SPECIALIZED
+#define dest_format ((uint)SPEC_DEST_FORMAT)
+#define src_format ((uint)SPEC_SRC_FORMAT)
+#define flags ((uint)SPEC_FLAGS)
+#define exp_bias ((int)SPEC_EXP_BIAS)
+#define dest_layout ((uint)SPEC_DEST_LAYOUT)
+#else
+#define dest_format cb_dest_format
+#define src_format cb_src_format
+#define flags cb_flags
+#define exp_bias cb_exp_bias
+#define dest_layout cb_dest_layout
+#endif
 #if DEPTH
 #if MSAA
 Texture2DMS<float> src_depth : register(t0);
@@ -136,7 +196,10 @@ Texture2DMS<float4> src : register(t0);
 Texture2D<float4> src : register(t0);
 #endif
 #endif
-RWByteAddressBuffer dst : register(u0);
+// The destination image through its UINT view (Xenos texel bits), or (B5G6R5, and the R32_FLOAT
+// image of depth resolves) as floats.
+RWTexture2D<uint4> dst : register(u0);
+RWTexture2D<float4> dst_float : register(u1);
 
 uint SampleSelect() { return (flags >> 4) & 7; }
 uint SampleCount() { return (flags >> 8) & 7; }
@@ -183,10 +246,16 @@ float F20e4ToF32(uint v) {
   }
   return asfloat(((e + 112u) << 23) | (m << 3));
 }
-// Xenia xenos::Float7e3To32.
-float F7e3ToF32(uint v) {
-  uint m = v & 0x7Fu, e = (v >> 7) & 7u;
-  return e == 0u ? (float)m * (1.0 / 512.0) : asfloat(((e + 124u) << 23) | (m << 16));
+// Float7e3To32(Float32To7e3(c)) without the encoding: from 2^-2 up, c rounded to nearest even
+// at 7 mantissa bits; below, in 7e3's denormal steps of 2^-9, from c * 2^25 truncated as
+// Float32To7e3's shift does (exact for the R16G16B16A16_FLOAT host targets either way).
+float3 Quantize7e3(float3 c) {
+  c = clamp(c, 0.0, 31.875);
+  uint3 u = asuint(c);
+  float3 normal = asfloat((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u);
+  uint3 t = (uint3)(c * 33554432.0);
+  float3 denormal = (float3)((t + 0x7FFFu + ((t >> 16) & 1u)) >> 16) * (1.0 / 512.0);
+  return c < 0.25 ? denormal : normal;
 }
 
 #if !DEPTH
@@ -195,8 +264,7 @@ float F7e3ToF32(uint v) {
 // the target to EDRAM before a resolve, so values below 7e3's smallest step (2^-9) become 0.
 float4 EdramSample(float4 c) {
   if (src_format == 3u || src_format == 12u)
-    return float4(F7e3ToF32(F7e3(c.r)), F7e3ToF32(F7e3(c.g)), F7e3ToF32(F7e3(c.b)),
-                  (float)U(c.a, 3.0) * (1.0 / 3.0));
+    return float4(Quantize7e3(c.rgb), (float)U(c.a, 3.0) * (1.0 / 3.0));
   return c;
 }
 
@@ -285,43 +353,69 @@ uint4 PackPixel(int2 p, out float r32f) {
 #endif
 }
 
+// The components of the UINT view holding packed texel bits v.
+uint4 Unpack(uint4 v) {
+  switch (dest_layout) {
+    case 0u: return uint4(v.x & 0xFFu, 0, 0, 0);
+    case 1u: return uint4(v.x & 0xFFu, (v.x >> 8) & 0xFFu, 0, 0);
+    case 2u: return uint4(v.x & 0xFFu, (v.x >> 8) & 0xFFu, (v.x >> 16) & 0xFFu, v.x >> 24);
+    case 3u: return uint4(v.x & 0x3FFu, (v.x >> 10) & 0x3FFu, (v.x >> 20) & 0x3FFu, v.x >> 30);
+    case 4u: return uint4(v.x & 0xFFFFu, 0, 0, 0);
+    case 5u: return uint4(v.x & 0xFFFFu, v.x >> 16, 0, 0);
+    case 6u: return uint4(v.x & 0xFFFFu, v.x >> 16, v.y & 0xFFFFu, v.y >> 16);
+    default: return v;
+  }
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-  uint bpp = 1u << bpp_log2;
-  uint per_thread = bpp >= 4u ? 1u : (4u >> bpp_log2);
-  uint x = id.x * per_thread;
-  if (x >= size.x || id.y >= size.y) return;
-  uint addr = id.y * row_pitch + x * bpp;
+  if (id.x >= size.x || id.y >= size.y) return;
   float r32f;
-  if (bpp >= 4u) {
-    uint4 v = PackPixel(src_origin + int2(x, id.y), r32f);
-    if (bpp == 4u) dst.Store(addr, v.x);
-    else if (bpp == 8u) dst.Store2(addr, v.xy);
-    else dst.Store4(addr, v);
+  uint4 v = PackPixel(src_origin + int2(id.xy), r32f);
+  uint2 p = dest_origin + id.xy;
 #if DEPTH
-    dst.Store(r32f_offset + addr, asuint(r32f));
+  dst[p] = Unpack(v);
+  dst_float[p] = r32f.xxxx;
+#else
+  if (dest_layout == 8u)  // B5G6R5: R in bits 11-15, exact unorm steps
+    dst_float[p] = float4(float3((v.x >> 11) & 31u, (v.x >> 5) & 63u, v.x & 31u) / float3(31.0, 63.0, 31.0), 1.0);
+  else
+    dst[p] = Unpack(v);
 #endif
-  } else {
-    uint word = 0, mask = (1u << (bpp * 8u)) - 1u;
-    for (uint k = 0; k < per_thread && x + k < size.x; ++k)
-      word |= (PackPixel(src_origin + int2(x + k, id.y), r32f).x & mask) << (k * bpp * 8u);
-    dst.Store(addr, word);
-  }
 }
 )";
 
 struct ShaderConstants {
   int32_t src_origin[2];
   uint32_t size[2];
-  uint32_t row_pitch, dest_format, src_format, flags;
+  uint32_t dest_origin[2];
+  uint32_t dest_format, src_format, flags;
   int32_t exp_bias;
-  uint32_t r32f_offset, bpp_log2, pad;
+  uint32_t dest_layout, pad;
 };
 static_assert(sizeof(ShaderConstants) == 48);
 
 using PFN_D3DCompile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
                                         LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
 
+// What a copy pipeline is compiled for: the generic ones read the resolve's parameters from the
+// root constants, a specialized one has them compiled in (kShader's SPEC_* macros).
+struct PipelineSpec {
+  bool depth = false, msaa = false, specialized = false;
+  uint32_t src_format = 0, dest_format = 0, flags = 0, dest_layout = 0;
+  int32_t exp_bias = 0;
+
+  static PipelineSpec Of(bool depth, bool msaa, const ShaderConstants& c) {
+    return {depth, msaa, true, c.src_format, c.dest_format, c.flags, c.dest_layout, c.exp_bias};
+  }
+  // Unique per variant: the formats fit 4 and 6 bits, the layout 4, flags 15, the bias is
+  // 6-bit signed.
+  uint64_t Key() const {
+    return uint64_t(depth) | uint64_t(msaa) << 1 | uint64_t(src_format & 15) << 2 |
+           uint64_t(dest_format & 63) << 6 | uint64_t(dest_layout & 15) << 12 | uint64_t(flags & 0xFFFF) << 16 |
+           uint64_t(uint32_t(exp_bias) & 63) << 32;
+  }
+};
 D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
   D3D12_RESOURCE_BARRIER b = {};
   b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -451,6 +545,18 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
     }
     p.clear_depth = float(args.f[0]);
     p.clear_stencil = uint8_t(Load32(base, args.sp + 92));
+    if (args.tiling == TilingCall::kEnd) {
+      const uint32_t tiles = std::min(Load32(base, device + kDevTileCount), kMaxTiles);
+      for (uint32_t i = 0; i < tiles; ++i) {
+        const uint32_t r = device + kDevTileRects + 16 * i;
+        if (p.x0 >= int32_t(Load32(base, r)) && p.y0 >= int32_t(Load32(base, r + 4)) &&
+            p.x0 < int32_t(Load32(base, r + 8)) && p.y0 < int32_t(Load32(base, r + 12))) {
+          p.edram_x = int32_t(Load32(base, device + kDevTileOrigins + 8 * i));
+          p.edram_y = int32_t(Load32(base, device + kDevTileOrigins + 8 * i + 4));
+          break;
+        }
+      }
+    }
   }
   *out = p;
   return true;
@@ -461,9 +567,9 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
 
 struct Resolver::Image {
   ComPtr<ID3D12Resource> texture, depth_r32f;
-  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  const DestStorage* storage = nullptr;
   uint32_t width = 0, height = 0;
-  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;  // of both resources
   ResolvedImage view;
 };
 
@@ -500,9 +606,113 @@ struct Resolver::Dump {
   bool guest_read = false;
 };
 
+// The copy pipelines. Variants are looked up and queued on the recording thread and compiled on
+// the worker; Variant::done publishes the pipeline.
+struct Resolver::Pipelines {
+  enum class Specialize { kOff, kAsync, kSync };
+  struct Variant {
+    ComPtr<ID3D12PipelineState> pso;  // null if compilation failed
+    std::atomic<bool> done{false};
+  };
+
+  ID3D12Device* device = nullptr;
+  PFN_D3DCompile compile = nullptr;
+  ComPtr<ID3D12RootSignature> root_signature;
+  ComPtr<ID3D12PipelineState> generic[4];  // [depth][msaa]
+  Specialize specialize = Specialize::kAsync;
+  std::unordered_map<uint64_t, std::unique_ptr<Variant>> variants;
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<std::pair<PipelineSpec, Variant*>> jobs;
+  bool stopping = false;
+  std::thread worker;
+
+  ~Pipelines() {
+    if (!worker.joinable()) return;
+    {
+      std::lock_guard lock(mutex);
+      stopping = true;
+    }
+    cv.notify_all();
+    worker.join();
+  }
+
+  ComPtr<ID3D12PipelineState> Compile(const PipelineSpec& s) const {
+    std::vector<D3D_SHADER_MACRO> defines = {
+        {"DEPTH", s.depth ? "1" : "0"}, {"MSAA", s.msaa ? "1" : "0"}, {"SPECIALIZED", s.specialized ? "1" : "0"}};
+    const std::string values[] = {std::to_string(s.src_format) + "u", std::to_string(s.dest_format) + "u",
+                                  std::to_string(s.flags) + "u", std::to_string(s.dest_layout) + "u",
+                                  std::to_string(s.exp_bias)};
+    if (s.specialized) {
+      const char* names[] = {"SPEC_SRC_FORMAT", "SPEC_DEST_FORMAT", "SPEC_FLAGS", "SPEC_DEST_LAYOUT", "SPEC_EXP_BIAS"};
+      for (size_t i = 0; i < std::size(names); ++i) defines.push_back({names[i], values[i].c_str()});
+    }
+    defines.push_back({nullptr, nullptr});
+    ComPtr<ID3DBlob> code, errors;
+    if (FAILED(compile(kShader, sizeof(kShader) - 1, "pgr4_resolve.hlsl", defines.data(), nullptr, "main",
+                       "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
+      REXLOG_ERROR("PGR4 native resolve: shader {:09X}{}: {}", s.Key(), s.specialized ? "" : " (generic)",
+                   errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+      return nullptr;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = root_signature.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    ComPtr<ID3D12PipelineState> pso;
+    if (Failed(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)), "resolve CreateComputePipelineState"))
+      return nullptr;
+    return pso;
+  }
+
+  // The specialized pipeline of the spec once compiled, else the generic one; queues the
+  // variant the first time it is asked for.
+  ID3D12PipelineState* Get(const PipelineSpec& s) {
+    ID3D12PipelineState* fallback = generic[(s.depth ? 2 : 0) + (s.msaa ? 1 : 0)].Get();
+    if (specialize == Specialize::kOff) return fallback;
+    auto [it, added] = variants.try_emplace(s.Key());
+    if (added) {
+      it->second = std::make_unique<Variant>();
+      if (specialize == Specialize::kSync) {
+        it->second->pso = Compile(s);
+        it->second->done.store(true, std::memory_order_release);
+      } else {
+        {
+          std::lock_guard lock(mutex);
+          jobs.emplace_back(s, it->second.get());
+        }
+        if (!worker.joinable()) {
+          worker = std::thread([this] { Work(); });
+          SetThreadDescription(worker.native_handle(), L"PGR4 native resolve shaders");
+        }
+        cv.notify_one();
+      }
+    }
+    const Variant& v = *it->second;
+    return v.done.load(std::memory_order_acquire) && v.pso ? v.pso.Get() : fallback;
+  }
+
+  void Work() {
+    for (;;) {
+      std::pair<PipelineSpec, Variant*> job;
+      {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return stopping || !jobs.empty(); });
+        if (stopping) return;
+        job = jobs.front();
+        jobs.pop_front();
+      }
+      const uint64_t t0 = NowNs();
+      job.second->pso = Compile(job.first);
+      job.second->done.store(true, std::memory_order_release);
+      REXLOG_INFO("PGR4 native resolve: copy shader {:09X} {} in {:.1f} ms", job.first.Key(),
+                  job.second->pso ? "specialized" : "failed", double(NowNs() - t0) / 1e6);
+    }
+  }
+};
+
 Resolver::Resolver() = default;
 Resolver::~Resolver() = default;
-
 bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12CommandQueue* queue) {
   device_ = device;
   targets_ = targets;
@@ -512,6 +722,10 @@ bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12Co
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "resolve CreateDescriptorHeap")) return false;
   heap_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {DXGI_FORMAT_B5G6R5_UNORM};
+  b5g6r5_store_ = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+                  (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+  if (!b5g6r5_store_) REXLOG_WARN("PGR4 native resolve: no typed UAV store for B5G6R5; k_5_6_5 resolves unsupported");
   if (!CreatePipelines()) return false;
   const std::string dir = REXCVAR_GET(pgr4_native_resolve_dump);
   if (!dir.empty()) {
@@ -523,26 +737,29 @@ bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12Co
   }
   if (REXCVAR_GET(pgr4_native_resolve_selftest) && queue)
     REXLOG_INFO("PGR4 native resolve selftest: {}", SelfTest(queue) ? "all passed" : "FAILED");
+  pipelines_->specialize = REXCVAR_GET(pgr4_native_resolve_specialize) ? Pipelines::Specialize::kAsync
+                                                                       : Pipelines::Specialize::kOff;
   return true;
 }
 
 bool Resolver::CreatePipelines() {
-  // Root signature: b0 = 12 root constants, t0-t1 = table, u0 = root UAV (the scratch buffer).
-  D3D12_DESCRIPTOR_RANGE range = {};
-  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  range.NumDescriptors = 2;
-  D3D12_ROOT_PARAMETER params[3] = {};
+  // Root signature: b0 = 12 root constants, one table of t0-t1 (sources) and u0-u1 (images).
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 2;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 2;
+  ranges[1].OffsetInDescriptorsFromTableStart = 2;
+  D3D12_ROOT_PARAMETER params[2] = {};
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[0].Constants.Num32BitValues = sizeof(ShaderConstants) / 4;
   params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[1].DescriptorTable.NumDescriptorRanges = 1;
-  params[1].DescriptorTable.pDescriptorRanges = &range;
+  params[1].DescriptorTable.NumDescriptorRanges = 2;
+  params[1].DescriptorTable.pDescriptorRanges = ranges;
   params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-  params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC rd = {};
-  rd.NumParameters = 3;
+  rd.NumParameters = 2;
   rd.pParameters = params;
   ComPtr<ID3DBlob> blob, error;
   if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error))) {
@@ -550,130 +767,93 @@ bool Resolver::CreatePipelines() {
                  error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
     return false;
   }
+  pipelines_ = std::make_unique<Pipelines>();
+  Pipelines& pl = *pipelines_;
+  pl.device = device_;
   if (Failed(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                          IID_PPV_ARGS(&root_signature_)),
+                                          IID_PPV_ARGS(&pl.root_signature)),
              "resolve CreateRootSignature"))
     return false;
 
   // d3dcompiler_47.dll ships with Windows 10/11 (and Proton); the shader is tiny.
   HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
-  auto compile = dll ? reinterpret_cast<PFN_D3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
-  if (!compile) {
+  pl.compile = dll ? reinterpret_cast<PFN_D3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
+  if (!pl.compile) {
     REXLOG_ERROR("PGR4 native resolve: d3dcompiler_47.dll / D3DCompile not found");
     return false;
   }
   for (int depth = 0; depth < 2; ++depth) {
     for (int msaa = 0; msaa < 2; ++msaa) {
-      const D3D_SHADER_MACRO defines[] = {{"DEPTH", depth ? "1" : "0"}, {"MSAA", msaa ? "1" : "0"}, {nullptr, nullptr}};
-      ComPtr<ID3DBlob> code, errors;
-      HRESULT hr = compile(kShader, sizeof(kShader) - 1, "pgr4_resolve.hlsl", defines, nullptr, "main", "cs_5_0",
-                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
-      if (FAILED(hr)) {
-        REXLOG_ERROR("PGR4 native resolve: shader (depth {}, msaa {}): {}", depth, msaa,
-                     errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
-        return false;
-      }
-      D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
-      pd.pRootSignature = root_signature_.Get();
-      pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-      if (Failed(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso_[depth * 2 + msaa])),
-                 "resolve CreateComputePipelineState"))
-        return false;
+      PipelineSpec s;
+      s.depth = depth;
+      s.msaa = msaa;
+      if (!(pl.generic[depth * 2 + msaa] = pl.Compile(s))) return false;
     }
   }
   return true;
 }
 
-bool Resolver::EnsureScratch(uint64_t bytes) {
-  if (scratch_ && scratch_size_ >= bytes) return true;
-  const uint64_t size = std::max<uint64_t>(bytes, 16ull << 20);
+Resolver::Image* Resolver::GetImage(const ResolveParams& p) {
+  static uint32_t log_store = 0;
+  const DestStorage& storage = *GetDestStorage(p.dest_format);
+  if (storage.layout == kB5G6R5Unorm && !b5g6r5_store_) {
+    PGR4_LOG_ONCE(log_store, "PGR4 native resolve: no typed UAV store for B5G6R5 (format {})", p.dest_format);
+    return nullptr;
+  }
+  const bool depth = p.source == 4;
+  Destination& dest = destinations_[p.dest_base];
+  for (const std::unique_ptr<Image>& img : dest.images)
+    if (img->storage == &storage && img->width == p.dest_width && img->height == p.dest_height &&
+        bool(img->depth_r32f) == depth)
+      return img.get();
+  auto img = std::make_unique<Image>();
+  img->storage = &storage;
+  img->width = p.dest_width;
+  img->height = p.dest_height;
   D3D12_RESOURCE_DESC d = {};
-  d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  d.Width = size;
-  d.Height = 1;
+  d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  d.Width = p.dest_width;
+  d.Height = p.dest_height;
   d.DepthOrArraySize = 1;
   d.MipLevels = 1;
+  d.Format = storage.resource;
   d.SampleDesc.Count = 1;
-  d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-  ComPtr<ID3D12Resource> res;
-  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON,
-                                              nullptr, IID_PPV_ARGS(&res)),
-             "resolve scratch buffer"))
-    return false;
-  if (scratch_) retired_.push_back({std::move(scratch_), frame_fence_});
-  scratch_ = std::move(res);
-  scratch_size_ = size;
-  scratch_state_ = D3D12_RESOURCE_STATE_COMMON;
-  return true;
-}
-
-Resolver::Image* Resolver::GetImage(const ResolveParams& p, uint32_t width, uint32_t height) {
-  const HostFormat* hf = GetHostFormat(xenos::TextureFormat(p.dest_format));
-  // The shader writes the texture cache's host layout, so its 16-bit field reorders are fine;
-  // depth conversions (k_24_8 sampled as R32_FLOAT) come from depth_r32f instead.
-  if (!hf || hf->block_compressed ||
-      (hf->conversion != TextureConversion::kCopy && hf->conversion != TextureConversion::kR5G6B5ToB5G6R5 &&
-       hf->conversion != TextureConversion::kR5G5B6ToB5G6R5WithRBGASwizzle))
-    return nullptr;
-  const bool depth = p.source == 4;
-  std::unique_ptr<Image>& slot = images_[p.dest_base];
-  if (changed_) changed_(p.dest_base);
-  if (slot && slot->format == hf->resource && slot->width == width && slot->height == height &&
-      bool(slot->depth_r32f) == depth)
-    return slot.get();
-  auto img = std::make_unique<Image>();
-  img->format = hf->resource;
-  img->width = width;
-  img->height = height;
-  D3D12_RESOURCE_DESC d = {};
-  d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  d.Width = width;
-  d.Height = height;
-  d.DepthOrArraySize = 1;
-  d.MipLevels = 1;
-  d.Format = hf->resource;
-  d.SampleDesc.Count = 1;
-  D3D12_HEAP_PROPERTIES hp = {};
-  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST,
+  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                               nullptr, IID_PPV_ARGS(&img->texture)),
              "resolve destination texture"))
     return nullptr;
   if (depth) {
     d.Format = DXGI_FORMAT_R32_FLOAT;
-    if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST,
+    if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                                 nullptr, IID_PPV_ARGS(&img->depth_r32f)),
                "resolve depth_r32f texture"))
       return nullptr;
   }
-  img->state = D3D12_RESOURCE_STATE_COPY_DEST;
   img->view.guest_base = p.dest_base;
   img->view.format = xenos::TextureFormat(p.dest_format);
   img->view.texture = img->texture.Get();
   img->view.depth_r32f = img->depth_r32f.Get();
-  if (slot) {
-    retired_.push_back({std::move(slot->texture), frame_fence_});
-    if (slot->depth_r32f) retired_.push_back({std::move(slot->depth_r32f), frame_fence_});
-  }
-  slot = std::move(img);
-  return slot.get();
+  // Creation is a stall on the guest thread; every one is logged so frame-time spikes can be
+  // matched against it.
+  REXLOG_INFO("PGR4 native resolve: image {} at {:08X}: format {} {}x{}{} ({} at this address)", ++image_count_,
+              p.dest_base, p.dest_format, p.dest_width, p.dest_height, depth ? " + depth float" : "",
+              dest.images.size() + 1);
+  return dest.images.emplace_back(std::move(img)).get();
 }
 
 const ResolvedImage* Resolver::Find(uint32_t guest_phys_base) const {
-  auto it = images_.find(guest_phys_base);
-  return it == images_.end() || it->second->view.seq == 0 ? nullptr : &it->second->view;
+  auto it = destinations_.find(guest_phys_base);
+  if (it == destinations_.end() || !it->second.current) return nullptr;
+  return &it->second.current->view;
 }
 
 void Resolver::BeginFrame(const uint8_t* base, uint64_t frame, uint64_t frame_fence, uint64_t completed_fence) {
   frame_ = frame;
   frame_fence_ = frame_fence;
   heap_next_ = 0;
-  retired_.erase(std::remove_if(retired_.begin(), retired_.end(),
-                                [&](const Retired& r) { return r.fence <= completed_fence; }),
-                 retired_.end());
   if (dump_) DumpBeginFrame(base, completed_fence);
 }
 
@@ -718,8 +898,8 @@ static uint32_t DestInfoOf(const ResolveParams& p) {
 bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) {
   static uint32_t log_raw = 0, log_rt = 0, log_img = 0, log_heap = 0;
   const bool depth = p.source == 4;
-  const int bpp_log2 = DestBppLog2(p.dest_format);
-  if (bpp_log2 < 0) return false;
+  const DestStorage* storage = GetDestStorage(p.dest_format);
+  if (!storage) return false;
   RenderTarget* rt = depth ? targets_->GetDepth(p.regs, uint32_t(std::max(p.y1, 0)))
                            : targets_->GetColor(p.regs, p.source, uint32_t(std::max(p.y1, 0)));
   if (!rt) {
@@ -727,11 +907,12 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
             p.regs.surface_info);
     return false;
   }
-  if (p.copy_command == 0 && !depth && ColorRtBppLog2(rt->guest_format) != uint32_t(bpp_log2)) {
+  if (p.copy_command == 0 && !depth && ColorRtBppLog2(rt->guest_format) != uint32_t(storage->bpp_log2)) {
     PGR4_LOG_ONCE(log_raw, "PGR4 native resolve: raw copy from RT format {} into format {}", rt->guest_format,
             p.dest_format);
     return false;
   }
+  if (!depth) targets_->SyncEdram(list, rt);
   // Clip the rectangle to the source target and the destination level.
   int32_t x0 = std::max(p.x0, 0), y0 = std::max(p.y0, 0);
   int32_t x1 = std::min<int32_t>(p.x1, int32_t(rt->width)), y1 = std::min<int32_t>(p.y1, int32_t(rt->height));
@@ -741,26 +922,25 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   if (x1 <= x0 || y1 <= y0 || dx < 0 || dy < 0) return true;  // nothing to copy
   const uint32_t w = uint32_t(x1 - x0), h = uint32_t(y1 - y0);
 
-  Image* img = GetImage(p, p.dest_width, p.dest_height);
+  Image* img = GetImage(p);
   if (!img) {
     PGR4_LOG_ONCE(log_img, "PGR4 native resolve: no host image for format {} {}x{}", p.dest_format, p.dest_width,
             p.dest_height);
     return false;
   }
-  const uint32_t bpp = 1u << bpp_log2;
-  const uint32_t row_pitch = (w * bpp + kPitchAlign - 1) & ~(kPitchAlign - 1);
-  const uint64_t image_bytes = (uint64_t(row_pitch) * h + kPlacement - 1) & ~(kPlacement - 1);
-  if (!EnsureScratch(depth ? image_bytes * 2 : image_bytes)) return false;
 
-  // Descriptors: t0 = color / depth plane, t1 = stencil plane (null SRV for color).
-  if (heap_next_ + 2 > kHeapPerFrame) {
-    PGR4_LOG_ONCE(log_heap, "PGR4 native resolve: more than {} resolves in a frame; descriptors wrap", kHeapPerFrame / 2);
+  // Descriptors: t0 = color / depth plane, t1 = stencil plane, u0 = the image's UINT view,
+  // u1 = its float view (B5G6R5) or the depth float image; null where unused.
+  if (heap_next_ + kViewsPerResolve > kHeapPerFrame) {
+    PGR4_LOG_ONCE(log_heap, "PGR4 native resolve: more than {} resolves in a frame; descriptors wrap",
+                  kHeapPerFrame / kViewsPerResolve);
     heap_next_ = 0;
   }
   const uint32_t slot = uint32_t(frame_ % kHeapSlots) * kHeapPerFrame + heap_next_;
-  heap_next_ += 2;
+  heap_next_ += kViewsPerResolve;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += size_t(slot) * heap_stride_;
+  auto view = [&](uint32_t i) { return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + size_t(i) * heap_stride_}; };
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
   gpu.ptr += uint64_t(slot) * heap_stride_;
   D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -768,85 +948,74 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   sd.ViewDimension = rt->samples > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
   if (rt->samples == 1) sd.Texture2D.MipLevels = 1;
   sd.Format = rt->srv_format;
-  device_->CreateShaderResourceView(rt->resource.Get(), &sd, cpu);
-  D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu;
-  cpu1.ptr += heap_stride_;
+  device_->CreateShaderResourceView(rt->resource.Get(), &sd, view(0));
   if (depth) {
     sd.Format = rt->stencil_srv_format;
     if (rt->samples == 1) sd.Texture2D.PlaneSlice = 1;
-    device_->CreateShaderResourceView(rt->resource.Get(), &sd, cpu1);
+    device_->CreateShaderResourceView(rt->resource.Get(), &sd, view(1));
   } else {
     D3D12_SHADER_RESOURCE_VIEW_DESC nd = {};
     nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     nd.Texture2D.MipLevels = 1;
-    device_->CreateShaderResourceView(nullptr, &nd, cpu1);
+    device_->CreateShaderResourceView(nullptr, &nd, view(1));
   }
+  const bool float_texels = storage->layout == kB5G6R5Unorm;
+  D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+  ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  ud.Format = float_texels ? DXGI_FORMAT_R32_UINT : storage->uav;
+  device_->CreateUnorderedAccessView(float_texels ? nullptr : img->texture.Get(), nullptr, &ud, view(2));
+  ud.Format = float_texels ? storage->uav : DXGI_FORMAT_R32_FLOAT;
+  device_->CreateUnorderedAccessView(float_texels ? img->texture.Get() : img->depth_r32f.Get(), nullptr, &ud,
+                                     view(3));
 
-  // Source readable by the compute shader, scratch writable.
-  RenderTargets::Transition(list, rt, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  if (scratch_state_ != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-    D3D12_RESOURCE_BARRIER b = Barrier(scratch_.Get(), scratch_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    list->ResourceBarrier(1, &b);
-    scratch_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  // Source readable by the compute shader, the image(s) writable: one barrier batch.
+  D3D12_RESOURCE_BARRIER bs[3];
+  uint32_t nb = 0;
+  constexpr D3D12_RESOURCE_STATES kSourceState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  if (rt->state != kSourceState) {
+    bs[nb++] = Barrier(rt->resource.Get(), rt->state, kSourceState);
+    rt->state = kSourceState;
   }
+  if (img->state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    bs[nb++] = Barrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (img->depth_r32f)
+      bs[nb++] = Barrier(img->depth_r32f.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  if (nb) list->ResourceBarrier(nb, bs);
   ShaderConstants c = {};
   c.src_origin[0] = x0;
   c.src_origin[1] = y0;
   c.size[0] = w;
   c.size[1] = h;
-  c.row_pitch = row_pitch;
+  c.dest_origin[0] = uint32_t(dx);
+  c.dest_origin[1] = uint32_t(dy);
   c.dest_format = p.dest_format;
   c.src_format = rt->guest_format;
   c.flags = (p.copy_command == 1 ? 1u : 0u) | (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) |
             (rt->samples << 8) | (p.dest_number << 12);
   c.exp_bias = p.exp_bias;
-  c.r32f_offset = uint32_t(image_bytes);
-  c.bpp_log2 = uint32_t(bpp_log2);
+  c.dest_layout = storage->layout;
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   list->SetDescriptorHeaps(1, heaps);
-  list->SetComputeRootSignature(root_signature_.Get());
-  list->SetPipelineState(pso_[(depth ? 2 : 0) + (rt->samples > 1 ? 1 : 0)].Get());
+  list->SetComputeRootSignature(pipelines_->root_signature.Get());
+  list->SetPipelineState(pipelines_->Get(PipelineSpec::Of(depth, rt->samples > 1, c)));
   list->SetComputeRoot32BitConstants(0, sizeof(c) / 4, &c, 0);
   list->SetComputeRootDescriptorTable(1, gpu);
-  list->SetComputeRootUnorderedAccessView(2, scratch_->GetGPUVirtualAddress());
-  const uint32_t per_thread = bpp >= 4 ? 1 : 4 >> bpp_log2;
-  list->Dispatch(((w + per_thread - 1) / per_thread + 7) / 8, (h + 7) / 8, 1);
+  if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p, GpuTimer::kResolveCopy));
+  list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 
-  // Scratch -> destination texture (and the depth float image).
-  D3D12_RESOURCE_BARRIER bs[3];
-  uint32_t nb = 0;
-  bs[nb++] = Barrier(scratch_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  scratch_state_ = D3D12_RESOURCE_STATE_COPY_SOURCE;
-  if (img->state != D3D12_RESOURCE_STATE_COPY_DEST) {
-    bs[nb++] = Barrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (img->depth_r32f) bs[nb++] = Barrier(img->depth_r32f.Get(), img->state, D3D12_RESOURCE_STATE_COPY_DEST);
-  }
-  list->ResourceBarrier(nb, bs);
-  D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
-  src.pResource = scratch_.Get();
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint.Offset = 0;
-  src.PlacedFootprint.Footprint = {img->format, w, h, 1, row_pitch};
-  dst.pResource = img->texture.Get();
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-  list->CopyTextureRegion(&dst, UINT(dx), UINT(dy), 0, &src, nullptr);
-  if (img->depth_r32f) {
-    src.PlacedFootprint.Offset = image_bytes;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
-    dst.pResource = img->depth_r32f.Get();
-    list->CopyTextureRegion(&dst, UINT(dx), UINT(dy), 0, &src, nullptr);
-  }
+  if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p, GpuTimer::kResolveRelease));
   nb = 0;
-  bs[nb++] = Barrier(img->texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kImageReadState);
-  if (img->depth_r32f) bs[nb++] = Barrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kImageReadState);
+  bs[nb++] = Barrier(img->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
+  if (img->depth_r32f) bs[nb++] = Barrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
   list->ResourceBarrier(nb, bs);
   img->state = kImageReadState;
   img->view.width = std::max(img->view.width, uint32_t(dx) + w);
   img->view.height = std::max(img->view.height, uint32_t(dy) + h);
   img->view.seq = ++seq_;
+  destinations_[p.dest_base].current = img;
   if (changed_) changed_(p.dest_base);
   ++resolves_;
 
@@ -854,6 +1023,7 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
 
   // Clears of the source surfaces over the resolved rectangle (after the copy).
   if (p.clear_flags) {
+    if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p, GpuTimer::kResolveClear));
     ClearParams cp;
     cp.flags = ((p.clear_flags & 0x100) ? (1u << (depth ? 0 : p.source)) : 0) |
                ((p.clear_flags & 0x200) ? 0x30u : 0);
@@ -861,6 +1031,9 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
     cp.depth = p.clear_depth;
     cp.stencil = p.clear_stencil;
     cp.rects.push_back({LONG(x0), LONG(y0), LONG(x1), LONG(y1)});
+    if (p.edram_x || p.edram_y)
+      cp.edram_rects.push_back({LONG(x0 - p.edram_x), LONG(y0 - p.edram_y), LONG(x1 - p.edram_x),
+                                LONG(y1 - p.edram_y)});
     targets_->Clear(list, p.regs, 0xF, true, uint32_t(std::max(p.y1, 0)), cp);
   }
   return true;
@@ -897,7 +1070,7 @@ void Resolver::DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& 
   src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   dst.pResource = e.readback.Get();
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  dst.PlacedFootprint.Footprint = {img->format, width, height, 1, e.row_pitch};
+  dst.PlacedFootprint.Footprint = {img->storage->resource, width, height, 1, e.row_pitch};
   D3D12_BOX box = {0, 0, 0, width, height, 1};
   list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
   d.entries.push_back(std::move(e));
@@ -1016,6 +1189,9 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       {"7e3 4x avg4 -> k_16_16_16_16_FLOAT", false, 2, 3, {1.5f, 0.25f, 1e-6f, 0.5f}, 0, 0, 32, 1, 6, false, 0,
        {0x34003E00u, 0x39550000u}, 0},
       {"7e3 1x -> k_8_8_8_8 (saturate)", false, 0, 3, {1.5f, 0.25f, 0.0f, 0.5f}, 0, 0, 6, 1, 0, false, 0, {0xAA0040FFu, 0}, 0},
+      // Ties round to even: 2.5 denormal steps -> 2, 1 + 1/256 -> 1, 1 + 3/256 -> 1 + 2/128.
+      {"7e3 1x ties -> k_16_16_16_16_FLOAT", false, 0, 3, {2.5f / 512, 1.00390625f, 1.01171875f, 1.0f}, 0, 0, 32, 1, 0,
+       false, 0, {0x3C001C00u, 0x3C003C10u}, 0},
       {"7e3_AS_16 2x avg2 -> k_2_10_10_10", false, 1, 12, {0.5f, 0.25f, 1.0f, 1.0f}, 0, 0, 7, 1, 4, false, 0,
        {0xFFF40200u, 0}, 0},
       {"8888 1x -> k_5_6_5", false, 0, 0, {1.0f, 0.0f, 0.0f, 1.0f}, 0, 0, 4, 1, 0, false, 0, {0xF800u, 0}, 0},
@@ -1034,115 +1210,123 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
   const int32_t rx0 = 8, ry0 = 8, rx1 = 40, ry1 = 24, px = 16, py = 4;  // rect and dest point
   uint64_t fence_value = 0;
   bool all_ok = true;
-  uint32_t index = 0;
-  for (const Case& c : cases) {
-    ResolveParams p;
-    p.regs.surface_info = kPitch | (c.msaa << 16);
-    const uint32_t base = 1024 + index * 32;  // EDRAM bases the game does not use at start
-    if (c.depth) p.regs.depth_info = base | (c.format << 16);
-    else p.regs.color_info[0] = base | (c.format << 16);
-    p.source = c.depth ? 4 : 0;
-    p.sample_select = c.sample_select;
-    p.copy_command = c.copy_command;
-    p.x0 = rx0; p.y0 = ry0; p.x1 = rx1; p.y1 = ry1;
-    p.dest_x = px; p.dest_y = py;
-    p.dest_base = 0xFFF00000u + index * 0x10000u;  // not a guest address: never found by textures
-    p.dest_format = c.dest_format;
-    p.dest_width = kDestW;
-    p.dest_height = kDestH;
-    p.dest_number = IsFloatFormat(c.dest_format) ? 7 : 0;
-    p.dest_swap = c.swap;
-    p.exp_bias = c.bias;
-    ++index;
+  // Every case through the generic pipeline, then through its specialized one.
+  for (const Pipelines::Specialize mode : {Pipelines::Specialize::kOff, Pipelines::Specialize::kSync}) {
+    const char* const mode_name = mode == Pipelines::Specialize::kOff ? "generic" : "specialized";
+    pipelines_->specialize = mode;
+    uint32_t index = 0;
+    for (const Case& c : cases) {
+      ResolveParams p;
+      p.regs.surface_info = kPitch | (c.msaa << 16);
+      const uint32_t base = 1024 + index * 32;  // EDRAM bases the game does not use at start
+      if (c.depth) p.regs.depth_info = base | (c.format << 16);
+      else p.regs.color_info[0] = base | (c.format << 16);
+      p.source = c.depth ? 4 : 0;
+      p.sample_select = c.sample_select;
+      p.copy_command = c.copy_command;
+      p.x0 = rx0; p.y0 = ry0; p.x1 = rx1; p.y1 = ry1;
+      p.dest_x = px; p.dest_y = py;
+      p.dest_base = 0xFFF00000u + index * 0x10000u;  // not a guest address: never found by textures
+      p.dest_format = c.dest_format;
+      p.dest_width = kDestW;
+      p.dest_height = kDestH;
+      p.dest_number = IsFloatFormat(c.dest_format) ? 7 : 0;
+      p.dest_swap = c.swap;
+      p.exp_bias = c.bias;
+      ++index;
 
-    alloc->Reset();
-    list->Reset(alloc.Get(), nullptr);
-    ClearParams cp;
-    cp.flags = c.depth ? 0x30 : 0x1;
-    std::memcpy(cp.color, c.color, sizeof(cp.color));
-    cp.depth = c.z;
-    cp.stencil = c.stencil;
-    targets_->Clear(list.Get(), p.regs, 1, c.depth, kDestH * 2, cp);
-    bool ok = Resolve(list.Get(), p);
-    Image* img = ok ? images_[p.dest_base].get() : nullptr;
-    const uint32_t bpp = 1u << DestBppLog2(c.dest_format);
-    const uint32_t w = uint32_t(rx1 - rx0), h = uint32_t(ry1 - ry0);
-    const uint32_t row_pitch = (kDestW * bpp + kPitchAlign - 1) & ~(kPitchAlign - 1);
-    ComPtr<ID3D12Resource> readback[2];
-    if (img) {
-      D3D12_RESOURCE_DESC bd = {};
-      bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-      bd.Width = uint64_t(row_pitch) * kDestH;
-      bd.Height = 1;
-      bd.DepthOrArraySize = 1;
-      bd.MipLevels = 1;
-      bd.SampleDesc.Count = 1;
-      bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-      D3D12_HEAP_PROPERTIES hp = {};
-      hp.Type = D3D12_HEAP_TYPE_READBACK;
-      for (int k = 0; k < (img->depth_r32f ? 2 : 1); ++k) {
-        if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                    nullptr, IID_PPV_ARGS(&readback[k])),
-                   "selftest readback"))
-          return false;
-        D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
-        src.pResource = k ? img->depth_r32f.Get() : img->texture.Get();
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.pResource = readback[k].Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Footprint = {k ? DXGI_FORMAT_R32_FLOAT : img->format, kDestW, kDestH, 1, row_pitch};
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-      }
-    }
-    list->Close();
-    ID3D12CommandList* lists[] = {list.Get()};
-    queue->ExecuteCommandLists(1, lists);
-    queue->Signal(fence.Get(), ++fence_value);
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    fence->SetEventOnCompletion(fence_value, ev);
-    WaitForSingleObject(ev, 5000);
-    CloseHandle(ev);
-    uint32_t bad = 0, first_bad[2] = {}, first_x = 0, first_y = 0;
-    float r32f_seen = 0;
-    if (img) {
-      const uint8_t* data = nullptr;
-      readback[0]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)));
-      const uint8_t* fdata = nullptr;
-      if (readback[1]) readback[1]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&fdata)));
-      for (uint32_t y = 0; y < h; ++y) {
-        for (uint32_t x = 0; x < w; ++x) {
-          const uint8_t* t = data + size_t(py + y) * row_pitch + size_t(px + x) * bpp;
-          uint32_t v[2] = {};
-          std::memcpy(v, t, std::min(bpp, 8u));
-          bool texel_ok = v[0] == c.expect[0] && (bpp < 8 || v[1] == c.expect[1]);
-          if (fdata) {
-            float f;
-            std::memcpy(&f, fdata + size_t(py + y) * row_pitch + size_t(px + x) * 4, 4);
-            r32f_seen = f;
-            texel_ok = texel_ok && std::fabs(f - c.expect_r32f) <= 1e-6f;
-          }
-          if (!texel_ok && bad++ == 0) {
-            first_bad[0] = v[0];
-            first_bad[1] = v[1];
-            first_x = x;
-            first_y = y;
-          }
+      alloc->Reset();
+      list->Reset(alloc.Get(), nullptr);
+      ClearParams cp;
+      cp.flags = c.depth ? 0x30 : 0x1;
+      std::memcpy(cp.color, c.color, sizeof(cp.color));
+      cp.depth = c.z;
+      cp.stencil = c.stencil;
+      targets_->Clear(list.Get(), p.regs, 1, c.depth, kDestH * 2, cp);
+      bool ok = Resolve(list.Get(), p);
+      Image* img = ok ? destinations_[p.dest_base].current : nullptr;
+      const uint32_t bpp = 1u << DestBppLog2(c.dest_format);
+      const uint32_t w = uint32_t(rx1 - rx0), h = uint32_t(ry1 - ry0);
+      const uint32_t row_pitch = (kDestW * bpp + kPitchAlign - 1) & ~(kPitchAlign - 1);
+      ComPtr<ID3D12Resource> readback[2];
+      if (img) {
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = uint64_t(row_pitch) * kDestH;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        for (int k = 0; k < (img->depth_r32f ? 2 : 1); ++k) {
+          if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                      nullptr, IID_PPV_ARGS(&readback[k])),
+                     "selftest readback"))
+            return false;
+          D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+          src.pResource = k ? img->depth_r32f.Get() : img->texture.Get();
+          src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+          dst.pResource = readback[k].Get();
+          dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+          dst.PlacedFootprint.Footprint = {k ? DXGI_FORMAT_R32_FLOAT : img->storage->resource, kDestW, kDestH, 1,
+                                           row_pitch};
+          list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
       }
-      readback[0]->Unmap(0, nullptr);
-      if (readback[1]) readback[1]->Unmap(0, nullptr);
-      images_.erase(p.dest_base);
-      if (changed_) changed_(p.dest_base);
+      list->Close();
+      ID3D12CommandList* lists[] = {list.Get()};
+      queue->ExecuteCommandLists(1, lists);
+      queue->Signal(fence.Get(), ++fence_value);
+      HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      fence->SetEventOnCompletion(fence_value, ev);
+      WaitForSingleObject(ev, 5000);
+      CloseHandle(ev);
+      uint32_t bad = 0, first_bad[2] = {}, first_x = 0, first_y = 0;
+      float r32f_seen = 0;
+      if (img) {
+        const uint8_t* data = nullptr;
+        readback[0]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)));
+        const uint8_t* fdata = nullptr;
+        if (readback[1]) readback[1]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&fdata)));
+        for (uint32_t y = 0; y < h; ++y) {
+          for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* t = data + size_t(py + y) * row_pitch + size_t(px + x) * bpp;
+            uint32_t v[2] = {};
+            std::memcpy(v, t, std::min(bpp, 8u));
+            bool texel_ok = v[0] == c.expect[0] && (bpp < 8 || v[1] == c.expect[1]);
+            if (fdata) {
+              float f;
+              std::memcpy(&f, fdata + size_t(py + y) * row_pitch + size_t(px + x) * 4, 4);
+              r32f_seen = f;
+              texel_ok = texel_ok && std::fabs(f - c.expect_r32f) <= 1e-6f;
+            }
+            if (!texel_ok && bad++ == 0) {
+              first_bad[0] = v[0];
+              first_bad[1] = v[1];
+              first_x = x;
+              first_y = y;
+            }
+          }
+        }
+        readback[0]->Unmap(0, nullptr);
+        if (readback[1]) readback[1]->Unmap(0, nullptr);
+        image_count_ -= destinations_[p.dest_base].images.size();
+        destinations_.erase(p.dest_base);
+        if (changed_) changed_(p.dest_base);
+      }
+      const bool pass = img && bad == 0;
+      all_ok = all_ok && pass;
+      if (pass)
+        REXLOG_INFO("PGR4 native resolve selftest: ok   {} {} ({:08X} {:08X})", mode_name, c.name, c.expect[0],
+                    c.expect[1]);
+      else
+        REXLOG_ERROR("PGR4 native resolve selftest: FAIL {} {}: {} of {} texels wrong, first at ({}, {}) = {:08X} "
+                     "{:08X}, expected {:08X} {:08X}, r32f {} (expected {}){}",
+                     mode_name, c.name, bad, w * h, first_x, first_y, first_bad[0], first_bad[1], c.expect[0],
+                     c.expect[1], r32f_seen, c.expect_r32f, img ? "" : ", resolve failed");
     }
-    const bool pass = img && bad == 0;
-    all_ok = all_ok && pass;
-    if (pass)
-      REXLOG_INFO("PGR4 native resolve selftest: ok   {} ({:08X} {:08X})", c.name, c.expect[0], c.expect[1]);
-    else
-      REXLOG_ERROR("PGR4 native resolve selftest: FAIL {}: {} of {} texels wrong, first at ({}, {}) = {:08X} {:08X}, "
-                   "expected {:08X} {:08X}, r32f {} (expected {}){}",
-                   c.name, bad, w * h, first_x, first_y, first_bad[0], first_bad[1], c.expect[0], c.expect[1],
-                   r32f_seen, c.expect_r32f, img ? "" : ", resolve failed");
   }
   return all_ok;
 }
