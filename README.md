@@ -206,7 +206,13 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   thread for two Swaps, switched the Xenos plugin to full readback and written two PNGs on the
   game thread, for a Xenos copy that is meaningless in primary mode: a frame of 104-749 ms per
   mark in the play session. A capture mid-race now made the next four frames 18-26 ms.
-
+- `marks.py` shows what the screen showed in the 5 s before each mark of a play session (a
+  mark comes a few seconds after what it marks): from the session recording, the slow frames
+  with their causes, the blocks that flashed and the whole-image jumps, each with its time
+  before the mark, as PNG sheets. With a recording running, a mark no longer writes the glitch
+  catcher's 2 s as well. In the play session's 19 marks it found geometry exploding into
+  screen-wide triangles and shards for single frames (a cockpit replay, AI cars, the garage),
+  with clean frame counters: the next bug to fix.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -449,17 +455,18 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 | `perf_hitch.py` | Slow frames and their causes |
 | `compare_resolves.py` | Resolve outputs against the Xenos plugin's |
 | `flicker.py` | Flashing blocks or whole-image jumps in a frame recording, as PNG sheets |
-
+| `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
 It also has a texture untiling harness and an offline shader translation test.
 
 ## What's next
 
-- Fix the render thread's wrong geometry. On the Deck it shows as a two-frame glitch about 10 s
-  into the St Petersburg race, in about one run in three: the sky turns red and the far
-  buildings break into shards while near geometry stays right.
+- Fix the wrong geometry. On the Deck it shows as a two-frame glitch about 10 s into the St
+  Petersburg race, in about one run in three (the sky turns red and the far buildings break
+  into shards while near geometry stays right), and in play as single frames where cars or the
+  cockpit explode into screen-wide triangles.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
-  work per frame (bool-constant shader specialization next).
+  work per frame.
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
 
 ## Tooling and agents

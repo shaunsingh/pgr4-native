@@ -58,10 +58,10 @@ REXCVAR_DEFINE_INT32(pgr4_native_record_chunk_frames, 0, "PGR4 native",
                      "Start a new --pgr4_native_record file every this many frames, named "
                      "<path without .rec>-<first frame>.rec (0: one file)");
 REXCVAR_DEFINE_STRING(pgr4_native_glitch_catch, "", "PGR4 native",
-                      "Keep the last 2 s of frames shown (as --pgr4_native_record would record "
-                      "them) in memory and write <this prefix>glitch-<frame>.rec when 1 to 4 "
-                      "frames jump away from the image and back, and <prefix>mark-<frame>.rec "
-                      "with all of them at a capture request (F12 or L3+R3)");
+                      "Keep the frames shown (as --pgr4_native_record would record them) in "
+                      "memory and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump "
+                      "away from the image and back; without --pgr4_native_record, also "
+                      "<prefix>mark-<frame>.rec with the last 2 s at a mark (F12 or L3+R3)");
 
 namespace pgr4::native {
 
@@ -632,7 +632,9 @@ void Presenter::Impl::Recorder::Write() {
     const std::vector<uint8_t>* out = &rgb;
     if (catching) {
       catcher.Add(h, buf.data() + sizeof(h));  // RGBA8 -> RGB8 into its ring
-      if (const uint64_t m = mark_request.exchange(0, std::memory_order_relaxed)) catcher.Mark(m - 1);
+      // With a recording file the mark's frames are in it (native/tools/marks.py).
+      const uint64_t m = mark_request.exchange(0, std::memory_order_relaxed);
+      if (m && path.empty()) catcher.Mark(m - 1);
       out = &catcher.At(catcher.count - 1).rgb;
     } else if (!path.empty()) {
       const size_t n = size_t(h.width) * h.height;
