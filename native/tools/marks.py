@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""What the screen showed in the seconds before each mark of a play session (F12 or L3+R3).
+"""What the screen showed in the seconds before each mark of a play session (F12).
 
 A mark comes a few seconds after what it marks, so for each "PGR4 native mark at frame N" line
 of the session log this looks at the frames shown in the --before seconds up to N (and --after

@@ -213,6 +213,16 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   catcher's 2 s as well. In the play session's 19 marks it found geometry exploding into
   screen-wide triangles and shards for single frames (a cockpit replay, AI cars, the garage),
   with clean frame counters: the next bug to fix.
+- Most of those frames are PGR4's look-back camera, which R3 (the right stick clicked) shows
+  while it is held: in the chase view the camera turns round to face the car's headlights, in
+  the cockpit it looks out of the rear window past the driver's arm. The mark chord L3+R3
+  reached the game too, so each mark, and each press too short for both buttons to show in one
+  frame, looked back for 1-6 frames; marks 25767, 41499, 91103 and 92537 each have one at the
+  mark itself. In a scripted race, R3 held for 300 ms and for 1.5 s looks back as long (td-19).
+  Marks are F12 alone now, a key the game has no binding for. The frame CSV has the pad as the
+  game read it (`pad_buttons` in hex, `pad_lt`/`pad_rt`, `pad_lx`..`pad_ry` as signed high
+  bytes; from XamInputGetState, buttons OR'd over a frame's reads and each axis at its largest
+  deflection), so a flash can be checked against the input.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -462,8 +472,11 @@ It also has a texture untiling harness and an offline shader translation test.
 
 - Fix the wrong geometry. On the Deck it shows as a two-frame glitch about 10 s into the St
   Petersburg race, in about one run in three (the sky turns red and the far buildings break
-  into shards while near geometry stays right), and in play as single frames where cars or the
-  cockpit explode into screen-wide triangles.
+  into shards while near geometry stays right). The single frames of play where the cockpit
+  turned white and broke up were the look-back camera; whether its view of the rear interior
+  is right is still to be compared with Xenos (the chase view's look-back matches it at
+  45-47 dB, td-21). Shards near AI cars and in the garage need a play session with the pad
+  column to tell them from look-backs.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
   work per frame.

@@ -442,3 +442,66 @@ diff --git a/include/rex/graphics/format/dxbc.h b/include/rex/graphics/format/dx
    void EmitAluOp(Opcode opcode, uint32_t src_are_integer, const Dest& dest, const Src& src,
                   bool saturate = false) {
      uint32_t dest_write_mask = dest.GetMask();
+diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
+index 131ea4c..d0ab459 100644
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -20,7 +20,10 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
+ 
++#include <algorithm>
++#include <atomic>
+ #include <chrono>
++#include <cstdlib>
+ 
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+@@ -99,6 +102,30 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
+   return is->GetCapabilities(actual_user_index, flags, caps);
+ }
+ 
++// pgr4-native: the pad as user 0's reads saw it since the last rex_xam_take_frame_pad call,
++// which the native renderer makes at every guest Swap for its frame CSV. Buttons are OR'd over
++// the reads, the triggers kept at their highest and each stick axis at its largest deflection,
++// so a press shorter than a frame shows too. Bits 0-15 buttons, 16-23 LT, 24-31 RT, then LX,
++// LY, RX and RY (the axes' signed high bytes), 8 bits each.
++namespace {
++std::atomic<uint64_t> frame_pad{0};
++
++void NoteFramePad(const rex::input::X_INPUT_GAMEPAD& g) {
++  const int8_t axes[4] = {int8_t(int16_t(g.thumb_lx) >> 8), int8_t(int16_t(g.thumb_ly) >> 8),
++                          int8_t(int16_t(g.thumb_rx) >> 8), int8_t(int16_t(g.thumb_ry) >> 8)};
++  uint64_t old = frame_pad.load(std::memory_order_relaxed), next;
++  do {
++    next = (old | uint16_t(g.buttons)) & 0xFFFF;
++    next |= uint64_t(std::max(uint8_t(old >> 16), g.left_trigger)) << 16;
++    next |= uint64_t(std::max(uint8_t(old >> 24), g.right_trigger)) << 24;
++    for (int i = 0; i < 4; ++i) {
++      const int8_t was = int8_t(old >> (32 + 8 * i));
++      const int8_t now = std::abs(axes[i]) > std::abs(was) ? axes[i] : was;
++      next |= uint64_t(uint8_t(now)) << (32 + 8 * i);
++    }
++  } while (!frame_pad.compare_exchange_weak(old, next, std::memory_order_relaxed));
++}
++}  // namespace
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
+ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
+   // Games call this with a NULL state ptr, probably as a query.
+@@ -147,9 +174,16 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
+     }
+     previous_buttons = buttons;
+   }
++  if (result == X_ERROR_SUCCESS && actual_user_index == 0 && input_state) {
++    NoteFramePad(input_state->gamepad);
++  }
+   return result;
+ }
+ 
++extern "C" uint64_t rex_xam_take_frame_pad() {
++  return frame_pad.exchange(0, std::memory_order_relaxed);
++}
++
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
+ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION> vibration) {
+   if (!vibration) {

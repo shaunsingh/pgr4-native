@@ -15,7 +15,6 @@
 #include <rex/system/xmemory.h>
 
 #include <d3dcompiler.h>
-#include <xinput.h>
 
 #include <algorithm>
 #include <atomic>
@@ -33,7 +32,7 @@
 REXCVAR_DEFINE_STRING(pgr4_native_capture_dir, "C:\\recomp\\logs\\pgr4-native-captures",
                       "PGR4 native",
                       "Front buffer captures (native + Xenos PNGs, PSNR); <dir>\\capture.request, "
-                      "F12 or L3+R3 triggers one");
+                      "F12 triggers one");
 REXCVAR_DEFINE_INT32(pgr4_native_capture_frame, -1, "PGR4 native",
                      "Capture the front buffer of this native frame index (-1 = off)");
 REXCVAR_DEFINE_INT32(pgr4_native_capture_hold_ms, 500, "PGR4 native",
@@ -61,7 +60,7 @@ REXCVAR_DEFINE_STRING(pgr4_native_glitch_catch, "", "PGR4 native",
                       "Keep the frames shown (as --pgr4_native_record would record them) in "
                       "memory and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump "
                       "away from the image and back; without --pgr4_native_record, also "
-                      "<prefix>mark-<frame>.rec with the last 2 s at a mark (F12 or L3+R3)");
+                      "<prefix>mark-<frame>.rec with the last 2 s at a mark (F12)");
 
 namespace pgr4::native {
 
@@ -412,12 +411,8 @@ struct Presenter::Impl {
   // Without it, once the frame has completed: the native PNG, on capture.writer.
   void WriteCapture();
 
-  // Mark inputs: F12, or both sticks clicked on any pad (a Steam Input binding can send both
-  // from a back grip). True on the press.
+  // The mark key, F12 (a Steam Input binding can send it from a back grip). True on the press.
   bool MarkPressed();
-  using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
-  XInputGetStateFn xinput_get_state = nullptr;
-  bool xinput_loaded = false;
   bool mark_down = false;
 };
 
@@ -872,18 +867,9 @@ bool Presenter::Impl::CaptureRequested(uint64_t frame) {
 
 bool Presenter::Impl::MarkPressed() {
   // The key's state rather than GetAsyncKeyState's "pressed since the last call" bit, which
-  // most F12 presses from a Steam Input binding did not set under Proton.
-  bool down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
-  if (!xinput_loaded) {
-    xinput_loaded = true;
-    if (HMODULE m = LoadLibraryW(L"xinput1_4.dll"))
-      xinput_get_state = reinterpret_cast<XInputGetStateFn>(GetProcAddress(m, "XInputGetState"));
-  }
-  constexpr WORD kSticks = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
-  for (DWORD i = 0; xinput_get_state && !down && i < XUSER_MAX_COUNT; ++i) {
-    XINPUT_STATE s;
-    down = xinput_get_state(i, &s) == ERROR_SUCCESS && (s.Gamepad.wButtons & kSticks) == kSticks;
-  }
+  // most F12 presses from a Steam Input binding did not set under Proton. A key and not a pad
+  // chord: the game reads the pad too, and R3 (L3+R3 was the chord) is PGR4's look back.
+  const bool down = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
   const bool pressed = down && !mark_down;
   mark_down = down;
   return pressed;

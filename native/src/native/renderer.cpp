@@ -25,6 +25,10 @@
 #include <thread>
 #include <vector>
 
+// rexglue-native-primary.patch (xam_input.cpp): what user 0's XamInputGetState calls returned
+// since the last call, merged (bit layout there).
+extern "C" uint64_t rex_xam_take_frame_pad();
+
 REXCVAR_DEFINE_BOOL(pgr4_native, false, "PGR4 native",
                     "Run the native D3D12 renderer beside the Xenos plugin (debug window)");
 REXCVAR_DEFINE_BOOL(pgr4_native_primary, false, "PGR4 native",
@@ -154,7 +158,7 @@ struct NativeRenderer::Queue {
   struct SwapCmd {
     SwapCall call;
     // Guest-thread numbers of the frame, added to the render thread's before its CSV row.
-    uint64_t hook_ns, hook_wait_ns, hook_max_ns, state_fail, track_calls;
+    uint64_t hook_ns, hook_wait_ns, hook_max_ns, state_fail, track_calls, pad;
     DrawRenderer::PrepareCounters prep;
     uint64_t ticks[profile::kStageCount];
   };
@@ -313,7 +317,8 @@ bool NativeRenderer::Initialize() {
                    "reg_writes,swap_untile_us,swap_submit_us,swap_present_us,swap_fence_us,"
                    "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
                    "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,coh_stale,coh_late,coh_gpu,coh_regs,"
-                   "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic");
+                   "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic,"
+                   "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -400,6 +405,7 @@ void NativeRenderer::RenderThreadMain() {
             stats_.hook_ns = s.hook_ns;
             stats_.hook_wait_ns = s.hook_wait_ns;
             stats_.hook_max_ns = s.hook_max_ns;
+            stats_.pad = s.pad;
             stats_.draws += s.state_fail;
             stats_.state_fail += s.state_fail;
             draw_->AddPrepareCounters(s.prep);
@@ -509,6 +515,7 @@ void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
   s.hook_ns = q.hook_ns + (t1 - t0);
   s.hook_max_ns = std::max(q.hook_max_ns, t1 - t0 - wait);
   s.track_calls = profile::g.track_calls;
+  s.pad = rex_xam_take_frame_pad();
   std::memcpy(s.ticks, profile::g.ticks, sizeof(s.ticks));
   for (uint64_t& t : profile::g.ticks) t = 0;
   profile::g.track_calls = 0;
@@ -576,6 +583,7 @@ void NativeRenderer::OnSwap(const uint8_t* base, const HookArgs& args) {
   base_ = base;
   SwapCall swap;
   Presenter::ReadSwap(base, args, &swap);
+  stats_.pad = rex_xam_take_frame_pad();
   ExecuteSwap(swap);
 }
 
@@ -689,7 +697,8 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
     std::fprintf(csv_->file,
                  "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
                  "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
-                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu",
+                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu,"
+                 "%04X,%u,%u,%d,%d,%d,%d",
                  (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
                  (unsigned long long)s.clears, (unsigned long long)s.resolves,
                  (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -713,7 +722,10 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  (unsigned long long)textures_->texture_count(),
                  (unsigned long long)(textures_->stats().evicted - csv_->evicted_prev),
                  (textures_->stats().evict_ns - csv_->evict_ns_prev) / 1000.0,
-                 (unsigned long long)ds.views, (unsigned long long)ds.pso_generic);
+                 (unsigned long long)ds.views, (unsigned long long)ds.pso_generic,
+                 unsigned(s.pad & 0xFFFF), unsigned(uint8_t(s.pad >> 16)), unsigned(uint8_t(s.pad >> 24)),
+                 int(int8_t(s.pad >> 32)), int(int8_t(s.pad >> 40)), int(int8_t(s.pad >> 48)),
+                 int(int8_t(s.pad >> 56)));
     csv_->evicted_prev = textures_->stats().evicted;
     csv_->evict_ns_prev = textures_->stats().evict_ns;
     if (profile::g.on) {

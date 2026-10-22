@@ -117,6 +117,8 @@ struct FrameStats {
   // Parts of swap_ns: waiting for the texture untile workers, then D3D12Device::EndFrameTimes.
   uint64_t swap_untile_ns = 0, swap_submit_ns = 0, swap_present_ns = 0, swap_fence_ns = 0;
   uint64_t frames_held = 0;  // Swaps not presented (DrawRenderer::FrameIncomplete)
+  // The guest's pad reads since the Swap before (rex_xam_take_frame_pad, taken at the Swap).
+  uint64_t pad = 0;
 };
 
 class NativeRenderer {

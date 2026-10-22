@@ -8,7 +8,7 @@
 //
 // Captures (oracle for M2): --pgr4_native_capture_dir (default
 // C:\recomp\logs\pgr4-native-captures) and either the file <dir>\capture.request (deleted
-// when taken), a mark (F12, or L3+R3 on any pad), or --pgr4_native_capture_frame=N. A request
+// when taken), a mark (F12), or --pgr4_native_capture_frame=N. A request
 // at Swap F-1 switches the Xenos plugin to full readback (HoldFullReadback in resolve.h; with
 // "fast" guest memory holds the previous frame's resolves) and captures frame F:
 //   f<F>-native.png  the native front buffer (read back after the frame's fence)
@@ -62,7 +62,7 @@ class Presenter {
 
   // Reads the Swap's front buffer texture object from guest memory.
   static void ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* out);
-  // A capture was requested (file, F12, L3+R3 or --pgr4_native_capture_frame == frame).
+  // A capture was requested (file, F12 or --pgr4_native_capture_frame == frame).
   bool CaptureRequested(uint64_t frame);
   // A capture runs its Swap and the one before with the guest thread held (to read the Xenos
   // plugin's copy of the frame, --pgr4_native_capture_xenos).

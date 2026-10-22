@@ -13,6 +13,7 @@
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
 #               [--output NAME] [--captures "5 10 15"] [--record "FROM FRAMES"] [--catch]
+#               [--keys FILE]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -36,6 +37,7 @@
 # native/tools/flicker.py finds the frames that flash and writes them out as PNG strips.
 # --catch keeps the last 2 s of frames in memory instead and writes only the whole-image jumps
 # (and F12's last 2 s) to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch).
+# --keys FILE drives the game with that route_player.py script instead of run/route-stpetersburg.keys.
 #
 # <tree> names $PGR4_BUILDS/native-<tree>/run/runtime (PGR4_BUILDS defaults to
 # ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is, so the released
@@ -52,7 +54,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-captures="5 10 15"; record=""; catch=0
+captures="5 10 15"; record=""; catch=0; keys=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --captures) captures=$2; shift 2 ;;
     --record) record=$2; shift 2 ;;
     --catch) catch=1; shift ;;
+    --keys) keys=$(readlink -f "$2"); shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -89,7 +92,8 @@ else
   runtime=${PGR4_BUILDS:-$HOME/recomp/builds/pgr4}/native-$tree/run/runtime
 fi
 game=${PGR4_GAME:-$HOME/recomp/dumps/pgr4/game}
-keys=$repo/run/route-stpetersburg.keys
+keys=${keys:-$repo/run/route-stpetersburg.keys}
+[[ -f $keys ]] || { echo "no key script $keys" >&2; exit 2; }
 top=$HOME/pgr4-proton
 compat=$HOME/.local/share/Steam/compatibilitytools.d
 shopt -s nullglob

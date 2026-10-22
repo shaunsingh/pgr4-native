@@ -12,8 +12,8 @@
 #
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own, so deck-run.sh never stops a game being played), userdata/ (the save, kept
-# between sessions), captures/ (a mark, F12 or both sticks clicked (L3+R3, which a Steam Input
-# binding can send from a back grip), writes the native front buffer there as f<frame>-native.png;
+# between sessions), captures/ (a mark, F12, which a Steam Input binding can send from a back
+# grip, writes the native front buffer there as f<frame>-native.png;
 # the frame number matches the CSV), logs/<stamp>-* (the last 30 sessions; <stamp>-glitch-<frame>.rec
 # holds the frames around each whole-image glitch the renderer saw, <stamp>-mark-<frame>.rec the 2 s
 # before each mark, <stamp>-<frame>.rec every frame shown from that one on, 5 minutes a file, until
@@ -84,7 +84,7 @@ done
 
 # MTR's launcher arguments for 60 fps (launcher/Launcher.cs) with the guest's vblank at the Deck
 # OLED panel's 90 Hz (PGR4_REFRESH=60 for an LCD Deck), the native renderer as the
-# presenter, and the session record. A mark (F12, L3+R3) writes the native image alone, off the
+# presenter, and the session record. A mark (F12) writes the native image alone, off the
 # guest thread: the Xenos copy only matters in oracle runs.
 args=(--game_data_root "$(win "$game")" --user_data_root "$(win "$top/userdata")"
   --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync --xmp_music_gain 0.35
