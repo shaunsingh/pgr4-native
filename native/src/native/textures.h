@@ -11,6 +11,9 @@
 // Write tracking: the guest pages of every uploaded texture are watched with ReXGlue's
 // physical memory access callbacks (the mechanism the Xenos plugin's shared memory uses); a
 // CPU write to a watched page marks the textures on it stale.
+// Lifetime: the game streams textures through the same guest memory under new keys, so the
+// cache evicts the least recently used textures over a memory budget (Xenia's texture cache
+// policy, see Budget) once the GPU has finished the frames that used them.
 //
 // Threading: Get/Retire run on the guest render thread (the renderer's On* calls); the
 // invalidation callback runs on any guest thread that faults on a watched page.
@@ -29,8 +32,10 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -44,6 +49,12 @@ namespace pgr4::native {
 // Returns the image last resolved to a guest physical address (Resolver::Find), or nullptr.
 using ResolvedLookup = std::function<const ResolvedImage*(uint32_t guest_physical)>;
 
+// One texture of the cache for as long as it lives: an evicted texture's slot is reused with
+// the next generation, so a handle kept past an eviction no longer matches.
+struct TextureHandle {
+  uint32_t slot = 0, generation = 0;  // generation 0: no texture
+};
+
 // What a draw binds for one texture fetch constant.
 struct TextureBinding {
   ID3D12Resource* resource = nullptr;      // in PIXEL|NON_PIXEL_SHADER_RESOURCE state
@@ -54,7 +65,7 @@ struct TextureBinding {
   DXGI_FORMAT srv_signed_format = DXGI_FORMAT_UNKNOWN;
   uint8_t swizzled_signs = 0;  // texture_util::SwizzleSigns (4 x 2-bit xenos::TextureSign)
   TextureKey key;
-  const void* entry = nullptr;  // the cache's texture, for TextureCache::Unchanged
+  TextureHandle entry;  // the cache's texture, for TextureCache::Unchanged and Touch
   bool aliased = false;  // `resource` is a resolved image bound in place of the texture's own
   // The game wrote the texture's memory after it queued the draw. With capture order on, bound
   // with the data from before that write, which is still to be uploaded for later draws (not
@@ -71,7 +82,18 @@ class TextureCache {
     // Profile counters (cumulative): memo misses, textures created, time in Create (resource
     // creation), Upload (buffer creation + untile + copies) and CopyResolved.
     uint64_t memo_misses = 0, created = 0, create_ns = 0, upload_ns = 0, copy_resolved_ns = 0;
+    uint64_t evicted = 0, evict_ns = 0;  // textures evicted over the budget, time in Retire
   };
+  // Texture memory budget, by the resources' allocation sizes. Over soft_bytes, textures unused
+  // for soft_lifetime_ms are evicted; over hard_bytes, the least recently used ones regardless.
+  // Either way only textures no frame in flight uses. Offline (texture_harness): unlimited.
+  struct Budget {
+    uint64_t soft_bytes = ~0ull, hard_bytes = ~0ull;
+    uint64_t soft_lifetime_ms = 30000;
+  };
+  // Called by Retire with the resources of the textures it evicts, before releasing them: the
+  // caller's views of them must go (the GPU has finished every frame that used them).
+  using EvictCallback = std::function<void(const std::vector<ID3D12Resource*>& resources)>;
 
   // In the game: memory = rex::system::kernel_memory(); textures are read from its physical
   // memory and their pages watched through it.
@@ -84,6 +106,8 @@ class TextureCache {
   TextureCache& operator=(const TextureCache&) = delete;
 
   void SetResolvedLookup(ResolvedLookup lookup) { resolved_lookup_ = std::move(lookup); }
+  void SetBudget(const Budget& budget) { budget_ = budget; }
+  void SetEvictCallback(EvictCallback callback) { evict_callback_ = std::move(callback); }
   // The resolver's Find result for this guest physical address may have changed
   // (Resolver::SetChangedCallback): textures with a subresource there recheck it at their next
   // Get.
@@ -112,34 +136,62 @@ class TextureCache {
   // command list Get recorded into is submitted; the GPU reads the upload memory only then.
   void FinishUploads();
 
-  // Recycles upload memory of frames the GPU finished. Once per Swap, after the submission.
+  // Recycles upload memory of frames the GPU finished and evicts textures over the budget. Once
+  // per Swap, after the submission.
   void Retire(uint64_t completed_fence);
 
-  // Whether the texture behind a binding Get returned can be bound again without a Get: no
-  // guest write and no resolve into it since, so its data, view and shader-read state are
-  // unchanged. Callers that memoize bindings check this per texture.
-  bool Unchanged(const void* entry) const;
-  // Goes up whenever a texture may stop being Unchanged (guest write, resolve into it, upload).
+  // Whether the texture behind a binding Get returned can be bound again without a Get: not
+  // evicted, no guest write and no resolve into it since, so its data, view and shader-read
+  // state are unchanged. Callers that memoize bindings check this per texture.
+  bool Unchanged(TextureHandle entry) const;
+  // A binding bound again without a Get is used by the frame completing at frame_fence: keeps
+  // its texture from eviction while that frame is in flight. Callers that memoize bindings
+  // call this once per frame for each texture they bind that way.
+  void Touch(TextureHandle entry, uint64_t frame_fence);
+  // Goes up whenever a texture may stop being Unchanged (guest write, resolve into it, upload,
+  // eviction).
   // A caller that checked Unchanged on its textures after reading the epoch may skip the checks
   // while the epoch still has that value.
   uint64_t change_epoch() const { return change_epoch_.load(std::memory_order_acquire); }
 
   const Stats& stats() const { return stats_; }
   size_t texture_count() const { return textures_.size(); }
+  uint64_t resident_bytes() const { return resident_bytes_; }
 
  private:
   struct Texture;
+  struct Slot {
+    std::unique_ptr<Texture> texture;  // null while free
+    uint32_t generation = 1;           // goes up when the texture is evicted
+  };
   struct Watch {
     uint32_t start, end;  // physical [start, end)
     Texture* texture;
   };
 
+  // A texture for key in a free slot, listed in textures_ (no resource yet).
+  Texture* NewTexture(const TextureKey& key);
   Texture* Create(const TextureKey& key, const HostFormat& host);
+  static bool Clean(const Texture& t);
+  // Moves t to the end of the LRU list, once per frame.
+  void MarkUsed(Texture& t, uint64_t frame_fence);
+  void EvictOverBudget(uint64_t completed_fence);
+  // Unlinks t from every structure that refers to it, frees its memory and its slot.
+  void Destroy(Texture& t);
   bool Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence);
-  // A texture resource in COPY_DEST state, placed in a pooled heap (committed if it does not
-  // fit one or a heap cannot be created).
+  // A texture resource in COPY_DEST state, placed in a pooled heap at *placed (kCommitted if it
+  // does not fit one or a heap cannot be created); *bytes: its allocation size.
   HRESULT CreateTextureResource(D3D12_RESOURCE_DESC& desc,
-                                Microsoft::WRL::ComPtr<ID3D12Resource>* out);
+                                Microsoft::WRL::ComPtr<ID3D12Resource>* out, uint64_t* placed,
+                                uint64_t* bytes);
+  static constexpr uint64_t kCommitted = ~0ull;
+  // Placed texture memory: best-fit ranges over all heaps (offset heap * kTextureHeapSize +
+  // offset in the heap); kCommitted if none fits.
+  uint64_t AllocatePlaced(uint64_t size, uint64_t alignment);
+  void FreePlaced(uint64_t offset, uint64_t size);
+  bool AddHeap();
+  void AddFreeRange(uint64_t offset, uint64_t size);
+  void UnwatchRange(Texture& t, uint32_t start, uint32_t length);
   bool CopyResolved(Texture& t, ID3D12GraphicsCommandList* list);
   // The resolved image CopyResolved copies into t from `image`, or null if its format family
   // does not match.
@@ -176,9 +228,9 @@ class TextureCache {
   bool unaligned_bc_supported_ = false;
   ResolvedLookup resolved_lookup_;
   // Direct-mapped memo of the last Get per fetch-dword hash: a hit (same 6 dwords, texture
-  // unchanged) skips the key decode, the map lookup and the SRV desc build. Textures are never
-  // destroyed, so the pointer stays valid. 1,024 entries: with 64, the race missed ~1,600 times
-  // per frame.
+  // unchanged) skips the key decode, the map lookup and the SRV desc build. An eviction clears
+  // the entries of the textures it destroys. 1,024 entries: with 64, the race missed ~1,600
+  // times per frame.
   struct GetMemo {
     uint32_t fetch[6] = {};
     Texture* texture = nullptr;
@@ -192,9 +244,21 @@ class TextureCache {
   static constexpr uint32_t kStaleLogLimit = 96;  // log lines about stale textures
   uint32_t stale_logged_ = 0;
 
-  std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKeyHasher> textures_;
+  std::vector<Slot> slots_;  // owns the textures
+  std::vector<uint32_t> free_slots_;
+  std::unordered_map<TextureKey, Texture*, TextureKeyHasher> textures_;
+  // Textures with a resource, least recently used first (MarkUsed).
+  Texture* lru_first_ = nullptr;
+  Texture* lru_last_ = nullptr;
+  uint64_t now_ms_ = 0;          // at the last Retire: the use time MarkUsed records
+  uint64_t resident_bytes_ = 0;  // allocation sizes of the textures with a resource
+  Budget budget_;
+  EvictCallback evict_callback_;
+  static constexpr size_t kMaxEvictionsPerFrame = 128;
+  std::vector<Texture*> evict_batch_;            // scratch
+  std::vector<ID3D12Resource*> evict_resources_;  // scratch
   // The watched ranges of every texture, listed in each 64 KB bucket of guest physical memory
-  // they touch (textures are never destroyed while the cache lives).
+  // they touch (Destroy removes a texture's).
   static constexpr uint32_t kWatchBucketShift = 16;
   static constexpr uint32_t kPageMask = 4095;
   // The memory unwatches at most the 4 MB-aligned block around a write fault
@@ -206,13 +270,13 @@ class TextureCache {
   // Guest physical address of every subresource CopyResolved looks up -> the textures there.
   std::unordered_map<uint32_t, std::vector<Texture*>> resolve_targets_;
   UploadPool upload_{32u << 20};  // untiled data, copied into the textures on the frame's list
-  // Texture memory: textures are never destroyed while the cache lives, so they are placed in
-  // large heaps by a bump allocator (CreatePlacedResource costs a fraction of
-  // CreateCommittedResource: 627 textures took 138 ms at race start as committed resources).
+  // Texture memory: textures are placed in large heaps (CreatePlacedResource costs a fraction of
+  // CreateCommittedResource: 627 textures took 138 ms at race start as committed resources),
+  // best fit, and an evicted texture's range coalesces with its free neighbours.
   static constexpr uint64_t kTextureHeapSize = 128ull << 20;
   std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> heaps_;
-  ID3D12Heap* heap_ = nullptr;  // the heap being filled (heaps_.back())
-  uint64_t heap_used_ = 0;
+  std::map<uint64_t, uint64_t> free_ranges_;              // offset -> size
+  std::set<std::pair<uint64_t, uint64_t>> free_by_size_;  // (size, offset)
   // The next heap, created on another thread while heap_ fills: creating a 128 MB heap on the
   // game thread took 20-130 ms in the frames where a heap ran full (HitchFix).
   std::future<Microsoft::WRL::ComPtr<ID3D12Heap>> spare_heap_;

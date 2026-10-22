@@ -22,6 +22,14 @@
 REXCVAR_DEFINE_STRING(pgr4_native_texture_trace, "", "PGR4 native",
                       "Log every TextureCache::Get of the texture at this guest physical address "
                       "(hex): dirty upload, resolved image seq, copy");
+REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_soft_mb, 512, "PGR4 native",
+                     "Texture memory above which textures unused for "
+                     "--pgr4_native_texture_memory_soft_lifetime_s are evicted (0: no limit)");
+REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_soft_lifetime_s, 30, "PGR4 native",
+                     "See --pgr4_native_texture_memory_soft_mb");
+REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_hard_mb, 1024, "PGR4 native",
+                     "Texture memory above which the least recently used textures are evicted, "
+                     "once no frame in flight uses them (0: no limit)");
 #endif
 
 #include <algorithm>
@@ -55,6 +63,11 @@ struct TextureCache::Texture {
   // The resolved image bound in place of `resource` (CopyResolved), or null.
   ID3D12Resource* alias = nullptr;
   uint32_t uploads = 0;                // Upload calls so far (the slow-upload log)
+  uint32_t slot = 0;
+  uint64_t placed = kCommitted, bytes = 0;  // CreateTextureResource's placement and size
+  uint64_t used_fence = 0, used_ms = 0;     // the last frame that bound it (MarkUsed)
+  Texture* lru_prev = nullptr;
+  Texture* lru_next = nullptr;
 };
 
 namespace {
@@ -142,6 +155,11 @@ TextureCache::TextureCache(ID3D12Device* device, rex::memory::Memory* memory)
     : TextureCache(device, memory->physical_membase()) {
   memory_ = memory;
   invalidation_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
+  auto limit = [](int32_t mb) { return mb > 0 ? uint64_t(mb) << 20 : ~0ull; };
+  budget_.soft_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_soft_mb));
+  budget_.hard_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_hard_mb));
+  budget_.soft_lifetime_ms =
+      uint64_t(std::max(REXCVAR_GET(pgr4_native_texture_memory_soft_lifetime_s), 0)) * 1000;
   // A quarter of the hardware threads, 1-4: 4 on an i9-13900K, 2 on a Steam Deck.
   const uint32_t n = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
   for (uint32_t i = 0; i < n; ++i) {
@@ -275,9 +293,33 @@ void TextureCache::OnResolved(uint32_t guest_physical) {
   change_epoch_.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool TextureCache::Unchanged(const void* entry) const {
-  const Texture* t = static_cast<const Texture*>(entry);
-  return !t->dirty.load(std::memory_order_acquire) && !t->resolve_pending;
+bool TextureCache::Clean(const Texture& t) {
+  return !t.dirty.load(std::memory_order_acquire) && !t.resolve_pending;
+}
+
+bool TextureCache::Unchanged(TextureHandle entry) const {
+  const Slot& s = slots_[entry.slot];
+  return s.generation == entry.generation && Clean(*s.texture);
+}
+
+void TextureCache::Touch(TextureHandle entry, uint64_t frame_fence) {
+  const Slot& s = slots_[entry.slot];
+  if (s.generation == entry.generation) MarkUsed(*s.texture, frame_fence);
+}
+
+void TextureCache::MarkUsed(Texture& t, uint64_t frame_fence) {
+  if (t.used_fence == frame_fence) return;
+  t.used_fence = frame_fence;
+  t.used_ms = now_ms_;
+  if (lru_last_ == &t) return;
+  if (t.lru_prev || lru_first_ == &t) {
+    (t.lru_prev ? t.lru_prev->lru_next : lru_first_) = t.lru_next;
+    t.lru_next->lru_prev = t.lru_prev;  // not the last, so it has a next
+  }
+  t.lru_prev = lru_last_;
+  t.lru_next = nullptr;
+  (lru_last_ ? lru_last_->lru_next : lru_first_) = &t;
+  lru_last_ = &t;
 }
 
 void TextureCache::WatchRange(Texture& t, uint32_t start, uint32_t length) {
@@ -289,10 +331,26 @@ void TextureCache::WatchRange(Texture& t, uint32_t start, uint32_t length) {
     watch_buckets_[b].push_back({start, end, &t});
 }
 
+TextureCache::Texture* TextureCache::NewTexture(const TextureKey& key) {
+  uint32_t slot;
+  if (!free_slots_.empty()) {
+    slot = free_slots_.back();
+    free_slots_.pop_back();
+  } else {
+    slot = uint32_t(slots_.size());
+    slots_.emplace_back();
+  }
+  Slot& s = slots_[slot];
+  s.texture = std::make_unique<Texture>();
+  Texture* t = s.texture.get();
+  t->key = key;
+  t->slot = slot;
+  textures_.emplace(key, t);
+  return t;
+}
+
 TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFormat& host) {
-  auto owned = std::make_unique<Texture>();
-  Texture& t = *owned;
-  t.key = key;
+  Texture& t = *NewTexture(key);
   t.host = &host;
   t.layout = texture_util::GetGuestTextureLayout(key.dimension, key.pitch, key.width, key.height,
                                                  key.depth_or_array_size, key.tiled, key.format,
@@ -318,12 +376,13 @@ TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFor
     desc.Format = host.resource;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    HRESULT hr = CreateTextureResource(desc, &t.resource);
+    HRESULT hr = CreateTextureResource(desc, &t.resource, &t.placed, &t.bytes);
     if (FAILED(hr)) {
       REXLOG_ERROR("PGR4 native textures: texture resource {}x{}x{} {} failed: {:08X}",
                    key.width, key.height, key.depth_or_array_size, info->name, uint32_t(hr));
       t.failed = true;
     } else {
+      resident_bytes_ += t.bytes;
       t.state = D3D12_RESOURCE_STATE_COPY_DEST;
       WatchRange(t, key.base_page << 12, t.base_bytes);
       WatchRange(t, key.mip_page << 12, t.mips_bytes);
@@ -331,13 +390,142 @@ TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFor
                             [&](size_t, uint32_t address) { resolve_targets_[address].push_back(&t); });
     }
   }
-  Texture* raw = owned.get();
-  textures_.emplace(key, std::move(owned));
-  return raw;
+  return &t;
+}
+
+void TextureCache::UnwatchRange(Texture& t, uint32_t start, uint32_t length) {
+  constexpr uint32_t kMemorySize = kWatchBucketCount << kWatchBucketShift;
+  if (!length || start >= kMemorySize) return;
+  const uint32_t end = start + std::min(length, kMemorySize - start);
+  std::lock_guard<std::mutex> lock(watch_mutex_);
+  for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b) {
+    std::vector<Watch>& v = watch_buckets_[b];
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const Watch& w) { return w.texture == &t; }),
+            v.end());
+  }
+}
+
+void TextureCache::Destroy(Texture& t) {
+  // The pages stay armed: a later write faults once, finds no watch and unwatches them.
+  UnwatchRange(t, t.key.base_page << 12, t.base_bytes);
+  UnwatchRange(t, t.key.mip_page << 12, t.mips_bytes);
+  ForEachResolveAddress(t.key, t.layout, [&](size_t, uint32_t address) {
+    auto it = resolve_targets_.find(address);
+    if (it == resolve_targets_.end()) return;
+    std::vector<Texture*>& v = it->second;
+    v.erase(std::remove(v.begin(), v.end(), &t), v.end());
+    if (v.empty()) resolve_targets_.erase(it);
+  });
+  (t.lru_prev ? t.lru_prev->lru_next : lru_first_) = t.lru_next;
+  (t.lru_next ? t.lru_next->lru_prev : lru_last_) = t.lru_prev;
+  textures_.erase(t.key);
+  resident_bytes_ -= t.bytes;
+  if (t.placed != kCommitted) FreePlaced(t.placed, t.bytes);
+  Slot& s = slots_[t.slot];
+  ++s.generation;
+  free_slots_.push_back(t.slot);
+  s.texture.reset();  // releases the resource
+}
+
+void TextureCache::EvictOverBudget(uint64_t completed_fence) {
+  if (resident_bytes_ <= budget_.soft_bytes) return;
+  const uint64_t t0 = NowNs();
+  evict_batch_.clear();
+  evict_resources_.clear();
+  uint64_t bytes = resident_bytes_;
+  for (Texture* t = lru_first_; t && evict_batch_.size() < kMaxEvictionsPerFrame; t = t->lru_next) {
+    // A frame in flight may read it, and every texture used after it.
+    if (t->used_fence > completed_fence) break;
+    if (bytes <= budget_.hard_bytes &&
+        (bytes <= budget_.soft_bytes || now_ms_ - t->used_ms < budget_.soft_lifetime_ms))
+      break;
+    evict_batch_.push_back(t);
+    evict_resources_.push_back(t->resource.Get());
+    bytes -= t->bytes;
+  }
+  if (evict_batch_.empty()) return;
+  if (!stats_.evicted)
+    REXLOG_INFO("PGR4 native textures: {} MB in {} textures, over the budget (soft {} MB for {} s "
+                "unused, hard {} MB): evicting",
+                resident_bytes_ >> 20, textures_.size(), budget_.soft_bytes >> 20,
+                budget_.soft_lifetime_ms / 1000, budget_.hard_bytes >> 20);
+  if (evict_callback_) evict_callback_(evict_resources_);
+  std::sort(evict_batch_.begin(), evict_batch_.end());
+  for (size_t i = 0; i < (size_t(1) << kGetMemoBits); ++i) {
+    GetMemo& m = get_memo_[i];
+    if (m.texture && std::binary_search(evict_batch_.begin(), evict_batch_.end(), m.texture))
+      m.texture = nullptr;
+  }
+  for (Texture* t : evict_batch_) Destroy(*t);
+  stats_.evicted += evict_batch_.size();
+  change_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  stats_.evict_ns += NowNs() - t0;
+}
+
+void TextureCache::AddFreeRange(uint64_t offset, uint64_t size) {
+  free_ranges_.emplace(offset, size);
+  free_by_size_.emplace(size, offset);
+}
+
+uint64_t TextureCache::AllocatePlaced(uint64_t size, uint64_t alignment) {
+  for (auto it = free_by_size_.lower_bound({size, 0}); it != free_by_size_.end(); ++it) {
+    const auto [range_size, start] = *it;
+    const uint64_t at = (start + alignment - 1) & ~(alignment - 1);
+    const uint64_t end = start + range_size;
+    if (at + size > end) continue;
+    free_by_size_.erase(it);
+    free_ranges_.erase(start);
+    if (at > start) AddFreeRange(start, at - start);
+    if (at + size < end) AddFreeRange(at + size, end - (at + size));
+    return at;
+  }
+  return kCommitted;
+}
+
+void TextureCache::FreePlaced(uint64_t offset, uint64_t size) {
+  uint64_t end = offset + size;
+  // Coalesce with the free neighbours in the same heap.
+  auto next = free_ranges_.lower_bound(offset);
+  if (next != free_ranges_.end() && next->first == end && end % kTextureHeapSize) {
+    end += next->second;
+    free_by_size_.erase({next->second, next->first});
+    next = free_ranges_.erase(next);
+  }
+  if (next != free_ranges_.begin() && offset % kTextureHeapSize) {
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == offset) {
+      offset = prev->first;
+      free_by_size_.erase({prev->second, prev->first});
+      free_ranges_.erase(prev);
+    }
+  }
+  AddFreeRange(offset, end - offset);
+}
+
+bool TextureCache::AddHeap() {
+  if (!spare_heap_.valid()) StartSpareHeap();
+  const auto t0 = std::chrono::steady_clock::now();
+  ComPtr<ID3D12Heap> heap = spare_heap_.get();
+  const double wait_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (wait_ms >= 1.0)
+    REXLOG_INFO("PGR4 native textures: waited {:.1f} ms for texture heap {}", wait_ms,
+                heaps_.size() + 1);
+  if (!heap) {
+    static bool logged = false;
+    if (!logged) REXLOG_WARN("PGR4 native textures: heap creation failed; committed textures");
+    logged = true;
+    return false;
+  }
+  AddFreeRange(heaps_.size() * kTextureHeapSize, kTextureHeapSize);
+  heaps_.push_back(std::move(heap));
+  StartSpareHeap();
+  return true;
 }
 
 HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc,
-                                            ComPtr<ID3D12Resource>* out) {
+                                            ComPtr<ID3D12Resource>* out, uint64_t* placed,
+                                            uint64_t* bytes) {
   // 4 KB placement when the driver allows it for this texture, else 64 KB.
   desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
   D3D12_RESOURCE_ALLOCATION_INFO info = device_->GetResourceAllocationInfo(0, 1, &desc);
@@ -345,34 +533,20 @@ HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc,
     desc.Alignment = 0;
     info = device_->GetResourceAllocationInfo(0, 1, &desc);
   }
+  *placed = kCommitted;
+  *bytes = info.SizeInBytes == UINT64_MAX ? 0 : info.SizeInBytes;
   if (info.SizeInBytes != UINT64_MAX && info.SizeInBytes <= kTextureHeapSize) {
-    uint64_t offset = (heap_used_ + info.Alignment - 1) & ~(info.Alignment - 1);
-    if (!heap_ || offset + info.SizeInBytes > kTextureHeapSize) {
-      if (!spare_heap_.valid()) StartSpareHeap();
-      const auto t0 = std::chrono::steady_clock::now();
-      ComPtr<ID3D12Heap> heap = spare_heap_.get();
-      const double wait_ms =
-          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      if (wait_ms >= 1.0)
-        REXLOG_INFO("PGR4 native textures: waited {:.1f} ms for texture heap {}", wait_ms,
-                    heaps_.size() + 1);
-      heap_ = nullptr;
-      if (heap) {
-        heap_ = heap.Get();
-        heaps_.push_back(std::move(heap));
-        heap_used_ = offset = 0;
-        StartSpareHeap();
-      } else {
-        static bool logged = false;
-        if (!logged) REXLOG_WARN("PGR4 native textures: heap creation failed; committed textures");
-        logged = true;
+    uint64_t offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
+    if (offset == kCommitted && AddHeap()) offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
+    if (offset != kCommitted) {
+      if (SUCCEEDED(device_->CreatePlacedResource(
+              heaps_[offset / kTextureHeapSize].Get(), offset % kTextureHeapSize, &desc,
+              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+              IID_PPV_ARGS(out->ReleaseAndGetAddressOf())))) {
+        *placed = offset;
+        return S_OK;
       }
-    }
-    if (heap_ && SUCCEEDED(device_->CreatePlacedResource(heap_, offset, &desc,
-                                                         D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                         IID_PPV_ARGS(out->ReleaseAndGetAddressOf())))) {
-      heap_used_ = offset + info.SizeInBytes;
-      return S_OK;
+      FreePlaced(offset, info.SizeInBytes);
     }
   }
   desc.Alignment = 0;
@@ -598,7 +772,8 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   GetMemo& memo = get_memo_[hash >> (32 - kGetMemoBits)];
   const bool same_fetch =
       memo.texture && std::memcmp(memo.fetch, fetch_dwords, sizeof(memo.fetch)) == 0;
-  if (same_fetch && Unchanged(memo.texture)) {
+  if (same_fetch && Clean(*memo.texture)) {
+    MarkUsed(*memo.texture, frame_fence);
     if (!memo.texture->alias) Transition(*memo.texture, list, kShaderRead);
     *out = memo.binding;
     return true;
@@ -610,19 +785,16 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   auto it = textures_.find(key);
   Texture* t;
   if (it != textures_.end()) {
-    t = it->second.get();
+    t = it->second;
   } else {
     const HostFormat* host = GetHostFormat(key.format);
     if (!host) {
       // Remember the key so the warning is logged once.
-      auto owned = std::make_unique<Texture>();
-      owned->key = key;
-      owned->failed = true;
+      t = NewTexture(key);
+      t->failed = true;
       REXLOG_WARN("PGR4 native textures: unsupported format {} ({}x{} at {:08X})",
                   rex::graphics::FormatInfo::Get(key.format)->name, key.width, key.height,
                   key.base_page << 12);
-      t = owned.get();
-      textures_.emplace(key, std::move(owned));
     } else {
       const uint64_t c0 = NowNs();
       t = Create(key, *host);
@@ -634,6 +806,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
     ++stats_.unsupported;
     return false;
   }
+  MarkUsed(*t, frame_fence);
   const bool was_dirty = t->dirty.load(std::memory_order_acquire);
   const bool stale =
       was_dirty && t->uploads && captured <= t->write_mark.load(std::memory_order_relaxed);
@@ -688,7 +861,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   std::memcpy(&fetch, fetch_dwords, sizeof(fetch));
   out->resource = t->alias ? t->alias : t->resource.Get();
   out->key = key;
-  out->entry = t;
+  out->entry = {t->slot, slots_[t->slot].generation};
   out->aliased = t->alias != nullptr;
   out->stale = stale;
   out->srv_signed_format = t->host->snorm;
@@ -719,6 +892,10 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   return true;
 }
 
-void TextureCache::Retire(uint64_t completed_fence) { upload_.EndFrame(completed_fence); }
+void TextureCache::Retire(uint64_t completed_fence) {
+  upload_.EndFrame(completed_fence);
+  now_ms_ = NowNs() / 1000000;
+  EvictOverBudget(completed_fence);
+}
 
 }  // namespace pgr4::native

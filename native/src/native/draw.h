@@ -93,6 +93,7 @@ class DrawRenderer {
     uint64_t textures = 0, textures_missing = 0;  // bindings; missing = null SRV bound
     uint64_t textures_stale = 0;  // bindings for draws queued before a newer guest write
     uint64_t srv_lookups = 0, srv_created = 0, samplers_created = 0;
+    uint64_t views = 0;           // texture views in the bindless heap (at the frame's end)
     uint64_t bind_memo_hits = 0, bind_memo_misses = 0;  // whole-shader texture binding memo
     uint64_t watch_faults = 0;    // guest writes caught by a page watch (any watcher), per frame
     uint64_t copy_batches = 0;    // groups of shared-memory copies, each between two barriers

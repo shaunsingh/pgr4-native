@@ -153,6 +153,37 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   only late rewrite is in the front end (6 pages of one vertex fetch range, once).
 - Logs: each new pipeline with its compile time, and each 4 MB chunk of shared memory with the
   frame it was mapped at.
+- Texture memory is bounded. The texture cache never destroyed a texture: in a 15-minute play
+  session it grew to 3.4 GB in 24 heaps of 128 MB (a race uses about 85 MB in 1,000 textures),
+  the kernel moved about 3 GB of it from VRAM to GTT, and after 65,000 frames the shader view
+  heap (65,536 descriptors) was full and the track stopped drawing. Textures are now held by
+  slot and generation handles on a least-recently-used list (touched once per frame) and
+  destroyed once no frame in flight uses them: past 512 MB those unused for 30 s, past 1 GB the
+  least recently used (`--pgr4_native_texture_memory_soft_mb`, `_soft_lifetime_s`,
+  `_hard_mb`). Their ranges in the placed heaps go back to a best-fit free list that merges
+  neighbours, and their shader views to a free list. With a 64/128 MB budget a race run
+  evicted 5,346 textures with a correct image, at most 1.2 ms per frame. The frame CSV has
+  `tex_mb`, `tex_count`, `tex_evicted`, `tex_evict_us` and `views`.
+- No frame is shown with draws missing. A draw whose pipeline is still compiling is skipped;
+  the frame is then held (the previous one stays on screen) and waits after its last draw for
+  all of its pipelines at once, at most 0.5 s, compiled on all but two hardware threads
+  (`--pgr4_native_pipeline_wait`, which replaces `--pgr4_native_pipeline_burst`). Before,
+  frames with fewer than 8 new pipelines were shown without their draws for 2-5 frames (207
+  race frames in a cold-cache run: objects flickered and buildings turned black or white), and
+  in a burst each draw waited for its own pipeline, so the pipelines compiled one after
+  another (30-40 ms each in the play session, several frames at the 500 ms limit). In a
+  cold-cache run (no vkd3d, Mesa or native pipeline cache, frames recorded) no frame was shown
+  with a draw missing; the race's 79 new pipelines held 48 frames for 2.4 s in total, 70-80 ms
+  each (1 % low 13.5 fps, against 26.9 when the frames were shown incomplete). With warm caches
+  nothing changes.
+- Marks: clicking both sticks (L3+R3) on any pad marks the moment as F12 does (the glitch
+  catcher's last 2 s, a PNG of the frame and a log line with the frame), so a back grip can mark
+  through a Steam Input binding that sends both. F12 is now read as the key's state: R4 bound
+  to F12 had marked once in a whole play session, as GetAsyncKeyState's "pressed since the last
+  call" bit was missing for most presses under Proton.
+- `deck-run.sh` keeps a `VKD3D_SHADER_CACHE_PATH` set by the caller (0: none), for
+  cold-cache runs with `MESA_SHADER_CACHE_DISABLE=true` and
+  `--pgr4_native_pipeline_cache=false`.
 
 ## Why a native renderer can beat emulation
 
@@ -364,7 +395,8 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native` | false | Run the native renderer beside the Xenos plugin, in a debug window |
 | `--pgr4_native_primary` | false | The native renderer is the game's output; implies `--pgr4_native` |
 | `--pgr4_native_render_thread` | true | Record and submit on a render thread; the game thread only captures each call |
-| `--pgr4_native_async_pipelines` | true | Compile new pipelines on a worker thread; draws wait for theirs |
+| `--pgr4_native_async_pipelines` | true | Compile new pipelines on worker threads; the draws that need them are skipped |
+| `--pgr4_native_pipeline_wait` | true | A frame that skipped draws is not shown and waits for their pipelines (at most 0.5 s) |
 | `--pgr4_native_pipeline_cache` | true | Keep pipelines across runs |
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
 | `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |
@@ -374,6 +406,8 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_record=<file>` | off | Record the frames shown at half size (`_record_from`, `_record_frames`, `_record_chunk_frames`) |
 | `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 2 s of frames; write whole-image jumps and F12's 2 s to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
 | `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
+| `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
+| `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
 
 With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 (`--gpu_skip_draws`, added by `native/rexglue-native-primary.patch`).

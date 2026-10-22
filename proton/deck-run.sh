@@ -151,9 +151,10 @@ export PROTON_LOG=1 PROTON_LOG_DIR=$top/logs DXVK_LOG_LEVEL=warn VKD3D_DEBUG=war
 # No xalia (Proton's gamepad-to-UI helper for launchers): the game has no use for it and it costs
 # ~10 % of a core during the race.
 export PROTON_USE_XALIA=0
-# One vkd3d-proton pipeline cache per build tree, outside the tree.
-export VKD3D_SHADER_CACHE_PATH=$top/cache/$(basename "$(dirname "$(dirname "$runtime")")")
-mkdir -p "$VKD3D_SHADER_CACHE_PATH"
+# One vkd3d-proton pipeline cache per build tree, outside the tree, unless the caller set one (0:
+# none, with MESA_SHADER_CACHE_DISABLE=true and --pgr4_native_pipeline_cache=false a cold start).
+export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$top/cache/$(basename "$(dirname "$(dirname "$runtime")")")}
+[[ $VKD3D_SHADER_CACHE_PATH == 0 ]] || mkdir -p "$VKD3D_SHADER_CACHE_PATH"
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 [[ -n $cpus ]] && cmd=(taskset -c "$cpus" "${cmd[@]}")
 echo "${cmd[*]}" > "$base-cmdline.txt"

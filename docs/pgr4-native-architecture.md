@@ -172,7 +172,7 @@ scratch row.
 | `pgr4_native_render_thread` | true | Capture on the game thread, record on `PGR4 native render`. On by default since 2026-10-21 23:20 although one race oracle capture in three drops to 29.5-29.6 dB (wrong geometry, unexplained) |
 | `pgr4_native_async_pipelines` | true | PSOs on workers; draws skipped until ready (`pso_pending`) |
 | `pgr4_native_pipeline_threads` | 0 | Compile threads (0: a quarter of the hardware threads, 1-4) |
-| `pgr4_native_pipeline_burst` | 8 | From this many new pipelines in a frame, draws wait for theirs (`pso_wait_us`, at most 0.5 s per frame) and a frame that skipped some is not presented (`held`) |
+| `pgr4_native_pipeline_wait` | true | A frame that skipped draws for pipelines still compiling is not presented (`held`) and waits for them at its end (`pso_wait_us`, at most 0.5 s per frame) |
 | `pgr4_native_luma_probe` | false | Front buffer row brightness per frame in the CSV (black-frame hunting) |
 | `pgr4_native_pipeline_cache` | true | `pipelines.bin` + prewarm + pipeline library |
 | `pgr4_native_dynamic_depth_bias` | true | `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` + `RSSetDepthBias` when `DynamicDepthBiasSupported`; PGR4 animates polygon offset, which made 821 of 1,088 pipelines depth-bias variants |

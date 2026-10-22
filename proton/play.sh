@@ -12,10 +12,11 @@
 #
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own, so deck-run.sh never stops a game being played), userdata/ (the save, kept
-# between sessions), captures/ (F12 writes the native front buffer there as f<frame>-native.png;
+# between sessions), captures/ (a mark, F12 or both sticks clicked (L3+R3, which a Steam Input
+# binding can send from a back grip), writes the native front buffer there as f<frame>-native.png;
 # the frame number matches the CSV), logs/<stamp>-* (the last 30 sessions; <stamp>-glitch-<frame>.rec
 # holds the frames around each whole-image glitch the renderer saw, <stamp>-mark-<frame>.rec the 2 s
-# before each F12, <stamp>-<frame>.rec every frame shown from that one on, 5 minutes a file, until
+# before each mark, <stamp>-<frame>.rec every frame shown from that one on, 5 minutes a file, until
 # 40 GB are left; native/tools/flicker.py shows them).
 # In Steam, add the "PGR4 (native renderer)" shortcut without a compatibility tool: this script
 # starts Proton itself.

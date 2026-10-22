@@ -94,6 +94,7 @@ struct NativeRenderer::Csv {
   uint64_t tsc0 = 0, ns0 = 0;
   uint64_t stage_ticks[profile::kStageCount] = {}, track_calls = 0;
   TextureCache::Stats tex_prev;  // texture counters at the previous CSV row
+  uint64_t evicted_prev = 0, evict_ns_prev = 0;  // the same for every row (tex_prev: profile)
   bool luma = false;             // --pgr4_native_luma_probe columns
   ~Csv() {
     if (file) std::fclose(file);
@@ -311,7 +312,8 @@ bool NativeRenderer::Initialize() {
                    "upload_kb,textures,textures_missing,front_buffer,hook_us,hook_wait_us,"
                    "reg_writes,swap_untile_us,swap_submit_us,swap_present_us,swap_fence_us,"
                    "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
-                   "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,coh_stale,coh_late,coh_gpu,coh_regs");
+                   "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,coh_stale,coh_late,coh_gpu,coh_regs,"
+                   "tex_mb,tex_count,tex_evicted,tex_evict_us,views");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -686,7 +688,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
     std::fprintf(csv_->file,
                  "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
                  "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
-                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
+                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu",
                  (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
                  (unsigned long long)s.clears, (unsigned long long)s.resolves,
                  (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -706,7 +708,13 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  (unsigned long long)ds.pso_wait_us, (unsigned long long)s.frames_held,
                  (unsigned long long)ds.textures_stale, (unsigned long long)ds.stale_pages,
                  (unsigned long long)ds.late_pages, (unsigned long long)ds.gpu_mismatch_pages,
-                 (unsigned long long)ds.reg_mismatches);
+                 (unsigned long long)ds.reg_mismatches, textures_->resident_bytes() / 1048576.0,
+                 (unsigned long long)textures_->texture_count(),
+                 (unsigned long long)(textures_->stats().evicted - csv_->evicted_prev),
+                 (textures_->stats().evict_ns - csv_->evict_ns_prev) / 1000.0,
+                 (unsigned long long)ds.views);
+    csv_->evicted_prev = textures_->stats().evicted;
+    csv_->evict_ns_prev = textures_->stats().evict_ns;
     if (profile::g.on) {
       for (uint64_t t : profile::g.ticks) std::fprintf(csv_->file, ",%.1f", double(t) / ticks_per_us);
       std::fprintf(csv_->file, ",%llu", (unsigned long long)profile::g.track_calls);

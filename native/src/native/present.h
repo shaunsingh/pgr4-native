@@ -8,9 +8,9 @@
 //
 // Captures (oracle for M2): --pgr4_native_capture_dir (default
 // C:\recomp\logs\pgr4-native-captures) and either the file <dir>\capture.request (deleted
-// when taken), F12, or --pgr4_native_capture_frame=N. A request at Swap F-1 switches the Xenos
-// plugin to full readback (HoldFullReadback in resolve.h; with "fast" guest memory holds the
-// previous frame's resolves) and captures frame F:
+// when taken), a mark (F12, or L3+R3 on any pad), or --pgr4_native_capture_frame=N. A request
+// at Swap F-1 switches the Xenos plugin to full readback (HoldFullReadback in resolve.h; with
+// "fast" guest memory holds the previous frame's resolves) and captures frame F:
 //   f<F>-native.png  the native front buffer (read back after the frame's fence)
 //   f<F>-xenos.png   the same front buffer as the Xenos plugin wrote it into guest memory
 //                    (read after the guest thread was held in the Swap hook for
@@ -62,7 +62,7 @@ class Presenter {
 
   // Reads the Swap's front buffer texture object from guest memory.
   static void ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* out);
-  // A capture was requested (file, F12 or --pgr4_native_capture_frame == frame).
+  // A capture was requested (file, F12, L3+R3 or --pgr4_native_capture_frame == frame).
   bool CaptureRequested(uint64_t frame);
 
   // In NativeRenderer::OnSwap before D3D12Device::EndFrame: records the blit into the back
