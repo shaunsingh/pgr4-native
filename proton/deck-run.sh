@@ -12,7 +12,7 @@
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
-#               [--output NAME] [--captures "5 10 15"]
+#               [--output NAME] [--captures "5 10 15"] [--record "FROM FRAMES"] [--catch]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -31,6 +31,11 @@
 # --perf N samples the game's user-space CPU time with perf for N seconds from the race mark and
 # prints its hottest functions per thread (native/tools/perf_symbols.py, with the .map files of
 # the runtime); sampling costs some speed, so such a run's frame rate is not a measurement.
+# --record "FROM FRAMES" records FRAMES frames (0: to the end) from native frame index FROM, as
+# shown at half size, into ~/pgr4-proton/rec-<tag>.rec (--pgr4_native_record); then
+# native/tools/flicker.py finds the frames that flash and writes them out as PNG strips.
+# --catch keeps the last 2 s of frames in memory instead and writes only the whole-image jumps
+# (and F12's last 2 s) to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch).
 #
 # <tree> names $PGR4_BUILDS/native-<tree>/run/runtime (PGR4_BUILDS defaults to
 # ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is, so the released
@@ -47,7 +52,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-captures="5 10 15"
+captures="5 10 15"; record=""; catch=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -67,6 +72,8 @@ while [[ $# -gt 0 ]]; do
     --refresh) refresh=$2; shift 2 ;;
     --output) output=$2; shift 2 ;;
     --captures) captures=$2; shift 2 ;;
+    --record) record=$2; shift 2 ;;
+    --catch) catch=1; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -129,6 +136,13 @@ if [[ $mode == oracle ]]; then
   args+=(--pgr4_native --readback_resolve=fast "--pgr4_native_capture_dir=$(win "$capdir")")
 fi
 [[ $uncapped == 1 ]] && args+=(--vsync=false --d3d12_present_vsync=false)
+if [[ -n $record ]]; then
+  read -r rec_from rec_frames <<<"$record"
+  rm -f "$top/rec-$tag.rec"
+  args+=("--pgr4_native_record=$(win "$top/rec-$tag.rec")" "--pgr4_native_record_from=$rec_from"
+    "--pgr4_native_record_frames=${rec_frames:-0}")
+fi
+[[ $catch == 1 ]] && args+=("--pgr4_native_glitch_catch=$(win "$base-")")
 # shellcheck disable=SC2206
 [[ -n $extra ]] && args+=($extra)
 

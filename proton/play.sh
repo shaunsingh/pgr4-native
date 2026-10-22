@@ -13,7 +13,10 @@
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own, so deck-run.sh never stops a game being played), userdata/ (the save, kept
 # between sessions), captures/ (F12 writes the native front buffer there as f<frame>-native.png;
-# the frame number matches the CSV), logs/<stamp>-* (the last 30 sessions).
+# the frame number matches the CSV), logs/<stamp>-* (the last 30 sessions; <stamp>-glitch-<frame>.rec
+# holds the frames around each whole-image glitch the renderer saw, <stamp>-mark-<frame>.rec the 2 s
+# before each F12, <stamp>-<frame>.rec every frame shown from that one on, 5 minutes a file, until
+# 40 GB are left; native/tools/flicker.py shows them).
 # In Steam, add the "PGR4 (native renderer)" shortcut without a compatibility tool: this script
 # starts Proton itself.
 set -euo pipefail
@@ -78,17 +81,19 @@ for ((i = 0; i + keep_sessions <= ${#sessions[@]}; i++)); do
   rm -f "$old".* "$old"-*
 done
 
-# MTR's launcher arguments for 60 fps (launcher/Launcher.cs), the native renderer as the
+# MTR's launcher arguments for 60 fps (launcher/Launcher.cs) with the guest's vblank at the Deck
+# OLED panel's 90 Hz (PGR4_REFRESH=60 for an LCD Deck), the native renderer as the
 # presenter, and the session record. The F12 capture hold only matters next to Xenos.
 args=(--game_data_root "$(win "$game")" --user_data_root "$(win "$top/userdata")"
   --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync --xmp_music_gain 0.35
   --pgr4_60fps --pgr4_garage_walk_fix --d3d12_texture_shared_heaps --gpu_vblank_deadline_timer
   --gpu_wait_reg_mem_high_res --no-clear_memory_page_state --gpu_ring_wake_fast --texture_resource_reuse
   --texture_reuse_pool_limit_mib=256 --texture_cache_memory_limit_soft_lifetime=30
-  --window_width=1280 --window_height=800
+  --window_width=1280 --window_height=800 "--video_mode_refresh_rate=${PGR4_REFRESH:-90}"
   --pgr4_native --pgr4_native_primary --pgr4_native_gpu_timing
   "--pgr4_native_csv=$(win "$base-frames.csv")"
   "--pgr4_native_capture_dir=$(win "$top/captures")" --pgr4_native_capture_hold_ms=0
+  "--pgr4_native_glitch_catch=$(win "$base-")"
   --guest_frame_stats --pgr4_d3d_stats_frames=150 --log_file "$(win "$base.log")")
 # Game Mode (and any gamescope session): fullscreen; a desktop: a 1280x800 window.
 if [[ ${XDG_CURRENT_DESKTOP:-} == gamescope || -n ${GAMESCOPE_WAYLAND_DISPLAY:-} ]]; then
@@ -96,10 +101,17 @@ if [[ ${XDG_CURRENT_DESKTOP:-} == gamescope || -n ${GAMESCOPE_WAYLAND_DISPLAY:-}
 else
   args+=(--fullscreen=false)
 fi
+# Every frame shown, at half size, in files of 5 minutes (27000 frames at 90 fps, ~19 GB):
+# native/tools/flicker.py finds what flashed afterwards. PGR4_RECORD=0 leaves them out.
+if [[ ${PGR4_RECORD:-1} != 0 ]]; then
+  args+=("--pgr4_native_record=$(win "$base.rec")" --pgr4_native_record_chunk_frames=27000)
+fi
 args+=("$@")
 
 export STEAM_COMPAT_DATA_PATH=$top/prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=$HOME/.local/share/Steam
 export WINEDEBUG=${WINEDEBUG:-fixme-all} VKD3D_DEBUG=${VKD3D_DEBUG:-warn}
+# As deck-run.sh: no xalia (Proton's gamepad-to-UI helper, ~10 % of a core during a race).
+export PROTON_USE_XALIA=0
 export VKD3D_SHADER_CACHE_PATH=$top/cache
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 { cat "$runtime/INSTALLED.txt" 2>/dev/null; echo "${cmd[*]}"; } > "$base-cmdline.txt"

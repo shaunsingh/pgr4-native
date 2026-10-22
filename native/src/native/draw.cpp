@@ -77,6 +77,12 @@ REXCVAR_DEFINE_BOOL(pgr4_native_dynamic_depth_bias, true, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_bool_specialize, true, "PGR4 native",
                     "Translate shaders whose control flow tests bool constants for each draw's "
                     "values, without the branches (shader_specialize.h)");
+REXCVAR_DEFINE_BOOL(pgr4_native_coherency_check, false, "PGR4 native",
+                    "Debug: keep a CPU copy of what shared memory holds and compare the vertex and "
+                    "index ranges draws read with guest memory, per request and again at the Swap "
+                    "(stale pages: a write the page watch missed; late pages: data rewritten after "
+                    "a draw of the frame read it), and check copy segments against every read. "
+                    "Slow (512 MB of host memory, a memcmp of every range read)");
 
 namespace pgr4::native {
 
@@ -653,6 +659,7 @@ struct DrawRenderer::Impl {
   void NewSegment() {
     ++segment_epoch;
     segment_exact.clear();
+    if (coherency) coherency->segment_reads.clear();
   }
   bool SegmentReads(uint32_t begin, uint32_t end) const {
     for (const auto& [b, e] : segment_exact)
@@ -778,6 +785,7 @@ struct DrawRenderer::Impl {
   struct PipelineJob {
     Pipeline* target;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;  // bytecode and root signature outlive the job
+    bool logged = false;  // a draw needed it new: its compile time is logged
   };
   std::vector<std::thread> pso_threads;
   std::mutex pso_mutex;
@@ -792,6 +800,20 @@ struct DrawRenderer::Impl {
   uint32_t frame_pending_draws = 0;  // skipped this frame, their pipeline compiling
   std::chrono::steady_clock::duration frame_pipeline_wait{};
   PipelineStore store;
+  // What made the pipelines created while running new (logged, kNewPipelineLog lines): a
+  // shader pair or a render state no pipeline had before, bool or texture-sign variants.
+  std::unordered_map<uint64_t, uint32_t> pipeline_states, pipeline_pairs;  // digest -> pipelines
+  uint32_t new_pipelines_logged = 0;
+  static constexpr uint32_t kNewPipelineLog = 64;
+  static uint64_t StateDigest(const PipelineKey& key) {
+    PipelineKey k = key;
+    k.vs = k.ps = nullptr;
+    return XXH3_64bits(&k, sizeof(k));
+  }
+  static uint64_t PairDigest(const PipelineKey& key) {
+    const void* pair[2] = {key.vs, key.ps};
+    return XXH3_64bits(pair, sizeof(pair));
+  }
   std::once_flag library_open;
   PipelineLibrary library;  // pipeline workers only
   // D3D12 OPTIONS16 dynamic depth bias: pipelines are created with
@@ -955,8 +977,10 @@ struct DrawRenderer::Impl {
   uint32_t TextureDescriptor(const TextureBinding& b, const DxbcShader::TextureBinding& tb);
   uint32_t SamplerDescriptor(const SamplerKey& k);
   // The pipeline for `key` (`hash`: its XXH3), added and recorded in the store if new.
+  // variant (for the log): 1 the vertex, 2 the pixel shader is a bool specialization, 4 the
+  // pixel shader's texture signs are specialized.
   Pipeline* GetPipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
-                        const DxbcShader::Translation* ps);
+                        const DxbcShader::Translation* ps, uint32_t variant);
   // Moves a pipeline's prewarm job, if no worker has taken it yet, to the draw queue: a draw
   // waits for it now.
   void PromotePipeline(Pipeline* p);
@@ -1086,6 +1110,57 @@ struct DrawRenderer::Impl {
       records.clear();
     }
   } trace;
+
+  // --pgr4_native_coherency_check; RequestRange's thread only.
+  struct Coherency {
+    // What shared memory holds once the copies recorded so far are done, in Prepare order.
+    std::unique_ptr<uint8_t[]> shadow{new uint8_t[kSharedMemorySize]};
+    // watch_frame + 1 when a page last matched guest memory, per request and at the Swap.
+    std::unique_ptr<uint32_t[]> checked{new uint32_t[kPageCount]()};
+    std::unique_ptr<uint32_t[]> swap_checked{new uint32_t[kPageCount]()};
+    struct Range {
+      uint32_t start, length;
+      uint8_t slot;
+    };
+    std::vector<Range> ranges;  // watched ranges read since the last Swap
+    // Every byte range the current copy segment's draws read (SegmentReads is conservative).
+    std::vector<std::pair<uint32_t, uint32_t>> segment_reads;
+    uint8_t slot = 0xFF;  // vertex fetch constant being requested, 0xFF: indices
+    uint64_t stale = 0, racy = 0, late = 0, segment_misses = 0;  // pages, since the last Swap
+    uint32_t logged = 0, late_logged = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> frame_copies;  // (start, size) since the Swap
+  };
+  std::unique_ptr<Coherency> coherency;
+  void CheckRequest(uint32_t start, uint32_t length);
+  void CheckSegmentCopy(uint32_t from, uint32_t size);
+  void CheckLateWrites();
+  std::shared_ptr<CoherencyJob> MakeCoherencyJob();
+  static constexpr uint32_t kRegisterBlocks[6] = {0, 0x4000, 0x4400, 0x4800, 0x4900,
+                                                  kGuestRegisterCount};
+  static void HashRegisterBlocks(const uint32_t* regs, uint64_t out[5]) {
+    for (uint32_t i = 0; i < 5; ++i)
+      out[i] = XXH3_64bits(regs + kRegisterBlocks[i],
+                           (kRegisterBlocks[i + 1] - kRegisterBlocks[i]) * 4) | 1;
+  }
+  uint32_t coherency_reg_logged = 0;
+  bool LogCoherency() { return coherency->logged < 200 && ++coherency->logged; }
+  // The GPU half (render thread): jobs whose read back is recorded, waiting for their fence.
+  static constexpr uint32_t kCoherencyReadback = 8u << 20;
+  std::shared_ptr<CoherencyJob> coherency_next;
+  std::deque<std::shared_ptr<CoherencyJob>> coherency_inflight;
+  std::vector<ComPtr<ID3D12Resource>> coherency_readbacks;  // free, kCoherencyReadback each
+  uint32_t coherency_gpu_logged = 0;
+  void CheckCoherencyJobs(uint64_t completed_fence);
+};
+
+// --pgr4_native_coherency_check: one frame's copied shared memory ranges, the bytes they should
+// hold once the frame's copies are done (the shadow's at the frame's Swap), and their read back.
+struct CoherencyJob {
+  uint32_t frame = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> runs;  // (start, size), sorted and disjoint
+  std::vector<uint8_t> expected;                     // the runs' bytes back to back
+  uint64_t fence = 0;
+  ComPtr<ID3D12Resource> readback;
 };
 
 bool DrawRenderer::Impl::Initialize() {
@@ -1145,6 +1220,10 @@ bool DrawRenderer::Impl::Initialize() {
   segment_pages.reset(new uint64_t[kPageCount / 64]());
   if (const std::string& path = REXCVAR_GET(pgr4_native_watch_trace); !path.empty())
     trace.file = std::fopen(path.c_str(), "wb");
+  if (REXCVAR_GET(pgr4_native_coherency_check)) {
+    coherency = std::make_unique<Coherency>();
+    REXLOG_INFO("PGR4 native draw: coherency check on");
+  }
   invalidation_handle = memory->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
 
   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewHeapSize,
@@ -1263,7 +1342,16 @@ void DrawRenderer::Impl::PipelineWorker(bool saves) {
     lock.unlock();
     ComPtr<ID3D12PipelineState> pso;
     bool loaded;
+    const auto t0 = std::chrono::steady_clock::now();
     const HRESULT hr = library.Create(job.desc, &pso, &loaded);
+    if (job.logged) {
+      static std::atomic<uint32_t> logged_times{0};
+      if (logged_times.fetch_add(1, std::memory_order_relaxed) < kNewPipelineLog)
+        REXLOG_INFO("PGR4 native pipelines: compiled in {:.1f} ms{}",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                        .count(),
+                    loaded ? " (from the library)" : "");
+    }
     if (SUCCEEDED(hr)) {
       job.target->pso = std::move(pso);
       job.target->state.store(kReady, std::memory_order_release);
@@ -1322,10 +1410,18 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
   const uint64_t fence = upload_fence;
   auto copy = [&](uint32_t from, uint32_t size) {
     if (preparing && !segment_conflict) segment_conflict = SegmentReads(from, from + size);
+    if (coherency && preparing) CheckSegmentCopy(from, size);
     if (!MapShared(from, size)) return false;
     UploadPool::Alloc a;
     if (!vertex_upload.Allocate(size, 16, fence, &a)) return false;
-    std::memcpy(a.cpu, membase + from, size);
+    if (coherency) {
+      // The upload is made from the shadow, so the two hold the same bytes.
+      std::memcpy(coherency->shadow.get() + from, membase + from, size);
+      std::memcpy(a.cpu, coherency->shadow.get() + from, size);
+      coherency->frame_copies.push_back({from, size});
+    } else {
+      std::memcpy(a.cpu, membase + from, size);
+    }
     out.push_back({a.resource, a.offset, from, size});
     if (threaded) {
       prep_upload_bytes += size;
@@ -1424,7 +1520,194 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     hash_pages.fetch_add(hashed, std::memory_order_relaxed);
     hash_copies.fetch_add(changed, std::memory_order_relaxed);
   }
-  return copy_changed();
+  if (!copy_changed()) return false;
+  if (coherency) CheckRequest(start, length);
+  return true;
+}
+
+void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
+  Coherency& c = *coherency;
+  const uint32_t stamp = watch_frame.load(std::memory_order_relaxed) + 1;
+  if (c.ranges.empty() || c.ranges.back().start != start || c.ranges.back().length != length)
+    c.ranges.push_back({start, length, c.slot});
+  const uint32_t end = start + length;
+  for (uint32_t p = start >> kPageShift; p <= (end - 1) >> kPageShift; ++p) {
+    if (c.checked[p] == stamp) continue;
+    const uint32_t lo = std::max(start, p << kPageShift), hi = std::min(end, (p + 1) << kPageShift);
+    if (!std::memcmp(membase + lo, c.shadow.get() + lo, hi - lo)) {
+      if (hi - lo == 1u << kPageShift) c.checked[p] = stamp;
+      continue;
+    }
+    const uint64_t bit = 1ull << (p & 63);
+    const bool is_valid = valid[p >> 6].load(std::memory_order_relaxed) & bit;
+    const bool is_hot = hot[p >> 6].load(std::memory_order_relaxed) & bit;
+    // A write after this request copied or trusted the page: it faulted (valid cleared) or, on a
+    // hot page, changed the hash since. Either way the next request copies it.
+    const bool written_since =
+        is_hot ? (XXH3_64bits(membase + (size_t(p) << kPageShift), 1u << kPageShift) | 1) !=
+                     hot_hash[p]
+               : !is_valid;
+    if (written_since) {
+      ++c.racy;
+      continue;
+    }
+    ++c.stale;
+    uint32_t differ = 0, first = UINT32_MAX;
+    for (uint32_t i = lo; i < hi; ++i)
+      if (membase[i] != c.shadow[i]) {
+        ++differ;
+        first = std::min(first, i);
+      }
+    if (LogCoherency())
+      REXLOG_WARN("PGR4 native coherency: frame {} stale page {:05X} (request {:08X}+{:X}, slot "
+                  "{}): {} of {} bytes differ from {:08X}, {} armed at frame {}, last write fault "
+                  "frame {}",
+                  stamp - 1, p, start, length, c.slot, differ, hi - lo, first,
+                  is_hot ? "hot" : "valid", armed_frame[p].load(std::memory_order_relaxed),
+                  int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
+  }
+}
+
+void DrawRenderer::Impl::CheckSegmentCopy(uint32_t from, uint32_t size) {
+  Coherency& c = *coherency;
+  const uint32_t end = from + size;
+  for (const auto& [b, e] : c.segment_reads) {
+    if (!(b < end && from < e)) continue;
+    if (segment_conflict) return;
+    ++c.segment_misses;
+    if (LogCoherency())
+      REXLOG_WARN("PGR4 native coherency: frame {} copy {:08X}+{:X} overwrites {:08X}-{:08X}, read "
+                  "earlier in its copy segment, without a new segment",
+                  watch_frame.load(std::memory_order_relaxed), from, size, b, e);
+    return;
+  }
+}
+
+std::shared_ptr<CoherencyJob> DrawRenderer::Impl::MakeCoherencyJob() {
+  Coherency& c = *coherency;
+  if (c.frame_copies.empty()) return nullptr;
+  auto job = std::make_shared<CoherencyJob>();
+  job->frame = watch_frame.load(std::memory_order_relaxed);
+  std::sort(c.frame_copies.begin(), c.frame_copies.end());
+  uint32_t total = 0;
+  for (const auto& [start, size] : c.frame_copies) {
+    uint32_t end = start + size;
+    if (!job->runs.empty()) {
+      auto& last = job->runs.back();
+      const uint32_t last_end = last.first + last.second;
+      if (start <= last_end) {
+        if (end > last_end) {
+          const uint32_t grow = std::min(end - last_end, kCoherencyReadback - total);
+          last.second += grow;
+          total += grow;
+        }
+        continue;
+      }
+    }
+    if (total >= kCoherencyReadback) break;
+    const uint32_t take = std::min(size, kCoherencyReadback - total);
+    job->runs.push_back({start, take});
+    total += take;
+  }
+  c.frame_copies.clear();
+  job->expected.resize(total);
+  uint8_t* out = job->expected.data();
+  for (const auto& [start, size] : job->runs) {
+    std::memcpy(out, c.shadow.get() + start, size);
+    out += size;
+  }
+  return job;
+}
+
+void DrawRenderer::Impl::CheckCoherencyJobs(uint64_t completed_fence) {
+  while (!coherency_inflight.empty() && coherency_inflight.front()->fence <= completed_fence) {
+    std::shared_ptr<CoherencyJob> job = std::move(coherency_inflight.front());
+    coherency_inflight.pop_front();
+    void* data = nullptr;
+    const D3D12_RANGE range = {0, job->expected.size()};
+    if (SUCCEEDED(job->readback->Map(0, &range, &data))) {
+      const uint8_t* got = static_cast<const uint8_t*>(data);
+      const uint8_t* want = job->expected.data();
+      for (const auto& [start, size] : job->runs) {
+        for (uint32_t off = 0; off < size;) {
+          const uint32_t addr = start + off;
+          const uint32_t n = std::min(size - off, ((addr >> kPageShift) + 1) * (1u << kPageShift) - addr);
+          if (std::memcmp(got + off, want + off, n)) {
+            ++stats.gpu_mismatch_pages;
+            uint32_t differ = 0, first = UINT32_MAX;
+            for (uint32_t i = 0; i < n; ++i)
+              if (got[off + i] != want[off + i]) {
+                ++differ;
+                first = std::min(first, addr + i);
+              }
+            if (coherency_gpu_logged < 200) {
+              ++coherency_gpu_logged;
+              REXLOG_WARN("PGR4 native coherency: frame {} shared memory page {:05X} (copied run "
+                          "{:08X}+{:X}) differs from its copies after the frame: {} of {} bytes "
+                          "from {:08X}",
+                          job->frame, addr >> kPageShift, start, size, differ, n, first);
+            }
+          }
+          off += n;
+        }
+        got += size;
+        want += size;
+      }
+      const D3D12_RANGE none = {0, 0};
+      job->readback->Unmap(0, &none);
+    }
+    coherency_readbacks.push_back(std::move(job->readback));
+  }
+}
+
+void DrawRenderer::Impl::CheckLateWrites() {
+  Coherency& c = *coherency;
+  const uint32_t stamp = watch_frame.load(std::memory_order_relaxed) + 1;
+  uint64_t late = 0, stale = 0;
+  uint32_t late_ranges = 0, slot_pages[256] = {};
+  const Coherency::Range* first_late = nullptr;
+  for (const Coherency::Range& r : c.ranges) {
+    const uint32_t end = r.start + r.length;
+    bool any = false;
+    for (uint32_t p = r.start >> kPageShift; p <= (end - 1) >> kPageShift; ++p) {
+      if (c.swap_checked[p] == stamp) continue;
+      c.swap_checked[p] = stamp;
+      const uint32_t lo = std::max(r.start, p << kPageShift);
+      const uint32_t hi = std::min(end, (p + 1) << kPageShift);
+      if (!std::memcmp(membase + lo, c.shadow.get() + lo, hi - lo)) continue;
+      const uint64_t bit = 1ull << (p & 63);
+      if ((valid[p >> 6].load(std::memory_order_relaxed) & bit) &&
+          !(hot[p >> 6].load(std::memory_order_relaxed) & bit)) {
+        // Valid and watched, yet guest memory differs: a write the watch missed.
+        ++stale;
+        if (LogCoherency())
+          REXLOG_WARN("PGR4 native coherency: frame {} stale page {:05X} at the Swap (range "
+                      "{:08X}+{:X}, slot {}), armed at frame {}",
+                      stamp - 1, p, r.start, r.length, r.slot,
+                      armed_frame[p].load(std::memory_order_relaxed));
+        continue;
+      }
+      ++late;
+      ++slot_pages[r.slot];
+      any = true;
+    }
+    if (any) {
+      ++late_ranges;
+      if (!first_late) first_late = &r;
+    }
+  }
+  c.late += late;
+  c.stale += stale;
+  if (late && c.late_logged < 400) {
+    ++c.late_logged;
+    std::string slots;
+    for (uint32_t s = 0; s < 256; ++s)
+      if (slot_pages[s]) slots += fmt::format(" {}:{}", s == 0xFF ? -1 : int(s), slot_pages[s]);
+    REXLOG_INFO("PGR4 native coherency: frame {} {} pages of {} ranges rewritten after a draw read "
+                "them (first {:08X}+{:X}); pages per slot{}",
+                stamp - 1, late, late_ranges, first_late->start, first_late->length, slots);
+  }
+  c.ranges.clear();
 }
 
 bool DrawRenderer::Impl::MapShared(uint32_t start, uint32_t length) {
@@ -1462,12 +1745,12 @@ bool DrawRenderer::Impl::MapShared(uint32_t start, uint32_t length) {
     shared_heaps.push_back(std::move(heap));
     for (uint32_t m = c; m < end; ++m)
       shared_mapped[m >> 6].fetch_or(1ull << (m & 63), std::memory_order_release);
-    const uint32_t before = shared_mapped_chunks;
     shared_mapped_chunks += chunks;
-    // Logged per 64 MB.
-    if ((before >> 4) != (shared_mapped_chunks >> 4))
-      REXLOG_INFO("PGR4 native draw: shared memory {} MB mapped",
-                  shared_mapped_chunks << (kSharedChunkShift - 20));
+    // At most 128 lines (4 MB chunks of 512 MB); the frame places a mapping next to a glitch.
+    REXLOG_INFO("PGR4 native draw: shared memory {:08X}+{} MB mapped at frame {}, {} MB in all",
+                c << kSharedChunkShift, chunks << (kSharedChunkShift - 20),
+                watch_frame.load(std::memory_order_relaxed),
+                shared_mapped_chunks << (kSharedChunkShift - 20));
     c = end - 1;
   }
   return true;
@@ -1576,12 +1859,26 @@ uint32_t DrawRenderer::Impl::SamplerDescriptor(const SamplerKey& k) {
 DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash,
                                                               const PipelineKey& key,
                                                               const DxbcShader::Translation& vs,
-                                                              const DxbcShader::Translation* ps) {
+                                                              const DxbcShader::Translation* ps,
+                                                              uint32_t variant) {
   auto it = pipelines.find(hash);
   Pipeline* p;
   if (it != pipelines.end()) {
     p = it->second.get();
   } else {
+    if (new_pipelines_logged < kNewPipelineLog) {
+      ++new_pipelines_logged;
+      const auto st = pipeline_states.find(StateDigest(key));
+      const auto pr = pipeline_pairs.find(PairDigest(key));
+      REXLOG_INFO("PGR4 native pipelines: new at frame {}: vs {:016X}{} ps {:016X}{}{}, state {} "
+                  "({} pipelines), shader pair {} ({} pipelines)",
+                  r.frame_index(), vs.shader().ucode_data_hash(), variant & 1 ? " (bools)" : "",
+                  ps ? ps->shader().ucode_data_hash() : 0, variant & 2 ? " (bools)" : "",
+                  variant & 4 ? " (signs)" : "", st == pipeline_states.end() ? "new" : "known",
+                  st == pipeline_states.end() ? 0 : st->second,
+                  pr == pipeline_pairs.end() ? "new" : "known",
+                  pr == pipeline_pairs.end() ? 0 : pr->second);
+    }
     p = CreatePipeline(hash, key, vs, ps, false);
     ++stats.pso_created;
     ++frame_new_pipelines;
@@ -1706,11 +2003,13 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
     b.RenderTargetWriteMask = rt.mask;
   }
   Pipeline* p = pipelines.emplace(hash, std::make_unique<Pipeline>()).first->second.get();
+  ++pipeline_states[StateDigest(key)];
+  ++pipeline_pairs[PairDigest(key)];
   if (!pso_threads.empty()) {
     p->prewarm = prewarm;
     {
       std::lock_guard<std::mutex> lock(pso_mutex);
-      (prewarm ? prewarm_jobs : pso_jobs).push_back({p, d});
+      (prewarm ? prewarm_jobs : pso_jobs).push_back({p, d, !prewarm});
     }
     pso_cv.notify_one();
     return p;
@@ -1837,9 +2136,11 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
       }
       const uint32_t start = f.address << 2, size = f.size << 2;
       const bool inline_data = s.inline_vertices && start == s.inline_vertices;
+      if (coherency) coherency->slot = uint8_t(index);
       if (!RequestRange(start, size, !inline_data, out)) return false;
     }
   }
+  if (coherency) coherency->slot = 0xFF;
   if (s.indexed && xenos::PrimitiveType(s.primitive) != xenos::PrimitiveType::kTriangleFan)
     return RequestRange(s.index_address, s.count * (s.index_32bit ? 4u : 2u), true, out);
   return true;
@@ -1854,6 +2155,7 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
   prep->ps = LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
   profile::Mark(profile::kCapShaders);
   if (!prep->vs) return;
+  if (coherency) HashRegisterBlocks(s.regs, prep->regs_hash);
   upload_fence = tag;
   const bool indexed_ok = !s.indexed || s.index_address;
   // Straight into the batch: copies made before a failed range still go out (their pages
@@ -1868,6 +2170,8 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
     prep->copy_segment = true;
   }
   for (const Read& read : draw_reads) SegmentAdd(read);
+  if (coherency)
+    for (const Read& read : draw_reads) coherency->segment_reads.push_back({read.begin, read.end});
   // Triangle fans: host indices from the guest's now (Draw reads them from here).
   const uint32_t count = s.count;
   if (prep->upload_ok && xenos::PrimitiveType(s.primitive) == xenos::PrimitiveType::kTriangleFan &&
@@ -1895,6 +2199,23 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     for (CachedCbv* cb : {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop, &cb_fetch,
                           &cb_desc_vs, &cb_desc_ps})
       cb->Reset();
+  }
+  if (prep && prep->regs_hash[0]) {
+    uint64_t now[5];
+    HashRegisterBlocks(s.regs, now);
+    if (std::memcmp(now, prep->regs_hash, sizeof(now))) {
+      ++stats.reg_mismatches;
+      if (coherency_reg_logged < 100) {
+        ++coherency_reg_logged;
+        REXLOG_WARN("PGR4 native coherency: frame {} draw {} registers differ from Prepare's in "
+                    "blocks{}{}{}{}{}",
+                    r.frame_index(), frame_draws, now[0] != prep->regs_hash[0] ? " state" : "",
+                    now[1] != prep->regs_hash[1] ? " vs-float" : "",
+                    now[2] != prep->regs_hash[2] ? " ps-float" : "",
+                    now[3] != prep->regs_hash[3] ? " fetch" : "",
+                    now[4] != prep->regs_hash[4] ? " bool-loop" : "");
+      }
+    }
   }
   if (prep) {
     // The guest thread copied the ranges (and marked their pages valid): they go into shared
@@ -1928,6 +2249,8 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     ++stats.failed;
     return;
   }
+  DxbcShader* const vs_generic = vs;
+  DxbcShader* const ps_generic = ps;
   if (bool_specialize) {
     const uint32_t* bools = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
     vs = vs_bools.Get(vs, bools);
@@ -1974,6 +2297,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
       for (const auto& tb : ps->texture_bindings()) mods_memo.ps_textures |= 1u << tb.fetch_constant;
   }
   ShaderModifications mods = mods_memo.mods;
+  const uint64_t generic_pixel_mod = mods.pixel;
   mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
                                        signed_is_unsigned_formats);
 
@@ -2288,7 +2612,9 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     pso = pso_slot.pso;
     ++diag.pso_hits;
   } else {
-    Pipeline* p = GetPipeline(key_hash, key, *vst, pst);
+    const uint32_t variant = (vs != vs_generic ? 1u : 0u) | (ps && ps != ps_generic ? 2u : 0u) |
+                             (pst && mods.pixel != generic_pixel_mod ? 4u : 0u);
+    Pipeline* p = GetPipeline(key_hash, key, *vst, pst, variant);
     uint8_t state = p->state.load(std::memory_order_acquire);
     if (state == kCompiling) {
       if (p->prewarm) PromotePipeline(p);
@@ -2854,12 +3180,59 @@ void DrawRenderer::Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep
 
 void DrawRenderer::BeginCopySegment() { impl_->NewSegment(); }
 
-void DrawRenderer::EndFramePrepare(uint64_t done, uint64_t* upload_bytes, uint64_t* uploads) {
-  impl_->watch_frame.fetch_add(1, std::memory_order_relaxed);
-  impl_->vertex_upload.EndFrame(done);
-  *upload_bytes = impl_->prep_upload_bytes;
-  *uploads = impl_->prep_uploads;
-  impl_->prep_upload_bytes = impl_->prep_uploads = 0;
+DrawRenderer::PrepareCounters DrawRenderer::EndFramePrepare(uint64_t done) {
+  Impl& m = *impl_;
+  PrepareCounters c;
+  if (m.coherency) {
+    m.CheckLateWrites();
+    c.stale_pages = std::exchange(m.coherency->stale, 0);
+    c.late_pages = std::exchange(m.coherency->late, 0);
+    c.job = m.MakeCoherencyJob();
+  }
+  m.watch_frame.fetch_add(1, std::memory_order_relaxed);
+  m.vertex_upload.EndFrame(done);
+  c.upload_bytes = std::exchange(m.prep_upload_bytes, 0);
+  c.uploads = std::exchange(m.prep_uploads, 0);
+  return c;
+}
+
+void DrawRenderer::AddPrepareCounters(const PrepareCounters& c) {
+  stats_.upload_bytes += c.upload_bytes;
+  stats_.uploads += c.uploads;
+  stats_.stale_pages += c.stale_pages;
+  stats_.late_pages += c.late_pages;
+  if (c.job) impl_->coherency_next = c.job;
+}
+
+void DrawRenderer::BeforeSubmit() {
+  Impl& m = *impl_;
+  if (!m.coherency_next) return;
+  std::shared_ptr<CoherencyJob> job = std::move(m.coherency_next);
+  if (!m.coherency_readbacks.empty()) {
+    job->readback = std::move(m.coherency_readbacks.back());
+    m.coherency_readbacks.pop_back();
+  } else {
+    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = Impl::kCoherencyReadback;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(m.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&job->readback))))
+      return;
+  }
+  ID3D12GraphicsCommandList* list = m.r.command_list();
+  m.TransitionShared(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  uint64_t offset = 0;
+  for (const auto& [start, size] : job->runs) {
+    list->CopyBufferRegion(job->readback.Get(), offset, m.shared.Get(), start, size);
+    offset += size;
+  }
+  job->fence = m.r.frame_fence();
+  m.coherency_inflight.push_back(std::move(job));
 }
 
 void DrawRenderer::InvalidateListState() {
@@ -2911,6 +3284,7 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   }
   if (!impl_->threaded) impl_->vertex_upload.EndFrame(completed_fence);
   impl_->constant_upload.EndFrame(completed_fence);
+  if (!impl_->coherency_inflight.empty()) impl_->CheckCoherencyJobs(completed_fence);
   impl_->Prewarm();
   impl_->store.Flush();
   impl_->frame_draws = 0;

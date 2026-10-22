@@ -132,6 +132,27 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   line, or stops against a barrier, reports where it diverged. Runs part ways only from about
   46 s after the grid shot.
 - `perf_symbols.py` names samples in Wine DLLs by their nearest export.
+- Frame recorder: `--pgr4_native_record` writes the frames shown, at half size and after the
+  gamma ramp, from a given frame and optionally in files of N frames (`deck-run.sh --record`).
+  `flicker.py` finds what flashed in a recording: blocks that depart from the frames on either
+  side for 1-4 frames, or whole-image jumps that come back (`--jumps`), and writes PNG sheets
+  of them with the frame CSV's counters for those frames.
+- Glitch catcher: `--pgr4_native_glitch_catch` keeps the last 2 s of frames in memory, finds
+  the whole-image jumps as they happen and writes the frames around each one; a capture
+  request (F12) writes all 2 s. About 5 % of one core. `play.sh` sessions run it and record
+  every frame, in files of 5 minutes, so a glitch seen in play can be found afterwards.
+- `play.sh` runs the guest's vblank at the OLED panel's 90 Hz (it was 60) and starts Proton
+  without xalia, as `deck-run.sh` does.
+- `--pgr4_native_coherency_check` (debug, the race runs at about 44 fps with it) keeps a CPU
+  copy of what shared memory should hold and checks, per draw, that the vertex and index
+  ranges it reads match guest memory, that no copy overwrites a range read earlier in its
+  copy segment, which ranges the game rewrites after a draw of the frame read them, that
+  shared memory read back after the frame holds what the frame's copies carried, and that the
+  render thread's register file matches the one the game thread prepared the draw with. Two
+  race runs with it found no stale page, no segment overwrite and no read-back mismatch; the
+  only late rewrite is in the front end (6 pages of one vertex fetch range, once).
+- Logs: each new pipeline with its compile time, and each 4 MB chunk of shared memory with the
+  frame it was mapped at.
 
 ## Why a native renderer can beat emulation
 
@@ -350,6 +371,9 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_profile` | false | Per-stage CPU time of the draw path, added to the CSV |
 | `--pgr4_native_capture_dir=<dir>` | `C:\recomp\logs\pgr4-native-captures` | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one |
 | `--pgr4_native_capture_frame=<n>` | -1 (off) | Capture the front buffers at this native frame |
+| `--pgr4_native_record=<file>` | off | Record the frames shown at half size (`_record_from`, `_record_frames`, `_record_chunk_frames`) |
+| `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 2 s of frames; write whole-image jumps and F12's 2 s to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
+| `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
 
 With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 (`--gpu_skip_draws`, added by `native/rexglue-native-primary.patch`).
@@ -366,12 +390,15 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 | `perf_stats.py` | Stage costs per draw from the CSV |
 | `perf_hitch.py` | Slow frames and their causes |
 | `compare_resolves.py` | Resolve outputs against the Xenos plugin's |
+| `flicker.py` | Flashing blocks or whole-image jumps in a frame recording, as PNG sheets |
 
 It also has a texture untiling harness and an offline shader translation test.
 
 ## What's next
 
-- Fix the render thread's wrong geometry.
+- Fix the render thread's wrong geometry. On the Deck it shows as a two-frame glitch about 10 s
+  into the St Petersburg race, in about one run in three: the sky turns red and the far
+  buildings break into shards while near geometry stays right.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
   work per frame (bool-constant shader specialization next).

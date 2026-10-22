@@ -17,11 +17,16 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 REXCVAR_DEFINE_STRING(pgr4_native_capture_dir, "C:\\recomp\\logs\\pgr4-native-captures",
@@ -37,6 +42,21 @@ REXCVAR_DEFINE_BOOL(pgr4_native_luma_probe, false, "PGR4 native",
                     "Read back three rows of every front buffer (at 10, 40 and 80 % of its "
                     "height) and log their mean brightness in the frame CSV, to find frames "
                     "drawn partly black");
+REXCVAR_DEFINE_STRING(pgr4_native_record, "", "PGR4 native",
+                      "Record the frames shown, at half size and after the gamma ramp, into this "
+                      "file (native/tools/flicker.py finds frames that flash and shows them)");
+REXCVAR_DEFINE_INT32(pgr4_native_record_from, 0, "PGR4 native",
+                     "The first frame index --pgr4_native_record records");
+REXCVAR_DEFINE_INT32(pgr4_native_record_frames, 0, "PGR4 native",
+                     "How many frames --pgr4_native_record records (0: all)");
+REXCVAR_DEFINE_INT32(pgr4_native_record_chunk_frames, 0, "PGR4 native",
+                     "Start a new --pgr4_native_record file every this many frames, named "
+                     "<path without .rec>-<first frame>.rec (0: one file)");
+REXCVAR_DEFINE_STRING(pgr4_native_glitch_catch, "", "PGR4 native",
+                      "Keep the last 2 s of frames shown (as --pgr4_native_record would record "
+                      "them) in memory and write <this prefix>glitch-<frame>.rec when 1 to 4 "
+                      "frames jump away from the image and back, and <prefix>mark-<frame>.rec "
+                      "with all of them at a capture request (F12)");
 
 namespace pgr4::native {
 
@@ -277,7 +297,93 @@ struct Presenter::Impl {
   LumaProbe probe_result;
   std::vector<uint8_t> probe_rgb;
 
+  // --pgr4_native_record: the blit drawn again at half the image's size (a 2x2 box filter) into
+  // `target`, copied to a readback slot per frame in flight, and handed when the slot comes round
+  // to a writer thread, which appends it to the file: a RecordHeader, then height rows of width
+  // RGB texels, per frame.
+  struct RecordHeader {
+    char magic[4] = {'P', 'G', 'R', 'F'};
+    uint32_t width = 0, height = 0, reserved = 0;
+    uint64_t frame = 0, time_us = 0;
+  };
+  static_assert(sizeof(RecordHeader) == 32);
+  // --pgr4_native_glitch_catch, on the recorder's writer thread: the frames it is handed, in a
+  // ring, and the whole-image jumps of native/tools/flicker.py --jumps found as they arrive (a
+  // frame whose mean block difference from the one before is at least 6x the median of the last
+  // kSteps and 15, followed within kMaxLen frames by one that is back near the frame before).
+  struct Catcher {
+    static constexpr uint32_t kRing = 180, kBlock = 10, kMaxLen = 4, kPad = 8, kSteps = 512;
+    static constexpr uint32_t kMaxDumps = 400, kMaxMarks = 30;  // ~14 MB and ~124 MB each
+    struct Frame {
+      RecordHeader h;
+      std::vector<uint8_t> rgb;
+      std::vector<float> means;  // per kBlock x kBlock block and channel
+      float step = 0, floor = 0;
+    };
+    std::string prefix;
+    std::vector<Frame> ring = std::vector<Frame>(kRing);
+    uint64_t count = 0;     // frames added; frame n is ring[n % kRing]
+    uint64_t consumed = 0;  // frames before this are part of a reported jump
+    uint64_t dump_from = 0, dump_to = 0, dump_label = 0;
+    bool dump_pending = false;
+    std::deque<float> steps;
+    std::vector<float> scratch;
+    std::vector<uint32_t> sums;
+    uint32_t dumps = 0, marks = 0;
+
+    Frame& At(uint64_t n) { return ring[n % kRing]; }
+    // Frames a..b (a <= b, both in the ring) are consecutive frames shown.
+    bool Contiguous(uint64_t a, uint64_t b) { return At(b).h.frame - At(a).h.frame == b - a; }
+    static float Diff(const Frame& a, const Frame& b);
+    void Add(const RecordHeader& h, const uint8_t* rgba);
+    void Mark(uint64_t frame);
+    void Dump(uint64_t from, uint64_t to, const char* kind, uint64_t label);
+  };
+  struct Recorder {
+    bool on = false, failed = false, finished = false, catching = false;
+    Catcher catcher;
+    // --pgr4_native_record: the file (or chunk) being written; none once one could not be.
+    std::string path;
+    uint32_t chunk_frames = 0;
+    uint64_t chunk_written = 0;
+    bool file_off = false;
+    static constexpr uint64_t kMinFreeBytes = 40ull << 30;  // a new chunk needs this much free
+    void OpenFile(uint64_t frame);
+    std::atomic<uint64_t> mark_request{0};  // frame + 1: dump the catcher's ring
+    uint64_t from = 0, until = 0;  // frame indices, until exclusive
+    ComPtr<ID3D12Resource> target, readback;
+    ComPtr<ID3D12DescriptorHeap> rtv_heap;
+    const uint8_t* mapped = nullptr;
+    uint32_t width = 0, height = 0, pitch = 0;
+    uint64_t slot_bytes = 0;
+    struct Slot {
+      uint64_t frame = 0, time_us = 0;
+      bool recorded = false;
+    } slots[D3D12Device::kFramesInFlight];
+    std::FILE* file = nullptr;
+    std::thread writer;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::vector<uint8_t>> queue;  // a RecordHeader, then RGBA rows (width * 4 bytes)
+    std::vector<std::vector<uint8_t>> spare;  // written buffers, reused
+    bool stopping = false;
+    uint64_t written = 0, recorded = 0, dropped = 0;
+    static constexpr size_t kMaxQueued = 96;
+
+    bool Start(ID3D12Device* device, uint32_t w, uint32_t h);
+    void Push(const Slot& s, uint32_t slot);
+    void Write();
+    void Stop();
+  } rec;
+
   explicit Impl(NativeRenderer& renderer) : r(renderer) {}
+  ~Impl() {
+    rec.Stop();
+    if (rec.writer.joinable()) rec.writer.join();
+  }
+  // In the blit's state (root signature, pipeline, source and ramp bound): records this frame,
+  // and hands the slot's previous one to the writer.
+  void Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih, uint32_t ramp_mode);
   // Reads the slot's previous rows into probe_result, then records this frame's copies.
   void Probe(ID3D12GraphicsCommandList* list, uint32_t slot, const ResolvedImage& image,
              uint32_t mapping, bool rgb10a2);
@@ -363,7 +469,330 @@ bool Presenter::Impl::Initialize() {
   }
   std::error_code ec;
   std::filesystem::create_directories(REXCVAR_GET(pgr4_native_capture_dir), ec);
+  rec.path = REXCVAR_GET(pgr4_native_record);
+  rec.catcher.prefix = REXCVAR_GET(pgr4_native_glitch_catch);
+  rec.catching = !rec.catcher.prefix.empty();
+  rec.on = rec.catching || !rec.path.empty();
+  if (!rec.path.empty()) {
+    rec.from = uint64_t(std::max(REXCVAR_GET(pgr4_native_record_from), 0));
+    const int32_t frames = REXCVAR_GET(pgr4_native_record_frames);
+    rec.until = frames > 0 ? rec.from + uint64_t(frames) : ~0ull;
+    rec.chunk_frames = uint32_t(std::max(REXCVAR_GET(pgr4_native_record_chunk_frames), 0));
+  } else {
+    rec.until = ~0ull;
+  }
   return true;
+}
+
+bool Presenter::Impl::Recorder::Start(ID3D12Device* device, uint32_t w, uint32_t h) {
+  width = w;
+  height = h;
+  pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+  slot_bytes = (uint64_t(pitch) * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+               ~uint64_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+  D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
+  D3D12_RESOURCE_DESC td = {};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  td.Width = w;
+  td.Height = h;
+  td.DepthOrArraySize = td.MipLevels = 1;
+  td.Format = D3D12Device::kBackBufferFormat;
+  td.SampleDesc.Count = 1;
+  td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_HEAP_PROPERTIES rp = {D3D12_HEAP_TYPE_READBACK};
+  D3D12_RESOURCE_DESC rd = {};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  rd.Width = slot_bytes * D3D12Device::kFramesInFlight;
+  rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+  void* p = nullptr;
+  if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                             IID_PPV_ARGS(&target)),
+             "record target") ||
+      Failed(device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &rd,
+                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&readback)),
+             "record readback") ||
+      Failed(readback->Map(0, nullptr, &p), "record readback map") ||
+      Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)), "record heap"))
+    return false;
+  mapped = static_cast<const uint8_t*>(p);
+  device->CreateRenderTargetView(target.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
+  writer = std::thread([this] { Write(); });
+  SetThreadDescription(writer.native_handle(), L"PGR4 native recorder");
+  if (catching)
+    REXLOG_INFO("PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
+                "{}glitch-<frame>.rec",
+                Catcher::kRing, w, h, catcher.prefix);
+  if (!path.empty())
+    REXLOG_INFO("PGR4 native record: frames from {} at {}x{} into {}{}", from, w, h, path,
+                chunk_frames ? fmt::format(", a file per {} frames", chunk_frames) : "");
+  return true;
+}
+
+void Presenter::Impl::Recorder::OpenFile(uint64_t frame) {
+  if (file) std::fclose(file);
+  file = nullptr;
+  chunk_written = 0;
+  std::string name = path;
+  if (chunk_frames) {
+    const size_t sep = path.find_last_of("\\/"), dot = path.rfind('.');
+    const bool ext = dot != std::string::npos && (sep == std::string::npos || dot > sep);
+    name = (ext ? path.substr(0, dot) : path) + "-" + std::to_string(frame) +
+           (ext ? path.substr(dot) : std::string(".rec"));
+  }
+  std::error_code ec;
+  const std::filesystem::space_info space =
+      std::filesystem::space(std::filesystem::path(name).parent_path(), ec);
+  if (!ec && space.available < kMinFreeBytes) {
+    REXLOG_WARN("PGR4 native record: stopped at frame {}, {} GB free", frame, space.available >> 30);
+    file_off = true;
+    return;
+  }
+  file = std::fopen(name.c_str(), "wb");
+  if (!file) {
+    REXLOG_ERROR("PGR4 native record: cannot open {}", name);
+    file_off = true;
+    return;
+  }
+  if (chunk_frames) REXLOG_INFO("PGR4 native record: frames from {} into {}", frame, name);
+}
+
+void Presenter::Impl::Recorder::Push(const Slot& s, uint32_t slot) {
+  std::vector<uint8_t> buf;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (queue.size() >= kMaxQueued) {
+      ++dropped;
+      return;
+    }
+    if (!spare.empty()) {
+      buf = std::move(spare.back());
+      spare.pop_back();
+    }
+  }
+  const size_t row = size_t(width) * 4;
+  buf.resize(sizeof(RecordHeader) + row * height);
+  RecordHeader h;
+  h.width = width;
+  h.height = height;
+  h.frame = s.frame;
+  h.time_us = s.time_us;
+  std::memcpy(buf.data(), &h, sizeof(h));
+  const uint8_t* src = mapped + slot_bytes * slot;
+  for (uint32_t y = 0; y < height; ++y)
+    std::memcpy(buf.data() + sizeof(h) + row * y, src + size_t(pitch) * y, row);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    queue.push_back(std::move(buf));
+  }
+  cv.notify_one();
+}
+
+void Presenter::Impl::Recorder::Write() {
+  std::vector<uint8_t> rgb;
+  std::unique_lock<std::mutex> lock(mutex);
+  for (;;) {
+    cv.wait(lock, [this] { return stopping || !queue.empty(); });
+    if (queue.empty()) break;
+    std::vector<uint8_t> buf = std::move(queue.front());
+    queue.pop_front();
+    lock.unlock();
+    RecordHeader h;
+    std::memcpy(&h, buf.data(), sizeof(h));
+    const std::vector<uint8_t>* out = &rgb;
+    if (catching) {
+      catcher.Add(h, buf.data() + sizeof(h));  // RGBA8 -> RGB8 into its ring
+      if (const uint64_t m = mark_request.exchange(0, std::memory_order_relaxed)) catcher.Mark(m - 1);
+      out = &catcher.At(catcher.count - 1).rgb;
+    } else if (!path.empty()) {
+      const size_t n = size_t(h.width) * h.height;
+      rgb.resize(n * 3);
+      const uint8_t* px = buf.data() + sizeof(h);
+      for (size_t i = 0; i < n; ++i) std::memcpy(&rgb[i * 3], px + i * 4, 3);  // RGBA8 -> RGB8
+    }
+    if (!path.empty() && !file_off) {
+      if (!file || (chunk_frames && chunk_written >= chunk_frames)) OpenFile(h.frame);
+      if (file) {
+        if (std::fwrite(&h, sizeof(h), 1, file) == 1 &&
+            std::fwrite(out->data(), 1, out->size(), file) == out->size()) {
+          ++chunk_written;
+          ++recorded;
+        } else {
+          REXLOG_ERROR("PGR4 native record: write failed after {} frames", recorded);
+          std::fclose(file);
+          file = nullptr;
+          file_off = true;
+        }
+      }
+    }
+    lock.lock();
+    spare.push_back(std::move(buf));
+    ++written;
+  }
+  if (file) std::fclose(file);
+  file = nullptr;
+  REXLOG_INFO("PGR4 native record: {} frames seen, {} recorded, {} dropped (writer behind)",
+              written, recorded, dropped);
+}
+
+float Presenter::Impl::Catcher::Diff(const Frame& a, const Frame& b) {
+  const size_t n = a.means.size();
+  if (!n || b.means.size() != n) return 0.0f;
+  float sum = 0.0f;
+  for (size_t i = 0; i < n; ++i) sum += std::fabs(a.means[i] - b.means[i]);
+  return sum / float(n);
+}
+
+void Presenter::Impl::Catcher::Add(const RecordHeader& h, const uint8_t* rgba) {
+  const uint64_t n = count++;
+  Frame& f = At(n);
+  f.h = h;
+  const size_t px = size_t(h.width) * h.height;
+  f.rgb.resize(px * 3);
+  for (size_t i = 0; i < px; ++i) std::memcpy(&f.rgb[i * 3], rgba + i * 4, 3);
+  const uint32_t bx = h.width / kBlock, by = h.height / kBlock;
+  sums.assign(size_t(bx) * by * 3, 0);
+  for (uint32_t y = 0; y < by * kBlock; ++y) {
+    const uint8_t* row = f.rgb.data() + size_t(y) * h.width * 3;
+    uint32_t* out = sums.data() + size_t(y / kBlock) * bx * 3;
+    for (uint32_t x = 0; x < bx * kBlock; ++x)
+      for (uint32_t c = 0; c < 3; ++c) out[(x / kBlock) * 3 + c] += row[x * 3 + c];
+  }
+  f.means.resize(sums.size());
+  for (size_t i = 0; i < sums.size(); ++i) f.means[i] = float(sums[i]) / float(kBlock * kBlock);
+
+  f.step = n && Contiguous(n - 1, n) ? Diff(f, At(n - 1)) : 0.0f;
+  float median = 0.0f;
+  if (!steps.empty()) {
+    scratch.assign(steps.begin(), steps.end());
+    auto mid = scratch.begin() + scratch.size() / 2;
+    std::nth_element(scratch.begin(), mid, scratch.end());
+    median = *mid;
+  }
+  f.floor = std::max(15.0f, 6.0f * median);
+  if (f.step > 0.0f) {
+    steps.push_back(f.step);
+    if (steps.size() > kSteps) steps.pop_front();
+  }
+  // A jump of frames i..n-1, back at n: the earliest start first, each frame in one jump.
+  for (uint64_t i = n >= kMaxLen ? n - kMaxLen : 1; i < n; ++i) {
+    if (i < 1 || i < consumed || !Contiguous(i - 1, n)) continue;
+    const Frame& s = At(i);
+    if (s.step < s.floor || s.floor <= 0.0f) continue;
+    const float back = Diff(f, At(i - 1));
+    if (back * 2.0f >= s.step) continue;
+    consumed = n + 1;
+    REXLOG_INFO("PGR4 native glitch catch: frames {}-{} ({}) jump {:.1f} ({:.1f}x), back to {:.1f}",
+                At(i).h.frame, At(n - 1).h.frame, n - i, s.step, s.step / s.floor, back);
+    const uint64_t from = i > kPad ? i - kPad : 0;
+    if (!dump_pending) {
+      dump_pending = true;
+      dump_from = std::max(from, count > kRing ? count - kRing : 0);
+      dump_label = s.h.frame;
+    }
+    dump_to = std::min(n + kPad, dump_from + kRing - 1);
+    break;
+  }
+  if (dump_pending && n >= dump_to) {
+    dump_pending = false;
+    if (dumps < kMaxDumps) {
+      ++dumps;
+      Dump(dump_from, n, "glitch", dump_label);
+    }
+  }
+}
+
+void Presenter::Impl::Catcher::Mark(uint64_t frame) {
+  if (!count || marks >= kMaxMarks) return;
+  ++marks;
+  const uint64_t last = count - 1;
+  Dump(count > kRing ? count - kRing : 0, last, "mark", frame);
+}
+
+void Presenter::Impl::Catcher::Dump(uint64_t from, uint64_t to, const char* kind, uint64_t label) {
+  const std::string path = prefix + kind + "-" + std::to_string(label) + ".rec";
+  std::FILE* out = std::fopen(path.c_str(), "wb");
+  if (!out) {
+    REXLOG_ERROR("PGR4 native glitch catch: cannot open {}", path);
+    return;
+  }
+  bool ok = true;
+  for (uint64_t n = from; n <= to && ok; ++n) {
+    const Frame& f = At(n);
+    ok = std::fwrite(&f.h, sizeof(f.h), 1, out) == 1 &&
+         std::fwrite(f.rgb.data(), 1, f.rgb.size(), out) == f.rgb.size();
+  }
+  std::fclose(out);
+  REXLOG_INFO("PGR4 native glitch catch: frames {}-{} {} {}", At(from).h.frame, At(to).h.frame,
+              ok ? "written to" : "failed writing", path);
+}
+
+void Presenter::Impl::Recorder::Stop() {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    stopping = true;
+  }
+  cv.notify_all();
+}
+
+void Presenter::Impl::Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih,
+                             uint32_t ramp_mode) {
+  Recorder& c = rec;
+  const uint64_t frame = r.frame_index();
+  Recorder::Slot& s = c.slots[slot];
+  if (s.recorded) {
+    s.recorded = false;
+    c.Push(s, slot);
+  }
+  if (c.finished || c.failed || frame < c.from) return;
+  if (frame >= c.until) {
+    if (std::none_of(std::begin(c.slots), std::end(c.slots),
+                     [](const Recorder::Slot& x) { return x.recorded; })) {
+      c.finished = true;
+      c.Stop();
+    }
+    return;
+  }
+  const uint32_t w = uint32_t(iw) / 2, h = uint32_t(ih) / 2;
+  if (!c.target && !c.Start(r.d3d12(), w, h)) {
+    c.failed = true;
+    return;
+  }
+  if (w != c.width || h != c.height) return;  // an image of another size: not recorded
+  const struct {
+    float image_size[2];
+    uint32_t ramp_mode, point_sampled;
+  } constants = {{iw, ih}, ramp_mode, 0};
+  list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = c.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  const D3D12_VIEWPORT vp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
+  const D3D12_RECT sc = {0, 0, LONG(w), LONG(h)};
+  list->RSSetViewports(1, &vp);
+  list->RSSetScissorRects(1, &sc);
+  list->DrawInstanced(3, 1, 0, 0);
+  D3D12_RESOURCE_BARRIER b = {};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition.pResource = c.target.Get();
+  b.Transition.Subresource = 0;
+  b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1, &b);
+  D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+  dst.pResource = c.readback.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint.Offset = c.slot_bytes * slot;
+  dst.PlacedFootprint.Footprint = {D3D12Device::kBackBufferFormat, w, h, 1, c.pitch};
+  src.pResource = c.target.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+  list->ResourceBarrier(1, &b);
+  s = {frame, NowNs() / 1000, true};
 }
 
 bool Presenter::Impl::WriteRamp(RampMode mode, uint32_t slot) {
@@ -589,6 +1018,7 @@ void Presenter::OnSwap(const SwapCall& swap) {
     list->RSSetScissorRects(1, &sc);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
+    if (m.rec.on) m.Record(list, ramp_slot, iw, ih, constants.ramp_mode);
   }
   std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
   list->ResourceBarrier(1, &b);
@@ -600,6 +1030,8 @@ void Presenter::OnSwap(const SwapCall& swap) {
   if (!m.capture.armed) {
     if (swap.capture_request < 0 ? m.CaptureRequested(renderer_.frame_index())
                                  : swap.capture_request > 0) {
+      if (m.rec.catching)
+        m.rec.mark_request.store(renderer_.frame_index() + 1, std::memory_order_relaxed);
       HoldFullReadback(true);
       m.capture.armed = true;
     }

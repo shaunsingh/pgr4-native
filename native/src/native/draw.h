@@ -51,6 +51,7 @@ namespace pgr4::native {
 
 class NativeRenderer;
 struct ClearCall;
+struct CoherencyJob;
 
 // Guest memory copied into upload memory, to be copied into shared memory at `dst`.
 struct VertexCopy {
@@ -72,6 +73,9 @@ struct DrawPrep {
   uint32_t fan_count = 0;
   bool fan_wide = false;
   uint64_t captured = ~0ull;  // TextureCache::MarkCapture stamp (kCapturedNow: none)
+  // --pgr4_native_coherency_check: XXH3 of the register file's blocks as Prepare saw them
+  // (render state, float constants VS and PS, fetch and bool/loop constants), 0: not taken.
+  uint64_t regs_hash[5] = {};
 };
 
 class DrawRenderer {
@@ -94,6 +98,19 @@ class DrawRenderer {
     uint64_t copy_batches = 0;    // groups of shared-memory copies, each between two barriers
     uint64_t watch_arms = 0, watch_arm_pages = 0;  // vertex/index watches armed (calls, pages)
     uint64_t hash_pages = 0, hash_copies = 0;  // hot pages hashed, and copied as they changed
+    // --pgr4_native_coherency_check: pages whose guest memory differed from shared memory's
+    // copy although the page watch said it was current, and pages rewritten after a draw of
+    // the frame read them.
+    uint64_t stale_pages = 0, late_pages = 0;
+    // ... and pages whose shared memory copy, read back at the end of a frame, differs from
+    // the bytes the frame's copies carried.
+    uint64_t gpu_mismatch_pages = 0;
+    uint64_t reg_mismatches = 0;  // draws whose register file differs from Prepare's
+  };
+  // Prepare's numbers for one frame (EndFramePrepare), added to stats() by AddPrepareCounters.
+  struct PrepareCounters {
+    uint64_t upload_bytes = 0, uploads = 0, stale_pages = 0, late_pages = 0;
+    std::shared_ptr<CoherencyJob> job;  // the frame's copied ranges to read back, or null
   };
 
   explicit DrawRenderer(NativeRenderer& renderer);
@@ -122,12 +139,12 @@ class DrawRenderer {
                std::vector<VertexCopy>* copies);
   void BeginCopySegment();
   // Guest thread, once per Swap: recycles vertex upload memory with tags <= `done`. Returns
-  // Prepare's upload counters since the previous call (added to stats() by AddUploads).
-  void EndFramePrepare(uint64_t done, uint64_t* upload_bytes, uint64_t* uploads);
-  void AddUploads(uint64_t upload_bytes, uint64_t uploads) {
-    stats_.upload_bytes += upload_bytes;
-    stats_.uploads += uploads;
-  }
+  // Prepare's counters since the previous call.
+  PrepareCounters EndFramePrepare(uint64_t done);
+  // Render thread, at the frame's Swap.
+  void AddPrepareCounters(const PrepareCounters& c);
+  // Render thread, the last thing recorded into a frame's command list.
+  void BeforeSubmit();
 
   // Something else set graphics/compute state or descriptor heaps on the command list (the
   // Resolver does): set everything again at the next draw. A new frame's list is detected
