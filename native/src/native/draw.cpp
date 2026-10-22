@@ -16,6 +16,7 @@
 #include "render_targets.h"
 #include "renderer.h"
 #include "shader_cache.h"
+#include "shader_specialize.h"
 #include "shader_translate.h"
 #include "textures.h"
 #include "upload_pool.h"
@@ -53,8 +54,15 @@
 #include <vector>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_async_pipelines, true, "PGR4 native",
-                    "Compile new pipeline states on a worker thread and skip the draws that need "
+                    "Compile new pipeline states on worker threads and skip the draws that need "
                     "them until they are ready, instead of stalling the game thread");
+REXCVAR_DEFINE_INT32(pgr4_native_pipeline_threads, 0, "PGR4 native",
+                     "Pipeline compile threads with --pgr4_native_async_pipelines (0: a quarter "
+                     "of the hardware threads, 1 to 4)");
+REXCVAR_DEFINE_INT32(pgr4_native_pipeline_burst, 8, "PGR4 native",
+                     "With --pgr4_native_async_pipelines, a frame that needs this many new "
+                     "pipelines (or follows one that did) waits for them, up to 0.5 s, instead of "
+                     "drawing the scene without them (0: never wait)");
 REXCVAR_DEFINE_BOOL(pgr4_native_pipeline_cache, true, "PGR4 native",
                     "Keep the shaders and pipelines the native renderer creates under "
                     "<cache_root>\\pgr4-native and compile them at start-up in later runs "
@@ -66,6 +74,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_dynamic_depth_bias, true, "PGR4 native",
                     "Set the polygon offset with RSSetDepthBias instead of baking it into the "
                     "pipeline state, where the driver supports it (the game animates it, which "
                     "made hundreds of pipelines per shader pair)");
+REXCVAR_DEFINE_BOOL(pgr4_native_bool_specialize, true, "PGR4 native",
+                    "Translate shaders whose control flow tests bool constants for each draw's "
+                    "values, without the branches (shader_specialize.h)");
 
 namespace pgr4::native {
 
@@ -588,6 +599,8 @@ struct DrawRenderer::Impl {
   rex::memory::Memory* memory = nullptr;
   const uint8_t* membase = nullptr;
   ShaderCache shaders;
+  BoolSpecializer vs_bools{shaders}, ps_bools{shaders};
+  bool bool_specialize = REXCVAR_GET(pgr4_native_bool_specialize);
   ComPtr<ID3D12RootSignature> root_signature;
 
   // Shared memory: guest physical memory mirror and its page validity (cleared by CPU writes).
@@ -746,30 +759,41 @@ struct DrawRenderer::Impl {
   uint64_t bind_clock = 0;
 
   // Pipelines by PipelineKey hash. With --pgr4_native_async_pipelines new ones compile on
-  // pso_thread and the draws that need them are skipped until they are ready
-  // (stats.pso_pending), so a burst of new pipelines (96 at race start, ~30 ms) does not stall
-  // the game thread. Entries are never removed.
+  // pso_threads and the draws that need them are skipped until they are ready
+  // (stats.pso_pending), so a pipeline first needed mid-race does not stall the game thread.
+  // A scene's first frame needs many at once (180 at race start), and skipping their draws
+  // would build the scene up part by part over several frames: from pipeline_burst new
+  // pipelines in a frame (or the one before), draws wait for theirs instead (a loading step,
+  // at most kPipelineWaitBudget per frame). Entries are never removed.
   // With --pgr4_native_pipeline_cache every new pipeline is recorded in `store`; the next run
   // translates and creates the recorded ones at start-up (Prewarm, a slice per frame) and the
-  // worker loads them from `library` instead of compiling them again.
+  // workers load them from `library` instead of compiling them again.
   enum : uint8_t { kCompiling, kReady, kFailed };
   struct Pipeline {
     ComPtr<ID3D12PipelineState> pso;
     std::atomic<uint8_t> state{kCompiling};
+    bool prewarm = false;  // its job was queued in prewarm_jobs (draw thread only)
   };
   std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> pipelines;
   struct PipelineJob {
     Pipeline* target;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;  // bytecode and root signature outlive the job
   };
-  std::thread pso_thread;
+  std::vector<std::thread> pso_threads;
   std::mutex pso_mutex;
   std::condition_variable pso_cv;
+  std::condition_variable pso_ready_cv;  // a job finished (notified under pso_mutex)
   std::deque<PipelineJob> pso_jobs;      // a draw is waiting for these
   std::deque<PipelineJob> prewarm_jobs;  // taken only when pso_jobs is empty
   bool pso_stopping = false;
+  static constexpr std::chrono::milliseconds kPipelineWaitBudget{500};
+  uint32_t pipeline_burst = 0;
+  uint32_t frame_new_pipelines = 0, last_frame_new_pipelines = 0;  // created or promoted
+  uint32_t frame_pending_draws = 0;  // skipped this frame, their pipeline compiling
+  std::chrono::steady_clock::duration frame_pipeline_wait{};
   PipelineStore store;
-  PipelineLibrary library;  // pso_thread only
+  std::once_flag library_open;
+  PipelineLibrary library;  // pipeline workers only
   // D3D12 OPTIONS16 dynamic depth bias: pipelines are created with
   // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS and keyed with a zero bias, and draws set it
   // with RSSetDepthBias.
@@ -885,13 +909,13 @@ struct DrawRenderer::Impl {
 
   Impl(NativeRenderer& renderer, DrawRenderer::Stats& s) : r(renderer), stats(s) {}
   ~Impl() {
-    if (pso_thread.joinable()) {
+    if (!pso_threads.empty()) {
       {
         std::lock_guard<std::mutex> lock(pso_mutex);
         pso_stopping = true;
       }
       pso_cv.notify_all();
-      pso_thread.join();
+      for (std::thread& t : pso_threads) t.join();
       library.Save();
     }
     if (invalidation_handle && memory)
@@ -930,15 +954,21 @@ struct DrawRenderer::Impl {
   }
   uint32_t TextureDescriptor(const TextureBinding& b, const DxbcShader::TextureBinding& tb);
   uint32_t SamplerDescriptor(const SamplerKey& k);
-  // The pipeline for `key`, or nullptr: *pending says whether it is still compiling (the draw
-  // waits for a later frame) rather than failed.
-  ID3D12PipelineState* GetPipeline(const PipelineKey& key, const DxbcShader::Translation& vs,
-                                   const DxbcShader::Translation* ps, bool* pending);
-  // Adds the pipeline under `hash` and creates it (queued on pso_thread when it runs; a
+  // The pipeline for `key` (`hash`: its XXH3), added and recorded in the store if new.
+  Pipeline* GetPipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
+                        const DxbcShader::Translation* ps);
+  // Moves a pipeline's prewarm job, if no worker has taken it yet, to the draw queue: a draw
+  // waits for it now.
+  void PromotePipeline(Pipeline* p);
+  // In a burst of new pipelines, waits until `p` is no longer compiling (within the frame's
+  // budget). Returns whether it waited.
+  bool WaitForPipeline(const Pipeline& p);
+  // Adds the pipeline under `hash` and creates it (queued on pso_threads when they run; a
   // prewarm job waits behind every draw's job).
   Pipeline* CreatePipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
                            const DxbcShader::Translation* ps, bool prewarm);
-  void PipelineWorker();
+  // `saves`: this worker saves the library when the workers have been idle for a while.
+  void PipelineWorker(bool saves);
   // Per frame: translates and queues stored pipelines from earlier runs for up to ~2 ms.
   void Prewarm();
 
@@ -1193,21 +1223,29 @@ bool DrawRenderer::Impl::Initialize() {
     }
   }
   if (REXCVAR_GET(pgr4_native_async_pipelines)) {
-    pso_thread = std::thread([this] { PipelineWorker(); });
-    SetThreadDescription(pso_thread.native_handle(), L"PGR4 native pipelines");
+    pipeline_burst = uint32_t(std::max(REXCVAR_GET(pgr4_native_pipeline_burst), 0));
+    int threads = REXCVAR_GET(pgr4_native_pipeline_threads);
+    if (threads <= 0) threads = int(std::thread::hardware_concurrency() / 4);
+    threads = std::clamp(threads, 1, 4);
+    for (int i = 0; i < threads; ++i) {
+      pso_threads.emplace_back([this, i] { PipelineWorker(i == 0); });
+      wchar_t name[32];
+      std::swprintf(name, 32, L"PGR4 native pipelines %d", i);
+      SetThreadDescription(pso_threads.back().native_handle(), name);
+    }
   }
   Prewarm();  // the first slice before the first frame, which needs some of them
   return true;
 }
 
-void DrawRenderer::Impl::PipelineWorker() {
-  library.Open(device, library_path);
+void DrawRenderer::Impl::PipelineWorker(bool saves) {
+  std::call_once(library_open, [this] { library.Open(device, library_path); });
   std::unique_lock<std::mutex> lock(pso_mutex);
   auto has_work = [this] {
     return pso_stopping || !pso_jobs.empty() || !prewarm_jobs.empty();
   };
   for (;;) {
-    if (library.dirty()) {
+    if (saves && library.dirty()) {
       // Save once no new pipeline came for 3 s (the burst is over).
       if (!pso_cv.wait_for(lock, std::chrono::seconds(3), has_work)) {
         lock.unlock();
@@ -1236,6 +1274,7 @@ void DrawRenderer::Impl::PipelineWorker() {
       job.target->state.store(kFailed, std::memory_order_release);
     }
     lock.lock();
+    pso_ready_cv.notify_all();
   }
 }
 
@@ -1534,17 +1573,18 @@ uint32_t DrawRenderer::Impl::SamplerDescriptor(const SamplerKey& k) {
   return index;
 }
 
-ID3D12PipelineState* DrawRenderer::Impl::GetPipeline(const PipelineKey& key,
-                                                     const DxbcShader::Translation& vs,
-                                                     const DxbcShader::Translation* ps,
-                                                     bool* pending) {
-  const uint64_t hash = XXH3_64bits(&key, sizeof(key));
+DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash,
+                                                              const PipelineKey& key,
+                                                              const DxbcShader::Translation& vs,
+                                                              const DxbcShader::Translation* ps) {
   auto it = pipelines.find(hash);
   Pipeline* p;
   if (it != pipelines.end()) {
     p = it->second.get();
   } else {
     p = CreatePipeline(hash, key, vs, ps, false);
+    ++stats.pso_created;
+    ++frame_new_pipelines;
     if (store.is_open()) {
       PipelineKey stored = key;
       stored.vs = stored.ps = nullptr;
@@ -1561,9 +1601,36 @@ ID3D12PipelineState* DrawRenderer::Impl::GetPipeline(const PipelineKey& key,
                            &stored, sizeof(stored));
     }
   }
-  const uint8_t state = p->state.load(std::memory_order_acquire);
-  *pending = state == kCompiling;
-  return state == kReady ? p->pso.Get() : nullptr;
+  return p;
+}
+
+void DrawRenderer::Impl::PromotePipeline(Pipeline* p) {
+  p->prewarm = false;
+  ++frame_new_pipelines;
+  std::lock_guard<std::mutex> lock(pso_mutex);
+  auto it = std::find_if(prewarm_jobs.begin(), prewarm_jobs.end(),
+                         [p](const PipelineJob& j) { return j.target == p; });
+  if (it == prewarm_jobs.end()) return;  // being compiled
+  pso_jobs.push_back(*it);
+  prewarm_jobs.erase(it);
+}
+
+bool DrawRenderer::Impl::WaitForPipeline(const Pipeline& p) {
+  if (!pipeline_burst ||
+      std::max(frame_new_pipelines, last_frame_new_pipelines) < pipeline_burst ||
+      frame_pipeline_wait >= kPipelineWaitBudget)
+    return false;
+  const auto t0 = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lock(pso_mutex);
+    pso_ready_cv.wait_for(lock, kPipelineWaitBudget - frame_pipeline_wait, [&p] {
+      return p.state.load(std::memory_order_acquire) != kCompiling;
+    });
+  }
+  const auto waited = std::chrono::steady_clock::now() - t0;
+  frame_pipeline_wait += waited;
+  stats.pso_wait_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(waited).count());
+  return true;
 }
 
 DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
@@ -1639,8 +1706,8 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
     b.RenderTargetWriteMask = rt.mask;
   }
   Pipeline* p = pipelines.emplace(hash, std::make_unique<Pipeline>()).first->second.get();
-  if (!prewarm) ++stats.pso_created;
-  if (pso_thread.joinable()) {
+  if (!pso_threads.empty()) {
+    p->prewarm = prewarm;
     {
       std::lock_guard<std::mutex> lock(pso_mutex);
       (prewarm ? prewarm_jobs : pso_jobs).push_back({p, d});
@@ -1859,6 +1926,11 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   if (!vs) {
     ++stats.failed;
     return;
+  }
+  if (bool_specialize) {
+    const uint32_t* bools = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
+    vs = vs_bools.Get(vs, bools);
+    ps = ps_bools.Get(ps, bools);
   }
 
   reg::VGT_DRAW_INITIATOR initiator;
@@ -2208,20 +2280,30 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     key.depth_bias = 0;
     key.slope_scaled_depth_bias = 0;
   }
-  bool pso_pending = false;
   const uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
   PsoMemo& pso_slot = pso_memo[key_hash & 1023];
-  ID3D12PipelineState* pso;
+  ID3D12PipelineState* pso = nullptr;
   if (pso_slot.pso && pso_slot.hash == key_hash) {
     pso = pso_slot.pso;
     ++diag.pso_hits;
   } else {
-    pso = GetPipeline(key, *vst, pst, &pso_pending);
-    if (pso) pso_slot = {key_hash, pso};
-  }
-  if (!pso) {
-    ++(pso_pending ? stats.pso_pending : stats.failed);
-    return;
+    Pipeline* p = GetPipeline(key_hash, key, *vst, pst);
+    uint8_t state = p->state.load(std::memory_order_acquire);
+    if (state == kCompiling) {
+      if (p->prewarm) PromotePipeline(p);
+      if (WaitForPipeline(*p)) state = p->state.load(std::memory_order_acquire);
+    }
+    if (state != kReady) {
+      if (state == kCompiling) {
+        ++stats.pso_pending;
+        ++frame_pending_draws;
+      } else {
+        ++stats.failed;
+      }
+      return;
+    }
+    pso = p->pso.Get();
+    pso_slot = {key_hash, pso};
   }
   profile::Mark(profile::kPipeline);
 
@@ -2803,6 +2885,12 @@ void DrawRenderer::LogClear(const ClearCall& c) {
   std::fprintf(f, "\n");
 }
 
+bool DrawRenderer::FrameIncomplete() const {
+  const Impl& m = *impl_;
+  return m.frame_pending_draws && m.pipeline_burst &&
+         std::max(m.frame_new_pipelines, m.last_frame_new_pipelines) >= m.pipeline_burst;
+}
+
 void DrawRenderer::EndFrame(uint64_t completed_fence) {
   stats_.watch_faults = impl_->watch_faults.exchange(0, std::memory_order_relaxed);
   stats_.watch_arms = impl_->watch_arms.exchange(0, std::memory_order_relaxed);
@@ -2822,6 +2910,9 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->Prewarm();
   impl_->store.Flush();
   impl_->frame_draws = 0;
+  impl_->last_frame_new_pipelines = std::exchange(impl_->frame_new_pipelines, 0);
+  impl_->frame_pipeline_wait = {};
+  impl_->frame_pending_draws = 0;
   impl_->WriteSnapshots(completed_fence);
   if (profile::g.on && ++impl_->diag.frames >= 300) {
     Impl::Diag& d = impl_->diag;

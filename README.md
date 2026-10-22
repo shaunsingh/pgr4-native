@@ -60,10 +60,10 @@ St Petersburg race, 40 s after the start (2026-10-22):
 
 | | |
 |---|---|
-| Average | 68-74 fps |
-| 1 % low | 33-47 fps |
+| Average | 72-75 fps |
+| 1 % low | 40-42 fps |
 | GPU | 82-92 % busy at 630-830 MHz (of 1600) |
-| APU power | 15 W cap reached in 99 % of samples: CPU 8.7 W, GPU 2.5 W, SoC 1.2 W |
+| APU power | 15 W cap reached in 99 % of samples: CPU 9.2 W, GPU 2.2 W, SoC 1.2 W |
 
 The APU's 15 W limit is shared, and the CPU takes most of it, so the GPU runs at about half its
 top clock. CPU time saved on any thread becomes GPU clock; GPU work saved shortens the frame
@@ -99,6 +99,20 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
 - `sample_b` (sampling with a LOD bias) translates to a biased sample with implicit gradients
   instead of explicit gradient math.
 - `--pgr4_native_shader_dump_dir` writes every translated shader (DXBC) for inspection.
+- Shaders are specialized for the guest's bool constants: branches on a bool constant are
+  resolved when the shader is translated, so the GPU no longer evaluates them per pixel (about
+  2 % of GPU time per race frame; `--pgr4_native_bool_specialize`).
+- Pipelines compile on up to four worker threads, and pipelines from the on-disk store are
+  built ahead of use and moved to the front of the queue when a draw needs one. When a frame
+  brings a burst of new pipelines (the race load brings 150-250), the renderer waits for them
+  (at most 500 ms per frame) and does not present a frame with draws still missing, so cars and
+  scenery no longer appear late or flicker at the start of a race. One loading pause replaces
+  a run of hitches: from a cold store the race's 1 % low went from 26 to 42 fps.
+- The pipeline store is safe to use from several threads.
+- `--pgr4_native_luma_probe` reads three rows of each presented frame back and logs their
+  brightness in the frame CSV, which finds black or flickering frames in a run without a
+  capture.
+
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game

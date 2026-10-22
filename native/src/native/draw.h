@@ -82,6 +82,7 @@ class DrawRenderer {
     uint64_t failed = 0;          // shader/PSO/RT/upload failures
     uint64_t pso_created = 0;
     uint64_t pso_pending = 0;     // draws skipped while their pipeline compiles (async)
+    uint64_t pso_wait_us = 0;     // draws waiting for their pipelines in a burst of new ones
     uint64_t upload_bytes = 0;    // guest memory copied into shared memory
     uint64_t uploads = 0;         // copy regions recorded
     uint64_t textures = 0, textures_missing = 0;  // bindings; missing = null SRV bound
@@ -133,6 +134,9 @@ class DrawRenderer {
   // Writes the clear into the draw log while one is open (draw-debug.txt bit 16).
   void LogClear(const ClearCall& c);
 
+  // At Swap, before EndFrame: the frame skipped draws in a burst of new pipelines (a scene's
+  // first frame, before its draws began waiting for them), so it is not worth showing.
+  bool FrameIncomplete() const;
   // Per frame, with the fence values of NativeRenderer (once per Swap, after EndFrame).
   void EndFrame(uint64_t completed_fence);
 

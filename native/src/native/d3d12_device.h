@@ -72,11 +72,12 @@ class D3D12Device {
   void WaitFence(uint64_t value);
 
   // Closes and submits the frame's command list (the caller recorded into the back buffer;
-  // EndFrame adds no barriers), presents, signals the frame fence, follows the parent window's
+  // EndFrame adds no barriers), presents (unless `present` is false: the window keeps the
+  // previous frame), signals the frame fence, follows the parent window's
   // client size (child mode), then waits for the slot kFramesInFlight frames back and opens the
   // next frame's list.
   // Returns false once the device or swapchain failed (logged once); the caller stops.
-  bool EndFrame();
+  bool EndFrame(bool present = true);
   // Where the last EndFrame spent its time.
   struct EndFrameTimes {
     uint64_t submit_ns = 0;   // Close + ExecuteCommandLists

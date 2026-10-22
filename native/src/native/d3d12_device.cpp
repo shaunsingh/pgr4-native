@@ -284,14 +284,14 @@ bool D3D12Device::OpenList() {
   return true;
 }
 
-bool D3D12Device::EndFrame() {
+bool D3D12Device::EndFrame(bool present) {
   const uint64_t t0 = NowNs();
   if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
   if (Failed(list_->Close(), "CommandList::Close")) return false;
   ID3D12CommandList* lists[] = {list_.Get()};
   queue_->ExecuteCommandLists(1, lists);
   const uint64_t t1 = NowNs();
-  HRESULT hr = !shown_ ? S_OK
+  HRESULT hr = !shown_ || !present ? S_OK
                : vsync_ ? swapchain_->Present(1, 0)
                         : swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
   end_frame_times_.submit_ns = t1 - t0;

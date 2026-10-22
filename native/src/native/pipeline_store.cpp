@@ -198,27 +198,36 @@ HRESULT PipelineLibrary::Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
   uint64_t h = XXH3_64bits(&plain, sizeof(plain));
   for (const D3D12_SHADER_BYTECODE* b : {&desc.VS, &desc.PS, &desc.DS, &desc.HS, &desc.GS})
     if (b->BytecodeLength) h = XXH3_64bits_withSeed(b->pShaderBytecode, b->BytecodeLength, h);
+  {
+    std::lock_guard<std::mutex> lock(busy_mutex_);
+    if (!busy_.insert(h).second)  // the same pipeline on another worker: bypass the library
+      return device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(out));
+  }
   wchar_t name[20];
   std::swprintf(name, 20, L"%016llX", static_cast<unsigned long long>(h));
-  if (SUCCEEDED(library_->LoadGraphicsPipeline(name, &desc, IID_PPV_ARGS(out)))) {
+  HRESULT hr = library_->LoadGraphicsPipeline(name, &desc, IID_PPV_ARGS(out));
+  if (SUCCEEDED(hr)) {
     *loaded = true;
-    ++loaded_;
-    return S_OK;
+    loaded_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(out));
+    if (SUCCEEDED(hr) && SUCCEEDED(library_->StorePipeline(name, *out))) {
+      stored_.fetch_add(1, std::memory_order_relaxed);
+      dirty_.store(true, std::memory_order_relaxed);
+    }
   }
-  const HRESULT hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(out));
-  if (SUCCEEDED(hr) && SUCCEEDED(library_->StorePipeline(name, *out))) {
-    dirty_ = true;
-    ++stored_;
-  }
+  std::lock_guard<std::mutex> lock(busy_mutex_);
+  busy_.erase(h);
   return hr;
 }
 
 void PipelineLibrary::Save() {
-  if (!library_ || !dirty_) return;
-  dirty_ = false;
+  if (!library_ || !dirty_.exchange(false, std::memory_order_relaxed)) return;
   std::vector<uint8_t> data(library_->GetSerializedSize());
   const HRESULT hr = library_->Serialize(data.data(), data.size());
   if (FAILED(hr)) {
+    // A pipeline stored since GetSerializedSize (another worker) makes the buffer too small.
+    dirty_.store(true, std::memory_order_relaxed);
     REXLOG_WARN("PGR4 native pipelines: library Serialize failed {:08X}", uint32_t(hr));
     return;
   }
@@ -231,7 +240,7 @@ void PipelineLibrary::Save() {
   std::error_code ec;
   if (ok) std::filesystem::rename(tmp, path_, ec);
   REXLOG_INFO("PGR4 native pipelines: library saved, {} KB ({} loaded, {} stored this run){}",
-              data.size() / 1024, loaded_, stored_, ok && !ec ? "" : " FAILED");
+              data.size() / 1024, loaded_.load(), stored_.load(), ok && !ec ? "" : " FAILED");
 }
 
 }  // namespace pgr4::native

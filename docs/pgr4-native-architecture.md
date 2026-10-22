@@ -170,7 +170,10 @@ scratch row.
 | `pgr4_native` | false | Native renderer beside Xenos, debug window |
 | `pgr4_native_primary` | false | Native renderer is the game's output; sets `gpu_skip_draws` |
 | `pgr4_native_render_thread` | true | Capture on the game thread, record on `PGR4 native render`. On by default since 2026-10-21 23:20 although one race oracle capture in three drops to 29.5-29.6 dB (wrong geometry, unexplained) |
-| `pgr4_native_async_pipelines` | true | PSOs on a worker; draws skipped until ready (`pso_pending`) |
+| `pgr4_native_async_pipelines` | true | PSOs on workers; draws skipped until ready (`pso_pending`) |
+| `pgr4_native_pipeline_threads` | 0 | Compile threads (0: a quarter of the hardware threads, 1-4) |
+| `pgr4_native_pipeline_burst` | 8 | From this many new pipelines in a frame, draws wait for theirs (`pso_wait_us`, at most 0.5 s per frame) and a frame that skipped some is not presented (`held`) |
+| `pgr4_native_luma_probe` | false | Front buffer row brightness per frame in the CSV (black-frame hunting) |
 | `pgr4_native_pipeline_cache` | true | `pipelines.bin` + prewarm + pipeline library |
 | `pgr4_native_dynamic_depth_bias` | true | `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` + `RSSetDepthBias` when `DynamicDepthBiasSupported`; PGR4 animates polygon offset, which made 821 of 1,088 pipelines depth-bias variants |
 | `pgr4_native_csv` | "" | Frame CSV path (`run.ps1 -Native` sets `<log base>-native.csv`) |
@@ -193,7 +196,13 @@ Always: `frame, draws, clears, resolves, state_fail, draw_us, clear_us, resolve_
 us_per_draw, frame_ms, host_draws, skipped, unsupported, failed, pso_created, upload_kb,
 textures, textures_missing, front_buffer`. With the render thread: `hook_us` (game-thread time
 in the On* calls), `hook_wait_us` (waiting for the render thread at Swap), `reg_writes`
-(register values replayed).
+(register values replayed). Then `swap_untile_us, swap_submit_us, swap_present_us, swap_fence_us,
+hook_max_us, watch_faults, gpu_prev_ms, copy_batches, watch_arms, watch_arm_pages, t_ms,
+hash_pages, hash_copies`, `pso_pending` (draws dropped while their pipeline compiles) and
+`pso_wait_us` (time draws waited for their pipelines in a burst of new ones), `held` (1: the
+frame was not presented, it skipped draws in such a burst). With `--pgr4_native_luma_probe`, last:
+`luma_frame, luma_top, luma_mid, luma_low` (mean brightness 0-255 of front buffer rows at 10, 40
+and 80 % of its height, for the frame `luma_frame`).
 
 With `--pgr4_native_profile`, also:
 - `st_<stage>_us` for each stage in `profile.h`: `read_state, shaders, setup, rt_bind,
@@ -204,7 +213,7 @@ With `--pgr4_native_profile`, also:
   hook, including nested tracking. These four are left out of the stage sum.
 - `track_calls, tex_memo_miss, tex_created, tex_create_us, tex_uploads, tex_upload_kb,
   tex_upload_us, tex_untile_us` (worker CPU), `tex_resolved_copies, tex_copy_resolved_us,
-  srv_lookups, srv_created, samplers_created, bind_hits, bind_misses, pso_pending`.
+  tex_resolved_aliases, srv_lookups, srv_created, samplers_created, bind_hits, bind_misses`.
 - Counters (`profile.h` `kCounterNames`): `bind_hit, bind_mru, bind_miss_empty,
   bind_miss_fetch, bind_miss_tex, bind_nomemo, get_miss_fetch, get_miss_changed, srv_memo_hit,
   tex_upload_skip`.

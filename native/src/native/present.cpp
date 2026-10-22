@@ -33,6 +33,10 @@ REXCVAR_DEFINE_INT32(pgr4_native_capture_frame, -1, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_capture_hold_ms, 500, "PGR4 native",
                      "How long a capture holds the guest thread in Swap so the Xenos plugin "
                      "finishes the frame before its front buffer is read from guest memory");
+REXCVAR_DEFINE_BOOL(pgr4_native_luma_probe, false, "PGR4 native",
+                    "Read back three rows of every front buffer (at 10, 40 and 80 % of its "
+                    "height) and log their mean brightness in the frame CSV, to find frames "
+                    "drawn partly black");
 
 namespace pgr4::native {
 
@@ -260,7 +264,23 @@ struct Presenter::Impl {
   } capture;
   bool log_fmt = false, log_missing = false;
 
+  // --pgr4_native_luma_probe: kProbeRows rows of each front buffer, a readback slot per frame in
+  // flight, read when the slot comes round again (its frame has completed).
+  static constexpr uint32_t kProbeRows = 3;
+  struct ProbeSlot {
+    uint64_t frame = 0;
+    uint32_t width = 0, mapping = 0;
+    bool rgb10a2 = false, recorded = false;
+  } probe_slots[D3D12Device::kFramesInFlight];
+  ComPtr<ID3D12Resource> probe_buffer;
+  const uint8_t* probe_mapped = nullptr;
+  LumaProbe probe_result;
+  std::vector<uint8_t> probe_rgb;
+
   explicit Impl(NativeRenderer& renderer) : r(renderer) {}
+  // Reads the slot's previous rows into probe_result, then records this frame's copies.
+  void Probe(ID3D12GraphicsCommandList* list, uint32_t slot, const ResolvedImage& image,
+             uint32_t mapping, bool rgb10a2);
 
   bool Initialize();
   // Copies the guest's current ramp of the mode into the frame's slot; false without one.
@@ -572,6 +592,8 @@ void Presenter::OnSwap(const SwapCall& swap) {
   }
   std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
   list->ResourceBarrier(1, &b);
+  if (last_found_ && REXCVAR_GET(pgr4_native_luma_probe))
+    m.Probe(list, d.frame_slot(), *image, mapping, format == xenos::TextureFormat::k_2_10_10_10);
 
   // A request arms the capture of the next frame: its resolves must reach guest memory
   // synchronously (HoldFullReadback), or the Xenos copy is the previous frame's.
@@ -626,6 +648,64 @@ void Presenter::OnSwap(const SwapCall& swap) {
     c.rgb10a2 = format == xenos::TextureFormat::k_2_10_10_10;
   }
 }
+
+void Presenter::Impl::Probe(ID3D12GraphicsCommandList* list, uint32_t slot,
+                             const ResolvedImage& image, uint32_t mapping, bool rgb10a2) {
+  // A row of the widest texture each, so the buffer never grows while a slot is in flight.
+  constexpr uint32_t kRowBytes = 8192 * 4;
+  if (!probe_buffer) {
+    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = uint64_t(kRowBytes) * kProbeRows * D3D12Device::kFramesInFlight;
+    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* mapped = nullptr;
+    if (Failed(r.d3d12()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&probe_buffer)),
+               "luma probe readback") ||
+        FAILED(probe_buffer->Map(0, nullptr, &mapped))) {
+      probe_buffer.Reset();
+      return;
+    }
+    probe_mapped = static_cast<const uint8_t*>(mapped);
+  }
+  ProbeSlot& ps = probe_slots[slot];
+  if (ps.recorded) {
+    probe_result.frame = ps.frame;
+    for (uint32_t i = 0; i < kProbeRows; ++i) {
+      ToRgb(probe_mapped + size_t(slot * kProbeRows + i) * kRowBytes, kRowBytes, ps.width, 1,
+            ps.mapping, ps.rgb10a2, &probe_rgb);
+      uint64_t sum = 0;
+      for (uint8_t v : probe_rgb) sum += v;
+      probe_result.luma[i] = float(double(sum) / double(probe_rgb.size()));
+    }
+  }
+  const D3D12_RESOURCE_DESC desc = image.texture->GetDesc();
+  const uint32_t w = std::min<uint32_t>(
+      {image.width ? image.width : uint32_t(desc.Width), uint32_t(desc.Width), 8192u});
+  const uint32_t h = std::min<uint32_t>(image.height ? image.height : desc.Height, desc.Height);
+  const uint32_t pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                         ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+  for (uint32_t i = 0; i < kProbeRows; ++i) {
+    static constexpr uint32_t kRowPercent[kProbeRows] = {10, 40, 80};
+    const uint32_t y = h * kRowPercent[i] / 100;
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = probe_buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = uint64_t(slot * kProbeRows + i) * kRowBytes;
+    dst.PlacedFootprint.Footprint = {desc.Format, w, 1, 1, pitch};
+    src.pResource = image.texture;  // COPY_SOURCE | shader resource (the Resolver's read state)
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX box = {0, y, 0, w, y + 1, 1};
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+  }
+  ps = {r.frame_index(), w, mapping, rgb10a2, true};
+}
+
+const LumaProbe& Presenter::luma_probe() const { return impl_->probe_result; }
 
 void Presenter::AfterEndFrame(const uint8_t* base) {
   if (impl_->capture.pending) impl_->FinishCapture(base);

@@ -33,6 +33,13 @@
 
 namespace pgr4::native {
 
+// --pgr4_native_luma_probe: the mean brightness (0-255, before the gamma ramp) of three rows of
+// a front buffer, at 10, 40 and 80 % of its height, kFramesInFlight frames after it was drawn.
+struct LumaProbe {
+  uint64_t frame = 0;  // the frame they belong to (0: none yet)
+  float luma[3] = {};
+};
+
 // What OnSwap needs from the guest Swap call (read at the call).
 struct SwapCall {
   uint32_t texture = 0;  // r4: the front buffer D3DBaseTexture (0 = none)
@@ -65,6 +72,7 @@ class Presenter {
   void AfterEndFrame(const uint8_t* base);
 
   bool front_buffer_found() const { return last_found_; }
+  const LumaProbe& luma_probe() const;
 
  private:
   struct Impl;
