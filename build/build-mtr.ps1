@@ -57,8 +57,9 @@ function Step([string]$Name, [scriptblock]$Body) {
 # CMakePresets add -march=x86-64-v2; rexglue_apply_target_settings adds -msse4.1 only when not
 # MSVC. Without them src\core\memory.cpp fails: "_mm_shuffle_epi8 requires target feature
 # 'ssse3'". CFLAGS/CXXFLAGS seed CMAKE_<LANG>_FLAGS on a fresh configure, so set the
-# equivalents here for the SDK and the game builds alike.
-$ClangClFlags = '/clang:-march=x86-64-v2 /clang:-ffp-model=strict /Zc:char8_t-'
+# equivalents here for the SDK and the game builds alike. The FP model is precise, not ReXGlue's
+# strict, which blocks most FP optimization of the generated code (see native/build.sh).
+$ClangClFlags = '/clang:-march=x86-64-v2 /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-'
 function Use-VcEnv {
     if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') {
         if (-not (Test-Path $Vcvars)) { throw "vcvars64.bat not found: $Vcvars" }

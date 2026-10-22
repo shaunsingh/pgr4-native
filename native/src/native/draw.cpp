@@ -1848,6 +1848,7 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
 void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep,
                                  std::vector<VertexCopy>* out) {
   *prep = DrawPrep{};
+  prep->captured = r.textures().MarkCapture();
   if (!s.vs.ucode || !s.vs.dwords) return;
   prep->vs = LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
   prep->ps = LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
@@ -2315,6 +2316,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   uint32_t desc_vs[64], desc_ps[64];
   uint8_t signs[32] = {};
   TextureCache& texture_cache = r.textures();
+  const uint64_t captured = prep ? prep->captured : TextureCache::kCapturedNow;
   auto bind_textures = [&](const DxbcShader& shader, uint32_t* indices) -> uint32_t {
     const auto& tex = shader.GetTextureBindingsAfterTranslation();
     const auto& smp = shader.GetSamplerBindingsAfterTranslation();
@@ -2405,7 +2407,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     profile::Scope miss_scope(profile::kTexMiss);
     ++stats.bind_memo_misses;
     std::fill(indices, indices + n, 0u);
-    uint32_t bound = 0, textures = 0, missing = 0;
+    uint32_t bound = 0, textures = 0, missing = 0, stale = 0;
     for (const auto& tb : tex) {
       ++textures;
       TextureBinding b;
@@ -2414,7 +2416,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
       bool got;
       {
         profile::Scope get_scope(profile::kTexGet);
-        got = texture_cache.Get(fetch, list, r.frame_fence(), &b) && b.resource;
+        got = texture_cache.Get(fetch, list, r.frame_fence(), &b, captured) && b.resource;
       }
       if (draw_log)
         std::fprintf(draw_log, "  tf%u %08X fmt=%u %ux%ux%u dim=%u tiled=%u mips=%u%s%s\n",
@@ -2424,6 +2426,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
                      got && b.aliased ? " alias" : "");
       if (got) {
         profile::Scope srv_scope(profile::kTexSrv);
+        stale += b.stale;
         const uint32_t mapping = b.srv.Shader4ComponentMapping;
         const uint64_t sh = (uint64_t(reinterpret_cast<uintptr_t>(b.resource)) ^
                              (uint64_t(mapping) << 32) ^ (uint64_t(tb.is_signed) << 3) ^
@@ -2481,7 +2484,8 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     }
     stats.textures += textures;
     stats.textures_missing += missing;
-    if (bm && !missing) {
+    stats.textures_stale += stale;
+    if (bm && !missing && !stale) {
       bm->shader = &shader;
       bm->epoch = epoch;
       uint32_t* stored = bm->data;

@@ -56,6 +56,10 @@ struct TextureBinding {
   TextureKey key;
   const void* entry = nullptr;  // the cache's texture, for TextureCache::Unchanged
   bool aliased = false;  // `resource` is a resolved image bound in place of the texture's own
+  // The game wrote the texture's memory after it queued the draw. With capture order on, bound
+  // with the data from before that write, which is still to be uploaded for later draws (not
+  // memoizable).
+  bool stale = false;
 };
 
 class TextureCache {
@@ -63,6 +67,7 @@ class TextureCache {
   struct Stats {
     uint64_t gets = 0, uploads = 0, upload_bytes = 0, resolved_copies = 0, resolved_aliases = 0;
     uint64_t unsupported = 0, untile_ns = 0;
+    uint64_t stale = 0;  // Gets for draws queued before a newer guest write of the texture
     // Profile counters (cumulative): memo misses, textures created, time in Create (resource
     // creation), Upload (buffer creation + untile + copies) and CopyResolved.
     uint64_t memo_misses = 0, created = 0, create_ns = 0, upload_ns = 0, copy_resolved_ns = 0;
@@ -84,12 +89,23 @@ class TextureCache {
   // Get.
   void OnResolved(uint32_t guest_physical);
 
+  // Capture order. With the render thread, Get runs up to a frame after the game captured the
+  // draw, and in primary mode the game may rewrite texture memory (update a dynamic texture or
+  // stream another one into it) as soon as it has queued the draws that read it. The guest thread stamps each draw with
+  // MarkCapture; the first write that stales an uploaded texture records the last stamp handed
+  // out, and a Get for a draw stamped at or before it binds the texture's current data, which
+  // predates the write. kCapturedNow: the draw sees guest memory as it is now. With capture
+  // order off, such Gets upload the newer data instead (and still count as stale).
+  static constexpr uint64_t kCapturedNow = ~0ull;
+  uint64_t MarkCapture() { return capture_seq_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+  void SetCaptureOrder(bool on) { capture_order_ = on; }
+
   // The texture for a fetch constant (6 dwords as in the register file), uploaded or copied on
   // `list` first if needed. frame_fence: the fence value that completes the frame `list`
-  // belongs to (upload buffers are kept until then). False: no data, unsupported format, or
-  // a D3D12 failure (each logged once per key).
+  // belongs to (upload buffers are kept until then). captured: the draw's MarkCapture stamp.
+  // False: no data, unsupported format, or a D3D12 failure (each logged once per key).
   bool Get(const uint32_t fetch[6], ID3D12GraphicsCommandList* list, uint64_t frame_fence,
-           TextureBinding* out);
+           TextureBinding* out, uint64_t captured = kCapturedNow);
 
   // In the game, untiling runs on worker threads: Upload records the GPU copies at once and
   // queues the untile into their upload memory (offline it runs inline). Call this before the
@@ -171,6 +187,10 @@ class TextureCache {
   static constexpr uint32_t kGetMemoBits = 10;
   std::unique_ptr<GetMemo[]> get_memo_{new GetMemo[size_t(1) << kGetMemoBits]};
   std::atomic<uint64_t> change_epoch_{1};
+  std::atomic<uint64_t> capture_seq_{0};  // MarkCapture stamps handed out
+  bool capture_order_ = true;
+  static constexpr uint32_t kStaleLogLimit = 96;  // log lines about stale textures
+  uint32_t stale_logged_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKeyHasher> textures_;
   // The watched ranges of every texture, listed in each 64 KB bucket of guest physical memory

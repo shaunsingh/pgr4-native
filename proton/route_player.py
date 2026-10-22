@@ -193,9 +193,14 @@ class Gamescope(X11):
 
     def focused(self, win: str) -> bool:
         focus = self._xdo("getwindowfocus", "-f")
-        # Wine may focus a child X window of the game's top-level window.
-        return focus not in ("", "0", "1") and (focus == win or self._xdo("getwindowpid", focus) ==
-                                                self._xdo("getwindowpid", win) != "")
+        if focus in ("", "0", "1"):
+            return False
+        if focus == win:
+            return True
+        # Wine may focus a child X window of the game's top-level window. The native renderer's
+        # debug window (--mode oracle) is the same process but does not take the game's input.
+        return (self._xdo("getwindowpid", focus) == self._xdo("getwindowpid", win) != "" and
+                not self._xdo("getwindowname", focus).startswith("PGR4 native"))
 
     def focus(self, win: str) -> bool:
         if win not in self._xdo("search", "--onlyvisible", "--name", ".").split():

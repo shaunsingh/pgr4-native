@@ -109,9 +109,29 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   scenery no longer appear late or flicker at the start of a race. One loading pause replaces
   a run of hitches: from a cold store the race's 1 % low went from 26 to 42 fps.
 - The pipeline store is safe to use from several threads.
-- `--pgr4_native_luma_probe` reads three rows of each presented frame back and logs their
-  brightness in the frame CSV, which finds black or flickering frames in a run without a
-  capture.
+- `--pgr4_native_luma_probe` reads three rows of each presented frame back and logs the
+  brightness of each quarter of them in the frame CSV, which finds black or flickering frames
+  (or one flashing object) in a run without a capture.
+- Textures keep the data their draw was queued with. The render thread reads a texture up to a
+  frame after the game queued the draw, and in primary mode the game's fences signal at once,
+  so the game may already have streamed new data into that memory. Each draw is stamped when it
+  is queued; the first write to an uploaded texture records the latest stamp, and the draws
+  queued before it bind the texture as it was. In a race, 100-280 texture bindings per frame
+  keep their older data during stretches of the lap (`tex_stale` in the frame CSV,
+  `--pgr4_native_texture_capture_order`). Nearly all of them read two textures the game
+  rewrites hundreds of times a race (256x512 RGB565 and 512x512 8-bit, read by about 100
+  scenery draws a frame); without this, those draws could pick up the next update early, a
+  likely cause of buildings flashing dark or bright for a frame.
+- Floating point: the Linux build compiles with `-ffp-model=precise -fno-math-errno` instead of
+  `strict`. clang-cl ignored the `strict` flag in the Windows builds, so all builds now use the
+  same model. Generated code spells out fused multiply-adds with `std::fma`, so contraction does
+  not change guest results. No change in frame rate was measured.
+- `frame_times.py` also reports a fixed race window (9-45 s after the pre-race grid shot, the
+  same span of game frames in every run) and checks the route against a reference
+  (`run/route-stpetersburg.draws`, draws per frame each second): a run whose car takes another
+  line, or stops against a barrier, reports where it diverged. Runs part ways only from about
+  46 s after the grid shot.
+- `perf_symbols.py` names samples in Wine DLLs by their nearest export.
 
 ## Why a native renderer can beat emulation
 

@@ -44,7 +44,10 @@ struct TextureCache::Texture {
   uint32_t base_bytes = 0, mips_bytes = 0;
   // Set by the invalidation callback (any thread), cleared before the guest memory is read.
   std::atomic<bool> dirty{true};
+  // The last MarkCapture stamp when a write set `dirty` (stored before it, under watch_mutex_).
+  std::atomic<uint64_t> write_mark{0};
   bool failed = false;  // unsupported or creation failed; logged once, never retried
+  uint64_t stale_gets = 0;  // for the log
   std::vector<uint64_t> resolved_seq;  // per subresource; 0 = holds guest-memory data
   // A resolve may have changed an image at one of its subresource addresses (OnResolved), or
   // the texture was uploaded: the next Get runs CopyResolved.
@@ -220,10 +223,16 @@ std::pair<uint32_t, uint32_t> TextureCache::Invalidate(uint32_t start, uint32_t 
   bool any = false;
   {
     std::lock_guard<std::mutex> lock(watch_mutex_);
+    const uint64_t mark = capture_seq_.load(std::memory_order_acquire);
     for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b) {
       for (const Watch& w : watch_buckets_[b]) {
         if (w.start < end && start < w.end) {
-          w.texture->dirty.store(true, std::memory_order_release);
+          Texture& t = *w.texture;
+          // The first write since the data was read: draws captured until now predate it.
+          if (!t.dirty.load(std::memory_order_acquire)) {
+            t.write_mark.store(mark, std::memory_order_relaxed);
+            t.dirty.store(true, std::memory_order_release);
+          }
           any = true;
         }
       }
@@ -582,7 +591,7 @@ bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
 }
 
 bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList* list,
-                       uint64_t frame_fence, TextureBinding* out) {
+                       uint64_t frame_fence, TextureBinding* out, uint64_t captured) {
   ++stats_.gets;
   uint32_t hash = 0;
   for (int i = 0; i < 6; ++i) hash = (hash ^ fetch_dwords[i]) * 0x9E3779B1u;
@@ -626,7 +635,20 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
     return false;
   }
   const bool was_dirty = t->dirty.load(std::memory_order_acquire);
-  if (was_dirty) {
+  const bool stale =
+      was_dirty && t->uploads && captured <= t->write_mark.load(std::memory_order_relaxed);
+  stats_.stale += stale;
+  // Logged at its 1st, 256th, 512th, 1024th... stale Get.
+  if (stale && stale_logged_ < kStaleLogLimit &&
+      (++t->stale_gets == 1 || (t->stale_gets >= 256 && !(t->stale_gets & (t->stale_gets - 1))))) {
+    ++stale_logged_;
+    REXLOG_INFO("PGR4 native textures: {:08X} {}x{}x{} {} mips {} rewritten after a draw that "
+                "reads it was queued: {} times (upload {}, get {})",
+                key.base_page << 12, key.width, key.height, key.depth_or_array_size,
+                rex::graphics::FormatInfo::Get(key.format)->name, key.mip_levels(), t->stale_gets,
+                t->uploads, stats_.gets);
+  }
+  if (was_dirty && !(stale && capture_order_)) {
     const uint64_t u0 = NowNs();
     const bool uploaded = Upload(*t, list, frame_fence);
     stats_.upload_ns += NowNs() - u0;
@@ -668,6 +690,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   out->key = key;
   out->entry = t;
   out->aliased = t->alias != nullptr;
+  out->stale = stale;
   out->srv_signed_format = t->host->snorm;
   out->swizzled_signs = texture_util::SwizzleSigns(fetch);
   D3D12_SHADER_RESOURCE_VIEW_DESC& srv = out->srv;
@@ -692,6 +715,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   std::memcpy(memo.fetch, fetch_dwords, sizeof(memo.fetch));
   memo.texture = t;
   memo.binding = *out;
+  memo.binding.stale = false;  // a memo hit needs the texture clean
   return true;
 }
 

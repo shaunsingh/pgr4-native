@@ -80,8 +80,15 @@ patches=("$repo_root/instrument/rexglue-drawcount.patch" "$here/rexglue-native-p
 sources=("$here/src/pgr4_d3d_trace.cpp" "$here/src/d3d_surface.inc")
 native_src=$here/src/native
 # build.ps1's flags (see build-mtr.ps1 for why clang-cl needs them spelled out), with the
-# target CPU from --march / --mtune.
-clang_cl_flags="/clang:-march=$march /clang:-mtune=$mtune /clang:-ffp-model=strict /Zc:char8_t-"
+# target CPU from --march / --mtune. Precise FP, not ReXGlue's strict: strict turns every FP
+# operation into a constrained intrinsic, which keeps LLVM from narrowing the guest's
+# double(float(a op b)) to single precision, vectorizing, hoisting or scheduling FP code, and
+# MTR's own clang-cl builds never had it (clang-cl drops the GNU spelling). The guest's FPSCR
+# writes still reach MXCSR; the compiler only assumes round-to-nearest when folding constants,
+# and the game sets the rounding mode in 5 places. Host FP exceptions are masked
+# (FPSCRPlatform::InitHostExceptions), so speculated FP operations cannot trap. No caller reads
+# errno after a math function, so sqrt and friends compile to bare instructions.
+clang_cl_flags="/clang:-march=$march /clang:-mtune=$mtune /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-"
 export PATH=$HOME/recomp/tools/bin:$PATH
 
 IFS=, read -ra stage_list <<< "$stages"

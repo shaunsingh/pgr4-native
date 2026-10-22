@@ -3,8 +3,9 @@
 
 perf cannot read the symbols of PE images, so samples in the recompiled exe and ReXGlue's DLLs
 are resolved here with the lld-link map files that native/build.sh links them with (/MAP), at
-the load addresses the game's /proc/<pid>/maps showed during the recording. Samples elsewhere
-(Wine, Mesa, libc) keep perf's own symbols.
+the load addresses the game's /proc/<pid>/maps showed during the recording. Samples in other PE
+images (Wine's ucrtbase, ntdll, d3d12core...) go to the nearest export at or below them, shown
+as "name+". Samples elsewhere (Wine's Unix side, Mesa, libc) keep perf's own symbols.
 
   perf_symbols.py <perf.data> <maps> <module.map>... [--top 25] [--threads 6] [--undname CMD]
 
@@ -67,6 +68,66 @@ def image_size(map_path: str) -> int:
     return 0
 
 
+class PeExports:
+    """Export table of a PE image on disk: a module without a map file or symbols."""
+
+    def __init__(self, path: str, base: int):
+        self.base = base
+        self.rvas, self.names = [], []
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            return
+        opt = pe + 24
+        sections_at = opt + struct.unpack_from("<H", data, pe + 20)[0]
+        sections = [struct.unpack_from("<IIII", data, sections_at + 40 * i + 8)
+                    for i in range(struct.unpack_from("<H", data, pe + 6)[0])]
+
+        def offset(rva: int) -> int:
+            for vsize, va, rawsize, raw in sections:
+                if va <= rva < va + max(vsize, rawsize):
+                    return rva - va + raw
+            return rva
+
+        data_dirs = opt + (112 if struct.unpack_from("<H", data, opt)[0] == 0x20B else 96)
+        export_rva, export_size = struct.unpack_from("<II", data, data_dirs)
+        if not export_rva:
+            return
+        e = offset(export_rva)
+        count, functions, names, ordinals = struct.unpack_from("<4I", data, e + 24)
+        function_rvas = struct.unpack_from(f"<{struct.unpack_from('<I', data, e + 20)[0]}I", data,
+                                           offset(functions))
+        symbols = {}
+        for i in range(count):
+            name_at = offset(struct.unpack_from("<I", data, offset(names) + 4 * i)[0])
+            name = data[name_at:data.index(b"\0", name_at)].decode("ascii", "replace")
+            rva = function_rvas[struct.unpack_from("<H", data, offset(ordinals) + 2 * i)[0]]
+            if not export_rva <= rva < export_rva + export_size:  # not a forwarder
+                symbols.setdefault(rva, name)
+        self.rvas = sorted(symbols)
+        self.names = [symbols[r] + "+" for r in self.rvas]
+
+    def lookup(self, ip: int):
+        i = bisect.bisect_right(self.rvas, ip - self.base) - 1
+        return self.names[i] if i >= 0 else None
+
+
+def pe_bases(maps_path: str) -> dict:
+    """Lowest mapping (the image header) of every .dll/.exe file in the maps."""
+    bases = {}
+    for line in open(maps_path):
+        parts = line.split(maxsplit=5)
+        if len(parts) == 6 and parts[5].strip().lower().endswith((".dll", ".exe")):
+            path = parts[5].strip()
+            start = int(parts[0].split("-")[0], 16)
+            bases[path] = min(bases.get(path, start), start)
+    return bases
+
+
 def load_bases(maps_path: str, modules) -> None:
     """Each module's image: from its lowest file mapping (the header) over SizeOfImage. Wine
     copies sections that are not page-aligned in the file into anonymous memory, so the file
@@ -120,6 +181,8 @@ def main() -> None:
         if m.base is None:
             print(f"{m.name}: not in {args.maps}; its samples stay unresolved", file=sys.stderr)
     modules = [m for m in modules if m.base is not None]
+    bases = pe_bases(args.maps)
+    exports = {}
 
     script = subprocess.run(["perf", "script", "-i", args.data, "-F", "comm,tid,ip,sym,dso"],
                             capture_output=True, text=True, errors="replace")
@@ -144,6 +207,10 @@ def main() -> None:
             key = ("[kernel]", "[kernel]")
         else:
             dso_name = os.path.basename(dso) if dso else "[unknown]"
+            if (not sym or sym == "[unknown]") and dso in bases:
+                if dso not in exports:
+                    exports[dso] = PeExports(dso, bases[dso])
+                sym = exports[dso].lookup(ip)
             key = (dso_name, sym if sym and sym != "[unknown]" else dso_name)
         total += 1
         by_symbol[key] += 1

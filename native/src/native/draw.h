@@ -71,6 +71,7 @@ struct DrawPrep {
   D3D12_GPU_VIRTUAL_ADDRESS fan_indices = 0;
   uint32_t fan_count = 0;
   bool fan_wide = false;
+  uint64_t captured = ~0ull;  // TextureCache::MarkCapture stamp (kCapturedNow: none)
 };
 
 class DrawRenderer {
@@ -86,6 +87,7 @@ class DrawRenderer {
     uint64_t upload_bytes = 0;    // guest memory copied into shared memory
     uint64_t uploads = 0;         // copy regions recorded
     uint64_t textures = 0, textures_missing = 0;  // bindings; missing = null SRV bound
+    uint64_t textures_stale = 0;  // bindings for draws queued before a newer guest write
     uint64_t srv_lookups = 0, srv_created = 0, samplers_created = 0;
     uint64_t bind_memo_hits = 0, bind_memo_misses = 0;  // whole-shader texture binding memo
     uint64_t watch_faults = 0;    // guest writes caught by a page watch (any watcher), per frame

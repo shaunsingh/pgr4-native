@@ -12,7 +12,7 @@
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
-#               [--output NAME]
+#               [--output NAME] [--captures "5 10 15"]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -36,7 +36,8 @@
 # ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is, so the released
 # MTR-PGR4 runtime runs too (--mode none: it has no native renderer).
 # --mode none runs Xenos alone; primary runs the native renderer as the presenter; oracle runs
-# both and captures their front buffers 5, 10 and 15 s after the race mark (see run.sh).
+# both and captures their front buffers 5, 10 and 15 s after the race mark (see run.sh), or at
+# the seconds after the mark that --captures lists (ascending, fractions allowed).
 # --stretch scales every delay of the route, for a machine that loads slower than the PC it was
 # timed on. --cpus pins the game with taskset. Logs: ~/pgr4-proton/logs/.
 set -euo pipefail
@@ -46,6 +47,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
+captures="5 10 15"
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --perf) perf_secs=$2; shift 2 ;;
     --refresh) refresh=$2; shift 2 ;;
     --output) output=$2; shift 2 ;;
+    --captures) captures=$2; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -302,8 +305,12 @@ if (( perf_secs > 0 )); then
 fi
 if [[ $mode == oracle ]]; then
   # The game takes one capture per request file at its next Swap and deletes the file.
-  for _ in 1 2 3; do nap 5; : > "$capdir/capture.request"; done
-  nap $((hold > 15 ? hold - 15 : 0))
+  waited=0
+  for at in $captures; do
+    nap "$(awk -v a="$at" -v w="$waited" 'BEGIN { d = a - w; print (d > 0 ? d : 0) }')"
+    waited=$at; : > "$capdir/capture.request"
+  done
+  nap "$(awk -v h="$hold" -v w="$waited" 'BEGIN { d = h - w; print (d > 0 ? d : 0) }')"
   echo "captures:"; cat "$capdir/captures.csv" 2>/dev/null || echo "  none"
 else
   nap 10; shoot race-10s
@@ -325,7 +332,9 @@ if [[ -n ${perfrec:-} ]]; then
 fi
 fps=$(python3 "$repo/native/tools/perf_fps.py" "$base.log" "$race_hms" 40 2>&1 || true)
 head -n 1 <<< "$fps"
-[[ -s $base-frames.csv ]] && { python3 "$repo/native/tools/frame_times.py" "$base-frames.csv" "$base.log" "$race_hms" 40 || true; }
+ref_draws=$repo/run/route-stpetersburg.draws
+[[ -s $base-frames.csv ]] && { python3 "$repo/native/tools/frame_times.py" "$base-frames.csv" "$base.log" "$race_hms" 40 \
+  ${ref_draws:+--ref "$ref_draws"} || true; }
 python3 "$here/deck_sampler.py" summary "$base-sampler.csv" "$race_hms" 40 || true
 # For ab_compare.py: side,log,mark rows are built from these lines.
 echo "RESULT $tag $base.log $race_iso $alive"

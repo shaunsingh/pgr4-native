@@ -77,7 +77,7 @@ function Step([string]$Name, [scriptblock]$Body) {
 }
 
 # Same environment as build-mtr.ps1 (see the comment there for the clang-cl flags).
-$ClangClFlags = '/clang:-march=x86-64-v2 /clang:-ffp-model=strict /Zc:char8_t-'
+$ClangClFlags = '/clang:-march=x86-64-v2 /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-'
 function Use-VcEnv {
     if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') {
         if (-not (Test-Path $Vcvars)) { throw "vcvars64.bat not found: $Vcvars" }

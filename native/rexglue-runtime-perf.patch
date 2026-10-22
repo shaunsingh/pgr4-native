@@ -1620,3 +1620,16 @@ diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor
  #if REX_PLATFORM_WIN32
    SignalRingWriteEvent(write_ptr_index_event_.get(), REXCVAR_GET(gpu_ring_wake_fast));
  #else
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -131,7 +131,8 @@ endif()
+ # Global compile options
+ add_compile_options(
+     -fno-strict-aliasing
+-    -ffp-model=strict
++    -ffp-model=precise
++    -fno-math-errno
+     $<$<CONFIG:DEBUG>:-g>
+     $<$<CONFIG:DEBUG>:-O0>
+     $<$<CONFIG:RELEASE>:-O3>

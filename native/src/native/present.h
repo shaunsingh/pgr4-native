@@ -33,11 +33,14 @@
 
 namespace pgr4::native {
 
-// --pgr4_native_luma_probe: the mean brightness (0-255, before the gamma ramp) of three rows of
-// a front buffer, at 10, 40 and 80 % of its height, kFramesInFlight frames after it was drawn.
+// --pgr4_native_luma_probe: the mean brightness (0-255, before the gamma ramp) of each quarter
+// of three rows of a front buffer, at 10, 40 and 80 % of its height (left to right), read
+// kFramesInFlight frames after it was drawn. Quarters, as a whole-row mean hides a flash
+// confined to one object.
 struct LumaProbe {
+  static constexpr uint32_t kRows = 3, kSegments = 4;
   uint64_t frame = 0;  // the frame they belong to (0: none yet)
-  float luma[3] = {};
+  float luma[kRows][kSegments] = {};
 };
 
 // What OnSwap needs from the guest Swap call (read at the call).

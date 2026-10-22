@@ -266,7 +266,7 @@ struct Presenter::Impl {
 
   // --pgr4_native_luma_probe: kProbeRows rows of each front buffer, a readback slot per frame in
   // flight, read when the slot comes round again (its frame has completed).
-  static constexpr uint32_t kProbeRows = 3;
+  static constexpr uint32_t kProbeRows = LumaProbe::kRows;
   struct ProbeSlot {
     uint64_t frame = 0;
     uint32_t width = 0, mapping = 0;
@@ -678,9 +678,13 @@ void Presenter::Impl::Probe(ID3D12GraphicsCommandList* list, uint32_t slot,
     for (uint32_t i = 0; i < kProbeRows; ++i) {
       ToRgb(probe_mapped + size_t(slot * kProbeRows + i) * kRowBytes, kRowBytes, ps.width, 1,
             ps.mapping, ps.rgb10a2, &probe_rgb);
-      uint64_t sum = 0;
-      for (uint8_t v : probe_rgb) sum += v;
-      probe_result.luma[i] = float(double(sum) / double(probe_rgb.size()));
+      for (uint32_t s = 0; s < LumaProbe::kSegments; ++s) {
+        const size_t x0 = size_t(ps.width) * s / LumaProbe::kSegments * 3;
+        const size_t x1 = size_t(ps.width) * (s + 1) / LumaProbe::kSegments * 3;
+        uint64_t sum = 0;
+        for (size_t x = x0; x < x1; ++x) sum += probe_rgb[x];
+        probe_result.luma[i][s] = x1 > x0 ? float(double(sum) / double(x1 - x0)) : 0.0f;
+      }
     }
   }
   const D3D12_RESOURCE_DESC desc = image.texture->GetDesc();

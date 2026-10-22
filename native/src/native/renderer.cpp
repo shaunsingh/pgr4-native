@@ -46,6 +46,10 @@ REXCVAR_DEFINE_BOOL(pgr4_native_gpu_timing_shaders, false, "PGR4 native",
                     "With --pgr4_native_gpu_timing: time draws per vertex/pixel shader pair "
                     "instead of per render target set, and log the ucode of the costliest "
                     "shaders once (render thread mode)");
+REXCVAR_DEFINE_BOOL(pgr4_native_texture_capture_order, true, "PGR4 native",
+                    "Bind textures as they were when the game queued the draw: a texture the game "
+                    "rewrites before the render thread reaches the draw keeps its older data for "
+                    "it (TextureCache::MarkCapture)");
 REXCVAR_DEFINE_BOOL(pgr4_native_render_thread, true, "PGR4 native",
                     "Record the native frames on their own thread (\"PGR4 native render\"): the "
                     "game thread only copies what each D3D call reads from guest memory and "
@@ -276,6 +280,7 @@ bool NativeRenderer::Initialize() {
   resolver_->set_gpu_timer(gpu_timer_);
   textures_ = std::make_unique<TextureCache>(device_->device(), rex::system::kernel_memory());
   textures_->SetResolvedLookup([this](uint32_t a) { return resolver_->Find(a); });
+  textures_->SetCaptureOrder(REXCVAR_GET(pgr4_native_texture_capture_order));
   resolver_->SetChangedCallback([this](uint32_t a) { textures_->OnResolved(a); });
   draw_ = std::make_unique<DrawRenderer>(*this);
   if (!draw_->Initialize()) return false;
@@ -305,7 +310,7 @@ bool NativeRenderer::Initialize() {
                    "upload_kb,textures,textures_missing,front_buffer,hook_us,hook_wait_us,"
                    "reg_writes,swap_untile_us,swap_submit_us,swap_present_us,swap_fence_us,"
                    "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
-                   "hash_pages,hash_copies,pso_pending,pso_wait_us,held");
+                   "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -315,7 +320,12 @@ bool NativeRenderer::Initialize() {
         for (const char* n : profile::kCounterNames) std::fprintf(csv_->file, ",%s", n);
       }
       csv_->luma = REXCVAR_GET(pgr4_native_luma_probe);
-      if (csv_->luma) std::fprintf(csv_->file, ",luma_frame,luma_top,luma_mid,luma_low");
+      if (csv_->luma) {
+        std::fprintf(csv_->file, ",luma_frame");
+        for (const char* row : {"top", "mid", "low"})
+          for (uint32_t s = 0; s < LumaProbe::kSegments; ++s)
+            std::fprintf(csv_->file, ",luma_%s_%u", row, s);
+      }
       std::fprintf(csv_->file, "\n");
     } else {
       REXLOG_ERROR("PGR4 native: cannot open {}", path);
@@ -675,7 +685,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
     std::fprintf(csv_->file,
                  "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
                  "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
-                 "%llu,%llu,%llu,%llu,%llu",
+                 "%llu,%llu,%llu,%llu,%llu,%llu",
                  (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
                  (unsigned long long)s.clears, (unsigned long long)s.resolves,
                  (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -692,7 +702,8 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  (unsigned long long)ds.watch_arms, (unsigned long long)ds.watch_arm_pages,
                  NowNs() / 1e6, (unsigned long long)ds.hash_pages,
                  (unsigned long long)ds.hash_copies, (unsigned long long)ds.pso_pending,
-                 (unsigned long long)ds.pso_wait_us, (unsigned long long)s.frames_held);
+                 (unsigned long long)ds.pso_wait_us, (unsigned long long)s.frames_held,
+                 (unsigned long long)ds.textures_stale);
     if (profile::g.on) {
       for (uint64_t t : profile::g.ticks) std::fprintf(csv_->file, ",%.1f", double(t) / ticks_per_us);
       std::fprintf(csv_->file, ",%llu", (unsigned long long)profile::g.track_calls);
@@ -714,8 +725,9 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
     }
     if (csv_->luma) {
       const LumaProbe& l = present_->luma_probe();
-      std::fprintf(csv_->file, ",%llu,%.2f,%.2f,%.2f", (unsigned long long)l.frame, l.luma[0],
-                   l.luma[1], l.luma[2]);
+      std::fprintf(csv_->file, ",%llu", (unsigned long long)l.frame);
+      for (const auto& row : l.luma)
+        for (float v : row) std::fprintf(csv_->file, ",%.1f", v);
     }
     std::fprintf(csv_->file, "\n");
     std::fflush(csv_->file);  // per frame, so a killed run keeps every row

@@ -200,9 +200,12 @@ in the On* calls), `hook_wait_us` (waiting for the render thread at Swap), `reg_
 hook_max_us, watch_faults, gpu_prev_ms, copy_batches, watch_arms, watch_arm_pages, t_ms,
 hash_pages, hash_copies`, `pso_pending` (draws dropped while their pipeline compiles) and
 `pso_wait_us` (time draws waited for their pipelines in a burst of new ones), `held` (1: the
-frame was not presented, it skipped draws in such a burst). With `--pgr4_native_luma_probe`, last:
-`luma_frame, luma_top, luma_mid, luma_low` (mean brightness 0-255 of front buffer rows at 10, 40
-and 80 % of its height, for the frame `luma_frame`).
+frame was not presented, it skipped draws in such a burst), `tex_stale` (texture bindings
+for draws the game queued before a newer write of the texture's memory; with
+`--pgr4_native_texture_capture_order` they keep the older data). With
+`--pgr4_native_luma_probe`, last: `luma_frame` and `luma_{top,mid,low}_{0..3}` (mean brightness
+0-255 of each quarter, left to right, of the front buffer rows at 10, 40 and 80 % of its height,
+for the frame `luma_frame`).
 
 With `--pgr4_native_profile`, also:
 - `st_<stage>_us` for each stage in `profile.h`: `read_state, shaders, setup, rt_bind,

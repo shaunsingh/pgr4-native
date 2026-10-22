@@ -91,10 +91,14 @@ bool D3D12Device::CreateWindowThread(const wchar_t* title) {
       AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
       // The debug window is owned by a hidden window, so it never becomes the process's "main
       // window" (.NET MainWindowHandle: unowned and visible), which the input scripts
-      // (instrument/keys.ps1, run/input-player.ps1) focus and send keys to.
+      // (instrument/keys.ps1, run/input-player.ps1) focus and send keys to. It never activates
+      // either: a window manager that focuses the newest window (gamescope) would otherwise
+      // hand it the game's keyboard input (Wine activates a window on WM_TAKE_FOCUS unless it
+      // is WS_EX_NOACTIVATE).
       HWND owner = CreateWindowExW(0, kClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr,
                                    inst, nullptr);
-      hwnd = CreateWindowExW(WS_EX_APPWINDOW, kClassName, title, WS_OVERLAPPEDWINDOW,
+      hwnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_NOACTIVATE, kClassName, title,
+                             WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                              owner, nullptr, inst, nullptr);
       if (hwnd) {
