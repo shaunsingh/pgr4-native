@@ -63,6 +63,10 @@ REXCVAR_DEFINE_BOOL(pgr4_native_pipeline_wait, true, "PGR4 native",
                     "With --pgr4_native_async_pipelines, a frame whose draws need pipelines still "
                     "compiling is not shown and waits for them at its end, up to 0.5 s (false: "
                     "show it without those draws)");
+REXCVAR_DEFINE_BOOL(pgr4_native_generic_pipelines, true, "PGR4 native",
+                    "With --pgr4_native_async_pipelines, a draw whose bool or texture-sign "
+                    "specialization is still compiling uses the pipeline of its unspecialized "
+                    "shaders when that one is ready (false: it waits for the specialization)");
 REXCVAR_DEFINE_BOOL(pgr4_native_pipeline_cache, true, "PGR4 native",
                     "Keep the shaders and pipelines the native renderer creates under "
                     "<cache_root>\\pgr4-native and compile them at start-up in later runs "
@@ -787,6 +791,9 @@ struct DrawRenderer::Impl {
     ComPtr<ID3D12PipelineState> pso;
     std::atomic<uint8_t> state{kCompiling};
     bool prewarm = false;  // its job was queued in prewarm_jobs (draw thread only)
+    // A specialization whose draws use their unspecialized shaders' pipeline until it is ready
+    // (draw thread only).
+    bool behind_generic = false;
     uint64_t pending_frame = ~0ull;  // last frame it was added to frame_pending (draw thread)
   };
   std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> pipelines;
@@ -806,6 +813,7 @@ struct DrawRenderer::Impl {
   bool pso_stopping = false;
   static constexpr std::chrono::milliseconds kPipelineWaitBudget{500};
   bool pipeline_wait = false;
+  bool generic_pipelines = false;  // --pgr4_native_generic_pipelines (with worker threads)
   std::vector<Pipeline*> frame_pending;  // pipelines of the frame's skipped draws, once each
   PipelineStore store;
   // What made the pipelines created while running new (logged, kNewPipelineLog lines): a
@@ -990,9 +998,11 @@ struct DrawRenderer::Impl {
   uint32_t SamplerDescriptor(const SamplerKey& k);
   // The pipeline for `key` (`hash`: its XXH3), added and recorded in the store if new.
   // variant (for the log): 1 the vertex, 2 the pixel shader is a bool specialization, 4 the
-  // pixel shader's texture signs are specialized.
+  // pixel shader's texture signs are specialized. `background`: a new one compiles behind the
+  // pipelines draws wait for (prewarm_jobs).
   Pipeline* GetPipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
-                        const DxbcShader::Translation* ps, uint32_t variant);
+                        const DxbcShader::Translation* ps, uint32_t variant,
+                        bool background = false);
   // Moves a pipeline's prewarm job, if no worker has taken it yet, to the draw queue: a draw
   // waits for it now.
   void PromotePipeline(Pipeline* p);
@@ -1318,6 +1328,7 @@ bool DrawRenderer::Impl::Initialize() {
   }
   if (REXCVAR_GET(pgr4_native_async_pipelines)) {
     pipeline_wait = REXCVAR_GET(pgr4_native_pipeline_wait);
+    generic_pipelines = REXCVAR_GET(pgr4_native_generic_pipelines);
     int threads = REXCVAR_GET(pgr4_native_pipeline_threads);
     if (threads <= 0) threads = int(std::thread::hardware_concurrency() / 4);
     threads = std::clamp(threads, 1, 4);
@@ -1899,7 +1910,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash,
                                                               const PipelineKey& key,
                                                               const DxbcShader::Translation& vs,
                                                               const DxbcShader::Translation* ps,
-                                                              uint32_t variant) {
+                                                              uint32_t variant, bool background) {
   auto it = pipelines.find(hash);
   Pipeline* p;
   if (it != pipelines.end()) {
@@ -1918,7 +1929,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash,
                   pr == pipeline_pairs.end() ? "new" : "known",
                   pr == pipeline_pairs.end() ? 0 : pr->second);
     }
-    p = CreatePipeline(hash, key, vs, ps, false);
+    p = CreatePipeline(hash, key, vs, ps, background);
     ++stats.pso_created;
     if (store.is_open()) {
       PipelineKey stored = key;
@@ -2654,13 +2665,56 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   } else {
     const uint32_t variant = (vs != vs_generic ? 1u : 0u) | (ps && ps != ps_generic ? 2u : 0u) |
                              (pst && mods.pixel != generic_pixel_mod ? 4u : 0u);
-    Pipeline* p = GetPipeline(key_hash, key, *vst, pst, variant);
-    uint8_t state = p->state.load(std::memory_order_acquire);
+    const auto found = pipelines.find(key_hash);
+    Pipeline* p = found != pipelines.end() ? found->second.get() : nullptr;
+    // A new specialization (bool constants, texture signs) of shaders and state whose
+    // unspecialized pipeline is ready compiles in the background while its draws use that
+    // pipeline: the same image for a little more GPU time. A race keeps bringing new
+    // combinations of known shaders for minutes, and each would otherwise hold a frame for its
+    // compile. The first draw of the shaders and state waits for its specialization, which has
+    // less code and compiles faster, and queues the unspecialized pipeline behind it.
+    Pipeline* use = nullptr;
+    DxbcShader* generic_ps = nullptr;
+    if (variant && generic_pipelines &&
+        (!p || (p->behind_generic && p->state.load(std::memory_order_acquire) == kCompiling))) {
+      const ShaderModifications gm =
+          SelectModifications(shaders.translator(), *vs_generic, ps_generic, sdr);
+      DxbcShader* gps = gm.pixel_shader_used ? ps_generic : nullptr;
+      // The draw's setup so far read the specialized pixel shader's depth output.
+      if (gm.draw && !gps == !ps && (!gps || gps->writes_depth() == ps->writes_depth())) {
+        DxbcShader::Translation* gvst = translate(*vs_generic, gm.vertex);
+        DxbcShader::Translation* gpst = gps ? translate(*gps, gm.pixel) : nullptr;
+        if (gvst && (!gps || gpst)) {
+          PipelineKey gkey = key;
+          gkey.vs = gvst;
+          gkey.ps = gpst;
+          GeometryShaderKey ggs;
+          gkey.gs_key = GetGeometryShaderKey(GeometryShaderForPrimitive(prim), gm.vertex,
+                                             gpst ? gm.pixel : 0, ggs)
+                            ? ggs.key
+                            : 0;
+          const uint64_t ghash = XXH3_64bits(&gkey, sizeof(gkey));
+          const auto gf = pipelines.find(ghash);
+          if (gf == pipelines.end()) {
+            GetPipeline(ghash, gkey, *gvst, gpst, 0, /*background=*/true);
+          } else if (gf->second->state.load(std::memory_order_acquire) == kReady) {
+            use = gf->second.get();
+            generic_ps = gps;
+            if (!p) {
+              p = GetPipeline(key_hash, key, *vst, pst, variant, /*background=*/true);
+              p->behind_generic = true;
+            }
+          }
+        }
+      }
+    }
+    if (!use) use = p ? p : GetPipeline(key_hash, key, *vst, pst, variant);
+    const uint8_t state = use->state.load(std::memory_order_acquire);
     if (state == kCompiling) {
-      if (p->prewarm) PromotePipeline(p);
-      if (p->pending_frame != r.frame_index()) {
-        p->pending_frame = r.frame_index();
-        frame_pending.push_back(p);
+      if (use->prewarm) PromotePipeline(use);
+      if (use->pending_frame != r.frame_index()) {
+        use->pending_frame = r.frame_index();
+        frame_pending.push_back(use);
       }
     }
     if (state != kReady) {
@@ -2671,8 +2725,15 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
       }
       return;
     }
-    pso = p->pso.Get();
-    pso_slot = {key_hash, pso};
+    pso = use->pso.Get();
+    if (use == p) {
+      pso_slot = {key_hash, pso};
+    } else {
+      // Bindings and constants below follow the shaders the pipeline was built from.
+      vs = vs_generic;
+      ps = generic_ps;
+      ++stats.pso_generic;
+    }
   }
   profile::Mark(profile::kPipeline);
 

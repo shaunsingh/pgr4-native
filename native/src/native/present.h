@@ -64,14 +64,19 @@ class Presenter {
   static void ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* out);
   // A capture was requested (file, F12, L3+R3 or --pgr4_native_capture_frame == frame).
   bool CaptureRequested(uint64_t frame);
+  // A capture runs its Swap and the one before with the guest thread held (to read the Xenos
+  // plugin's copy of the frame, --pgr4_native_capture_xenos).
+  bool capture_holds_guest() const;
 
   // In NativeRenderer::OnSwap before D3D12Device::EndFrame: records the blit into the back
   // buffer (PRESENT state on entry and exit) and, for a capture, the readback copy. Sets its own
-  // root signature, pipeline and descriptor heap on the list.
-  void OnSwap(const SwapCall& swap);
+  // root signature, pipeline and descriptor heap on the list. `shown`: the frame is presented
+  // (false: held, no blit).
+  void OnSwap(const SwapCall& swap, bool shown);
 
-  // In NativeRenderer::OnSwap after EndFrame: finishes a pending capture (waits for the frame's
-  // fence, holds the guest thread, reads guest memory, writes the PNGs).
+  // In NativeRenderer::OnSwap after EndFrame: finishes a pending capture (with the Xenos copy:
+  // waits for the frame's fence, holds the guest thread, reads guest memory, writes the PNGs;
+  // without it: hands a completed frame's image to a thread that writes its PNG).
   void AfterEndFrame(const uint8_t* base);
 
   bool front_buffer_found() const { return last_found_; }

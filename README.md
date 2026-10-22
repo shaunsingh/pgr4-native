@@ -184,6 +184,28 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
 - `deck-run.sh` keeps a `VKD3D_SHADER_CACHE_PATH` set by the caller (0: none), for
   cold-cache runs with `MESA_SHADER_CACHE_DISABLE=true` and
   `--pgr4_native_pipeline_cache=false`.
+- A held frame is not drawn to the back buffer and not recorded, so recordings, the glitch
+  catcher and the luma probe see only what the screen showed. 58 of the play session's 86
+  glitch dumps were held frames nobody saw (frame 23024, where the Shanghai buildings were
+  missing, was one); in a cold run's recording exactly the 39 held frames are missing.
+- New bool and texture-sign specializations of known shaders no longer hold frames. A draw
+  whose specialization is new uses the pipeline of its unspecialized shaders when that one is
+  ready, and the specialization compiles behind the pipelines frames wait for
+  (`--pgr4_native_generic_pipelines`, CSV `pso_generic`). The first draw of a shader pair and
+  state still waits, for its specialization (it has less code and compiles faster), and queues
+  the unspecialized pipeline. The play session's overtake race brought about 3,500 new
+  pipelines, most of them new bool/sign combinations of known shaders, and held frames for
+  5-8.5 s per 30 s. Waiting for the unspecialized pipeline instead, as a first version did,
+  held fewer frames in a cold race (15 against 40) but each for twice as long (100-190 ms).
+  Now, cold (td-18 against td-15): the race window held 16 frames for 0.85 s in total (40 for
+  2.0 s), the whole run waited 6.0 s (8.1), and the race's 1 % low was 15.3 fps (13.5). The
+  intro frames drawn partly on unspecialized pipelines look like those of the run without.
+  Cold runs leave the route after 15 s, so their averages are not comparable.
+- Marks in play sessions write the native image alone, from a thread, once the frame's fence
+  has passed (`--pgr4_native_capture_xenos=false` in `play.sh`). A mark had held the game
+  thread for two Swaps, switched the Xenos plugin to full readback and written two PNGs on the
+  game thread, for a Xenos copy that is meaningless in primary mode: a frame of 104-749 ms per
+  mark in the play session. A capture mid-race now made the next four frames 18-26 ms.
 
 ## Why a native renderer can beat emulation
 
@@ -397,12 +419,14 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_render_thread` | true | Record and submit on a render thread; the game thread only captures each call |
 | `--pgr4_native_async_pipelines` | true | Compile new pipelines on worker threads; the draws that need them are skipped |
 | `--pgr4_native_pipeline_wait` | true | A frame that skipped draws is not shown and waits for their pipelines (at most 0.5 s) |
+| `--pgr4_native_generic_pipelines` | true | A draw whose bool/sign specialization is still compiling uses its unspecialized shaders' pipeline when that one is ready |
 | `--pgr4_native_pipeline_cache` | true | Keep pipelines across runs |
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
 | `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |
 | `--pgr4_native_profile` | false | Per-stage CPU time of the draw path, added to the CSV |
 | `--pgr4_native_capture_dir=<dir>` | `C:\recomp\logs\pgr4-native-captures` | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one |
 | `--pgr4_native_capture_frame=<n>` | -1 (off) | Capture the front buffers at this native frame |
+| `--pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and its PSNR, holding the game thread; false: the native PNG alone, written from a thread |
 | `--pgr4_native_record=<file>` | off | Record the frames shown at half size (`_record_from`, `_record_frames`, `_record_chunk_frames`) |
 | `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 2 s of frames; write whole-image jumps and F12's 2 s to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
 | `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |

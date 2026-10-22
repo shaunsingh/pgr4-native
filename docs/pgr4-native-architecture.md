@@ -75,9 +75,11 @@ Measured on the race (13900K): `Main XThread` ~98 % in every mode (the game itse
    Present, fence), retirement of upload memory, the CSV row.
 4. Pacing: at Swap F the game thread waits until the render thread finished Swap F-1, so the
    renderer is at most one frame behind. `hook_wait_us` in the CSV is that wait; it was 0 in every
-   steady race window measured. Captures (`capture.request`) run their arming Swap and the
-   captured Swap synchronously, so `HoldFullReadback` and the guest-memory read happen while the
-   game thread is held in its Swap hook.
+   steady race window measured. Captures (`capture.request`) with the Xenos copy run their
+   arming Swap and the captured Swap synchronously, so `HoldFullReadback` and the guest-memory
+   read happen while the game thread is held in its Swap hook. Without it
+   (`--pgr4_native_capture_xenos=false`, play sessions) a capture copies the native front buffer
+   in the frame's command list and a thread writes the PNG once the frame's fence has passed.
 
 With `--pgr4_native_render_thread=false` every module runs on the game thread right after the
 hook, as before the rthread merge. The only shared change is the tracker's change tracking.
@@ -172,7 +174,8 @@ scratch row.
 | `pgr4_native_render_thread` | true | Capture on the game thread, record on `PGR4 native render`. On by default since 2026-10-21 23:20 although one race oracle capture in three drops to 29.5-29.6 dB (wrong geometry, unexplained) |
 | `pgr4_native_async_pipelines` | true | PSOs on workers; draws skipped until ready (`pso_pending`) |
 | `pgr4_native_pipeline_threads` | 0 | Compile threads (0: a quarter of the hardware threads, 1-4) |
-| `pgr4_native_pipeline_wait` | true | A frame that skipped draws for pipelines still compiling is not presented (`held`) and waits for them at its end (`pso_wait_us`, at most 0.5 s per frame) |
+| `pgr4_native_pipeline_wait` | true | A frame that skipped draws for pipelines still compiling is not presented (`held`: no blit, not recorded) and waits for them at its end (`pso_wait_us`, at most 0.5 s per frame) |
+| `pgr4_native_generic_pipelines` | true | A draw whose bool/texture-sign specialization is still compiling uses its unspecialized shaders' pipeline when that one is ready (`pso_generic`); the first draw of a shader pair and state waits for the specialization and queues the unspecialized pipeline behind the waited-for ones |
 | `pgr4_native_luma_probe` | false | Front buffer row brightness per frame in the CSV (black-frame hunting) |
 | `pgr4_native_pipeline_cache` | true | `pipelines.bin` + prewarm + pipeline library |
 | `pgr4_native_dynamic_depth_bias` | true | `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` + `RSSetDepthBias` when `DynamicDepthBiasSupported`; PGR4 animates polygon offset, which made 821 of 1,088 pipelines depth-bias variants |
@@ -181,6 +184,7 @@ scratch row.
 | `pgr4_native_width`, `_height` | 1280, 720 | Debug window size |
 | `pgr4_native_capture_dir` | `C:\recomp\logs\pgr4-native-captures` | Capture requests and outputs |
 | `pgr4_native_capture_frame`, `_capture_hold_ms` | -1, 500 | Capture a given frame; hold the guest so Xenos readback completes |
+| `pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and write the PSNR (guest held); false: the native PNG only, written off the guest thread |
 | `pgr4_native_resolve_dump` | "" | Dump every resolve of one frame (render thread off) |
 | `pgr4_native_resolve_selftest` | false | Resolver self-test at start-up |
 | `pgr4_native_texture_trace` | "" | Log every Get of one texture address (hex) |
@@ -199,10 +203,13 @@ in the On* calls), `hook_wait_us` (waiting for the render thread at Swap), `reg_
 (register values replayed). Then `swap_untile_us, swap_submit_us, swap_present_us, swap_fence_us,
 hook_max_us, watch_faults, gpu_prev_ms, copy_batches, watch_arms, watch_arm_pages, t_ms,
 hash_pages, hash_copies`, `pso_pending` (draws dropped while their pipeline compiles) and
-`pso_wait_us` (time draws waited for their pipelines in a burst of new ones), `held` (1: the
-frame was not presented, it skipped draws in such a burst), `tex_stale` (texture bindings
-for draws the game queued before a newer write of the texture's memory; with
-`--pgr4_native_texture_capture_order` they keep the older data). With
+`pso_wait_us` (time the frame waited at its end for those pipelines), `held` (1: the frame was
+not presented, it skipped such draws), `tex_stale` (texture bindings for draws the game queued
+before a newer write of the texture's memory; with `--pgr4_native_texture_capture_order` they
+keep the older data), `coh_stale, coh_late, coh_gpu, coh_regs` (`--pgr4_native_coherency_check`
+mismatches), `tex_mb, tex_count, tex_evicted, tex_evict_us, views` (texture memory, textures
+alive, destroyed this frame and the time it took, shader views in use) and `pso_generic` (draws
+on an unspecialized pipeline while their specialization compiles). With
 `--pgr4_native_luma_probe`, last: `luma_frame` and `luma_{top,mid,low}_{0..3}` (mean brightness
 0-255 of each quarter, left to right, of the front buffer rows at 10, 40 and 80 % of its height,
 for the frame `luma_frame`).

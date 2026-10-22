@@ -313,7 +313,7 @@ bool NativeRenderer::Initialize() {
                    "reg_writes,swap_untile_us,swap_submit_us,swap_present_us,swap_fence_us,"
                    "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
                    "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,coh_stale,coh_late,coh_gpu,coh_regs,"
-                   "tex_mb,tex_count,tex_evicted,tex_evict_us,views");
+                   "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -488,15 +488,16 @@ void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
   Queue::Batch& b = *q.current;
   Queue::SwapCmd& s = b.swaps.emplace_back();
   Presenter::ReadSwap(base, args, &s.call);
-  // Captures: the Swap that arms one (HoldFullReadback) and the captured one run before the
-  // guest continues, as without the render thread.
+  // Captures with the Xenos copy: the Swap that arms one (HoldFullReadback) and the captured
+  // one run before the guest continues, as without the render thread.
   bool sync = q.capture_armed;
   if (q.capture_armed) {
     q.capture_armed = false;
     s.call.capture_request = 0;
   } else {
-    q.capture_armed = sync = present_->CaptureRequested(q.frame);
-    s.call.capture_request = sync ? 1 : 0;
+    const bool requested = present_->CaptureRequested(q.frame);
+    s.call.capture_request = requested ? 1 : 0;
+    q.capture_armed = sync = requested && present_->capture_holds_guest();
   }
   s.prep = draw_->EndFramePrepare(q.gpu_frames_done.load(std::memory_order_acquire));
   // At most one frame ahead: frame F is queued once the render thread finished F - 1.
@@ -625,8 +626,12 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   BeginFrame(base_);
   D3D12Device& d = *device_;
   if (gpu_timer_) gpu_timer_->Pass(d.command_list(), GpuTimer::KeyPresent());
+  // A scene's first frame without the draws whose pipelines were compiling: the previous frame
+  // stays on screen while the next one waits for them.
+  const bool incomplete = draw_->FrameIncomplete();
+  if (incomplete) ++stats_.frames_held;
   // The resolved front buffer into the debug window (back buffer PRESENT in and out).
-  present_->OnSwap(swap);
+  present_->OnSwap(swap, !incomplete);
   // The frame's texture copies read upload memory the untile workers fill.
   const uint64_t u0 = NowNs();
   textures_->FinishUploads();
@@ -635,10 +640,6 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   const uint64_t fence = d.frame_fence();
   // The SDK draws XAM dialogs into the game window, under the child window.
   d.SetShown(!rex::kernel::xam::xeXamIsUIActive());
-  // A scene's first frame without the draws whose pipelines were compiling: the previous frame
-  // stays on screen while the next one waits for them.
-  const bool incomplete = draw_->FrameIncomplete();
-  if (incomplete) ++stats_.frames_held;
   if (!d.EndFrame(!incomplete)) {
     g_failed = true;
     REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
@@ -688,7 +689,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
     std::fprintf(csv_->file,
                  "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
                  "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
-                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu",
+                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu",
                  (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
                  (unsigned long long)s.clears, (unsigned long long)s.resolves,
                  (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -712,7 +713,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  (unsigned long long)textures_->texture_count(),
                  (unsigned long long)(textures_->stats().evicted - csv_->evicted_prev),
                  (textures_->stats().evict_ns - csv_->evict_ns_prev) / 1000.0,
-                 (unsigned long long)ds.views);
+                 (unsigned long long)ds.views, (unsigned long long)ds.pso_generic);
     csv_->evicted_prev = textures_->stats().evicted;
     csv_->evict_ns_prev = textures_->stats().evict_ns;
     if (profile::g.on) {

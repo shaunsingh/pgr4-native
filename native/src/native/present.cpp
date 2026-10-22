@@ -39,6 +39,10 @@ REXCVAR_DEFINE_INT32(pgr4_native_capture_frame, -1, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_capture_hold_ms, 500, "PGR4 native",
                      "How long a capture holds the guest thread in Swap so the Xenos plugin "
                      "finishes the frame before its front buffer is read from guest memory");
+REXCVAR_DEFINE_BOOL(pgr4_native_capture_xenos, true, "PGR4 native",
+                    "Captures also write the Xenos plugin's copy of the frame and the PSNR "
+                    "between them, holding the guest thread (--pgr4_native_capture_hold_ms); "
+                    "false: the native image alone, written off the guest thread");
 REXCVAR_DEFINE_BOOL(pgr4_native_luma_probe, false, "PGR4 native",
                     "Read back three rows of every front buffer (at 10, 40 and 80 % of its "
                     "height) and log their mean brightness in the frame CSV, to find frames "
@@ -272,7 +276,8 @@ struct Presenter::Impl {
   uint32_t ramp_changes_logged = 0;
 
   struct Capture {
-    bool armed = false;  // requested at the previous Swap: full readback held, capture this one
+    bool armed = false;  // requested: capture the next shown frame
+    bool xenos = true;   // with the Xenos copy (--pgr4_native_capture_xenos): full readback held
     bool pending = false;
     uint64_t frame = 0, fence = 0;
     uint32_t fetch[6] = {};
@@ -282,6 +287,7 @@ struct Presenter::Impl {
     bool rgb10a2 = false;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     ComPtr<ID3D12Resource> readback;
+    std::thread writer;  // the PNG of a capture without the Xenos copy
   } capture;
   bool log_fmt = false, log_missing = false;
 
@@ -373,6 +379,12 @@ struct Presenter::Impl {
 
     bool Start(ID3D12Device* device, uint32_t w, uint32_t h);
     void Push(const Slot& s, uint32_t slot);
+    // Hands the slot's previous frame to the writer (its fence was waited for), every Swap.
+    void Collect(uint32_t slot) {
+      if (!slots[slot].recorded) return;
+      slots[slot].recorded = false;
+      Push(slots[slot], slot);
+    }
     void Write();
     void Stop();
   } rec;
@@ -381,9 +393,10 @@ struct Presenter::Impl {
   ~Impl() {
     rec.Stop();
     if (rec.writer.joinable()) rec.writer.join();
+    if (capture.writer.joinable()) capture.writer.join();
   }
-  // In the blit's state (root signature, pipeline, source and ramp bound): records this frame,
-  // and hands the slot's previous one to the writer.
+  // In the blit's state (root signature, pipeline, source and ramp bound): records this frame
+  // (after Recorder::Collect of the slot).
   void Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih, uint32_t ramp_mode);
   // Reads the slot's previous rows into probe_result, then records this frame's copies.
   void Probe(ID3D12GraphicsCommandList* list, uint32_t slot, const ResolvedImage& image,
@@ -393,7 +406,11 @@ struct Presenter::Impl {
   // Copies the guest's current ramp of the mode into the frame's slot; false without one.
   bool WriteRamp(RampMode mode, uint32_t slot);
   bool CaptureRequested(uint64_t frame);
+  // With the Xenos copy: waits for the frame, holds the guest thread while the plugin finishes
+  // it, reads both images and writes the PNGs and their PSNR.
   void FinishCapture(const uint8_t* base);
+  // Without it, once the frame has completed: the native PNG, on capture.writer.
+  void WriteCapture();
 
   // Mark inputs: F12, or both sticks clicked on any pad (a Steam Input binding can send both
   // from a back grip). True on the press.
@@ -753,10 +770,6 @@ void Presenter::Impl::Record(ID3D12GraphicsCommandList* list, uint32_t slot, flo
   Recorder& c = rec;
   const uint64_t frame = r.frame_index();
   Recorder::Slot& s = c.slots[slot];
-  if (s.recorded) {
-    s.recorded = false;
-    c.Push(s, slot);
-  }
   if (c.finished || c.failed || frame < c.from) return;
   if (frame >= c.until) {
     if (std::none_of(std::begin(c.slots), std::end(c.slots),
@@ -874,6 +887,42 @@ bool Presenter::Impl::MarkPressed() {
   return pressed;
 }
 
+namespace {
+
+// A completed front buffer copy as RGB rows.
+bool ReadbackRgb(ID3D12Resource* readback, uint32_t row_pitch, uint32_t width, uint32_t height,
+                 uint32_t mapping, bool rgb10a2, std::vector<uint8_t>* rgb) {
+  void* p = nullptr;
+  const D3D12_RANGE range = {0, SIZE_T(row_pitch) * height};
+  if (FAILED(readback->Map(0, &range, &p))) {
+    REXLOG_ERROR("PGR4 native capture: readback map failed");
+    return false;
+  }
+  ToRgb(static_cast<const uint8_t*>(p), row_pitch, width, height, mapping, rgb10a2, rgb);
+  const D3D12_RANGE none = {0, 0};
+  readback->Unmap(0, &none);
+  return true;
+}
+
+}  // namespace
+
+void Presenter::Impl::WriteCapture() {
+  Capture& c = capture;
+  c.pending = false;
+  if (c.writer.joinable()) c.writer.join();
+  c.writer = std::thread([readback = std::move(c.readback), pitch = c.footprint.Footprint.RowPitch,
+                          w = c.width, h = c.height, mapping = c.mapping, rgb10a2 = c.rgb10a2,
+                          frame = c.frame,
+                          dir = std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir))] {
+    std::vector<uint8_t> rgb;
+    if (!ReadbackRgb(readback.Get(), pitch, w, h, mapping, rgb10a2, &rgb)) return;
+    const std::string name = "f" + std::to_string(frame) + "-native.png";
+    const bool ok = WritePng(dir / name, rgb, w, h);
+    REXLOG_INFO("PGR4 native capture: frame {} {}x{} ({}\\{}{})", frame, w, h, dir.string(), name,
+                ok ? "" : ", write failed");
+  });
+}
+
 void Presenter::Impl::FinishCapture(const uint8_t* base) {
   (void)base;
   Capture& c = capture;
@@ -885,19 +934,10 @@ void Presenter::Impl::FinishCapture(const uint8_t* base) {
   HoldFullReadback(false);
 
   std::vector<uint8_t> native_rgb, xenos_rgb;
-  {
-    void* p = nullptr;
-    D3D12_RANGE range = {0, SIZE_T(c.footprint.Footprint.RowPitch) * c.height};
-    if (FAILED(c.readback->Map(0, &range, &p))) {
-      REXLOG_ERROR("PGR4 native capture: readback map failed");
-      return;
-    }
-    ToRgb(static_cast<const uint8_t*>(p), c.footprint.Footprint.RowPitch, c.width, c.height,
-          c.mapping, c.rgb10a2, &native_rgb);
-    D3D12_RANGE none = {0, 0};
-    c.readback->Unmap(0, &none);
-  }
+  const bool read = ReadbackRgb(c.readback.Get(), c.footprint.Footprint.RowPitch, c.width,
+                                c.height, c.mapping, c.rgb10a2, &native_rgb);
   c.readback.Reset();
+  if (!read) return;
   {
     TextureKey key;
     if (!TextureKeyFromFetch(c.fetch, &key)) return;
@@ -958,7 +998,7 @@ void Presenter::ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* ou
     for (int i = 0; i < 6; ++i) out->fetch[i] = Load32(base, out->texture + 28 + 4 * i);
 }
 
-void Presenter::OnSwap(const SwapCall& swap) {
+void Presenter::OnSwap(const SwapCall& swap, bool shown) {
   Impl& m = *impl_;
   D3D12Device& d = renderer_.device();
   ID3D12GraphicsCommandList* list = d.command_list();
@@ -995,86 +1035,95 @@ void Presenter::OnSwap(const SwapCall& swap) {
                 fetch[1] & 0xFFFFF000u, tex);
   }
 
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = d.back_buffer();
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-  b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-  list->ResourceBarrier(1, &b);
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.back_buffer_rtv();
-  // Black bars around the aspect-fit image (and a black frame when there is no image).
-  const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-  list->ClearRenderTargetView(rtv, black, 0, nullptr);
   uint32_t mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  if (last_found_) {
-    mapping = GuestToHostComponentMapping((fetch[3] >> 1) & 0xFFF, host->host_swizzle);
-    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-    sd.Format = host->unorm;
-    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sd.Shader4ComponentMapping = mapping;
-    sd.Texture2D.MipLevels = 1;
-    const uint32_t slot = m.heap_next++ % Impl::kHeapSize;
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = m.heap->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += size_t(slot) * m.heap_stride;
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = m.heap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += uint64_t(slot) * m.heap_stride;
-    device->CreateShaderResourceView(image->texture, &sd, cpu);
-    ID3D12DescriptorHeap* heaps[] = {m.heap.Get()};
-    list->SetDescriptorHeaps(1, heaps);
-    list->SetGraphicsRootSignature(m.root_signature.Get());
-    list->SetPipelineState(m.pso.Get());
-    list->SetGraphicsRootDescriptorTable(0, gpu);
-    // The image (1280x720 in PGR4's mode) scaled to fit the window, centred, aspect kept.
-    const D3D12_RESOURCE_DESC desc = image->texture->GetDesc();
-    const float iw = float(std::min<uint64_t>(image->width ? image->width : desc.Width, desc.Width));
-    const float ih = float(std::min<uint32_t>(image->height ? image->height : desc.Height, desc.Height));
-    const float ww = float(d.width()), wh = float(d.height());
-    const float s = std::min(ww / iw, wh / ih);
-    const float vw = std::round(iw * s), vh = std::round(ih * s);
-    const RampMode wanted = format == xenos::TextureFormat::k_2_10_10_10 ? kRampPwl : kRampTable;
-    const uint32_t ramp_slot = d.frame_slot();
-    struct {
-      float image_size[2];
-      uint32_t ramp_mode, point_sampled;
-    } constants = {{iw, ih}, m.WriteRamp(wanted, ramp_slot) ? wanted : kRampNone,
-                   vw == iw && vh == ih};
-    list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
-    list->SetGraphicsRootConstantBufferView(
-        2, m.ramp_buffer->GetGPUVirtualAddress() + uint64_t(ramp_slot) * kRampSlotBytes);
-    list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-    D3D12_VIEWPORT vp = {std::floor((ww - vw) * 0.5f), std::floor((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
-    D3D12_RECT sc = {0, 0, LONG(d.width()), LONG(d.height())};
-    list->RSSetViewports(1, &vp);
-    list->RSSetScissorRects(1, &sc);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    list->DrawInstanced(3, 1, 0, 0);
-    if (m.rec.on) m.Record(list, ramp_slot, iw, ih, constants.ramp_mode);
-  }
-  std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-  list->ResourceBarrier(1, &b);
-  if (last_found_ && REXCVAR_GET(pgr4_native_luma_probe))
-    m.Probe(list, d.frame_slot(), *image, mapping, format == xenos::TextureFormat::k_2_10_10_10);
-
-  // A request arms the capture of the next frame: its resolves must reach guest memory
-  // synchronously (HoldFullReadback), or the Xenos copy is the previous frame's.
-  if (!m.capture.armed) {
-    if (swap.capture_request < 0 ? m.CaptureRequested(renderer_.frame_index())
-                                 : swap.capture_request > 0) {
-      if (m.rec.catching)
-        m.rec.mark_request.store(renderer_.frame_index() + 1, std::memory_order_relaxed);
-      HoldFullReadback(true);
-      m.capture.armed = true;
+  if (last_found_) mapping = GuestToHostComponentMapping((fetch[3] >> 1) & 0xFFF, host->host_swizzle);
+  if (m.rec.on) m.rec.Collect(d.frame_slot());
+  // A held frame (DrawRenderer::FrameIncomplete) never reaches the screen: it is neither blitted
+  // nor recorded, so recordings, the glitch catcher and the luma probe see what was shown.
+  if (shown) {
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = d.back_buffer();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    list->ResourceBarrier(1, &b);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.back_buffer_rtv();
+    // Black bars around the aspect-fit image (and a black frame when there is no image).
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    list->ClearRenderTargetView(rtv, black, 0, nullptr);
+    if (last_found_) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+      sd.Format = host->unorm;
+      sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      sd.Shader4ComponentMapping = mapping;
+      sd.Texture2D.MipLevels = 1;
+      const uint32_t slot = m.heap_next++ % Impl::kHeapSize;
+      D3D12_CPU_DESCRIPTOR_HANDLE cpu = m.heap->GetCPUDescriptorHandleForHeapStart();
+      cpu.ptr += size_t(slot) * m.heap_stride;
+      D3D12_GPU_DESCRIPTOR_HANDLE gpu = m.heap->GetGPUDescriptorHandleForHeapStart();
+      gpu.ptr += uint64_t(slot) * m.heap_stride;
+      device->CreateShaderResourceView(image->texture, &sd, cpu);
+      ID3D12DescriptorHeap* heaps[] = {m.heap.Get()};
+      list->SetDescriptorHeaps(1, heaps);
+      list->SetGraphicsRootSignature(m.root_signature.Get());
+      list->SetPipelineState(m.pso.Get());
+      list->SetGraphicsRootDescriptorTable(0, gpu);
+      // The image (1280x720 in PGR4's mode) scaled to fit the window, centred, aspect kept.
+      const D3D12_RESOURCE_DESC desc = image->texture->GetDesc();
+      const float iw = float(std::min<uint64_t>(image->width ? image->width : desc.Width, desc.Width));
+      const float ih = float(std::min<uint32_t>(image->height ? image->height : desc.Height, desc.Height));
+      const float ww = float(d.width()), wh = float(d.height());
+      const float s = std::min(ww / iw, wh / ih);
+      const float vw = std::round(iw * s), vh = std::round(ih * s);
+      const RampMode wanted = format == xenos::TextureFormat::k_2_10_10_10 ? kRampPwl : kRampTable;
+      const uint32_t ramp_slot = d.frame_slot();
+      struct {
+        float image_size[2];
+        uint32_t ramp_mode, point_sampled;
+      } constants = {{iw, ih}, m.WriteRamp(wanted, ramp_slot) ? wanted : kRampNone,
+                     vw == iw && vh == ih};
+      list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+      list->SetGraphicsRootConstantBufferView(
+          2, m.ramp_buffer->GetGPUVirtualAddress() + uint64_t(ramp_slot) * kRampSlotBytes);
+      list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+      D3D12_VIEWPORT vp = {std::floor((ww - vw) * 0.5f), std::floor((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
+      D3D12_RECT sc = {0, 0, LONG(d.width()), LONG(d.height())};
+      list->RSSetViewports(1, &vp);
+      list->RSSetScissorRects(1, &sc);
+      list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      list->DrawInstanced(3, 1, 0, 0);
+      if (m.rec.on) m.Record(list, ramp_slot, iw, ih, constants.ramp_mode);
     }
-  } else {
-    m.capture.armed = false;
+    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+    list->ResourceBarrier(1, &b);
+    if (last_found_ && REXCVAR_GET(pgr4_native_luma_probe))
+      m.Probe(list, d.frame_slot(), *image, mapping, format == xenos::TextureFormat::k_2_10_10_10);
+  }
+
+  // A request arms the capture of the next shown frame. With the Xenos copy, that frame's
+  // resolves must reach guest memory synchronously (HoldFullReadback) from its start, or the
+  // copy is the previous frame's; the native image alone is this frame's.
+  Impl::Capture& c = m.capture;
+  if (!c.armed && (swap.capture_request < 0 ? m.CaptureRequested(renderer_.frame_index())
+                                            : swap.capture_request > 0)) {
+    if (m.rec.catching)
+      m.rec.mark_request.store(renderer_.frame_index() + 1, std::memory_order_relaxed);
+    c.armed = true;
+    c.xenos = REXCVAR_GET(pgr4_native_capture_xenos);
+    if (c.xenos) {
+      HoldFullReadback(true);
+      return;
+    }
+  }
+  if (c.armed && shown && !c.pending) {
+    c.armed = false;
     if (!last_found_) {
-      HoldFullReadback(false);
+      if (c.xenos) HoldFullReadback(false);
       REXLOG_WARN("PGR4 native capture: frame {}: no native front buffer to capture",
                   renderer_.frame_index());
       return;
     }
-    Impl::Capture& c = m.capture;
     const D3D12_RESOURCE_DESC desc = image->texture->GetDesc();
     UINT64 total = 0;
     device->GetCopyableFootprints(&desc, 0, 1, 0, &c.footprint, nullptr, nullptr, &total);
@@ -1089,7 +1138,7 @@ void Presenter::OnSwap(const SwapCall& swap) {
                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                IID_PPV_ARGS(&c.readback)),
                "capture readback")) {
-      HoldFullReadback(false);
+      if (c.xenos) HoldFullReadback(false);
       return;
     }
     D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
@@ -1174,8 +1223,13 @@ void Presenter::Impl::Probe(ID3D12GraphicsCommandList* list, uint32_t slot,
 
 const LumaProbe& Presenter::luma_probe() const { return impl_->probe_result; }
 
+bool Presenter::capture_holds_guest() const { return REXCVAR_GET(pgr4_native_capture_xenos); }
+
 void Presenter::AfterEndFrame(const uint8_t* base) {
-  if (impl_->capture.pending) impl_->FinishCapture(base);
+  Impl& m = *impl_;
+  if (!m.capture.pending) return;
+  if (m.capture.xenos) m.FinishCapture(base);
+  else if (renderer_.device().completed_fence() >= m.capture.fence) m.WriteCapture();
 }
 
 }  // namespace pgr4::native

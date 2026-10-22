@@ -84,7 +84,8 @@ done
 
 # MTR's launcher arguments for 60 fps (launcher/Launcher.cs) with the guest's vblank at the Deck
 # OLED panel's 90 Hz (PGR4_REFRESH=60 for an LCD Deck), the native renderer as the
-# presenter, and the session record. The F12 capture hold only matters next to Xenos.
+# presenter, and the session record. A mark (F12, L3+R3) writes the native image alone, off the
+# guest thread: the Xenos copy only matters in oracle runs.
 args=(--game_data_root "$(win "$game")" --user_data_root "$(win "$top/userdata")"
   --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync --xmp_music_gain 0.35
   --pgr4_60fps --pgr4_garage_walk_fix --d3d12_texture_shared_heaps --gpu_vblank_deadline_timer
@@ -93,7 +94,7 @@ args=(--game_data_root "$(win "$game")" --user_data_root "$(win "$top/userdata")
   --window_width=1280 --window_height=800 "--video_mode_refresh_rate=${PGR4_REFRESH:-90}"
   --pgr4_native --pgr4_native_primary --pgr4_native_gpu_timing
   "--pgr4_native_csv=$(win "$base-frames.csv")"
-  "--pgr4_native_capture_dir=$(win "$top/captures")" --pgr4_native_capture_hold_ms=0
+  "--pgr4_native_capture_dir=$(win "$top/captures")" --pgr4_native_capture_xenos=false
   "--pgr4_native_glitch_catch=$(win "$base-")"
   --guest_frame_stats --pgr4_d3d_stats_frames=150 --log_file "$(win "$base.log")")
 # Game Mode (and any gamescope session): fullscreen; a desktop: a 1280x800 window.
