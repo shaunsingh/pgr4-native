@@ -12,7 +12,7 @@
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
-#               [--output NAME] [--captures "5 10 15"] [--record "FROM FRAMES"] [--catch]
+#               [--output NAME] [--captures "5 10 15"] [--catch]
 #               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu] [--server-trace]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
@@ -34,10 +34,9 @@
 # the runtime); sampling costs some speed, so such a run's frame rate is not a measurement.
 # --pmu (with --perf) counts the front end over the same seconds, per thread: instructions per
 # cycle, fetch stalls, instruction cache fills and iTLB misses (pmu_summary.py).
-# --record "FROM FRAMES" records FRAMES frames (0: to the end) from native frame index FROM, as
-# shown at half size, into ~/pgr4-proton/rec-<tag>.rec (--pgr4_native_record); then
-# native/tools/flicker.py finds the frames that flash and writes them out as PNG strips.
-# --catch keeps the last 5 s of frames in memory instead and writes only the whole-image jumps to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch).
+# --catch keeps the last 5 s of frames shown in memory and writes the frames around each
+# whole-image jump to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch;
+# native/tools/flicker.py shows them).
 # --keys FILE drives the game with that route_player.py script instead of run/route-stpetersburg.keys.
 # --race-draws N is the median draws per frame that shows the race is on (St Petersburg draws
 # 4000+; a Quebec street race about 2000, its menus 1500-2000).
@@ -63,7 +62,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-captures="5 10 15"; record=""; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0
+captures="5 10 15"; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -83,7 +82,6 @@ while [[ $# -gt 0 ]]; do
     --refresh) refresh=$2; shift 2 ;;
     --output) output=$2; shift 2 ;;
     --captures) captures=$2; shift 2 ;;
-    --record) record=$2; shift 2 ;;
     --catch) catch=1; shift ;;
     --keys) keys=$(readlink -f "$2"); shift 2 ;;
     --race-draws) race_draws=$2; shift 2 ;;
@@ -157,12 +155,6 @@ elif (( draw_log > 0 )); then
 fi
 (( draw_log > 0 )) && args+=("--pgr4_native_draw_log_frames=$draw_log")
 [[ $uncapped == 1 ]] && args+=(--vsync=false --d3d12_present_vsync=false)
-if [[ -n $record ]]; then
-  read -r rec_from rec_frames <<<"$record"
-  rm -f "$top/rec-$tag.rec"
-  args+=("--pgr4_native_record=$(win "$top/rec-$tag.rec")" "--pgr4_native_record_from=$rec_from"
-    "--pgr4_native_record_frames=${rec_frames:-0}")
-fi
 [[ $catch == 1 ]] && args+=("--pgr4_native_glitch_catch=$(win "$base-")")
 # shellcheck disable=SC2206
 [[ -n $extra ]] && args+=($extra)

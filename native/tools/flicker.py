@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find the frames of a --pgr4_native_record recording that flash, and write them out as PNGs.
+"""Find the frames of a glitch catcher dump (.rec) that flash, and write them out as PNGs.
 
 A flash is a stretch of 1 to --max-len frames in which part of the image departs from what it
 showed just before and returns to it just after. The image is cut into --block x --block pixel

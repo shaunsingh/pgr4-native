@@ -3,21 +3,19 @@
 
 A mark comes a few seconds after what it marks, so for each "PGR4 native mark at frame N" line
 of the session log this looks at the frames shown in the --before seconds up to N (and --after
-past it): from the session recording (play.sh records every frame shown, in chunks) or, without
-one, the glitch catcher's mark-<N>.rec. Held frames, which the screen never showed, are left
-out (recordings before held frames stopped being recorded have them). Per mark it prints the
-slow frames of the window with the frame CSV's causes, the blocks that flash (flicker.py's
-events) and whole-image jumps, each with how long before the mark it was, and writes into
---out/mark-<N>/ an overview sheet of the window and a sheet per event and jump.
+past it) in the glitch catcher's mark-<N>.rec. Held frames, which the screen never showed, are
+left out. Per mark it prints the slow frames of the window with the frame CSV's causes, the
+blocks that flash (flicker.py's events) and whole-image jumps, each with how long before the
+mark it was, and writes into --out/mark-<N>/ an overview sheet of the window and a sheet per
+event and jump.
 
   marks.py <session prefix> [--before 5] [--after 0.5] [--out DIR] [--top 4] [--mark N ...]
 
 <session prefix>: the session's path without .log, e.g. ~/pgr4-proton/play/logs/20261022-141955
-(the log, <prefix>-frames.csv and <prefix>-<first frame>.rec). Needs numpy.
+(the log, <prefix>-frames.csv and <prefix>-mark-<N>.rec). Needs numpy.
 """
 
 import argparse
-import glob
 import os
 import re
 import sys
@@ -32,14 +30,6 @@ MARK = re.compile(r"PGR4 native mark at frame (\d+)")
 CAUSES = ["held", "pso_created", "pso_wait_us", "swap_fence_us", "hook_wait_us", "draw_us",
           "tex_evicted", "textures_missing"]
 
-
-def session_recordings(prefix):
-    """(memmap, width, height, frames, times) of the session recording: <prefix>.rec or its
-    chunks <prefix>-<first frame>.rec."""
-    paths = [p for p in glob.glob(glob.escape(prefix) + "-*.rec")
-             if re.fullmatch(r"-\d+\.rec", p[len(prefix):])]
-    paths += glob.glob(glob.escape(prefix) + ".rec")
-    return [open_rec(p) for p in sorted(paths)]
 
 
 def window(recs, mark, before, after, held):
@@ -108,14 +98,12 @@ def main():
     held = {f for f, r in rows_csv.items() if r.get("held") == "1"}
     out = os.path.expanduser(a.out or prefix + "-marks")
     print(f"{len(marks)} marks in {prefix}.log: {' '.join(map(str, marks))}")
-    session = session_recordings(prefix)
 
     for mark in marks:
         dump = prefix + f"-mark-{mark}.rec"
-        recs = session or ([open_rec(dump)] if os.path.exists(dump) else [])
-        got = window(recs, mark, a.before, a.after, held)
+        got = os.path.exists(dump) and window([open_rec(dump)], mark, a.before, a.after, held)
         if not got:
-            print(f"\nmark {mark}: not in a recording")
+            print(f"\nmark {mark}: no {dump}")
             continue
         rows, w, h, frames, times = got
         d = os.path.join(out, f"mark-{mark}")

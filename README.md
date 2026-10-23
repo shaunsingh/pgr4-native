@@ -374,6 +374,12 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   thread writes (once per draw), is a plain store on a cache line of its own instead of a
   locked add beside members the render thread reads for every texture it binds. td-73 runs
   both; no run measures them on their own.
+- The continuous recorder is gone (`--pgr4_native_record`, `play.sh`'s `PGR4_RECORD`,
+  `deck-run.sh --record`). It wrote every frame shown to disk at half size, about 50 MB/s,
+  which stalled the game, while the glitch catcher already keeps the last 5 s in memory and
+  writes them out at each whole-image jump and each F12 mark; `marks.py` and `flicker.py` read
+  those dumps.
+
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
@@ -594,7 +600,6 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_capture_dir=<dir>` | off | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one, and `draw-debug.txt` there is read. Off, none of them is polled (`run.ps1 -Native`: `C:\recomp\logs\pgr4-native-captures`) |
 | `--pgr4_native_capture_frame=<n>` | -1 (off) | Capture the front buffers at this native frame |
 | `--pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and its PSNR, holding the game thread; false: the native PNG alone, written from a thread |
-| `--pgr4_native_record=<file>` | off | Record the frames shown at half size (`_record_from`, `_record_frames`, `_record_chunk_frames`) |
 | `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 5 s of frames; write whole-image jumps and F12's 5 s (with a capture folder) to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
 | `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
 | `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
@@ -619,7 +624,7 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 | `perf_stats.py` | Stage costs per draw from the CSV |
 | `perf_hitch.py` | Slow frames and their causes |
 | `compare_resolves.py` | Resolve outputs against the Xenos plugin's |
-| `flicker.py` | Flashing blocks or whole-image jumps in a frame recording, as PNG sheets |
+| `flicker.py` | Flashing blocks or whole-image jumps in a glitch catcher dump, as PNG sheets |
 | `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
 
 It also has a texture untiling harness and an offline shader translation test. `proton/` has the

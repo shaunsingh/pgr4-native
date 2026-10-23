@@ -20,10 +20,9 @@
 # which a Steam Input binding can send from a back grip, writes the native front buffer to
 # captures/f<frame>-native.png (the frame number matches the CSV) and the 5 s before it to
 # logs/<stamp>-mark-<frame>.rec; <stamp>-glitch-<frame>.rec holds the frames around each
-# whole-image glitch the renderer saw; with PGR4_RECORD=1 too, <stamp>-<frame>.rec holds every
-# frame shown, 5 minutes a file, until 40 GB are left (native/tools/flicker.py and marks.py show
-# them). In Steam, add the "PGR4 (native renderer)" shortcut without a compatibility tool: this
-# script starts Proton itself.
+# whole-image glitch the renderer saw (native/tools/flicker.py and marks.py show them). In Steam,
+# add the "PGR4 (native renderer)" shortcut without a compatibility tool: this script starts
+# Proton itself.
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -67,8 +66,6 @@ DESKTOP
 fi
 debug=${PGR4_DEBUG:-0}
 if [[ ${1:-} == --debug ]]; then debug=1; shift; fi
-# A recording is only of use with the session's CSV and log.
-if [[ ${PGR4_RECORD:-0} != 0 ]]; then debug=1; fi
 
 runtime=$top/runtime
 [[ -f $runtime/pgr4_recompiled.exe ]] || { echo "nothing installed: play.sh --install [tree]" >&2; exit 1; }
@@ -120,13 +117,6 @@ else
   args+=(--log_level=warn)
   export WINEDEBUG=${WINEDEBUG:--all} VKD3D_DEBUG=${VKD3D_DEBUG:-none}
   export VKD3D_SHADER_DEBUG=${VKD3D_SHADER_DEBUG:-none}
-fi
-# PGR4_RECORD=1: every frame shown, at half size, in files of 5 minutes (27000 frames at 90 fps,
-# ~19 GB), for native/tools/flicker.py. Off by default: its ~50 MB/s of writes stall the game
-# (every few seconds the kernel's writeback pauses the process's writers, the frame CSV and the
-# log among them, for 0.1-1 s), and a mark's 5 s are in the glitch catcher's ring without it.
-if [[ ${PGR4_RECORD:-0} != 0 ]]; then
-  args+=("--pgr4_native_record=$(win "$base.rec")" --pgr4_native_record_chunk_frames=27000)
 fi
 args+=("$@")
 

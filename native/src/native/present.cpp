@@ -46,22 +46,12 @@ REXCVAR_DEFINE_BOOL(pgr4_native_luma_probe, false, "PGR4 native",
                     "Read back three rows of every front buffer (at 10, 40 and 80 % of its "
                     "height) and log their mean brightness in the frame CSV, to find frames "
                     "drawn partly black");
-REXCVAR_DEFINE_STRING(pgr4_native_record, "", "PGR4 native",
-                      "Record the frames shown, at half size and after the gamma ramp, into this "
-                      "file (native/tools/flicker.py finds frames that flash and shows them)");
-REXCVAR_DEFINE_INT32(pgr4_native_record_from, 0, "PGR4 native",
-                     "The first frame index --pgr4_native_record records");
-REXCVAR_DEFINE_INT32(pgr4_native_record_frames, 0, "PGR4 native",
-                     "How many frames --pgr4_native_record records (0: all)");
-REXCVAR_DEFINE_INT32(pgr4_native_record_chunk_frames, 0, "PGR4 native",
-                     "Start a new --pgr4_native_record file every this many frames, named "
-                     "<path without .rec>-<first frame>.rec (0: one file)");
 REXCVAR_DEFINE_STRING(pgr4_native_glitch_catch, "", "PGR4 native",
-                      "Keep the frames shown (as --pgr4_native_record would record them) in "
-                      "memory and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump "
-                      "away from the image and back; without --pgr4_native_record, also "
-                      "<prefix>mark-<frame>.rec with the last 5 s at a mark (F12, with "
-                      "--pgr4_native_capture_dir)");
+                      "Keep the frames shown, at half size and after the gamma ramp, in memory "
+                      "and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump away "
+                      "from the image and back, and <prefix>mark-<frame>.rec with the last 5 s "
+                      "at a mark (F12, with --pgr4_native_capture_dir); native/tools/flicker.py "
+                      "and marks.py show them");
 
 namespace pgr4::native {
 
@@ -304,20 +294,20 @@ struct Presenter::Impl {
   LumaProbe probe_result;
   std::vector<uint8_t> probe_rgb;
 
-  // --pgr4_native_record: the blit drawn again at half the image's size (a 2x2 box filter) into
-  // `target`, copied to a readback slot per frame in flight, and handed when the slot comes round
-  // to a writer thread, which appends it to the file: a RecordHeader, then height rows of width
-  // RGB texels, per frame.
+  // --pgr4_native_glitch_catch: the blit drawn again at half the image's size (a 2x2 box filter)
+  // into `target`, copied to a readback slot per frame in flight, and handed when the slot comes
+  // round to the catcher's thread. A .rec file holds, per frame, a RecordHeader and height rows
+  // of width RGB texels.
   struct RecordHeader {
     char magic[4] = {'P', 'G', 'R', 'F'};
     uint32_t width = 0, height = 0, reserved = 0;
     uint64_t frame = 0, time_us = 0;
   };
   static_assert(sizeof(RecordHeader) == 32);
-  // --pgr4_native_glitch_catch, on the recorder's writer thread: the frames it is handed, in a
-  // ring, and the whole-image jumps of native/tools/flicker.py --jumps found as they arrive (a
-  // frame whose mean block difference from the one before is at least 6x the median of the last
-  // kSteps and 15, followed within kMaxLen frames by one that is back near the frame before).
+  // On the recorder's thread: the frames it is handed, in a ring, and the whole-image jumps of
+  // native/tools/flicker.py --jumps found as they arrive (a frame whose mean block difference from
+  // the one before is at least 6x the median of the last kSteps and 15, followed within kMaxLen
+  // frames by one that is back near the frame before).
   struct Catcher {
     // kRing: 5 s at 90 Hz, since a mark comes a few seconds after what it marks.
     static constexpr uint32_t kRing = 450, kBlock = 10, kMaxLen = 4, kPad = 8, kSteps = 512;
@@ -348,17 +338,9 @@ struct Presenter::Impl {
     void Dump(uint64_t from, uint64_t to, const char* kind, uint64_t label);
   };
   struct Recorder {
-    bool on = false, failed = false, finished = false, catching = false;
+    bool on = false, failed = false;
     Catcher catcher;
-    // --pgr4_native_record: the file (or chunk) being written; none once one could not be.
-    std::string path;
-    uint32_t chunk_frames = 0;
-    uint64_t chunk_written = 0;
-    bool file_off = false;
-    static constexpr uint64_t kMinFreeBytes = 40ull << 30;  // a new chunk needs this much free
-    void OpenFile(uint64_t frame);
     std::atomic<uint64_t> mark_request{0};  // frame + 1: dump the catcher's ring
-    uint64_t from = 0, until = 0;  // frame indices, until exclusive
     ComPtr<ID3D12Resource> target, readback;
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     const uint8_t* mapped = nullptr;
@@ -368,19 +350,19 @@ struct Presenter::Impl {
       uint64_t frame = 0, time_us = 0;
       bool recorded = false;
     } slots[D3D12Device::kFramesInFlight];
-    std::FILE* file = nullptr;
     std::thread writer;
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::vector<uint8_t>> queue;  // a RecordHeader, then RGBA rows (width * 4 bytes)
-    std::vector<std::vector<uint8_t>> spare;  // written buffers, reused
+    std::vector<std::vector<uint8_t>> spare;  // consumed buffers, reused
     bool stopping = false;
-    uint64_t written = 0, recorded = 0, dropped = 0;
+    uint64_t written = 0, dropped = 0;
     static constexpr size_t kMaxQueued = 96;
 
     bool Start(ID3D12Device* device, uint32_t w, uint32_t h);
     void Push(const Slot& s, uint32_t slot);
-    // Hands the slot's previous frame to the writer (its fence was waited for), every Swap.
+    // Hands the slot's previous frame to the recorder's thread (its fence was waited for), every
+    // Swap.
     void Collect(uint32_t slot) {
       if (!slots[slot].recorded) return;
       slots[slot].recorded = false;
@@ -499,18 +481,8 @@ bool Presenter::Impl::Initialize() {
     std::filesystem::create_directories(capture_dir, ec);
     capture_request = capture_dir / "capture.request";
   }
-  rec.path = REXCVAR_GET(pgr4_native_record);
   rec.catcher.prefix = REXCVAR_GET(pgr4_native_glitch_catch);
-  rec.catching = !rec.catcher.prefix.empty();
-  rec.on = rec.catching || !rec.path.empty();
-  if (!rec.path.empty()) {
-    rec.from = uint64_t(std::max(REXCVAR_GET(pgr4_native_record_from), 0));
-    const int32_t frames = REXCVAR_GET(pgr4_native_record_frames);
-    rec.until = frames > 0 ? rec.from + uint64_t(frames) : ~0ull;
-    rec.chunk_frames = uint32_t(std::max(REXCVAR_GET(pgr4_native_record_chunk_frames), 0));
-  } else {
-    rec.until = ~0ull;
-  }
+  rec.on = !rec.catcher.prefix.empty();
   return true;
 }
 
@@ -553,42 +525,10 @@ bool Presenter::Impl::Recorder::Start(ID3D12Device* device, uint32_t w, uint32_t
   device->CreateRenderTargetView(target.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
   writer = std::thread([this] { Write(); });
   SetThreadDescription(writer.native_handle(), L"PGR4 native recorder");
-  if (catching)
-    REXLOG_INFO("PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
-                "{}glitch-<frame>.rec",
-                Catcher::kRing, w, h, catcher.prefix);
-  if (!path.empty())
-    REXLOG_INFO("PGR4 native record: frames from {} at {}x{} into {}{}", from, w, h, path,
-                chunk_frames ? fmt::format(", a file per {} frames", chunk_frames) : "");
+  REXLOG_INFO("PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
+              "{}glitch-<frame>.rec",
+              Catcher::kRing, w, h, catcher.prefix);
   return true;
-}
-
-void Presenter::Impl::Recorder::OpenFile(uint64_t frame) {
-  if (file) std::fclose(file);
-  file = nullptr;
-  chunk_written = 0;
-  std::string name = path;
-  if (chunk_frames) {
-    const size_t sep = path.find_last_of("\\/"), dot = path.rfind('.');
-    const bool ext = dot != std::string::npos && (sep == std::string::npos || dot > sep);
-    name = (ext ? path.substr(0, dot) : path) + "-" + std::to_string(frame) +
-           (ext ? path.substr(dot) : std::string(".rec"));
-  }
-  std::error_code ec;
-  const std::filesystem::space_info space =
-      std::filesystem::space(std::filesystem::path(name).parent_path(), ec);
-  if (!ec && space.available < kMinFreeBytes) {
-    REXLOG_WARN("PGR4 native record: stopped at frame {}, {} GB free", frame, space.available >> 30);
-    file_off = true;
-    return;
-  }
-  file = std::fopen(name.c_str(), "wb");
-  if (!file) {
-    REXLOG_ERROR("PGR4 native record: cannot open {}", name);
-    file_off = true;
-    return;
-  }
-  if (chunk_frames) REXLOG_INFO("PGR4 native record: frames from {} into {}", frame, name);
 }
 
 void Presenter::Impl::Recorder::Push(const Slot& s, uint32_t slot) {
@@ -623,7 +563,6 @@ void Presenter::Impl::Recorder::Push(const Slot& s, uint32_t slot) {
 }
 
 void Presenter::Impl::Recorder::Write() {
-  std::vector<uint8_t> rgb;
   std::unique_lock<std::mutex> lock(mutex);
   for (;;) {
     cv.wait(lock, [this] { return stopping || !queue.empty(); });
@@ -633,42 +572,14 @@ void Presenter::Impl::Recorder::Write() {
     lock.unlock();
     RecordHeader h;
     std::memcpy(&h, buf.data(), sizeof(h));
-    const std::vector<uint8_t>* out = &rgb;
-    if (catching) {
-      catcher.Add(h, buf.data() + sizeof(h));  // RGBA8 -> RGB8 into its ring
-      // With a recording file the mark's frames are in it (native/tools/marks.py).
-      const uint64_t m = mark_request.exchange(0, std::memory_order_relaxed);
-      if (m && path.empty()) catcher.Mark(m - 1);
-      out = &catcher.At(catcher.count - 1).rgb;
-    } else if (!path.empty()) {
-      const size_t n = size_t(h.width) * h.height;
-      rgb.resize(n * 3);
-      const uint8_t* px = buf.data() + sizeof(h);
-      for (size_t i = 0; i < n; ++i) std::memcpy(&rgb[i * 3], px + i * 4, 3);  // RGBA8 -> RGB8
-    }
-    if (!path.empty() && !file_off) {
-      if (!file || (chunk_frames && chunk_written >= chunk_frames)) OpenFile(h.frame);
-      if (file) {
-        if (std::fwrite(&h, sizeof(h), 1, file) == 1 &&
-            std::fwrite(out->data(), 1, out->size(), file) == out->size()) {
-          ++chunk_written;
-          ++recorded;
-        } else {
-          REXLOG_ERROR("PGR4 native record: write failed after {} frames", recorded);
-          std::fclose(file);
-          file = nullptr;
-          file_off = true;
-        }
-      }
-    }
+    catcher.Add(h, buf.data() + sizeof(h));  // RGBA8 -> RGB8 into its ring
+    if (const uint64_t m = mark_request.exchange(0, std::memory_order_relaxed)) catcher.Mark(m - 1);
     lock.lock();
     spare.push_back(std::move(buf));
     ++written;
   }
-  if (file) std::fclose(file);
-  file = nullptr;
-  REXLOG_INFO("PGR4 native record: {} frames seen, {} recorded, {} dropped (writer behind)",
-              written, recorded, dropped);
+  REXLOG_INFO("PGR4 native glitch catch: {} frames seen, {} dropped (catcher behind)", written,
+              dropped);
 }
 
 float Presenter::Impl::Catcher::Diff(const Frame& a, const Frame& b) {
@@ -776,15 +687,7 @@ void Presenter::Impl::Record(ID3D12GraphicsCommandList* list, uint32_t slot, flo
   Recorder& c = rec;
   const uint64_t frame = r.frame_index();
   Recorder::Slot& s = c.slots[slot];
-  if (c.finished || c.failed || frame < c.from) return;
-  if (frame >= c.until) {
-    if (std::none_of(std::begin(c.slots), std::end(c.slots),
-                     [](const Recorder::Slot& x) { return x.recorded; })) {
-      c.finished = true;
-      c.Stop();
-    }
-    return;
-  }
+  if (c.failed) return;
   const uint32_t w = uint32_t(iw) / 2, h = uint32_t(ih) / 2;
   if (!c.target && !c.Start(r.d3d12(), w, h)) {
     c.failed = true;
@@ -1035,7 +938,7 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
   if (last_found_) mapping = GuestToHostComponentMapping((fetch[3] >> 1) & 0xFFF, host->host_swizzle);
   if (m.rec.on) m.rec.Collect(d.frame_slot());
   // A held frame (DrawRenderer::FrameIncomplete) never reaches the screen: it is neither blitted
-  // nor recorded, so recordings, the glitch catcher and the luma probe see what was shown.
+  // nor recorded, so the glitch catcher and the luma probe see what was shown.
   if (shown) {
     D3D12_RESOURCE_BARRIER b = {};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1103,7 +1006,7 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
   Impl::Capture& c = m.capture;
   if (!c.armed && (swap.capture_request < 0 ? m.CaptureRequested(renderer_.frame_index())
                                             : swap.capture_request > 0)) {
-    if (m.rec.catching)
+    if (m.rec.on)
       m.rec.mark_request.store(renderer_.frame_index() + 1, std::memory_order_relaxed);
     c.armed = true;
     c.xenos = REXCVAR_GET(pgr4_native_capture_xenos);
