@@ -405,6 +405,12 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   columns) with Google's own short functions, if statements and loops on one line. Run
   `clang-format -i` on the files a change touches (the distrobox has it). The formatting
   commit is in `.git-blame-ignore-revs`.
+- The profile-guided optimization profile is taken again (td-75: one scripted race of the
+  instrumented build, 68.5 fps while counting). The functions the cleanup changed had been
+  compiled without a profile, among them the game and render threads' busiest (`OnDraw`,
+  `AfterCall`, `TakeChanges`, `ReadDrawState`). td-77 against td-74: race 83.2 fps (82.4), 1 %
+  low 54.6 (56.6), no hitches in either. td-76, the same build run while this session's agent
+  worked beside it, had 12: in each the render thread waited 8-34 ms for the GPU.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
