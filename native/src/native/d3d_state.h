@@ -157,7 +157,7 @@ class GuestStateTracker {
   // each register as the guest stores it (big-endian), so Copy compares guest memory with it
   // four registers at a time without swapping.
   void Record(uint32_t reg, uint32_t value) {
-    if (recording_) changes_.push_back({reg, value});
+    if (recording_) changes_.emplace_back(reg, value);
   }
   void Put(uint32_t reg, uint32_t value) {
     if (regs_[reg] == value) return;

@@ -136,7 +136,7 @@ unless noted.
 | `BindMemo` | (shader, the fetch constants it reads), 2-way set-associative, 2^11 sets, plus each shader's last entry checked first (87 % of hits) | `change_epoch` equal, or every bound texture `Unchanged`; shaders with a missing texture or more than the slot limit are not memoized | draw.cpp `bind_textures` |
 | SRV memo | texture resource (not the fetch slot) | resource + view desc equal | draw.cpp |
 | Sampler memo | hashed table of (fetch dwords, filter overrides) | equal | draw.cpp |
-| `CachedCbv` (b0-b4) | last upload of each constant buffer, kept in CPU-cached upload memory | bytes equal (compared against the last upload itself) | draw.cpp |
+| `CachedCbv` (b0-b4) | each constant buffer's current bytes, kept in the CPU's copy (`last`); uploads are streaming stores the CPU never reads back | bytes equal | draw.cpp |
 | Valid-page bitmap | 4 KB guest pages mirrored into the shared-memory buffer | cleared by the page-watch callback on a guest write | draw.cpp (`RequestRange`) |
 | Resolve targets | every subresource address `CopyResolved` looks up → textures there | `OnResolved(address)` marks those textures `resolve_pending` and bumps `change_epoch` | textures.cpp |
 | Pipeline library | hash of description + bytecode | the driver accepts the library; otherwise it is rebuilt | `<cache_root>\pgr4-native\pipelines.d3d12lib` |

@@ -226,7 +226,7 @@ struct NativeRenderer::Queue {
   }
   void Push(Kind kind, uint32_t index) {
     GuestState().TakeChanges(&current->regs);
-    current->cmds.push_back({kind, index, uint32_t(current->regs.size())});
+    current->cmds.emplace_back(kind, index, uint32_t(current->regs.size()));
     if (kind != kSwap && current->cmds.size() >= kBatchCommands) Publish();
   }
   // Blocks the guest thread until the render thread finished `frames` Swaps; returns the ns.

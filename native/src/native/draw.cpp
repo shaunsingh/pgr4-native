@@ -574,20 +574,18 @@ inline bool Equal(const void* a, const void* b, uint32_t size) {
   return i == size || std::memcmp(x + i, y + i, size - i) == 0;
 }
 
-// A constant buffer that is re-uploaded only when its bytes change within a frame. The
-// upload memory is CPU-cached (UploadPool cpu_cached), so new data is compared with the last
-// upload itself (`cpu`) and copied once. `last` is the staging area of the packed float
-// constants (the largest CBV is 256 float4 = 4 KB). gpu == 0: nothing current uploaded.
+// A constant buffer that is re-uploaded only when its bytes change within a frame. `last`
+// holds the bytes of the current upload (the largest CBV is 256 float4 = 4 KB): new data is
+// compared with it, and an upload streams it into upload memory that the CPU never reads back.
+// gpu == 0: nothing current uploaded.
 struct CachedCbv {
   static constexpr uint32_t kMaxSize = 256 * 16;
   alignas(16) uint8_t last[kMaxSize];
   uint32_t size = 0;
-  const uint8_t* cpu = nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
   D3D12_GPU_VIRTUAL_ADDRESS bound = 0;
   void Reset() {
     size = 0;
-    cpu = nullptr;
     gpu = 0;
     bound = 0;
   }
@@ -713,7 +711,7 @@ struct DrawRenderer::Impl {
         auto& last = segment_exact.back();
         last = {std::min(last.first, read.begin), std::max(last.second, read.end)};
       } else {
-        segment_exact.push_back({read.begin, read.end});
+        segment_exact.emplace_back(read.begin, read.end);
       }
       return;
     }
@@ -728,7 +726,7 @@ struct DrawRenderer::Impl {
   }
 
   UploadPool vertex_upload{16u << 20};
-  // CPU-cached: CachedCbv compares new constants with its last upload in place.
+  // Write-back pages, written with streaming stores (CommitCbv).
   UploadPool constant_upload{4u << 20, /*cpu_cached=*/true};
 
   // Descriptors.
@@ -1018,14 +1016,16 @@ struct DrawRenderer::Impl {
   bool MapShared(uint32_t start, uint32_t length);
   void FlushCopies(ID3D12GraphicsCommandList* list);
   void TransitionShared(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES to);
-  // Uploads cb.size bytes of `data` unless cb.gpu is current, and binds it at `root_index`.
-  bool CommitCbv(CachedCbv& cb, const void* data, uint32_t root_index,
-                 ID3D12GraphicsCommandList* list);
+  // Uploads cb.size bytes of cb.last unless cb.gpu is current, and binds it at `root_index`.
+  bool CommitCbv(CachedCbv& cb, uint32_t root_index, ID3D12GraphicsCommandList* list);
   bool UploadCbv(CachedCbv& cb, const void* data, uint32_t size, uint32_t root_index,
                  ID3D12GraphicsCommandList* list) {
-    if (cb.gpu && (cb.size != size || !Equal(cb.cpu, data, size))) cb.gpu = 0;
-    cb.size = size;
-    return CommitCbv(cb, data, root_index, list);
+    if (cb.size != size || !Equal(cb.last, data, size)) {
+      std::memcpy(cb.last, data, size);
+      cb.size = size;
+      cb.gpu = 0;
+    }
+    return CommitCbv(cb, root_index, list);
   }
   uint32_t TextureDescriptor(const TextureBinding& b, const DxbcShader::TextureBinding& tb);
   // TextureCache::EvictCallback: frees the views of evicted textures.
@@ -1462,7 +1462,7 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     return false;
   }
   const bool exact = !watch || upload_every_draw.load(std::memory_order_relaxed);
-  if (preparing) draw_reads.push_back({start, start + length, exact});
+  if (preparing) draw_reads.emplace_back(start, start + length, exact);
   const uint64_t fence = upload_fence;
   auto copy = [&](uint32_t from, uint32_t size) {
     if (preparing && !segment_conflict) segment_conflict = SegmentReads(from, from + size);
@@ -1474,11 +1474,11 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
       // The upload is made from the shadow, so the two hold the same bytes.
       std::memcpy(coherency->shadow.get() + from, membase + from, size);
       std::memcpy(a.cpu, coherency->shadow.get() + from, size);
-      coherency->frame_copies.push_back({from, size});
+      coherency->frame_copies.emplace_back(from, size);
     } else {
       std::memcpy(a.cpu, membase + from, size);
     }
-    out.push_back({a.resource, a.offset, from, size});
+    out.emplace_back(a.resource, a.offset, from, size);
     if (threaded) {
       prep_upload_bytes += size;
       ++prep_uploads;
@@ -1829,14 +1829,19 @@ void DrawRenderer::Impl::FlushCopies(ID3D12GraphicsCommandList* list) {
   TransitionShared(list, kSharedReadState);
 }
 
-bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, const void* data, uint32_t root_index,
+bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
                                    ID3D12GraphicsCommandList* list) {
   if (!cb.gpu) {
+    // Whole float4s (a CBV is read in them; `last` has room). Streaming stores: each upload
+    // takes fresh lines that only the GPU reads, so they bypass the caches instead of being
+    // read from memory for ownership and then pushing the game's code and data out.
+    // D3D12Device::CloseAndExecute fences them before the GPU can read them.
+    const uint32_t vectors = std::max<uint32_t>((cb.size + 15) / 16, 1);
     UploadPool::Alloc a;
-    if (!constant_upload.Allocate(std::max<uint32_t>(cb.size, 16), 256, r.frame_fence(), &a))
-      return false;
-    std::memcpy(a.cpu, data, cb.size);
-    cb.cpu = a.cpu;
+    if (!constant_upload.Allocate(vectors * 16, 256, r.frame_fence(), &a)) return false;
+    auto* dst = reinterpret_cast<__m128i*>(a.cpu);
+    const auto* src = reinterpret_cast<const __m128i*>(cb.last);
+    for (uint32_t i = 0; i < vectors; ++i) _mm_stream_si128(dst + i, _mm_load_si128(src + i));
     cb.gpu = a.gpu;
     ++diag.cbv_uploads[root_index & 15];
     diag.cbv_bytes[root_index & 15] += cb.size;
@@ -3122,10 +3127,11 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     list->SetGraphicsRootDescriptorTable(kBindlessRoot_ViewHeap, table);
     list_dirty = false;
   }
+  static_assert(sizeof(sys) <= CachedCbv::kMaxSize);
   bool ok =
       UploadCbv(cb_system, &sys, sizeof(sys), kBindlessRoot_SystemConstants, list) &&
-      CommitCbv(cb_float_vs, cb_float_vs.last, kBindlessRoot_FloatConstantsVertex, list) &&
-      CommitCbv(cb_float_ps, cb_float_ps.last, kBindlessRoot_FloatConstantsPixel, list) &&
+      CommitCbv(cb_float_vs, kBindlessRoot_FloatConstantsVertex, list) &&
+      CommitCbv(cb_float_ps, kBindlessRoot_FloatConstantsPixel, list) &&
       UploadCbv(cb_bool_loop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], (8 + 32) * 4,
                 kBindlessRoot_BoolLoopConstants, list) &&
       UploadCbv(cb_fetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4,

@@ -156,7 +156,7 @@ void GuestStateTracker::TakeChanges(std::vector<RegWrite>* out) {
     recording_ = true;
     changes_.reserve(4096);
     for (uint32_t reg = 0; reg < kGuestRegisterCount; ++reg)
-      if (regs_[reg]) out->push_back({reg, regs_[reg]});
+      if (regs_[reg]) out->emplace_back(reg, regs_[reg]);
     return;
   }
   out->insert(out->end(), changes_.begin(), changes_.end());

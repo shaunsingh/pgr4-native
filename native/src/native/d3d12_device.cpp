@@ -7,6 +7,8 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include <xmmintrin.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <cstdio>
@@ -314,6 +316,9 @@ bool D3D12Device::OpenList() {
 
 bool D3D12Device::CloseAndExecute() {
   if (Failed(list_->Close(), "CommandList::Close")) return false;
+  // The constant uploads are streaming stores, which are weakly ordered: make them visible
+  // before the GPU can read them.
+  _mm_sfence();
   ID3D12CommandList* lists[] = {list_.Get()};
   queue_->ExecuteCommandLists(1, lists);
   return true;
