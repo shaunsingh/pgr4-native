@@ -37,14 +37,14 @@ inline uint64_t Load64(const uint8_t* base, uint32_t a) {
   std::memcpy(&v, Host(base, a), 8);
   return __builtin_bswap64(v);
 }
-// Virtual -> physical the way the D3D computes GPU addresses (e.g. sub_8269ADD8's index base).
+// Virtual -> physical the way the D3D computes GPU addresses (e.g. sub_826D0340's index base).
 inline uint32_t GpuAddress(uint32_t a) {
   return (a & 0x1FFFFFFFu) + ((((a >> 20) & 0xFFFu) + 0x200u) & 0x1000u);
 }
 
-// Register blocks the draw functions flush with sub_826A8720, (device offset, first register,
+// Register blocks the draw functions flush with sub_826DDC90, (device offset, first register,
 // registers, dirty mask (device + 8 * mask), the mask bit of the first register, registers per
-// bit). The counts are the dirty-mask widths in sub_8269ADD8 (the shadow areas between the
+// bit). The counts are the dirty-mask widths in sub_826D0340 (the shadow areas between the
 // offsets are longer for 0x2000: 19 dwords, of which only 16 are ever flushed). The flush
 // functions shift a block's bits to the top of the word and walk them with count-leading-zeros,
 // so bit `top - k` covers the k-th group of `per` registers.
@@ -60,27 +60,27 @@ constexpr Block kRegisterBlocks[] = {
     {10596, 0x2280, 21, 3, 54, 1},                  // mask +24 bits 54..34
     {10680, 0x2300, 38, 4, 37, 1},                  // mask +32 bits 37..0
     {10832, 0x2380, 8, 4, 45, 1},                   // mask +32 bits 45..38
-    {dev::kClipPlanes, 0x2388, 24, 4, 54, 4},       // mask +32 bits 54..49, sub_826A87E0
-    {dev::kFetchConstants, 0x4800, 192, 3, 31, 6},  // mask +24 bits 31..0, sub_826A8960
+    {dev::kClipPlanes, 0x2388, 24, 4, 54, 4},       // mask +32 bits 54..49, sub_826DDD50
+    {dev::kFetchConstants, 0x4800, 192, 3, 31, 6},  // mask +24 bits 31..0, sub_826DDED0
     {dev::kBoolLoop, 0x4900, 40, 4, 56, 40},        // mask +32 bit 56
 };
 
-// Mask +16 bits 17..20 make a draw call the shader load sub_826A9858 (bit 19 = vertex shader,
+// Mask +16 bits 17..20 make a draw call the shader load sub_826DEDC8 (bit 19 = vertex shader,
 // 20 = pixel shader). Besides the stream, it writes registers of the 0x2000, 0x2180 and 0x2200
-// blocks into the shadow (0x2001, 0x2180-0x2182 and, through sub_826A8188, 0x2203, 0x2208)
+// blocks into the shadow (0x2001, 0x2180-0x2182 and, through sub_826DD6F8, 0x2203, 0x2208)
 // and the draw flushes them in the same call, so their dirty bits are not set at its entry.
 constexpr uint64_t kShaderLoadBits = 0x1E0000ull;
 constexpr uint64_t kShaderLoadBlocks = (0xFFFFull << 42) | (0x1Full << 12) | 0xFFFull;  // mask +16
 // Vertex fetch constant 31 (mask +24 bit 0): BeginVertices' inline vertex buffer.
 constexpr uint64_t kFetch31 = 1ull;
 
-constexpr uint32_t kFnBeginVertices = 0x8269A4F8, kFnDrawVerticesUP = 0x8269A9A8,
-                   kFnDrawVertices = 0x8269A9F0, kFnDrawIndexed = 0x8269ADD8,
-                   kFnDrawIndx2Inline = 0x8269B230, kFnDrawIndx2Split = 0x826A7318,
-                   kFnClearF = 0x8269C378, kFnClear = 0x8269C4A0, kFnResolve = 0x82696978,
-                   kFnSwap = 0x82695BE0, kFn10A8 = 0x826A10A8;
+constexpr uint32_t kFnBeginVertices = 0x826CFA60, kFnDrawVerticesUP = 0x826CFF10,
+                   kFnDrawVertices = 0x826CFF58, kFnDrawIndexed = 0x826D0340,
+                   kFnDrawIndx2Inline = 0x826D0798, kFnDrawIndx2Split = 0x826DC888,
+                   kFnClearF = 0x826D18E0, kFnClear = 0x826D1A08, kFnResolve = 0x826CBEE0,
+                   kFnSwap = 0x826CB148, kFn10A8 = 0x826D6610;
 
-// Shader-rebind dirty bits in the mask at +16 (sub_826A9858): 19 vertex shader, 20 pixel shader.
+// Shader-rebind dirty bits in the mask at +16 (sub_826DEDC8): 19 vertex shader, 20 pixel shader.
 constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 
 }  // namespace
@@ -176,7 +176,7 @@ void GuestStateTracker::TakeChanges(std::vector<RegWrite>* out) {
   }
 }
 
-// sub_826A9668: a shader object's literal constants, LOAD_ALU_CONSTANT'd from guest memory into
+// sub_826DEBD8: a shader object's literal constants, LOAD_ALU_CONSTANT'd from guest memory into
 // the float constants when the shader is (re)bound. `table` is the object's constant table,
 // `data` the virtual base its offsets are relative to.
 void GuestStateTracker::LoadLiterals(const uint8_t* base, uint32_t table, uint32_t data) {
@@ -245,7 +245,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   vs_imm_pending_valid_ = false;
 
   // Float constants: only the 4-vec4 groups whose dirty bit the call cleared reached the GPU
-  // (sub_826A8AC0; bit 63 - k = constants 4k..4k+3). The rest of the shadow may hold values
+  // (sub_826DE030; bit 63 - k = constants 4k..4k+3). The rest of the shadow may hold values
   // the game wrote without a dirty bit (c247-c255 in the M1 traces).
   for (uint32_t m = 0; m < 2; ++m) {
     uint64_t now = Load64(base, device + dev::kDirtyMasks + m * 8);
@@ -280,8 +280,8 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   }
   inline_fetch_ = false;
 
-  // Window scissor: sub_8268DEB0 writes PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR straight into the
-  // stream from the rectangle SetScissorRect (fn_826904C8) keeps at device+10436/+10440 (15-bit
+  // Window scissor: sub_826C33C0 writes PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR straight into the
+  // stream from the rectangle SetScissorRect (fn_826C59D8) keeps at device+10436/+10440 (15-bit
   // signed x | y << 16); Resolve, Clear and the others write their own and then restore it
   // from there. Untiled form (offset 0); with predicated tiling the D3D writes one clamped
   // copy per tile instead.
@@ -296,7 +296,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   const bool draw = fn_addr == kFnBeginVertices || fn_addr == kFnDrawVertices ||
                     fn_addr == kFnDrawIndexed || fn_addr == kFn10A8;
   if (draw) {
-    // Bound shaders and the literal constants sub_826A9858 loads when they are rebound (after
+    // Bound shaders and the literal constants sub_826DEDC8 loads when they are rebound (after
     // the constant flush, so they win over the shadow).
     uint32_t vs = Load32(base, device + dev::kVertexShader);
     uint32_t ps = Load32(base, device + dev::kPixelShader);
@@ -304,13 +304,13 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     if (stride_changed && vs) rebind |= kVsRebind;  // BeginVertices sets it itself
     if (vs) {
       if (vs_imm_new) {
-        // sub_826A9508 ran inside this draw: the GPU now holds the patched copy.
+        // sub_826DEA78 ran inside this draw: the GPU now holds the patched copy.
         vs_imm_.swap(vs_imm_pending_);
         vs_ = vs_imm_pending_ref_;
         vs_.immediate = vs_imm_.data();
       } else if (!vs_.immediate || (rebind & kVsRebind)) {
         // IM_LOAD of the object's variant, or nothing loaded (same shader as before). After an
-        // immediate load the D3D reloads the VS only under the VS rebind bit (sub_826A9858).
+        // immediate load the D3D reloads the VS only under the VS rebind bit (sub_826DEDC8).
         // Variant 1 is used without a pixel shader when the object has one (flag 0x20).
         uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
         uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
@@ -365,7 +365,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
 }
 
 void GuestStateTracker::AfterImmediateVs(const uint8_t* base, const uint32_t r[8]) {
-  // sub_826A9508(device, patch, vs object, ..., variant): reserves 5 + n dwords, writes
+  // sub_826DEA78(device, patch, vs object, ..., variant): reserves 5 + n dwords, writes
   // INVALIDATE_STATE (0xC0003B00, 0x100) and IM_LOAD_IMMEDIATE (header, 0 = vertex, n), copies
   // the n ucode dwords of variant [vs + 896 + 8 * variant], patches them in place and leaves
   // the push cursor (device+48) on the last of them. No space: nothing is written.

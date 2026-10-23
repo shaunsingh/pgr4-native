@@ -57,7 +57,7 @@ constexpr uint32_t kDevShadow2000 = 10368;     // registers 0x2000..0x2012
 constexpr uint32_t kDevShadow2100 = 10444;     // registers 0x2100..0x2114
 constexpr uint32_t kDevColorSurfaces = 12432;  // 4 x guest D3D surface object
 constexpr uint32_t kDevDepthSurface = 12448;
-// Predicated tiling, as BeginTiling (fn_8269C6D0) stores it: the tile count, each tile's
+// Predicated tiling, as BeginTiling (fn_826D1C38) stores it: the tile count, each tile's
 // rectangle in surface pixels {x1, y1, x2, y2} (16 bytes), and each tile's origin rounded down
 // to 32 pixels {x, y} (8 bytes), the surface pixel the guest renders at the EDRAM base.
 constexpr uint32_t kDevTileCount = 12740;

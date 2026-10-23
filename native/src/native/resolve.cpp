@@ -127,7 +127,7 @@ int DestBppLog2(uint32_t f) {
 uint32_t ColorRtBppLog2(uint32_t f) { return (f == 5 || f == 7 || f == 15) ? 3 : 2; }
 
 // The guest D3D's mapping from the destination texture's format to RB_COPY_DEST_INFO's
-// (sub_82696978: the cmplwi chain on the fetch format).
+// (sub_826CBEE0: the cmplwi chain on the fetch format).
 uint32_t D3DCopyDestFormat(uint32_t f) {
   switch (f) {
     case 54: return 7;   // k_2_10_10_10_AS_16_16_16_16 -> k_2_10_10_10
@@ -492,7 +492,7 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
   p.dest_width = std::max(1u, key.width >> level);
   p.dest_height = std::max(1u, key.height >> level);
   // Destination address of the level and slice. The texture object holds virtual addresses;
-  // the D3D (sub_82696978) makes them physical the way the 0xE0000000 view maps: low 29 bits
+  // the D3D (sub_826CBEE0) makes them physical the way the 0xE0000000 view maps: low 29 bits
   // plus 4 KiB for addresses at or above 0xE0000000. That is also the physical address the
   // GPU-side fetch constant (and so the texture cache) sees.
   auto d3d_phys = [](uint32_t a) { return (a & 0x1FFFFFFFu) + ((((a >> 20) + 0x200u) & 0x1000u)); };
@@ -533,14 +533,14 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
     p.dest_x = int32_t(Load32(base, point_ptr));
     p.dest_y = int32_t(Load32(base, point_ptr + 4));
   }
-  // Clears: color from pClearColor (default: the D3D's constant at 0x82240844), depth from
-  // ClearZ (f1), stencil from the stack argument (caller r1 + 92, read in sub_82696978).
+  // Clears: color from pClearColor (default: the D3D's constant at 0x82258A0C), depth from
+  // ClearZ (f1), stencil from the stack argument (caller r1 + 92, read in sub_826CBEE0).
   p.clear_flags = flags & 0x300;
   if (p.clear_flags) {
     if (color_ptr) {
       for (int i = 0; i < 4; ++i) p.clear_color[i] = LoadF(base, color_ptr + 4 * i);
     } else {
-      const float c = LoadF(base, 0x82240844u);
+      const float c = LoadF(base, 0x82258A0Cu);
       for (float& v : p.clear_color) v = c;
     }
     p.clear_depth = float(args.f[0]);

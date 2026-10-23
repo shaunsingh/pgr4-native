@@ -426,7 +426,7 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
   };
   if (args.fn == HookFn::kClear) {
     // Clear(dev, Count r4, pRects r5, Flags r6, Color r7, Z f1, Stencil r9): Z takes r8's
-    // argument slot (sub_8269C4A0 passes r9 on to ClearF as its stencil).
+    // argument slot (sub_826D1A08 passes r9 on to ClearF as its stencil).
     const uint32_t count = args.r[1], rects = args.r[2], color = args.r[4];
     p.flags = args.r[3];
     p.color[0] = float((color >> 16) & 0xFF) / 255.0f;
@@ -440,7 +440,7 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
     if (rects && count && p.rects.empty()) return false;  // only empty rectangles
   } else if (args.fn == HookFn::kClearF) {
     // ClearF(dev, Flags r4, pRect r5, pColor r6 (D3DVECTOR4), Z f1, Stencil r8): Z takes r7's
-    // argument slot (sub_8269BCE8 reads the stencil from r8).
+    // argument slot (sub_826D1250 reads the stencil from r8).
     p.flags = args.r[1];
     if (args.r[3])
       for (int i = 0; i < 4; ++i) p.color[i] = LoadF(base, args.r[3] + 4 * i);
@@ -450,7 +450,7 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
       read_rect(args.r[2]);
       if (p.rects.empty()) return false;
     }
-    // Inside BeginTiling (fn_8269C6D0) the rectangle is the largest tile's extent at the EDRAM
+    // Inside BeginTiling (fn_826D1C38) the rectangle is the largest tile's extent at the EDRAM
     // base. Every tile starts from these values: the first from this clear, each later one
     // from the previous tile's resolve, which EndTiling clears with BeginTiling's color, Z and
     // stencil. The host surface holds all tiles, so it clears each of them.

@@ -1,6 +1,7 @@
 # Custom Match street race in Quebec with snow (the play session's Subaru snow invitational
 # flickered there): Single Player -> Custom Match -> Street Race, city Quebec, weather Snow,
-# Lobby -> Start, then full throttle. Needs a fresh save. Taps of 300 ms move menus twice.
+# Lobby -> Start, then full throttle. Needs a fresh save and title update 2, which adds World
+# Challenge to the Single Player menu. Taps of 300 ms move menus twice.
 30000 return          # skip the intro FMV
 +12000 return         # title: PRESS START -> Gamer Profiles
 +8000 space           # Next -> Select Driver
@@ -10,6 +11,7 @@
 +8000 space           # Continue -> Main Menu
 +20000 space          # Single Player -> Arcade Mode
 +6000 d 60            # -> Gotham Career
++2000 d 60            # -> World Challenge
 +2000 d 60            # -> Time Attack
 +2000 d 60            # -> Custom Match
 +3000 space           # -> Street Race / Eliminator

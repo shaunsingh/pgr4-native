@@ -1,0 +1,87 @@
+# Title Update #2 (0.0.2.1): the entry options build.sh and build.ps1 put in place of MTR-PGR4's,
+# whose addresses are the base executable's. setjmp/longjmp, and the function starts codegen does
+# not find by itself: targets reached only through vtables, among them the this-adjusting thunks
+# (addi r3,r3,-N; b). From PGR4-Recomp's manifest (MIT, github.com/beatrixzy/PGR4-Recomp), which
+# runs on this title update, and MTR-PGR4's entries mapped by native/tools/tu_address_map.py
+# (addresses.txt).
+setjmp_address = 0x828DE260
+longjmp_address = 0x828DE7E0
+
+[entrypoint.functions]
+0x822E5C00 = {}
+0x824DAB48 = {}
+0x8254B090 = {}
+0x827348C8 = {}
+0x827348D0 = {}
+0x827348E0 = {}
+0x827348F0 = {}
+0x82734918 = {}
+0x82734920 = {}
+0x82739968 = {}
+0x8273AEA8 = {}
+0x8273AEB0 = {}
+0x8273AEB8 = {}
+0x8274FC68 = {}
+0x8274FC70 = {}
+0x8274FC88 = {}
+0x8274FCB8 = {}
+0x8274FCC8 = {}
+0x8274FCD0 = {}
+0x8274FCE0 = {}
+0x8274FCE8 = {}
+0x8274FCF0 = {}
+0x8274FD00 = {}
+0x8274FD28 = {}
+0x8274FD30 = {}
+0x8274FD40 = {}
+0x8274FD60 = {}
+0x8274FD68 = {}
+0x8274FD70 = {}
+0x8274FD78 = {}
+0x8274FD88 = {}
+0x8274FD90 = {}
+0x8274FD98 = {}
+0x8276CC30 = {}
+0x8276CC50 = {}
+0x8276CC60 = {}
+0x8276CC68 = {}
+0x8276CC70 = {}
+0x8277BA24 = {}
+0x8277D008 = {}
+0x8277D010 = {}
+0x82782CA8 = {}
+0x82782CB8 = {}
+0x82782CC0 = {}
+0x82782CE0 = {}
+0x82782CE8 = {}
+0x827854E8 = {}
+0x8278AECC = {}
+0x8278B5C0 = {}
+0x8278B620 = {}
+0x8278B628 = {}
+0x8278B638 = {}
+0x8278C8B8 = {}
+0x8278C8C0 = {}
+0x827966D0 = {}
+0x827E30A8 = {}
+0x828033D8 = {}
+0x828036D8 = {}
+0x82803850 = {}
+0x828F8E88 = {}
+0x829191D0 = {}
+0x82919B18 = {}
+0x82919C48 = {}
+0x8291BCF8 = {}
+0x8291BD20 = {}
+0x8291BD28 = {}
+0x8291BD30 = {}
+0x8291BD48 = {}
+0x8291BD58 = {}
+0x8291BD60 = {}
+0x8291BD70 = {}
+0x8291E2B0 = {}
+0x82931E78 = {}
+0x82934650 = {}
+0x829468B0 = {}
+0x829468B8 = {}
+0x829F75A0 = {}

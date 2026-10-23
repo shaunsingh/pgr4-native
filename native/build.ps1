@@ -11,15 +11,23 @@
 # Stages, in order (default: all):
 #   prep     robocopy $Root\MTR-PGR4 (source and patched SDK source; no build dirs, no
 #            generated code) to $Dest\MTR-PGR4, apply rexglue-drawcount.patch and then
-#            rexglue-native-primary.patch (--gpu_skip_draws) and rexglue-runtime-perf.patch
-#            (blocking timer queue, cheaper write-watch faults) to the SDK copy,
+#            rexglue-native-primary.patch (--gpu_skip_draws), rexglue-runtime-perf.patch
+#            (blocking timer queue, cheaper write-watch faults) and rexglue-content.patch (title
+#            update on update:\, DLC install, image check) to the SDK copy,
 #            copy src\pgr4_d3d_trace.cpp and src\d3d_surface.inc into the game's src\ and add
 #            the .cpp to its CMakeLists.txt; mirror src\native\ to the game's src\native\ and
-#            append a CMake block that compiles src/native/*.cpp and links d3d12, dxgi, dxguid.
+#            append a CMake block that compiles src/native/*.cpp and links d3d12, dxgi, dxguid;
+#            rewrite the base-executable addresses in the copy's game patches
+#            (tools\apply_game_patches.ps1, src\pgr4_patches.cpp) with Title Update #2's
+#            (..\title-update\addresses.txt), and apply ..\title-update\apply_game_patches.patch
+#            for the one patched function TU#2 changed.
 #   sdk      configure + build + install the SDK copy (clang-cl, Release) into $Dest\sdk-install.
-#   game     codegen default.xex with the copy's manifest (MTR's game patches included), build
+#   game     codegen Title Update #2: $Game\default.xex with ..\title-update\default.xexp beside
+#            it (copies in $Dest\title-update-image), with the copy's manifest and TU#2's entry
+#            options (..\title-update\entrypoint.toml); MTR's game patches included. Build
 #            out\pgr4\pgr4_recompiled.exe (no Geometry Wars, no launcher).
-#   install  $Dest\run\runtime: exe, rexruntime.dll, rexgpu-xenos.dll; seeds userdata\ from the
+#   install  $Dest\run\runtime: exe, rexruntime.dll, rexgpu-xenos.dll and title-update\ (the
+#            runtime's update:\ when no --update_data_root is given); seeds userdata\ from the
 #            instrumented build's profile if this one has none (read-only copy).
 #
 # Run: run.ps1 beside this script.
@@ -43,6 +51,12 @@ $Patch = Join-Path $PSScriptRoot '..\instrument\rexglue-drawcount.patch'
 $PrimaryPatch = Join-Path $PSScriptRoot 'rexglue-native-primary.patch'
 # Runtime fixes: a blocking timer queue and write-watch faults without VirtualQuery.
 $RuntimePatch = Join-Path $PSScriptRoot 'rexglue-runtime-perf.patch'
+# The title update on update:\, DLC install from --content_root, the XEX image size check.
+$ContentPatch = Join-Path $PSScriptRoot 'rexglue-content.patch'
+$TitleUpdate = Join-Path $PSScriptRoot '..\title-update'
+$AddressMap = Join-Path $TitleUpdate 'addresses.txt'
+$Retarget = Join-Path $PSScriptRoot 'tools\tu_address_map.py'
+$GamePatch = Join-Path $TitleUpdate 'apply_game_patches.patch'
 $Sources = @('pgr4_d3d_trace.cpp', 'd3d_surface.inc') | ForEach-Object { Join-Path $PSScriptRoot "src\$_" }
 $NativeSrc = Join-Path $PSScriptRoot 'src\native'
 # Appended to the game's CMakeLists.txt by prep, replaced whole when it changes. The two SDK
@@ -97,21 +111,48 @@ if (Want 'prep') {
         if (-not (Test-Path (Join-Path $Src 'thirdparty\rexglue-sdk\.git'))) {
             throw "missing $Src with its patched SDK; run build-mtr.ps1 -Stage prep,sdk first"
         }
-        foreach ($f in @($Patch, $PrimaryPatch, $NativeSrc) + $Sources) { if (-not (Test-Path $f)) { throw "missing $f" } }
+        foreach ($f in @($Patch, $PrimaryPatch, $RuntimePatch, $ContentPatch, $NativeSrc, $AddressMap, $Retarget, $GamePatch) + $Sources) {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+        }
         New-Item -ItemType Directory -Force -Path $Dest | Out-Null
         $exclude = @('out', 'sdk-install', 'generated', 'geometry-wars\generated', 'thirdparty\rexglue-sdk\out') |
             ForEach-Object { Join-Path $Src $_ }
         # Keep an already patched CMakeLists.txt, so a re-run of prep does not touch it (and does
         # not force a full rebuild of the game).
         $destCml = Join-Path $Repo 'CMakeLists.txt'
-        $keep = if ((Test-Path $destCml) -and ([IO.File]::ReadAllText($destCml) -match 'pgr4_d3d_trace\.cpp')) {
-            @('/XF', (Join-Path $Src 'CMakeLists.txt'))
-        } else { @() }
-        robocopy $Src $Repo /E /XD @exclude @keep /NFL /NDL /NJH /NP /R:1 /W:1 | Out-Host
+        $xf = @(Join-Path $Src 'src\pgr4_patches.cpp')
+        if ((Test-Path $destCml) -and ([IO.File]::ReadAllText($destCml) -match 'pgr4_d3d_trace\.cpp')) {
+            $xf += Join-Path $Src 'CMakeLists.txt'
+        }
+        robocopy $Src $Repo /E /XD @exclude /XF @xf /NFL /NDL /NJH /NP /R:1 /W:1 | Out-Host
         if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
         $global:LASTEXITCODE = 0
 
-        foreach ($p in @($Patch, $PrimaryPatch, $RuntimePatch)) {
+        # MTR's game patches name the base executable's addresses; the code is Title Update #2's,
+        # which also changed one patched function (apply_game_patches.patch). The patch script
+        # takes the time of the newest of its inputs; pgr4_patches.cpp is replaced only when its
+        # text changes, so it recompiles only then.
+        $mtrPatcher = Join-Path $Src 'tools\apply_game_patches.ps1'
+        $patcher = Join-Path $Repo 'tools\apply_game_patches.ps1'
+        Copy-Item $mtrPatcher $patcher -Force
+        & python $Retarget retarget $AddressMap $patcher
+        if ($LASTEXITCODE -ne 0) { throw 'retargeting tools\apply_game_patches.ps1 failed' }
+        & git -C $Repo apply --ignore-whitespace $GamePatch
+        if ($LASTEXITCODE -ne 0) { throw "git apply $GamePatch failed" }
+        $newest = @($mtrPatcher, $AddressMap, $GamePatch) | Get-Item | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+        (Get-Item $patcher).LastWriteTimeUtc = $newest.LastWriteTimeUtc
+        $tmp = New-TemporaryFile
+        try {
+            Copy-Item (Join-Path $Src 'src\pgr4_patches.cpp') $tmp.FullName -Force
+            & python $Retarget retarget $AddressMap $tmp.FullName
+            if ($LASTEXITCODE -ne 0) { throw 'retargeting src\pgr4_patches.cpp failed' }
+            $dst = Join-Path $Repo 'src\pgr4_patches.cpp'
+            if (-not (Test-Path $dst) -or [IO.File]::ReadAllText($tmp.FullName) -cne [IO.File]::ReadAllText($dst)) {
+                Copy-Item $tmp.FullName $dst -Force
+            }
+        } finally { Remove-Item $tmp.FullName -ErrorAction SilentlyContinue }
+
+        foreach ($p in @($Patch, $PrimaryPatch, $RuntimePatch, $ContentPatch)) {
             $name = Split-Path $p -Leaf
             & git -C $SdkSrc apply --check --reverse $p 2>$null
             if ($LASTEXITCODE -eq 0) {
@@ -175,16 +216,45 @@ if (Want 'sdk') {
 
 if (Want 'game') {
     Step 'game' {
-        if (-not (Test-Path (Join-Path $Game 'default.xex'))) { throw "missing $Game\default.xex" }
+        $tuEntry = Join-Path $TitleUpdate 'entrypoint.toml'
+        foreach ($f in @((Join-Path $Game 'default.xex'), (Join-Path $TitleUpdate 'default.xexp'), $tuEntry, $AddressMap)) {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+        }
         $rexglue = Join-Path $Sdk 'bin\rexglue.exe'
         if (-not (Test-Path $rexglue)) { throw "missing $rexglue; run the sdk stage first" }
         Use-VcEnv
-        # Same rewrite as MTR's scripts\build.ps1 (Local-Manifest), PGR4 only.
+        # Codegen applies an XEX patch found beside the XEX it loads: a copy of the disc's
+        # default.xex with TU#2's default.xexp next to it (copied only when changed).
+        $image = Join-Path $Dest 'title-update-image'
+        New-Item -ItemType Directory -Force -Path $image | Out-Null
+        foreach ($f in @((Join-Path $Game 'default.xex'), (Join-Path $TitleUpdate 'default.xexp'))) {
+            $to = Join-Path $image (Split-Path $f -Leaf)
+            if (-not (Test-Path $to) -or (Get-FileHash $f).Hash -ne (Get-FileHash $to).Hash) { Copy-Item $f $to -Force }
+        }
+        # Same rewrite as MTR's scripts\build.ps1 (Local-Manifest), PGR4 only, on the image above.
         $manifest = Join-Path $Repo 'pgr4_local.toml'
-        $content = [IO.File]::ReadAllText((Join-Path $Repo 'pgr4_recompiled_manifest.toml'))
-        $gamePath = $Game.Replace('\', '/')
-        $content = $content -replace 'game_root = "[^"]*"', ('game_root = "' + $gamePath + '"')
-        $content = $content -replace 'file_path = "[^"]*"', ('file_path = "' + $gamePath + '/default.xex"')
+        $content = [IO.File]::ReadAllText((Join-Path $Repo 'pgr4_recompiled_manifest.toml')) -replace "`r", ''
+        $imagePath = $image.Replace('\', '/')
+        $content = $content -replace 'game_root = "[^"]*"', ('game_root = "' + $imagePath + '"')
+        $content = $content -replace 'file_path = "[^"]*"', ('file_path = "' + $imagePath + '/default.xex"')
+        # TU#2's setjmp, longjmp and function entries in place of MTR's, each of which
+        # addresses.txt must account for.
+        $known = @{}
+        foreach ($line in [IO.File]::ReadAllLines($AddressMap)) {
+            if ($line -match '^(82[0-9A-Fa-f]{6})\s') { $known[[Convert]::ToUInt32($Matches[1], 16)] = $true }
+        }
+        $funcs = [regex]::Match($content, '(?ms)^\[entrypoint\.functions\]\n(.*?)(?=^\[|\z)')
+        if (-not $funcs.Success) { throw 'pgr4_recompiled_manifest.toml: [entrypoint.functions] not found' }
+        $mtr = @([regex]::Matches($funcs.Groups[1].Value, '(?m)^\s*0x([0-9A-Fa-f]{8})\s*=') | ForEach-Object { $_.Groups[1].Value }) +
+            @([regex]::Matches($content, '(?m)^\s*(?:setjmp|longjmp)_address\s*=\s*0x([0-9A-Fa-f]{8})') | ForEach-Object { $_.Groups[1].Value })
+        $unknown = @($mtr | Where-Object { -not $known.ContainsKey([Convert]::ToUInt32($_, 16)) } | Sort-Object -Unique)
+        if ($unknown) {
+            throw "MTR's manifest has entries ..\title-update\addresses.txt lacks: 0x$($unknown -join ', 0x') (native\tools\tu_address_map.py maps them)"
+        }
+        $tu = [IO.File]::ReadAllText($tuEntry) -replace "`r", ''
+        $jumps = -join @([regex]::Matches($tu, '(?m)^(?:setjmp|longjmp)_address\s*=.*\n') | ForEach-Object { $_.Value })
+        $content = $content.Remove($funcs.Index, $funcs.Length).Insert($funcs.Index, $tu.Substring($tu.IndexOf('[entrypoint.functions]')))
+        $content = $content -replace '(?m)^(?:setjmp|longjmp)_address\s*=.*\n', ''
         # Register-as-local codegen: guest CR, CTR, XER and the non-volatile registers become C++
         # locals instead of PPCContext fields, and the register save/restore helper calls disappear
         # (XenonRecomp's README; UnleashedRecomp's SWA.toml sets all eight options). Arguments and r1
@@ -204,9 +274,9 @@ if (Want 'game') {
             throw 'the MTR manifest already sets codegen register options; merge by hand'
         }
         $locals = "cr_as_local = true`nctr_as_local = true`nxer_as_local = true`nnon_volatile_as_local = true`nreserved_as_local = true`n"
-        $entry = [regex]::Match($content, '(?m)^\[entrypoint\]\r?\n')
+        $entry = [regex]::Match($content, '(?m)^\[entrypoint\]\n')
         if (-not $entry.Success) { throw 'pgr4_recompiled_manifest.toml: [entrypoint] not found' }
-        $content = $content.Insert($entry.Index + $entry.Length, $locals)
+        $content = $content.Insert($entry.Index + $entry.Length, $locals + $jumps)
         [IO.File]::WriteAllText($manifest, $content, (New-Object Text.UTF8Encoding($false)))
         $stamp = Join-Path $Repo 'generated\default\codegen.build.stamp'
         if ($Force -and (Test-Path $stamp)) { Remove-Item $stamp }
@@ -221,7 +291,8 @@ if (Want 'game') {
         # A pattern that still finds nothing fails the build in the patch script itself.
         $patcher = Join-Path $Repo 'tools\apply_game_patches.ps1'
         $ptext = [IO.File]::ReadAllText($patcher)
-        $plocal = [regex]::Replace($ptext, '\bctx\.(r1[4-9]|r2[0-9]|r3[01]|f1[4-9]|f2[0-9]|f3[01]|cr[0-7]|ctr|xer)\b', '$1')
+        # Not \b in front: PowerShell's `t and `n run into the name (`tctx.r29).
+        $plocal = [regex]::Replace($ptext, '(?:(?<!\w)|(?<=`[tn]))ctx\.(r1[4-9]|r2[0-9]|r3[01]|f1[4-9]|f2[0-9]|f3[01]|cr[0-7]|ctr|xer)\b', '$1')
         if ($plocal -ne $ptext) { [IO.File]::WriteAllText($patcher, $plocal, (New-Object Text.UTF8Encoding($false))) }
         $build = Join-Path $Repo 'out\pgr4'
         & cmake -S $Repo -B $build -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release `
@@ -243,6 +314,9 @@ if (Want 'install') {
             if (-not (Test-Path $f)) { throw "missing $f" }
             Copy-Item $f $runtime -Force
         }
+        $tuDir = Join-Path $runtime 'title-update'
+        New-Item -ItemType Directory -Force -Path $tuDir | Out-Null
+        foreach ($f in @('default.xexp', 'Pgr4TitleUpdate.bin')) { Copy-Item (Join-Path $TitleUpdate $f) $tuDir -Force }
         $user = Join-Path $runtime 'userdata'
         $seed = Join-Path $Root 'instrumented\run\runtime\userdata'
         if (-not (Test-Path $user) -and (Test-Path $seed)) {

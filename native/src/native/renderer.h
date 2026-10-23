@@ -60,21 +60,21 @@ struct SwapCall;
 // Guest D3D entry points the native path receives (addresses in the base-disc default.xex;
 // names from native/src/d3d_surface.inc).
 enum class HookFn : uint32_t {
-  kBeginVertices = 0x8269A4F8,        // draw; the game writes the vertices after it returns
-  kDrawVerticesUP = 0x8269A9A8,       // draw
-  kDrawVertices = 0x8269A9F0,         // draw
-  kDrawIndexedVertices = 0x8269ADD8,  // draw
-  kDrawIndx2Inline = 0x8269B230,      // draw, called only from inside the D3D library
-  kDrawIndx2Split = 0x826A7318,       // draw, called only from inside the D3D library
-  kClearF = 0x8269C378,
-  kClear = 0x8269C4A0,
-  kResolve = 0x82696978,
-  kSwap = 0x82695BE0,
+  kBeginVertices = 0x826CFA60,        // draw; the game writes the vertices after it returns
+  kDrawVerticesUP = 0x826CFF10,       // draw
+  kDrawVertices = 0x826CFF58,         // draw
+  kDrawIndexedVertices = 0x826D0340,  // draw
+  kDrawIndx2Inline = 0x826D0798,      // draw, called only from inside the D3D library
+  kDrawIndx2Split = 0x826DC888,       // draw, called only from inside the D3D library
+  kClearF = 0x826D18E0,
+  kClear = 0x826D1A08,
+  kResolve = 0x826CBEE0,
+  kSwap = 0x826CB148,
 };
 
 // The guest D3D's predicated tiling calls a hooked call can be nested in. BeginTiling
-// (fn_8269C6D0) clears through ClearF with the largest tile's extent at the EDRAM base, meaning
-// every tile; EndTiling (fn_8269CB68) resolves each tile, its rectangle in surface pixels and
+// (fn_826D1C38) clears through ClearF with the largest tile's extent at the EDRAM base, meaning
+// every tile; EndTiling (fn_826D20D0) resolves each tile, its rectangle in surface pixels and
 // the EDRAM holding the tile from its origin (the tile list at device+12740, render_targets.h).
 enum class TilingCall : uint8_t { kNone, kBegin, kEnd };
 

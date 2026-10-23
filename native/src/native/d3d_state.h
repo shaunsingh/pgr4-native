@@ -2,20 +2,20 @@
 // from the guest D3D device instead of the push buffer.
 //
 // The XDK D3D device keeps a shadow of the GPU registers (offsets below, from the flush calls
-// in DrawIndexedVertices sub_8269ADD8) and six 64-bit dirty masks at device+0..+40. The draw
+// in DrawIndexedVertices sub_826D0340) and six 64-bit dirty masks at device+0..+40. The draw
 // functions (and Clear/Resolve for the register blocks) flush the dirty parts of the shadow
 // into the push buffer and clear the masks. What the GPU sees therefore differs from the
 // shadow in three ways (the development notes, "Renderer decision", M1 shadow mismatches):
 //   1. float constants written to the shadow without their dirty bit are never sent; the
 //      bound shaders' literal constants are loaded straight from the shader objects
-//      (LOAD_ALU_CONSTANT in sub_826A9668) when a shader is rebound, never into the shadow;
+//      (LOAD_ALU_CONSTANT in sub_826DEBD8) when a shader is rebound, never into the shadow;
 //   2. the draw functions write some registers straight into the stream: VGT_INDX_OFFSET
 //      (base vertex / start vertex), vertex fetch slots 93-95 (BeginVertices' inline vertex
 //      buffer); Resolve writes RB_COPY_* and queries write RB_SAMPLE_COUNT_ADDR (not draw
 //      state, not tracked here);
 //   3. the user clip planes PA_CL_UCP_0..5 (0x2388-0x239F) are not in the 0x2380 block (that
 //      block is 8 registers, 0x2380-0x2387); they are flushed from device+10272, 16 bytes per
-//      plane, by sub_826A87E0 under dirty bits 49..54 of the mask at +32.
+//      plane, by sub_826DDD50 under dirty bits 49..54 of the mask at +32.
 //
 // GuestState keeps the GPU's view of the register file: the hook dispatch captures the dirty
 // masks at the entry of every flushing D3D call (ReadDirtyMasks) and reports the call's exit
@@ -63,7 +63,7 @@ struct CallEntry {
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device);
 
 // The D3D functions that flush the shadow (directly or through the internal draw builders):
-// the draws, DrawIndx2Inline/Split, Clear/ClearF, Resolve, Swap and fn_826A10A8. The dispatch
+// the draws, DrawIndx2Inline/Split, Clear/ClearF, Resolve, Swap and fn_826D6610. The dispatch
 // calls ReadDirtyMasks before and GuestState().AfterCall after each of them, at every
 // nesting depth, whenever --pgr4_native or the trace tap is on.
 bool IsStateFlushingFn(uint32_t addr);
@@ -75,15 +75,15 @@ bool IsTapOnlyRegister(uint32_t reg);
 // A shader as the GPU loads it (IM_LOAD): physical ucode address and size in dwords.
 //
 // When the bound vertex declaration does not match a vertex shader's built-in binding, the
-// D3D (sub_826A9858 -> sub_826A9508) copies the shader variant into the push buffer, patches
+// D3D (sub_826DEDC8 -> sub_826DEA78) copies the shader variant into the push buffer, patches
 // its vertex fetches for the declaration there and loads it with IM_LOAD_IMMEDIATE. Then
 // `immediate` points at a copy of the patched ucode (big-endian dwords, valid until the next
 // immediate VS load reaches a draw), `ucode` is its push-buffer address and `immediate_seq`
 // counts these loads (a cache key: push-buffer addresses get reused).
 //
 // A built-in variant is also patched where it is: once the GPU has finished the frames that
-// loaded it, binding it with another declaration (sub_826A9718) rewrites its vertex fetches in
-// place (sub_826A8C20) and records the declaration in the variant's binding record (vs + 416 *
+// loaded it, binding it with another declaration (sub_826DEC88) rewrites its vertex fetches in
+// place (sub_826DE190) and records the declaration in the variant's binding record (vs + 416 *
 // variant: declaration id at +40, stream layout at +48 and +56). `binding` hashes that record;
 // the ucode at `ucode` changes with it while its address, size and first and last dwords stay.
 struct ShaderRef {
@@ -136,7 +136,7 @@ class GuestStateTracker {
   // After a flushing call returned. `r` = r3..r10 at entry (r[0] = device), `ret` = r3 after.
   void AfterCall(const uint8_t* base, uint32_t fn_addr, const CallEntry& entry, const uint32_t r[8],
                  uint64_t ret);
-  // After sub_826A9508 (immediate VS load) returned; `r` = r3..r10 at its entry (r3 device,
+  // After sub_826DEA78 (immediate VS load) returned; `r` = r3..r10 at its entry (r3 device,
   // r5 vertex shader object, r10 variant). The copy is taken over by the draw that made it.
   void AfterImmediateVs(const uint8_t* base, const uint32_t r[8]);
   // State of the draw `args` describes; call after AfterCall for that draw (OnDraw).

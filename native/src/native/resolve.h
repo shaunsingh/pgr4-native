@@ -13,7 +13,7 @@
 // destination address, format and size, so their resources and views stay valid.
 //
 // Arguments are decoded the way the guest D3D does it (read from its generated code,
-// sub_82696978): NULL source rect = the destination level's size, right/bottom rounded up to
+// sub_826CBEE0): NULL source rect = the destination level's size, right/bottom rounded up to
 // 8; NULL dest point = (0, 0); sample select from Flags bits 4-6 (0 = by the surface's MSAA:
 // 1x sample 0, 2x average of 2, 4x average of 4); exponent bias from Flags bits 26-31;
 // red/blue swap when the destination's swizzle X is not R; raw copies for depth, conversion

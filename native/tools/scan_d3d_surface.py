@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lists the guest D3D API surface of PGR4 (base-disc default.xex) from ReXGlue generated C++.
+"""Lists the guest D3D API surface of PGR4 (Title Update #2's default.xex) from ReXGlue generated C++.
 
 Run on a copy of the generated code (it stays off git), e.g.:
 
@@ -13,7 +13,7 @@ Method:
   (game code). Internal draw builders are added explicitly because DrawCounter counted them.
 - The D3D device keeps a shadow copy of the GPU registers. The draw functions flush dirty
   blocks with type-0 packets copied verbatim from these device offsets (see the
-  `addi r6,r31,OFF ; li r5,REG ; bl 0x826a8720/0x826a8ac0` sequences in sub_8269ADD8). A small
+  `addi r6,r31,OFF ; li r5,REG ; bl 0x826ddc90/0x826de030` sequences in sub_826D0340). A small
   setter that stores into one of these offsets and sets a dirty bit in the 64-bit masks at
   device+0..40 is named after the register it changes; a small getter after the register it
   reads.
@@ -27,9 +27,9 @@ import os
 import re
 import sys
 
-LIB_LO, LIB_HI = 0x8268DEB0, 0x826AC280
+LIB_LO, LIB_HI = 0x826C33C0, 0x826E17F0
 
-# device offset -> (first register, register count); from the flush calls in sub_8269ADD8.
+# device offset -> (first register, register count); from the flush calls in sub_826D0340.
 SHADOW = [
     (1152, 0x4800, 192),   # fetch constants (32 x 6 dwords)
     (1920, 0x4000, 1024),  # vertex shader float constants
@@ -46,64 +46,64 @@ SHADOW = [
 
 # Functions named by reading them. (address, name, category)
 KNOWN = {
-    0x8269ADD8: ("DrawIndexedVertices", "kDraw"),       # DRAW_INDX with index buffer (dev+12428)
-    0x8269A9F0: ("DrawVertices", "kDraw"),              # DRAW_INDX, auto index
-    0x8269A4F8: ("BeginVertices", "kDraw"),             # DRAW_INDX auto index, returns inline space
-    0x8269B230: ("DrawIndx2Inline", "kDraw"),           # internal: DRAW_INDX_2 with inline indices
-    0x826A7318: ("DrawIndx2Split", "kDraw"),            # internal: DRAW_INDX_2 split at 65534
-    0x8269A9A8: ("DrawVerticesUP", "kDraw"),            # BeginVertices + memcpy + restore push
-    0x82696978: ("Resolve", "kResolve"),                # 3-vertex rect DRAW_INDX_2 in copy mode
-    0x82695BE0: ("Swap", "kSwap"),                      # calls VdSwap / VdGetSystemCommandBuffer
-    0x82695BD8: ("KickOff", "kPush"),                   # li r4,0 ; b 0x82695738
-    0x82695738: ("KickOffEx", "kPush"),
-    0x82699358: ("MakeSpace", "kPush"),                 # push pointer dev+48 past limit dev+56
-    0x826995E0: ("InsertFence", "kPush"),
-    0x8269A998: ("RestorePush", "kPush"),               # dev+48 = dev+13428
-    0x826991D0: ("SwitchSegment", "kPush"),             # internal: dev+48 = new segment - 4
-    0x82698F78: ("StartSegment", "kPush"),              # internal: dev+48 = dev+16712 / new - 4
-    0x82698300: ("RestoreSegment", "kPush"),            # internal: dev+48 = dev+16712
-    0x82697E18: ("RestoreSegment13392", "kPush"),       # internal: dev+48 = dev+13392
-    0x82698DD8: ("BlockOnResource", "kSync"),
-    0x82698DB8: ("BlockOnFence", "kSync"),
-    0x826943F8: ("SetVertexShaderConstantF", "kConst"),  # dev+1920 + 16*reg
-    0x826944E0: ("SetPixelShaderConstantF", "kConst"),   # dev+6016 + 16*reg
-    0x826945C8: ("GetVertexShaderConstantF", "kConst"),
-    0x826945E8: ("GetPixelShaderConstantF", "kConst"),
-    0x82694608: ("SetVertexShaderConstantB", "kConst"),  # dev+10112 bit array
-    0x82694668: ("SetPixelShaderConstantB", "kConst"),   # dev+10128 bit array
-    0x82694920: ("SetVertexShader", "kShader"),          # dev+12684
-    0x82694AE0: ("GetVertexShader", "kShader"),
-    0x82694C20: ("SetPixelShader", "kShader"),           # dev+12688
-    0x82694DF0: ("GetPixelShader", "kShader"),
-    0x82694E38: ("SetVertexDeclaration", "kShader"),     # dev+11812
-    0x82694E50: ("GetVertexDeclaration", "kShader"),
-    0x82693850: ("SetTexture", "kTexture"),              # fetch slot dev+1152+24*stage, ptr dev+12536+4*stage
-    0x826939D0: ("GetTexture", "kTexture"),
-    0x8268FAD8: ("SetSamplerState_A", "kTexture"),       # fetch slot dwords 3-4
-    0x8268FC68: ("SetSamplerState_B", "kTexture"),
-    0x82690618: ("SetStreamSource", "kStream"),          # vertex fetch constant 95-stream
-    0x82690738: ("GetStreamSource", "kStream"),
-    0x826907C0: ("SetIndices", "kStream"),               # dev+12428
-    0x82690850: ("GetIndices", "kStream"),
-    0x82690FA0: ("SetRenderTarget", "kSurface"),         # dev+12432+4*index
-    0x826915E0: ("SetRenderTargetThunk", "kSurface"),    # b 0x82690fa0
-    0x82690890: ("GetRenderTarget", "kSurface"),
-    0x82691308: ("SetDepthStencilSurface", "kSurface"),  # dev+12448
-    0x826908D8: ("GetDepthStencilSurface", "kSurface"),
-    0x82690E68: ("SetViewport", "kState"),
-    0x8269C4A0: ("Clear", "kClear"),
-    0x8269C378: ("ClearF", "kClear"),
-    0x826A0D60: ("SetBinMask", "kTiling"),               # SET_BIN_MASK_LO/HI (DrawCounter)
-    0x8269D998: ("QueryIssue", "kQuery"),                # query types 9 (occlusion) / 10
-    0x8269DC20: ("QueryGetData", "kQuery"),
-    0x82697D08: ("CreateDevice", "kDevice"),             # allocates the 22,400-byte device
-    0x8269A108: ("ResourceRelease", "kResource"),        # atomic refcount at +4
+    0x826D0340: ("DrawIndexedVertices", "kDraw"),       # DRAW_INDX with index buffer (dev+12428)
+    0x826CFF58: ("DrawVertices", "kDraw"),              # DRAW_INDX, auto index
+    0x826CFA60: ("BeginVertices", "kDraw"),             # DRAW_INDX auto index, returns inline space
+    0x826D0798: ("DrawIndx2Inline", "kDraw"),           # internal: DRAW_INDX_2 with inline indices
+    0x826DC888: ("DrawIndx2Split", "kDraw"),            # internal: DRAW_INDX_2 split at 65534
+    0x826CFF10: ("DrawVerticesUP", "kDraw"),            # BeginVertices + memcpy + restore push
+    0x826CBEE0: ("Resolve", "kResolve"),                # 3-vertex rect DRAW_INDX_2 in copy mode
+    0x826CB148: ("Swap", "kSwap"),                      # calls VdSwap / VdGetSystemCommandBuffer
+    0x826CB140: ("KickOff", "kPush"),                   # li r4,0 ; b 0x826CACA0
+    0x826CACA0: ("KickOffEx", "kPush"),
+    0x826CE8C0: ("MakeSpace", "kPush"),                 # push pointer dev+48 past limit dev+56
+    0x826CEB48: ("InsertFence", "kPush"),
+    0x826CFF00: ("RestorePush", "kPush"),               # dev+48 = dev+13428
+    0x826CE738: ("SwitchSegment", "kPush"),             # internal: dev+48 = new segment - 4
+    0x826CE4E0: ("StartSegment", "kPush"),              # internal: dev+48 = dev+16712 / new - 4
+    0x826CD868: ("RestoreSegment", "kPush"),            # internal: dev+48 = dev+16712
+    0x826CD380: ("RestoreSegment13392", "kPush"),       # internal: dev+48 = dev+13392
+    0x826CE340: ("BlockOnResource", "kSync"),
+    0x826CE320: ("BlockOnFence", "kSync"),
+    0x826C9908: ("SetVertexShaderConstantF", "kConst"),  # dev+1920 + 16*reg
+    0x826C99F0: ("SetPixelShaderConstantF", "kConst"),   # dev+6016 + 16*reg
+    0x826C9AD8: ("GetVertexShaderConstantF", "kConst"),
+    0x826C9AF8: ("GetPixelShaderConstantF", "kConst"),
+    0x826C9B18: ("SetVertexShaderConstantB", "kConst"),  # dev+10112 bit array
+    0x826C9B78: ("SetPixelShaderConstantB", "kConst"),   # dev+10128 bit array
+    0x826C9E30: ("SetVertexShader", "kShader"),          # dev+12684
+    0x826C9FF0: ("GetVertexShader", "kShader"),
+    0x826CA130: ("SetPixelShader", "kShader"),           # dev+12688
+    0x826CA300: ("GetPixelShader", "kShader"),
+    0x826CA348: ("SetVertexDeclaration", "kShader"),     # dev+11812
+    0x826CA360: ("GetVertexDeclaration", "kShader"),
+    0x826C8D60: ("SetTexture", "kTexture"),              # fetch slot dev+1152+24*stage, ptr dev+12536+4*stage
+    0x826C8EE0: ("GetTexture", "kTexture"),
+    0x826C4FE8: ("SetSamplerState_A", "kTexture"),       # fetch slot dwords 3-4
+    0x826C5178: ("SetSamplerState_B", "kTexture"),
+    0x826C5B28: ("SetStreamSource", "kStream"),          # vertex fetch constant 95-stream
+    0x826C5C48: ("GetStreamSource", "kStream"),
+    0x826C5CD0: ("SetIndices", "kStream"),               # dev+12428
+    0x826C5D60: ("GetIndices", "kStream"),
+    0x826C64B0: ("SetRenderTarget", "kSurface"),         # dev+12432+4*index
+    0x826C6AF0: ("SetRenderTargetThunk", "kSurface"),    # b 0x826c64b0
+    0x826C5DA0: ("GetRenderTarget", "kSurface"),
+    0x826C6818: ("SetDepthStencilSurface", "kSurface"),  # dev+12448
+    0x826C5DE8: ("GetDepthStencilSurface", "kSurface"),
+    0x826C6378: ("SetViewport", "kState"),
+    0x826D1A08: ("Clear", "kClear"),
+    0x826D18E0: ("ClearF", "kClear"),
+    0x826D62C8: ("SetBinMask", "kTiling"),               # SET_BIN_MASK_LO/HI (DrawCounter)
+    0x826D2F00: ("QueryIssue", "kQuery"),                # query types 9 (occlusion) / 10
+    0x826D3188: ("QueryGetData", "kQuery"),
+    0x826CD270: ("CreateDevice", "kDevice"),             # allocates the 22,400-byte device
+    0x826CF670: ("ResourceRelease", "kResource"),        # atomic refcount at +4
 }
 
 # Internal functions hooked as well: the two draw builders DrawCounter counted, MakeSpace, and
 # the functions that assign the push pointer (dev+48) to a new segment; the trace tap decodes up
 # to the old pointer at their entry and skips the hole they leave.
-INTERNAL_EXTRA = [0x8269B230, 0x826A7318, 0x82699358, 0x826991D0, 0x82698F78, 0x82698300, 0x82697E18]
+INTERNAL_EXTRA = [0x826D0798, 0x826DC888, 0x826CE8C0, 0x826CE738, 0x826CE4E0, 0x826CD868, 0x826CD380]
 
 
 def load_registers(path):
@@ -184,7 +184,8 @@ def main():
         out.append((addr, name, cat, ext, len(asm)))
 
     print('// Generated by native/tools/scan_d3d_surface.py from the ReXGlue')
-    print('// generated C++ of the base-disc default.xex (sha256 f9a411d8...f423e). Do not edit by hand.')
+    print('// generated C++ of Title Update #2\'s default.xex (0.0.2.1: the disc\'s f9a411d8...f423e with')
+    print('// title-update/default.xexp). Do not edit by hand.')
     print('// D3D_FN(address, name, category)  // external call sites, instructions')
     for addr, name, cat, ext, n in out:
         print(f'D3D_FN({addr:08X}, "{name}", {cat})  // ext={ext} n={n}')

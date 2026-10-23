@@ -19,26 +19,26 @@
 namespace {
 
 enum Hook : uint32_t {
-  kDrawIndxAuto_8269A4F8,     // 0xC0012201 x2: DRAW_INDX, 2 dwords (auto index), predicated
-  kDrawIndxAuto_8269A9F0,     // 0xC0012201: DRAW_INDX, 2 dwords, predicated
-  kDrawIndxDma_8269ADD8,      // 0xC0032201: DRAW_INDX, 4 dwords (index buffer), predicated
-  kDrawIndx2_8269B230,        // 0xC0003601 | n<<16: DRAW_INDX_2, predicated
-  kDrawIndx2_826A7318,        // 0xC0003601, initiator count<<16 | 0x81, split at 65534: predicated
-  kDrawIndx2Np_826942B0,      // 0xC0003600 / 0x00010081 in a 24x loop: not predicated (aux)
-  kDrawIndx2Np_82696978,      // 0xC0003600 | n<<16, initiator 0x00030088 (3-vertex rect): aux,
+  kDrawIndxAuto_826CFA60,     // 0xC0012201 x2: DRAW_INDX, 2 dwords (auto index), predicated
+  kDrawIndxAuto_826CFF58,     // 0xC0012201: DRAW_INDX, 2 dwords, predicated
+  kDrawIndxDma_826D0340,      // 0xC0032201: DRAW_INDX, 4 dwords (index buffer), predicated
+  kDrawIndx2_826D0798,        // 0xC0003601 | n<<16: DRAW_INDX_2, predicated
+  kDrawIndx2_826DC888,        // 0xC0003601, initiator count<<16 | 0x81, split at 65534: predicated
+  kDrawIndx2Np_826C97C0,      // 0xC0003600 / 0x00010081 in a 24x loop: not predicated (aux)
+  kDrawIndx2Np_826CBEE0,      // 0xC0003600 | n<<16, initiator 0x00030088 (3-vertex rect): aux,
                               // likely the D3D clear/resolve rectangle
-  kIndirectBuffer_82698618,   // 0xC0013F00: INDIRECT_BUFFER
-  kBinAll_82690AF8,           // SET_BIN_MASK_LO/HI + SET_BIN_SELECT_LO/HI
-  kBinSelectLo_826AAD48,      // SET_BIN_SELECT_LO
-  kBinSelHiMask_826A10A8,     // SET_BIN_SELECT_HI + SET_BIN_MASK_LO/HI
-  kBinMask_826A0D60,          // SET_BIN_MASK_LO/HI
+  kIndirectBuffer_826CDB80,   // 0xC0013F00: INDIRECT_BUFFER
+  kBinAll_826C6008,           // SET_BIN_MASK_LO/HI + SET_BIN_SELECT_LO/HI
+  kBinSelectLo_826E02B8,      // SET_BIN_SELECT_LO
+  kBinSelHiMask_826D6610,     // SET_BIN_SELECT_HI + SET_BIN_MASK_LO/HI
+  kBinMask_826D62C8,          // SET_BIN_MASK_LO/HI
   kCount
 };
 
 const char* const kNames[kCount] = {
-    "draw_8269A4F8",  "draw_8269A9F0",  "draw_8269ADD8", "draw_8269B230",
-    "draw_826A7318",  "aux_826942B0",   "aux_82696978", "ib_82698618",
-    "bin_82690AF8",   "binsel_826AAD48", "binsel_826A10A8", "binmask_826A0D60",
+    "draw_826CFA60",  "draw_826CFF58",  "draw_826D0340", "draw_826D0798",
+    "draw_826DC888",  "aux_826C97C0",   "aux_826CBEE0", "ib_826CDB80",
+    "bin_826C6008",   "binsel_826E02B8", "binsel_826D6610", "binmask_826D62C8",
 };
 
 std::atomic<uint64_t> g_counts[kCount];
@@ -61,15 +61,15 @@ extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(
     __imp__sub_##addr(ctx, base);                                 \
   }
 
-DRAWCOUNT_HOOK(8269A4F8, kDrawIndxAuto_8269A4F8)
-DRAWCOUNT_HOOK(8269A9F0, kDrawIndxAuto_8269A9F0)
-DRAWCOUNT_HOOK(8269ADD8, kDrawIndxDma_8269ADD8)
-DRAWCOUNT_HOOK(8269B230, kDrawIndx2_8269B230)
-DRAWCOUNT_HOOK(826A7318, kDrawIndx2_826A7318)
-DRAWCOUNT_HOOK(826942B0, kDrawIndx2Np_826942B0)
-DRAWCOUNT_HOOK(82696978, kDrawIndx2Np_82696978)
-DRAWCOUNT_HOOK(82698618, kIndirectBuffer_82698618)
-DRAWCOUNT_HOOK(82690AF8, kBinAll_82690AF8)
-DRAWCOUNT_HOOK(826AAD48, kBinSelectLo_826AAD48)
-DRAWCOUNT_HOOK(826A10A8, kBinSelHiMask_826A10A8)
-DRAWCOUNT_HOOK(826A0D60, kBinMask_826A0D60)
+DRAWCOUNT_HOOK(826CFA60, kDrawIndxAuto_826CFA60)
+DRAWCOUNT_HOOK(826CFF58, kDrawIndxAuto_826CFF58)
+DRAWCOUNT_HOOK(826D0340, kDrawIndxDma_826D0340)
+DRAWCOUNT_HOOK(826D0798, kDrawIndx2_826D0798)
+DRAWCOUNT_HOOK(826DC888, kDrawIndx2_826DC888)
+DRAWCOUNT_HOOK(826C97C0, kDrawIndx2Np_826C97C0)
+DRAWCOUNT_HOOK(826CBEE0, kDrawIndx2Np_826CBEE0)
+DRAWCOUNT_HOOK(826CDB80, kIndirectBuffer_826CDB80)
+DRAWCOUNT_HOOK(826C6008, kBinAll_826C6008)
+DRAWCOUNT_HOOK(826E02B8, kBinSelectLo_826E02B8)
+DRAWCOUNT_HOOK(826D6610, kBinSelHiMask_826D6610)
+DRAWCOUNT_HOOK(826D62C8, kBinMask_826D62C8)

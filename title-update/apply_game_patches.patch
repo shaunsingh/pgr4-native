@@ -1,0 +1,23 @@
+--- a/tools/apply_game_patches.ps1
++++ b/tools/apply_game_patches.ps1
+@@ -132,13 +132,14 @@
+ # Preserve its early near-zero rejection and normal collision resolution.
+ $garageCallerOriginal = "`tuint32_t ea{};`n`t// mflr r12"
+ $garageCallerPatched = "`tuint32_t ea{};`n`tconst uint32_t pgr4_walk_caller = uint32_t(ctx.lr);`n`t// mflr r12"
+-$garageCountOriginal = "`t// lwz r11,80(r1)`n`tctx.r11.u64 = REX_LOAD_U32(ctx.r1.u32 + 80);`n`t// extsw r10,r11"
++# Title Update #2 loads the count into r29, which also bounds its step loop (cmpw cr6,r28,r29).
++$garageCountOriginal = "`t// lwz r29,80(r1)`n`tctx.r29.u64 = REX_LOAD_U32(ctx.r1.u32 + 80);`n`t// extsw r11,r29"
+ $garageCountPatched = @"
+-`t// lwz r11,80(r1)
+-`tctx.r11.u64 = REX_LOAD_U32(ctx.r1.u32 + 80);
++`t// lwz r29,80(r1)
++`tctx.r29.u64 = REX_LOAD_U32(ctx.r1.u32 + 80);
+ `textern int32_t Pgr4GarageCollisionSteps(int32_t, uint32_t);
+-`tctx.r11.s64 = Pgr4GarageCollisionSteps(ctx.r11.s32, pgr4_walk_caller);
+-`t// extsw r10,r11
++`tctx.r29.s64 = Pgr4GarageCollisionSteps(ctx.r29.s32, pgr4_walk_caller);
++`t// extsw r11,r29
+ "@.TrimEnd()
+ Update-GeneratedFile 'generated/default/pgr4_recompiled_recomp.58.cpp' 'sub_824BB618' $garageCallerOriginal $garageCallerPatched
+ Update-GeneratedFile 'generated/default/pgr4_recompiled_recomp.58.cpp' 'sub_824BB618' $garageCountOriginal $garageCountPatched
+\ No newline at end of file

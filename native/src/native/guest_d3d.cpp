@@ -10,10 +10,10 @@
 
 REXCVAR_DEFINE_BOOL(pgr4_native_replace_draws, true, "PGR4 native",
                     "With --pgr4_native_primary, replace the guest D3D's DrawIndexedVertices "
-                    "(sub_8269ADD8): keep the device state, skip its PM4 packets");
+                    "(sub_826D0340): keep the device state, skip its PM4 packets");
 REXCVAR_DECLARE(bool, pgr4_native_primary);
 
-REX_EXTERN(sub_826A9858);
+REX_EXTERN(sub_826DEDC8);
 
 namespace pgr4::native::guest_d3d {
 namespace {
@@ -31,22 +31,22 @@ inline uint64_t Load64(uint8_t* base, uint32_t a) {
 // in its predicated form and records its address in the tile list at +13232 for the per-tile
 // replay; without a packet there is nothing to record, so the replacement covers both forms.
 constexpr uint32_t kTilingFlags = 10940;
-// Bits of the mask at +16 that make the draw call sub_826A9858 (shader rebind and the related
+// Bits of the mask at +16 that make the draw call sub_826DEDC8 (shader rebind and the related
 // state bits 17..20; 19 = vertex shader, 20 = pixel shader).
 constexpr uint64_t kShaderBits = 0x1E0000ull;
 
 }  // namespace
 
-// The original (sub_8269ADD8(device, primitive, base vertex, start index, index count)):
-//   1. flushes the dirty float constants (masks +0, +8, sub_826A8AC0), clears both masks;
-//   2. mask +16 & kShaderBits: sub_826A9858 (shader load; the immediate, patched VS copy comes
-//      from its call to sub_826A9508), which returns the new mask +16; that mask & mask +40:
-//      sub_826A8388 (stream-only registers derived from it);
-//   3. flushes the register blocks of masks +16, +24, +32 (sub_826A8720, the fetch constants
-//      sub_826A8960, clip planes sub_826A87E0), clears the three masks;
+// The original (sub_826D0340(device, primitive, base vertex, start index, index count)):
+//   1. flushes the dirty float constants (masks +0, +8, sub_826DE030), clears both masks;
+//   2. mask +16 & kShaderBits: sub_826DEDC8 (shader load; the immediate, patched VS copy comes
+//      from its call to sub_826DEA78), which returns the new mask +16; that mask & mask +40:
+//      sub_826DD8F8 (stream-only registers derived from it);
+//   3. flushes the register blocks of masks +16, +24, +32 (sub_826DDC90, the fetch constants
+//      sub_826DDED0, clip planes sub_826DDD50), clears the three masks;
 //   4. writes VGT_INDX_OFFSET and DRAW_INDX (in pieces of at most 65535 indices), MakeSpace
-//      (sub_82699358) when the push buffer is full.
-// Steps 1, 3 and 4 and sub_826A8388 write only the push buffer and its cursor (device +48); the
+//      (sub_826CE8C0) when the push buffer is full.
+// Steps 1, 3 and 4 and sub_826DD8F8 write only the push buffer and its cursor (device +48); the
 // shadow is unchanged and the state tracker (d3d_state.cpp) reads the shadow and which dirty
 // bits the call cleared. So the replacement runs step 2's shader load and clears the masks.
 bool DrawIndexed(PPCContext& ctx, uint8_t* base) {
@@ -70,7 +70,7 @@ bool DrawIndexed(PPCContext& ctx, uint8_t* base) {
     ctx.r1.u64 = sp - 256;
     ctx.r3.u64 = device;
     ctx.r4.u64 = shader;
-    sub_826A9858(ctx, base);
+    sub_826DEDC8(ctx, base);
     ctx.r1.u64 = sp;
   }
   std::memset(masks + 16, 0, 24);  // masks +16, +24, +32

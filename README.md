@@ -246,8 +246,22 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   a hash of the float constants each shader reads; resolves, EDRAM fills and render target
   creation are logged between the draws), `--pgr4_d3d_tap_check`. `deck-run.sh --draw-log N`
   logs N frames from the race start; `--race-draws` sets the median draws per frame that
-  shows the race is on (3000, St Petersburg's; the snow route runs with 1000).## Why a native renderer can beat emulation
+  shows the race is on (3000, St Petersburg's; the snow route runs with 1000).
+- Title Update #2 (0.0.2.1, the game's last version): the build recompiles the disc's
+  executable with the update applied, so World Challenge mode is in the Single Player menu and
+  the game reads downloadable content (`title-update/README.md`). The update, free on Xbox Live,
+  ships in `title-update/`; codegen applies its `default.xexp` to a copy of the disc's
+  `default.xex`, and the runtime mounts the folder as `update:\` and refuses an image other than
+  the one the code was generated from. MTR-PGR4's patches to the generated code name base
+  addresses: `native/tools/tu_address_map.py` matched the two executables' functions
+  instruction by instruction (`title-update/addresses.txt`), the build rewrites MTR's patches
+  and manifest entries with that table, and the garage step-count patch is rewritten for the
+  register the update keeps the count in. The renderer's own hooks into the D3D library moved
+  by the same map. DLC copied off a console as STFS packages goes in the game folder's
+  `Content\` (or `--content_root`); the runtime installs each new package into the user data's
+  content store at startup (td-41: Vehicle Pack 1 installed, World Challenge in the menu).
 
+## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
   makes about 3,300 draw calls per frame, and the Xenos plugin executes about 5,500 GPU draws
@@ -471,8 +485,10 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
 | `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
 | `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |
-| `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) || `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
+| `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) |
+| `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
+| `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
 
 With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 (`--gpu_skip_draws`, added by `native/rexglue-native-primary.patch`).

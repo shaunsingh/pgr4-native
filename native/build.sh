@@ -10,14 +10,21 @@
 #
 # Stages, in order (default: all):
 #   prep     rsync $root/MTR-PGR4 (source and patched SDK source; no build dirs, no generated
-#            code) to $dest/MTR-PGR4, apply rexglue-drawcount.patch, rexglue-native-primary.patch
-#            and rexglue-runtime-perf.patch to the SDK copy, copy src/pgr4_d3d_trace.cpp and src/d3d_surface.inc into the game's
-#            src/, mirror src/native/ and add both to the game's CMakeLists.txt.
+#            code) to $dest/MTR-PGR4, apply rexglue-drawcount.patch, rexglue-native-primary.patch,
+#            rexglue-runtime-perf.patch and rexglue-content.patch to the SDK copy, copy
+#            src/pgr4_d3d_trace.cpp and src/d3d_surface.inc into the game's src/, mirror src/native/
+#            and add both to the game's CMakeLists.txt; rewrite the base-executable addresses in the
+#            copy's game patches (tools/apply_game_patches.ps1, src/pgr4_patches.cpp) with Title
+#            Update #2's (title-update/addresses.txt), and apply title-update/apply_game_patches.patch
+#            for the one patched function TU#2 changed.
 #   sdk      build the codegen tool (rexglue) for this machine into $dest/host-sdk, then
 #            cross-build the SDK copy and install it into $dest/sdk-install.
-#   game     codegen default.xex with the copy's manifest (MTR's game patches included), build
+#   game     codegen Title Update #2: $game/default.xex with title-update/default.xexp beside it
+#            (copies in $dest/title-update-image), with the copy's manifest and TU#2's entry
+#            options (title-update/entrypoint.toml); MTR's game patches included. Build
 #            out/pgr4/pgr4_recompiled.exe.
-#   install  $dest/run/runtime: exe, rexruntime.dll, rexgpu-xenos.dll.
+#   install  $dest/run/runtime: exe, rexruntime.dll, rexgpu-xenos.dll, and title-update/ (the
+#            runtime's update:\ when no --update_data_root is given).
 #
 # --march / --mtune set the target CPU of the SDK and the game. The default is the Steam Deck's
 # Zen 2: x86-64-v3 brings FMA (the recompiled code's thousands of std::fma calls become one
@@ -76,7 +83,8 @@ host_build=$dest/host-sdk
 host_rexglue=$sdk_src/out/linux-amd64/rexglue
 toolchain=$repo_root/build/clang-cl-xwin.cmake
 patches=("$repo_root/instrument/rexglue-drawcount.patch" "$here/rexglue-native-primary.patch"
-  "$here/rexglue-runtime-perf.patch")
+  "$here/rexglue-runtime-perf.patch" "$here/rexglue-content.patch")
+title_update=$repo_root/title-update
 sources=("$here/src/pgr4_d3d_trace.cpp" "$here/src/d3d_surface.inc")
 native_src=$here/src/native
 # build.ps1's flags (see build-mtr.ps1 for why clang-cl needs them spelled out), with the
@@ -145,13 +153,35 @@ endif()
 CMAKE
 
 prep() {
-  need "$src/thirdparty/rexglue-sdk/.git" "${patches[@]}" "${sources[@]}" "$native_src"
+  need "$src/thirdparty/rexglue-sdk/.git" "${patches[@]}" "${sources[@]}" "$native_src" \
+    "$title_update/addresses.txt" "$title_update/apply_game_patches.patch"
   mkdir -p "$dest"
   local keep=()
   # An already patched CMakeLists.txt stays, so a re-run of prep does not force a full rebuild.
   grep -q 'pgr4_d3d_trace\.cpp' "$tree/CMakeLists.txt" 2>/dev/null && keep=(--exclude=/CMakeLists.txt)
   rsync -a --exclude=/out --exclude=/sdk-install --exclude=/generated/default \
-    --exclude=/geometry-wars/generated --exclude=/thirdparty/rexglue-sdk/out "${keep[@]}" "$src/" "$tree/"
+    --exclude=/geometry-wars/generated --exclude=/thirdparty/rexglue-sdk/out \
+    --exclude=/src/pgr4_patches.cpp "${keep[@]}" "$src/" "$tree/"
+  # MTR's game patches name the base executable's addresses; the code is Title Update #2's, which
+  # also changed one patched function (title-update/apply_game_patches.patch). The patch script
+  # takes the time of the newest of its inputs: Ninja reruns it (and recompiles all generated
+  # code) after every codegen anyway, and otherwise only when one of them changes.
+  # pgr4_patches.cpp is replaced only when its text changes, so it recompiles only then.
+  local retarget=("$here/tools/tu_address_map.py" retarget "$title_update/addresses.txt")
+  local patcher=$tree/tools/apply_game_patches.ps1 newest=$src/tools/apply_game_patches.ps1 f
+  cp "$newest" "$patcher"
+  python3 "${retarget[@]}" "$patcher"
+  git -C "$tree" apply --ignore-whitespace "$title_update/apply_game_patches.patch"
+  for f in "$title_update/addresses.txt" "$title_update/apply_game_patches.patch"; do
+    [[ $f -nt $newest ]] && newest=$f
+  done
+  touch -r "$newest" "$patcher"
+  local tmp
+  tmp=$(mktemp)
+  cp "$src/src/pgr4_patches.cpp" "$tmp"
+  python3 "${retarget[@]}" "$tmp"
+  cmp -s "$tmp" "$tree/src/pgr4_patches.cpp" || cp "$tmp" "$tree/src/pgr4_patches.cpp"
+  rm -f "$tmp"
   local p
   for p in "${patches[@]}"; do
     if git -C "$sdk_src" apply --check --reverse "$p" 2>/dev/null; then
@@ -212,23 +242,48 @@ sdk_stage() {
 }
 
 game_stage() {
-  need "$game/default.xex" "$host_rexglue" "$sdk/lib/cmake/rexglue/rexglueConfig.cmake"
-  local manifest=$tree/pgr4_local.toml
-  # Same manifest rewrite as build.ps1: the game path, and register-as-local codegen (see the
-  # comment there for why these five options and not the other three).
-  python3 - "$tree/pgr4_recompiled_manifest.toml" "$manifest" "$game" <<'PY'
+  need "$game/default.xex" "$host_rexglue" "$sdk/lib/cmake/rexglue/rexglueConfig.cmake" \
+    "$title_update/default.xexp" "$title_update/entrypoint.toml" "$title_update/addresses.txt"
+  local manifest=$tree/pgr4_local.toml image=$dest/title-update-image f
+  # Codegen applies an XEX patch found beside the XEX it loads: a copy of the disc's default.xex
+  # with TU#2's default.xexp next to it (copied only when changed, the codegen check below
+  # compares their times).
+  mkdir -p "$image"
+  for f in "$game/default.xex" "$title_update/default.xexp"; do
+    cmp -s "$f" "$image/$(basename "$f")" || cp -p "$f" "$image/"
+  done
+  # Same manifest rewrite as build.ps1: the image path, register-as-local codegen (see the
+  # comment there for why these five options and not the other three), and TU#2's setjmp,
+  # longjmp and function entries in place of MTR's, each of which addresses.txt must account for.
+  python3 - "$tree/pgr4_recompiled_manifest.toml" "$manifest" "$image" "$title_update" <<'PY'
 import re, sys
-src, dst, game = sys.argv[1:]
+src, dst, image, tu = sys.argv[1:]
 text = open(src, encoding="utf-8").read()
-text = re.sub(r'game_root = "[^"]*"', f'game_root = "{game}"', text)
-text = re.sub(r'file_path = "[^"]*"', f'file_path = "{game}/default.xex"', text)
+text = re.sub(r'game_root = "[^"]*"', f'game_root = "{image}"', text)
+text = re.sub(r'file_path = "[^"]*"', f'file_path = "{image}/default.xex"', text)
 if re.search(r"(?m)^\s*((cr|ctr|xer|non_volatile|non_argument|reserved)_as_local|skip_lr|skip_msr)\s*=", text):
     sys.exit("the MTR manifest already sets codegen register options; merge by hand")
 m = re.search(r"(?m)^\[entrypoint\]\n", text)
 if not m:
     sys.exit("pgr4_recompiled_manifest.toml: [entrypoint] not found")
+known = {int(line.split()[0], 16) for line in open(f"{tu}/addresses.txt", encoding="utf-8")
+         if re.match(r"82[0-9A-Fa-f]{6}\s", line)}
+funcs = re.search(r"(?ms)^\[entrypoint\.functions\]\n(.*?)(?=^\[|\Z)", text)
+if not funcs:
+    sys.exit("pgr4_recompiled_manifest.toml: [entrypoint.functions] not found")
+mtr = {int(a, 16) for a in re.findall(r"(?m)^\s*0x([0-9A-Fa-f]{8})\s*=", funcs.group(1))}
+mtr |= {int(a, 16) for a in re.findall(r"(?m)^\s*(?:setjmp|longjmp)_address\s*=\s*0x([0-9A-Fa-f]{8})", text)}
+if unknown := sorted(mtr - known):
+    sys.exit("MTR's manifest has entries title-update/addresses.txt lacks: "
+             + ", ".join(f"0x{a:08X}" for a in unknown)
+             + " (native/tools/tu_address_map.py maps them)")
+entry = open(f"{tu}/entrypoint.toml", encoding="utf-8").read()
+jumps = "".join(re.findall(r"(?m)^(?:setjmp|longjmp)_address\s*=.*\n", entry))
+text = text[:funcs.start()] + entry[entry.index("[entrypoint.functions]"):] + text[funcs.end():]
+text = re.sub(r"(?m)^(?:setjmp|longjmp)_address\s*=.*\n", "", text)
+m = re.search(r"(?m)^\[entrypoint\]\n", text)
 locals_ = "".join(f"{k}_as_local = true\n" for k in ("cr", "ctr", "xer", "non_volatile", "reserved"))
-new = text[:m.end()] + locals_ + text[m.end():]
+new = text[:m.end()] + locals_ + jumps + text[m.end():]
 # Unchanged content keeps its timestamp: the codegen step depends on this file (codegen.d),
 # and a rewrite would regenerate and recompile all generated code.
 try:
@@ -243,7 +298,8 @@ PY
   # Codegen rewrites its stamp even when its output does not change, and every generated object
   # depends on the stamp (through MTR's patch step), so a run with the inputs in codegen.d
   # unchanged would recompile all generated code.
-  if [[ ! -f $stamp || $manifest -nt $stamp || $game/default.xex -nt $stamp || $host_rexglue -nt $stamp ]]; then
+  if [[ ! -f $stamp || $manifest -nt $stamp || $image/default.xex -nt $stamp ||
+        $image/default.xexp -nt $stamp || $host_rexglue -nt $stamp ]]; then
     (cd "$tree" && "$host_rexglue" codegen "$manifest")
   fi
   # As in build.ps1: MTR's patch script matches ctx.r31-style text that the options above turn
@@ -255,7 +311,8 @@ import os, re, sys
 path = sys.argv[1]
 st = os.stat(path)
 text = open(path, encoding="utf-8").read()
-new = re.sub(r"\bctx\.(r1[4-9]|r2[0-9]|r3[01]|f1[4-9]|f2[0-9]|f3[01]|cr[0-7]|ctr|xer)\b", r"\1", text)
+# Not \b in front: PowerShell's `t and `n run into the name (`tctx.r29).
+new = re.sub(r"(?:(?<!\w)|(?<=`[tn]))ctx\.(r1[4-9]|r2[0-9]|r3[01]|f1[4-9]|f2[0-9]|f3[01]|cr[0-7]|ctr|xer)\b", r"\1", text)
 if new != text:
     open(path, "w", encoding="utf-8", newline="\n").write(new)
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -272,8 +329,9 @@ install_stage() {
   local runtime=$dest/run/runtime
   local files=("$tree/out/pgr4/pgr4_recompiled.exe" "$sdk/bin/rexruntime.dll" "$sdk/bin/rexgpu-xenos.dll")
   need "${files[@]}"
-  mkdir -p "$runtime"
+  mkdir -p "$runtime/title-update"
   cp -f "${files[@]}" "$runtime/"
+  cp -f "$title_update/default.xexp" "$title_update/Pgr4TitleUpdate.bin" "$runtime/title-update/"
   # Their linker maps, for deck-run.sh --perf (perf_symbols.py).
   local map
   for map in "$tree/out/pgr4/pgr4_recompiled.map" "$sdk_src"/out/win-amd64/{rexruntime,rexgpu-xenos}.map; do
