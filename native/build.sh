@@ -16,7 +16,8 @@
 #            and add both to the game's CMakeLists.txt; rewrite the base-executable addresses in the
 #            copy's game patches (tools/apply_game_patches.ps1, src/pgr4_patches.cpp) with Title
 #            Update #2's (title-update/addresses.txt), and apply title-update/apply_game_patches.patch
-#            for the one patched function TU#2 changed.
+#            (the one patched function TU#2 changed, and the presentation interval the native
+#            renderer's frame pacer sets).
 #   sdk      build the codegen tool (rexglue) for this machine into $dest/host-sdk, then
 #            cross-build the SDK copy and install it into $dest/sdk-install.
 #   game     codegen Title Update #2: $game/default.xex with title-update/default.xexp beside it
@@ -187,8 +188,9 @@ prep() {
     --exclude=/geometry-wars/generated --exclude=/thirdparty/rexglue-sdk/out \
     --exclude=/src/pgr4_patches.cpp "${keep[@]}" "$src/" "$tree/"
   # MTR's game patches name the base executable's addresses; the code is Title Update #2's, which
-  # also changed one patched function (title-update/apply_game_patches.patch). The patch script
-  # takes the time of the newest of its inputs: Ninja reruns it (and recompiles all generated
+  # also changed one patched function; title-update/apply_game_patches.patch adapts that one and
+  # hands the presentation interval to the native renderer (Pgr4PresentationInterval). The patch
+  # script takes the time of the newest of its inputs: Ninja reruns it (and recompiles all generated
   # code) after every codegen anyway, and otherwise only when one of them changes.
   # pgr4_patches.cpp is replaced only when its text changes, so it recompiles only then.
   local retarget=("$here/tools/tu_address_map.py" retarget "$title_update/addresses.txt")

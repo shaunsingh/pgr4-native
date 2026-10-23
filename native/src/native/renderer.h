@@ -44,6 +44,7 @@ namespace pgr4::native {
 
 class D3D12Device;
 class DrawRenderer;
+class FramePacer;
 class GpuTimer;
 class Presenter;
 class RenderTargets;
@@ -118,6 +119,10 @@ struct FrameStats {
   uint64_t submits = 0;      // lists submitted before the Swap's (--pgr4_native_submit_draws)
   // The guest's pad reads since the Swap before (rex_xam_take_frame_pad, taken at the Swap).
   uint64_t pad = 0;
+  // Pacing (NowNs clock): when the guest thread began the frame (its previous Swap returned) and
+  // reached its Swap, how long FramePacer::WaitToBegin held it before it began, and the frame's
+  // present number (D3D12Device::EndFrameTimes::presents; 0: not presented).
+  uint64_t guest_begin_ns = 0, guest_swap_ns = 0, pace_wait_ns = 0, present = 0;
 };
 
 class NativeRenderer {
@@ -132,6 +137,11 @@ class NativeRenderer {
     NativeRenderer* r = Get();
     return r && r->live_.load(std::memory_order_relaxed) ? r : nullptr;
   }
+
+  // True while the renderer presents the game's frames and paces them on the display
+  // (frame_pacer.h): the guest D3D then presents without waiting for a vblank
+  // (Pgr4PresentationInterval in pgr4_d3d_trace.cpp). Any thread.
+  static bool PacesFrames() { return paces_frames_.load(std::memory_order_relaxed); }
 
   // Hook entry points. `base` is the guest memory base the hook received (guest virtual
   // address a is at base + a, plus 0x1000 for a >= 0xE0000000 like the generated code).
@@ -181,6 +191,13 @@ class NativeRenderer {
   void SubmitEarly();
   // A failed submission or present: logs and turns the native path off for the rest of the run.
   void Fail();
+  // Primary mode, at a Swap before anything is recorded into the back buffer: who presents into
+  // the game window. The renderer while it draws the game and no XAM dialog is up; ReXGlue's
+  // presenter otherwise (the dialogs are its ImGui overlay, and after the renderer switch it
+  // shows the Xenos plugin's frames). A window has one swapchain at a time: the presenter's
+  // surface is disconnected before ours is created, and ours released before it is connected
+  // again. Returns false when the swapchain cannot be created (logged).
+  bool OwnGameWindow(bool own);
   // Render thread mode.
   struct Queue;
   void QueueDraw(const uint8_t* base, const HookArgs& args);
@@ -199,6 +216,7 @@ class NativeRenderer {
   void HandOver(uint8_t* base, uint32_t device);
   void TakeBack();
 
+  static inline std::atomic<bool> paces_frames_{false};  // pacer_->pacing(), for any thread
   std::atomic<bool> live_{true};
   std::atomic<bool> switch_requested_{false};
   bool switch_bound_ = false;  // primary mode with --pgr4_native_renderer_switch
@@ -206,11 +224,14 @@ class NativeRenderer {
   std::unique_ptr<Queue> queue_;  // render thread mode only
 
   std::unique_ptr<D3D12Device> device_;
+  bool primary_ = false;  // --pgr4_native_primary: presenting into the game window
   std::unique_ptr<RenderTargets> rt_;
   std::unique_ptr<Resolver> resolver_;
   std::unique_ptr<TextureCache> textures_;
   std::unique_ptr<DrawRenderer> draw_;
   std::unique_ptr<Presenter> present_;
+  // Primary mode with --pgr4_native_frame_latency > 0, or observing only with --pgr4_native_csv.
+  std::unique_ptr<FramePacer> pacer_;
   GpuTimer* gpu_timer_ = nullptr;  // device_'s, with --pgr4_native_gpu_timing
   bool frame_begun_ = false;
   uint64_t frame_index_ = 0;

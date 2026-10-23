@@ -1,6 +1,23 @@
 --- a/tools/apply_game_patches.ps1
 +++ b/tools/apply_game_patches.ps1
-@@ -132,13 +132,14 @@
+@@ -49,8 +49,14 @@
+     [System.IO.File]::WriteAllText($path, $content, $utf8)
+ }
+ 
+-$fpsOriginal = "loc_826CAD54:`n`t// lwz r10,13580(r31)`n`tctx.r10.u64 = REX_LOAD_U32(ctx.r31.u32 + 13580);"
+-$fpsPatched = "loc_826CAD54:`n`t// Optional 60 FPS patch: 0x826CAD54, lwz r10,13580(r31) -> li r10,1.`n`tctx.r10.u64 = Pgr4Enable60Fps() ? 1 : REX_LOAD_U32(ctx.r31.u32 + 13580);"
++# Presentation interval (KickOffEx): Pgr4PresentationInterval (pgr4-native,
++# native/src/pgr4_d3d_trace.cpp) returns IMMEDIATE while the native renderer paces the frames on
++# the display, else the game's interval or, with the 60 FPS option, ONE. The second original is
++# the 60 FPS patch's text, so a tree generated and patched before is patched again in place.
++$fpsOriginal = @(
++    "loc_826CAD54:`n`t// lwz r10,13580(r31)`n`tctx.r10.u64 = REX_LOAD_U32(ctx.r31.u32 + 13580);",
++    "loc_826CAD54:`n`t// Optional 60 FPS patch: 0x826CAD54, lwz r10,13580(r31) -> li r10,1.`n`tctx.r10.u64 = Pgr4Enable60Fps() ? 1 : REX_LOAD_U32(ctx.r31.u32 + 13580);")
++$fpsPatched = "loc_826CAD54:`n`t// Presentation interval: 0x826CAD54, lwz r10,13580(r31) -> Pgr4PresentationInterval(r10).`n`textern uint32_t Pgr4PresentationInterval(uint32_t);`n`tctx.r10.u64 = Pgr4PresentationInterval(REX_LOAD_U32(ctx.r31.u32 + 13580));"
+ $hdrOriginal = "`t// stw r11,144(r1)`n`tREX_STORE_U32(ctx.r1.u32 + 144, ctx.r11.u32);`n`t// li r11,1`n`tctx.r11.s64 = 1;`n`t// stw r31,140(r1)"
+ $hdrPatched = "`t// stw r11,144(r1)`n`tREX_STORE_U32(ctx.r1.u32 + 144, ctx.r11.u32);`n`t// Optional upscale flicker patch: 0x829DD9F4, li r11,1 -> li r11,0.`n`tctx.r11.s64 = Pgr4DisableHdr() ? 0 : 1;`n`t// stw r31,140(r1)"
+ 
+@@ -132,13 +138,14 @@
  # Preserve its early near-zero rejection and normal collision resolution.
  $garageCallerOriginal = "`tuint32_t ea{};`n`t// mflr r12"
  $garageCallerPatched = "`tuint32_t ea{};`n`tconst uint32_t pgr4_walk_caller = uint32_t(ctx.lr);`n`t// mflr r12"

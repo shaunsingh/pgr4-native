@@ -1,10 +1,13 @@
-// pgr4-native PGR4 native renderer: the app's own D3D12 queue, fence, frame command lists and a
-// window with its own swapchain, separate from ReXGlue's presenter and the Xenos plugin.
+// pgr4-native PGR4 native renderer: the app's own D3D12 queue, fence, frame command lists and
+// swapchain, separate from ReXGlue's presenter and the Xenos plugin.
 //
-// Two window modes: the debug window (a top-level window beside the game's), or, with
-// --pgr4_native_primary, a disabled child window covering the game window's client area (the
-// SDK's own window and swapchain stay underneath; keyboard focus and input stay with the game
-// window, and the child follows its client size).
+// Two window modes: the debug window (a top-level window of its own beside the game's), or, with
+// --pgr4_native_primary, the game window itself (the SDK's). There the swapchain exists only
+// between AttachSwapchain and DetachSwapchain, while the renderer owns the window; the rest of
+// the time ReXGlue's presenter has its swapchain there (renderer.h, OwnGameWindow). The game
+// window and not a child window over it: gamescope's WSI layer flips only the swapchain of a
+// top-level window with no child window above it, and sends any other through Xwayland's copy,
+// which has neither FIFO nor the frame limiter and drops all but the newest frame per refresh.
 //
 // D3D12 returns the same ID3D12Device for the same adapter within a process, so the device may
 // be the one the Xenos plugin also uses; everything else here (queue, allocators, lists,
@@ -42,24 +45,35 @@ class D3D12Device {
 
   ~D3D12Device();
 
-  // Creates the device objects, the window (on its own message thread) and the swapchain, and
-  // opens the first frame's command list. With `parent`, the window is a child of it, sized to
-  // its client area (width/height are ignored). Logs and returns false on failure.
-  bool Initialize(uint32_t width, uint32_t height, const wchar_t* title, HWND parent = nullptr);
+  // Creates the device objects and opens the first frame's command list; without
+  // `game_window`, also the debug window (on its own message thread) and its swapchain. With it,
+  // the frames are presented there, at its client size, once AttachSwapchain created the
+  // swapchain (width/height are ignored). Logs and returns false on failure.
+  bool Initialize(uint32_t width, uint32_t height, const wchar_t* title,
+                  HWND game_window = nullptr);
 
   // Present with sync interval 1 (vsync) instead of 0 (tearing when supported).
   void set_vsync(bool vsync) { vsync_ = vsync; }
+  // Before Initialize: every swapchain gets a frame latency waitable object (frame_pacer.h).
+  void set_frame_latency_waitable(bool on) { latency_waitable_ = on; }
+  // The current swapchain's frame latency waitable object, with room for `max_latency` presents
+  // in flight; the caller owns it. Take it before the swapchain's first Present. nullptr without
+  // set_frame_latency_waitable, or on failure (logged).
+  HANDLE TakeFrameLatencyWaitable(uint32_t max_latency);
 
-  // Child mode: hides the window (and skips presenting) while false, so the game window's own
-  // content, such as the SDK's XAM dialogs or the Xenos plugin's frames, shows instead. No
-  // effect on the debug window.
-  void SetShown(bool shown);
+  // Game window mode, between frames (no back buffer use recorded in the open list):
+  // AttachSwapchain creates the swapchain at the window's client size; no other swapchain may
+  // exist on the window. Logs and returns false on failure. DetachSwapchain waits for the GPU
+  // and releases it. Frames recorded without a swapchain are submitted but not presented.
+  bool AttachSwapchain();
+  void DetachSwapchain();
+  bool has_swapchain() const { return swapchain_ != nullptr; }
 
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
 
-  // The debug window's current back buffer (state PRESENT outside EndFrame) and its RTV.
+  // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV.
   ID3D12Resource* back_buffer() const { return back_buffers_[back_index_].Get(); }
   D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv() const;
   uint32_t width() const { return width_; }
@@ -74,10 +88,10 @@ class D3D12Device {
   void WaitFence(uint64_t value);
 
   // Closes and submits the frame's command list (the caller recorded into the back buffer;
-  // EndFrame adds no barriers), presents (unless `present` is false: the window keeps the
-  // previous frame), signals the frame fence, follows the parent window's
-  // client size (child mode), then waits for the slot kFramesInFlight frames back and opens the
-  // next frame's list.
+  // EndFrame adds no barriers), presents (unless `present` is false or there is no swapchain:
+  // the window keeps the previous frame), signals the frame fence, follows the game window's
+  // client size, then waits for the slot kFramesInFlight frames back and opens the next frame's
+  // list.
   // Returns false once the device or swapchain failed (logged once); the caller stops.
   bool EndFrame(bool present = true);
   // Submits what the frame recorded so far and continues it in the same list, reset on the
@@ -90,6 +104,8 @@ class D3D12Device {
     uint64_t submit_ns = 0;   // Close + ExecuteCommandLists
     uint64_t present_ns = 0;  // Present
     uint64_t fence_ns = 0;    // OpenList: waiting for the GPU to finish the slot's last frame
+    bool presented = false;   // Present ran (a swapchain and a complete frame)
+    uint64_t presents = 0;    // Presents so far, this one included
   };
   const EndFrameTimes& end_frame_times() const { return end_frame_times_; }
 
@@ -106,10 +122,11 @@ class D3D12Device {
 
  private:
   bool CreateWindowThread(const wchar_t* title);
+  bool CreateSwapchain(HWND hwnd);
   bool OpenList();
   bool CloseAndExecute();
   bool GetBackBuffers();
-  bool FollowParentSize();
+  bool FollowWindowSize();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
   uint32_t width_ = 0, height_ = 0;
@@ -130,13 +147,15 @@ class D3D12Device {
   ComPtr<ID3D12DescriptorHeap> rtv_heap_;
   uint32_t rtv_stride_ = 0;
   uint32_t back_index_ = 0;
+  UINT swapchain_flags_ = 0;  // DXGI_SWAP_CHAIN_FLAG_*: creation and every ResizeBuffers
   bool tearing_ = false;
   bool vsync_ = false;
-  bool shown_ = true;
-  HWND parent_ = nullptr;
+  bool latency_waitable_ = false;
+  HWND game_window_ = nullptr;
 
   std::unique_ptr<GpuTimer> gpu_timer_;
 
+  // The debug window and its message thread.
   std::thread window_thread_;
   std::atomic<HWND> hwnd_{nullptr};
   std::atomic<uint64_t> title_frame_{0};

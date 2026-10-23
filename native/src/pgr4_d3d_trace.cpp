@@ -1214,6 +1214,19 @@ extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint6
   return 9;
 }
 
+bool Pgr4Enable60Fps();  // MTR's src/pgr4_patches.cpp
+
+// The presentation interval KickOffEx (sub_826CACA0) hands to the GPU, read from the device
+// (title-update/apply_game_patches.patch). While the native renderer paces the frames on the
+// display the guest presents at once: waiting for a vblank as well would pace the game on
+// ReXGlue's vblank timer a second time (frame_pacer.h). Otherwise the game's own interval, or
+// ONE with MTR's 60 FPS option.
+extern "C" uint32_t Pgr4PresentationInterval(uint32_t guest) {
+  constexpr uint32_t kOne = 1, kImmediate = 0x80000000;  // D3DPRESENT_INTERVAL_*
+  if (pgr4::native::NativeRenderer::PacesFrames()) return kImmediate;
+  return Pgr4Enable60Fps() ? kOne : guest;
+}
+
 #define D3D_FN(a, n, c)                                           \
   REX_EXTERN(__imp__sub_##a);                                     \
   REX_HOOK_RAW(sub_##a) {                                         \

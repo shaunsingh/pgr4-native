@@ -1,4 +1,5 @@
-// pgr4-native PGR4 native renderer: D3D12 device, frame command lists and the debug window.
+// pgr4-native PGR4 native renderer: D3D12 device, frame command lists, swapchain and the debug
+// window.
 #include "d3d12_device.h"
 
 #include "gpu_timer.h"
@@ -97,41 +98,23 @@ bool D3D12Device::CreateWindowThread(const wchar_t* title) {
     wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));  // IDC_ARROW (no UNICODE here)
     wc.lpszClassName = kClassName;
     RegisterClassExW(&wc);
-    HWND hwnd = nullptr;
-    if (parent_) {
-      // Primary: a disabled child over the game window's client area. Disabled, so it never
-      // takes focus and mouse input goes to the game window; no WM_PARENTNOTIFY to the SDK's
-      // UI thread.
-      RECT pr = {};
-      GetClientRect(parent_, &pr);
-      width_ = uint32_t((std::max)(LONG(64), pr.right - pr.left));
-      height_ = uint32_t((std::max)(LONG(64), pr.bottom - pr.top));
-      hwnd = CreateWindowExW(WS_EX_NOPARENTNOTIFY, kClassName, title,
-                             WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPSIBLINGS, 0, 0,
-                             int(width_), int(height_), parent_, nullptr, inst, nullptr);
-      if (hwnd) {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-      }
-    } else {
-      RECT r = {0, 0, LONG(width_), LONG(height_)};
-      AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-      // The debug window is owned by a hidden window, so it never becomes the process's "main
-      // window" (.NET MainWindowHandle: unowned and visible), which the input scripts
-      // (instrument/keys.ps1, run/input-player.ps1) focus and send keys to. It never activates
-      // either: a window manager that focuses the newest window (gamescope) would otherwise
-      // hand it the game's keyboard input (Wine activates a window on WM_TAKE_FOCUS unless it
-      // is WS_EX_NOACTIVATE).
-      HWND owner = CreateWindowExW(0, kClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst,
-                                   nullptr);
-      hwnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_NOACTIVATE, kClassName, title,
-                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
-                             r.bottom - r.top, owner, nullptr, inst, nullptr);
-      if (hwnd) {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(hwnd, kTitleTimer, 500, nullptr);
-      }
+    RECT r = {0, 0, LONG(width_), LONG(height_)};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    // The debug window is owned by a hidden window, so it never becomes the process's "main
+    // window" (.NET MainWindowHandle: unowned and visible), which the input scripts
+    // (instrument/keys.ps1, run/input-player.ps1) focus and send keys to. It never activates
+    // either: a window manager that focuses the newest window (gamescope) would otherwise hand
+    // it the game's keyboard input (Wine activates a window on WM_TAKE_FOCUS unless it is
+    // WS_EX_NOACTIVATE).
+    HWND owner =
+        CreateWindowExW(0, kClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
+    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_NOACTIVATE, kClassName, title,
+                                WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
+                                r.bottom - r.top, owner, nullptr, inst, nullptr);
+    if (hwnd) {
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+      ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+      SetTimer(hwnd, kTitleTimer, 500, nullptr);
     }
     {
       std::lock_guard lock(m);
@@ -156,10 +139,11 @@ bool D3D12Device::CreateWindowThread(const wchar_t* title) {
   return true;
 }
 
-bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* title, HWND parent) {
+bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* title,
+                             HWND game_window) {
   width_ = width;
   height_ = height;
-  parent_ = parent;
+  game_window_ = game_window;
   if (Failed(CreateDXGIFactory2(0, IID_PPV_ARGS(factory_.ReleaseAndGetAddressOf())),
              "CreateDXGIFactory2"))
     return false;
@@ -198,11 +182,42 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
     return false;
   list_->SetName(L"pgr4 native frame");
 
-  if (!CreateWindowThread(title)) return false;
-
   BOOL tearing = FALSE;
   factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
   tearing_ = tearing != FALSE;
+  swapchain_flags_ = (tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
+                     (latency_waitable_ ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0);
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  hd.NumDescriptors = kBackBuffers;
+  if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(rtv_heap_.GetAddressOf())),
+             "CreateDescriptorHeap(RTV)"))
+    return false;
+  rtv_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  if (!game_window_ && !(CreateWindowThread(title) && CreateSwapchain(hwnd_.load()))) return false;
+  REXLOG_INFO("PGR4 native: D3D12 on {} (feature level 11_0+), presenting into the {}, tearing {}",
+              name, game_window_ ? "game window" : "debug window", tearing_ ? "on" : "off");
+  return true;
+}
+
+bool D3D12Device::AttachSwapchain() {
+  RECT r = {};
+  GetClientRect(game_window_, &r);
+  width_ = uint32_t((std::max)(LONG(64), r.right - r.left));
+  height_ = uint32_t((std::max)(LONG(64), r.bottom - r.top));
+  if (!CreateSwapchain(game_window_)) return false;
+  REXLOG_INFO("PGR4 native: swapchain {}x{} in the game window", width_, height_);
+  return true;
+}
+
+void D3D12Device::DetachSwapchain() {
+  WaitIdle();
+  for (auto& b : back_buffers_) b.Reset();
+  swapchain_.Reset();
+  REXLOG_INFO("PGR4 native: swapchain released");
+}
+
+bool D3D12Device::CreateSwapchain(HWND hwnd) {
   DXGI_SWAP_CHAIN_DESC1 sd = {};
   sd.Width = width_;
   sd.Height = height_;
@@ -213,27 +228,24 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
   sd.Scaling = DXGI_SCALING_STRETCH;
   sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
   sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-  sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+  sd.Flags = swapchain_flags_;
   ComPtr<IDXGISwapChain1> sc1;
-  if (Failed(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd_.load(), &sd, nullptr, nullptr,
+  if (Failed(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr,
                                               sc1.GetAddressOf()),
              "CreateSwapChainForHwnd"))
     return false;
-  if (!parent_) factory_->MakeWindowAssociation(hwnd_.load(), DXGI_MWA_NO_ALT_ENTER);
+  // Fullscreen is the window's own (SDL's in the game window).
+  factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
   if (Failed(sc1.As(&swapchain_), "IDXGISwapChain3")) return false;
+  return GetBackBuffers();
+}
 
-  D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-  hd.NumDescriptors = kBackBuffers;
-  if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(rtv_heap_.GetAddressOf())),
-             "CreateDescriptorHeap(RTV)"))
-    return false;
-  rtv_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-  if (!GetBackBuffers()) return false;
-  REXLOG_INFO("PGR4 native: D3D12 on {} (feature level 11_0+), {} {}x{}, tearing {}", name,
-              parent_ ? "child of the game window" : "debug window", width_, height_,
-              tearing_ ? "on" : "off");
-  return true;
+HANDLE D3D12Device::TakeFrameLatencyWaitable(uint32_t max_latency) {
+  if (!latency_waitable_) return nullptr;
+  // The count must hold every release the waiter has not taken yet (DXGI bounds it by this).
+  if (Failed(swapchain_->SetMaximumFrameLatency(max_latency), "SetMaximumFrameLatency"))
+    return nullptr;
+  return swapchain_->GetFrameLatencyWaitableObject();
 }
 
 bool D3D12Device::GetBackBuffers() {
@@ -249,33 +261,23 @@ bool D3D12Device::GetBackBuffers() {
   return true;
 }
 
-// Child mode: the game window's client size changed (window resize, fullscreen toggle). The
-// child is resized and the swapchain buffers follow; a minimized parent (0x0) is skipped.
-bool D3D12Device::FollowParentSize() {
-  if (!parent_) return true;
-  RECT pr = {};
-  if (!GetClientRect(parent_, &pr)) return true;
-  const uint32_t w = uint32_t(pr.right - pr.left), h = uint32_t(pr.bottom - pr.top);
+// The game window's client size changed (window resize, fullscreen toggle): the swapchain
+// buffers follow; a minimized window (0x0) is skipped.
+bool D3D12Device::FollowWindowSize() {
+  if (!game_window_ || !swapchain_) return true;
+  RECT r = {};
+  if (!GetClientRect(game_window_, &r)) return true;
+  const uint32_t w = uint32_t(r.right - r.left), h = uint32_t(r.bottom - r.top);
   if (w < 64 || h < 64 || (w == width_ && h == height_)) return true;
-  if (HWND hwnd = hwnd_.load())
-    SetWindowPos(hwnd, nullptr, 0, 0, int(w), int(h), SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
   WaitIdle();
   for (auto& b : back_buffers_) b.Reset();
-  if (Failed(swapchain_->ResizeBuffers(kBackBuffers, w, h, kBackBufferFormat,
-                                       tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0),
+  if (Failed(swapchain_->ResizeBuffers(kBackBuffers, w, h, kBackBufferFormat, swapchain_flags_),
              "ResizeBuffers"))
     return false;
   REXLOG_INFO("PGR4 native: game window client {}x{} -> {}x{}", width_, height_, w, h);
   width_ = w;
   height_ = h;
   return GetBackBuffers();
-}
-
-void D3D12Device::SetShown(bool shown) {
-  if (!parent_ || shown == shown_) return;
-  shown_ = shown;
-  if (HWND hwnd = hwnd_.load()) ShowWindowAsync(hwnd, shown ? SW_SHOWNA : SW_HIDE);
-  REXLOG_INFO("PGR4 native: window {}", shown ? "shown" : "hidden");
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {
@@ -337,7 +339,8 @@ bool D3D12Device::EndFrame(bool present) {
   if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
   if (!CloseAndExecute()) return false;
   const uint64_t t1 = NowNs();
-  HRESULT hr = !shown_ || !present ? S_OK
+  const bool shown = swapchain_ && present;
+  HRESULT hr = !shown   ? S_OK
                : vsync_ ? swapchain_->Present(1, 0)
                         : swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
   end_frame_times_.submit_ns = t1 - t0;
@@ -347,13 +350,15 @@ bool D3D12Device::EndFrame(bool present) {
       Failed(device_->GetDeviceRemovedReason(), "device removed, reason");
     return false;
   }
+  end_frame_times_.presented = shown;
+  end_frame_times_.presents += end_frame_times_.presented;
   uint64_t v = next_fence_++;
   if (Failed(queue_->Signal(fence_.Get(), v), "CommandQueue::Signal")) return false;
   slot_fence_[slot_] = v;
   if (REXCVAR_GET(pgr4_native_gpu_serialize)) WaitFence(v);
   slot_ = (slot_ + 1) % kFramesInFlight;
-  back_index_ = swapchain_->GetCurrentBackBufferIndex();
-  if (!FollowParentSize()) return false;
+  if (swapchain_) back_index_ = swapchain_->GetCurrentBackBufferIndex();
+  if (!FollowWindowSize()) return false;
   return OpenList();
 }
 

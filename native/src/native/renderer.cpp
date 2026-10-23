@@ -4,6 +4,7 @@
 #include "d3d12_device.h"
 #include "d3d_state.h"
 #include "draw.h"
+#include "frame_pacer.h"
 #include "gpu_timer.h"
 #include "present.h"
 #include "profile.h"
@@ -13,8 +14,12 @@
 
 #include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
+#include <rex/runtime.h>
+#include <rex/system/interfaces/graphics.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/keybinds.h>
+#include <rex/ui/window.h>
+#include <rex/ui/windowed_app_context.h>
 
 #include <algorithm>
 #include <atomic>
@@ -66,6 +71,13 @@ REXCVAR_DEFINE_INT32(pgr4_native_submit_draws, 256, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_renderer_switch, true, "PGR4 native",
                     "With --pgr4_native_primary, the key bind_renderer_switch (F9) switches "
                     "between the native renderer and the Xenos plugin at the next Swap");
+REXCVAR_DEFINE_INT32(pgr4_native_frame_latency, 3, "PGR4 native",
+                     "With --pgr4_native_primary: pace the game's frames on the display, with at "
+                     "most this many frames begun but not yet shown (1-3, frame_pacer.h; the game "
+                     "thread, render thread and GPU each hold one at 90 fps); 0 leaves "
+                     "the pacing to the game's vblank wait (with --pgr4_native_csv the shown "
+                     "presents are still logged)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 
@@ -117,32 +129,23 @@ namespace {
 // Set once the device or swapchain failed; the native path stops.
 std::atomic<bool> g_failed{false};
 
-// The game window: the process's visible, unowned top-level window (the SDK's), not ours.
-HWND FindGameWindow() {
-  struct Ctx {
-    DWORD pid;
-    HWND found;
-  } ctx = {GetCurrentProcessId(), nullptr};
-  EnumWindows(
-      [](HWND h, LPARAM lp) -> BOOL {
-        auto* c = reinterpret_cast<Ctx*>(lp);
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid != c->pid || !IsWindowVisible(h) || GetWindow(h, GW_OWNER)) return TRUE;
-        wchar_t cls[64] = {};
-        GetClassNameW(h, cls, 64);
-        if (!wcscmp(cls, L"pgr4_native_debug")) return TRUE;
-        c->found = h;
-        return FALSE;
-      },
-      reinterpret_cast<LPARAM>(&ctx));
-  return ctx.found;
+// The game window (the SDK's display window), and ReXGlue's presenter, which presents into it
+// unless the renderer does (OwnGameWindow).
+rex::ui::Window* GameWindow() {
+  rex::Runtime* runtime = rex::Runtime::instance();
+  return runtime ? runtime->display_window() : nullptr;
+}
+rex::ui::Presenter* SdkPresenter() {
+  rex::Runtime* runtime = rex::Runtime::instance();
+  rex::system::IGraphicsSystem* graphics = runtime ? runtime->graphics_system() : nullptr;
+  return graphics ? graphics->presenter() : nullptr;
 }
 
 bool FlagOn(const char* name) {
   const std::string v = rex::cvar::GetFlagByName(name);
   return v == "true" || v == "1";
 }
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -168,6 +171,7 @@ struct NativeRenderer::Queue {
     SwapCall call;
     // Guest-thread numbers of the frame, added to the render thread's before its CSV row.
     uint64_t hook_ns, hook_wait_ns, hook_max_ns, state_fail, track_calls, pad;
+    uint64_t guest_begin_ns, guest_swap_ns, pace_wait_ns;
     DrawRenderer::PrepareCounters prep;
     uint64_t ticks[profile::kStageCount];
   };
@@ -206,6 +210,7 @@ struct NativeRenderer::Queue {
   uint64_t frame = 0;  // Swaps queued
   bool capture_armed = false;
   uint64_t hook_ns = 0, hook_wait_ns = 0, hook_max_ns = 0, state_fail = 0;
+  uint64_t begin_ns = 0, pace_wait_ns = 0;  // the frame being captured (FrameStats)
   void AddHook(uint64_t ns) {
     hook_ns += ns;
     hook_max_ns = std::max(hook_max_ns, ns);
@@ -268,17 +273,27 @@ bool NativeRenderer::Initialize() {
   device_ = std::make_unique<D3D12Device>();
   uint32_t w = uint32_t((std::max)(64, REXCVAR_GET(pgr4_native_width)));
   uint32_t h = uint32_t((std::max)(64, REXCVAR_GET(pgr4_native_height)));
-  const bool primary = REXCVAR_GET(pgr4_native_primary);
+  const bool primary = primary_ = REXCVAR_GET(pgr4_native_primary);
+  const bool paced = primary && REXCVAR_GET(pgr4_native_frame_latency) > 0;
+  // The pacer, or with the CSV only its log of the presents shown.
+  const bool pacer = paced || (primary && !REXCVAR_GET(pgr4_native_csv).empty());
   HWND game_window = nullptr;
   if (primary) {
-    // The first D3D call comes after the SDK created its window; wait briefly in case not.
-    for (int i = 0; i < 100 && !(game_window = FindGameWindow()); ++i) Sleep(50);
+    // The first D3D call comes after the SDK opened its window; wait briefly in case not.
+    for (int i = 0; i < 100 && !game_window; ++i) {
+      if (rex::ui::Window* window = GameWindow())
+        game_window = static_cast<HWND>(window->GetNativeWindowHandle());
+      if (!game_window) Sleep(50);
+    }
     if (!game_window) {
       REXLOG_ERROR("PGR4 native: --pgr4_native_primary: no game window found");
       return false;
     }
-    // Same pacing switch as the SDK presenter's.
-    device_->set_vsync(FlagOn("d3d12_present_vsync"));
+    // The pacer needs FIFO: vkd3d-proton releases the frame latency waitable on the display's
+    // present feedback only for capped present modes, and on the blit for the others. Without
+    // the pacer, the same switch as the SDK presenter's.
+    device_->set_vsync(paced || FlagOn("d3d12_present_vsync"));
+    device_->set_frame_latency_waitable(pacer);
   }
   if (!device_->Initialize(w, h, primary ? L"PGR4 native" : L"PGR4 native (debug)", game_window))
     return false;
@@ -338,7 +353,8 @@ bool NativeRenderer::Initialize() {
           "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,"
           "coh_stale,coh_late,coh_gpu,coh_regs,"
           "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic,"
-          "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry,submits");
+          "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry,submits,"
+          "guest_begin_ms,guest_swap_ms,pace_wait_us,present");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file,
@@ -359,6 +375,20 @@ bool NativeRenderer::Initialize() {
     } else {
       REXLOG_ERROR("PGR4 native: cannot open {}", path);
     }
+  }
+  if (pacer) {
+    std::FILE* log = nullptr;
+    if (!path.empty()) {
+      const std::string log_path =
+          path.substr(0, path.size() - (path.ends_with(".csv") ? 4 : 0)) + "-presents.csv";
+      if (!(log = std::fopen(log_path.c_str(), "w")))
+        REXLOG_ERROR("PGR4 native: cannot open {}", log_path);
+    }
+    pacer_ = std::make_unique<FramePacer>(
+        uint32_t(std::max(0, REXCVAR_GET(pgr4_native_frame_latency))), log);
+    if (pacer_->frame_latency() > 0)
+      REXLOG_INFO("PGR4 native: frames paced on the display, at most {} begun but not shown",
+                  pacer_->frame_latency());
   }
   frame_start_ns_ = NowNs();
   if (REXCVAR_GET(pgr4_native_render_thread)) {
@@ -431,6 +461,9 @@ void NativeRenderer::RenderThreadMain() {
             stats_.hook_wait_ns = s.hook_wait_ns;
             stats_.hook_max_ns = s.hook_max_ns;
             stats_.pad = s.pad;
+            stats_.guest_begin_ns = s.guest_begin_ns;
+            stats_.guest_swap_ns = s.guest_swap_ns;
+            stats_.pace_wait_ns = s.pace_wait_ns;
             stats_.draws += s.state_fail;
             stats_.state_fail += s.state_fail;
             draw_->AddPrepareCounters(s.prep);
@@ -514,6 +547,9 @@ void NativeRenderer::QueueSwap(uint8_t* base, const HookArgs& args) {
   Queue& q = *queue_;
   Queue::Batch& b = *q.current;
   Queue::SwapCmd& s = b.swaps.emplace_back();
+  s.guest_begin_ns = q.begin_ns;
+  s.guest_swap_ns = t0;
+  s.pace_wait_ns = q.pace_wait_ns;
   Presenter::ReadSwap(base, args, &s.call);
   // Captures with the Xenos copy: the Swap that arms one (HoldFullReadback) and the captured
   // one run before the guest continues, as without the render thread.
@@ -547,10 +583,15 @@ void NativeRenderer::QueueSwap(uint8_t* base, const HookArgs& args) {
   ++q.frame;
   // Handing over and a capture's wait count towards the next frame.
   const uint64_t capture_wait = sync ? q.WaitFrames(q.frame) : 0;
-  const uint64_t tail = NowNs() - t1;
+  const uint64_t pace_wait = pacer_ ? pacer_->WaitToBegin() : 0;
+  const uint64_t t2 = NowNs();
+  // The pacer's wait is the gap between two frames, not time in the hook.
+  const uint64_t tail = t2 - t1 - pace_wait;
   q.hook_wait_ns = capture_wait;
   q.hook_ns = tail;
   q.hook_max_ns = tail - capture_wait;
+  q.begin_ns = t2;
+  q.pace_wait_ns = pace_wait;
   if (hand_over) HandOver(base, args.device);
 }
 
@@ -581,11 +622,15 @@ void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
 
 void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
   if (queue_) return QueueSwap(base, args);
+  stats_.guest_swap_ns = NowNs();
   SwapCall swap;
   Presenter::ReadSwap(base, args, &swap);
   stats_.pad = rex_xam_take_frame_pad();
   swap.hand_over = SwitchRequested();
   ExecuteSwap(swap);
+  // stats_ is the next frame's from here.
+  stats_.pace_wait_ns = pacer_ ? pacer_->WaitToBegin() : 0;
+  stats_.guest_begin_ns = NowNs();
   if (swap.hand_over) HandOver(base, args.device);
 }
 
@@ -602,13 +647,15 @@ void NativeRenderer::HandOver(uint8_t* base, uint32_t device) {
   // of it.
   MarkAllDirty(base, device);
   rex::cvar::SetFlagByName("gpu_skip_draws", "false");
+  // The plugin presents on its own: the game waits for its vblanks again.
+  paces_frames_.store(false, std::memory_order_relaxed);
   live_.store(false, std::memory_order_relaxed);
   REXLOG_INFO("PGR4 native: renderer switch: the Xenos plugin draws");
 }
 
 void NativeRenderer::TakeBack() {
-  // The tracker saw none of the calls the plugin drew. The window is shown again by the next
-  // native frame's ExecuteSwap.
+  // The tracker saw none of the calls the plugin drew. The next native frame's ExecuteSwap
+  // takes the game window back (OwnGameWindow), and the pacing with it.
   GuestState().Resync();
   rex::cvar::SetFlagByName("gpu_skip_draws", "true");
   live_.store(true, std::memory_order_relaxed);
@@ -677,8 +724,39 @@ void NativeRenderer::SubmitEarly() {
 
 void NativeRenderer::Fail() {
   g_failed = true;
+  paces_frames_.store(false, std::memory_order_relaxed);
+  if (pacer_) pacer_->Stop();
   REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
                frame_index_);
+}
+
+bool NativeRenderer::OwnGameWindow(bool own) {
+  D3D12Device& d = *device_;
+  if (own == d.has_swapchain()) return true;
+  rex::ui::Window* window = GameWindow();
+  rex::ui::Presenter* presenter = SdkPresenter();
+  // The window's presenter belongs to the UI thread.
+  const auto connect = [&](rex::ui::Presenter* p) {
+    if (window && presenter)
+      window->app_context().CallInUIThreadSynchronous([&] { window->SetPresenter(p); });
+  };
+  if (!own) {
+    paces_frames_.store(false, std::memory_order_relaxed);
+    d.DetachSwapchain();
+    if (pacer_) pacer_->Detach();
+    connect(presenter);
+    REXLOG_INFO("PGR4 native: the game window shows ReXGlue's presenter");
+    return true;
+  }
+  connect(nullptr);
+  if (!d.AttachSwapchain()) return false;
+  if (pacer_) {
+    HANDLE waitable = d.TakeFrameLatencyWaitable(FramePacer::kMaxFrameLatency);
+    if (!waitable) return false;
+    pacer_->Attach(waitable);
+    paces_frames_.store(pacer_->pacing(), std::memory_order_relaxed);
+  }
+  return true;
 }
 
 void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
@@ -690,22 +768,27 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   // stays on screen while the next one waits for them.
   const bool incomplete = draw_->FrameIncomplete();
   if (incomplete) ++stats_.frames_held;
-  // The resolved front buffer into the debug window (back buffer PRESENT in and out).
-  present_->OnSwap(swap, !incomplete);
+  if (primary_ && !OwnGameWindow(!swap.hand_over && !rex::kernel::xam::xeXamIsUIActive()))
+    return Fail();
+  const bool shown = !incomplete && d.has_swapchain();
+  // The resolved front buffer into the back buffer (PRESENT in and out).
+  present_->OnSwap(swap, shown);
   // The frame's texture copies read upload memory the untile workers fill.
   const uint64_t u0 = NowNs();
   textures_->FinishUploads();
   stats_.swap_untile_ns = NowNs() - u0;
   draw_->BeforeSubmit();
   const uint64_t fence = d.frame_fence();
-  // The SDK draws XAM dialogs into the game window, under the child window, and after the
-  // renderer switch the Xenos plugin presents there.
-  d.SetShown(!swap.hand_over && !rex::kernel::xam::xeXamIsUIActive());
-  if (!d.EndFrame(!incomplete)) return Fail();
+  if (!d.EndFrame(shown)) return Fail();
   const D3D12Device::EndFrameTimes& et = d.end_frame_times();
   stats_.swap_submit_ns = et.submit_ns;
   stats_.swap_present_ns = et.present_ns;
   stats_.swap_fence_ns = et.fence_ns;
+  stats_.present = et.presented ? et.presents : 0;
+  if (pacer_ && et.presented)
+    pacer_->Presented();
+  else if (pacer_)
+    pacer_->RetireUnshown();
   ++frame_index_;
   frame_begun_ = false;
   d.SetTitleFrame(frame_index_);
@@ -748,7 +831,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
         "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
         "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
         "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu,"
-        "%04X,%u,%u,%d,%d,%d,%d,%llu",
+        "%04X,%u,%u,%d,%d,%d,%d,%llu,%.3f,%.3f,%.1f,%llu",
         (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
         (unsigned long long)s.clears, (unsigned long long)s.resolves,
         (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -774,7 +857,8 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
         (unsigned long long)ds.pso_generic, unsigned(s.pad & 0xFFFF),
         unsigned(uint8_t(s.pad >> 16)), unsigned(uint8_t(s.pad >> 24)), int(int8_t(s.pad >> 32)),
         int(int8_t(s.pad >> 40)), int(int8_t(s.pad >> 48)), int(int8_t(s.pad >> 56)),
-        (unsigned long long)s.submits);
+        (unsigned long long)s.submits, s.guest_begin_ns / 1e6, s.guest_swap_ns / 1e6,
+        s.pace_wait_ns / 1000.0, (unsigned long long)s.present);
     csv_->evicted_prev = textures_->stats().evicted;
     csv_->evict_ns_prev = textures_->stats().evict_ns;
     if (profile::g.on) {

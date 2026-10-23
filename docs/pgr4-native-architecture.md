@@ -32,9 +32,13 @@ Two modes:
   shader loads and swaps. Its `GPU Commands` thread drops from ~98 % of a core to ~13 %.
   The key `bind_renderer_switch` (F9) hands the game to the plugin at the next Swap and back:
   handing over marks the guest D3D's whole state dirty (so the next draw writes all of it into
-  the stream), clears `gpu_skip_draws` and hides the child window; `NativeRenderer::Live()` is
-  then null, so the hooks leave the guest D3D alone and track nothing. Taking back resyncs the
-  state tracker from the device.
+  the stream), clears `gpu_skip_draws`, releases the native swapchain and gives the game window
+  back to ReXGlue's presenter; `NativeRenderer::Live()` is then null, so the hooks leave the
+  guest D3D alone and track nothing. Taking back resyncs the state tracker from the device.
+  The native swapchain is the game's top-level window's own (`NativeRenderer::OwnGameWindow`),
+  never a child window over it: gamescope flips only a top-level window's surface, and a child
+  window's frames go through Xwayland's copy, which ignores FIFO and frame limits. The same
+  hand-over happens while a XAM dialog is up, which ReXGlue's presenter draws.
 
 ## Threads
 
@@ -45,7 +49,8 @@ Two modes:
 | `PGR4 native untile` (1-4) | `TextureCache` (a quarter of the hardware threads, clamped 1-4: 4 on an i9-13900K, 2 on a Deck) | Untiles guest textures into upload memory |
 | `PGR4 native pipelines` | `DrawRenderer` when `--pgr4_native_async_pipelines` (default on) | Creates PSOs, loads/stores them in the `ID3D12PipelineLibrary`, runs prewarm jobs |
 | texture-heap `std::async` | `TextureCache::StartSpareHeap` | Creates the next 128 MB texture heap while the current one fills |
-| window thread | `D3D12Device` | Owns the debug window or the child window over the game window |
+| window thread | `D3D12Device` | Owns the debug window (`--pgr4_native` without `_primary`) |
+| `PGR4 native pacer` | `FramePacer` while a swapchain is attached | Counts the frames the display showed (the swapchain's frame latency waitable) and lets the game thread begin the next |
 | `GPU Commands` (SDK) | Xenos plugin | PM4 parsing; in primary mode only fences/interrupts |
 
 Measured on the race (13900K): `Main XThread` ~98 % in every mode (the game itself fills it),
