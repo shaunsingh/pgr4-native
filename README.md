@@ -280,6 +280,15 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   diffuser's edge holds still from frame to frame (mean luma change 0.14, p99 2); the white that
   comes and goes there is the title screen's rain, streaks of one or two frames that Xenos draws
   too.
+- Pass-through D3D hooks jump straight to the game's function. Of the D3D library functions the
+  renderer hooks, the ones neither it nor the state tracker needs (`IsPassThrough`) still went
+  through `OnHook` on every call to be counted. They now return through the original unless the
+  tap or the profiler is on; `RestorePush` keeps the full path, since a held `BeginVertices`
+  draw is queued at its entry. `OnHook` was 3.4 % of the game thread (td-46) and is gone from
+  td-47's profile. The frame rate did not move (race 69.1 fps against 68.8): the APU is at its
+  15 W limit in every sample, the CPU takes 9.1 W of it and the GPU runs at 600-685 MHz, 86 %
+  busy. The frame waits on the GPU, and the CPU's savings are power the GPU can clock up with.
+
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game

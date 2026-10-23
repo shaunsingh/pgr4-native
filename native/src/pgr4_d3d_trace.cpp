@@ -1,8 +1,9 @@
 // pgr4-native PGR4 native renderer, milestone 1 (design A): guest D3D API hooks and frame trace.
 //
 // Every function in d3d_surface.inc (the XDK D3D entry points PGR4's game code calls, plus the
-// internal draw builders and MakeSpace) is overridden with a REX_HOOK_RAW that counts the call
-// and forwards to the original __imp__sub_X. Forwarding can be switched off per class at run time
+// internal draw builders and MakeSpace) is overridden with a REX_HOOK_RAW that forwards to the
+// original __imp__sub_X and counts the call (the pass-through ones only while the tap or the
+// profiler is on). Forwarding can be switched off per class at run time
 // (`skip draw|clear|resolve|none`), which is the switch a native backend will use to take draws
 // away from the Xenos plugin while it stays available as the A/B oracle.
 //
@@ -62,6 +63,7 @@ REXCVAR_DEFINE_STRING(pgr4_d3d_skip, "", "PGR4 native",
                       "Classes not forwarded to the guest D3D at start: draw,clear,resolve");
 REXCVAR_DEFINE_STRING(pgr4_d3d_frame_csv, "", "PGR4 native",
                       "Per-frame counter CSV (frame, calls, draw calls, tap draws, ...)");
+REXCVAR_DECLARE(bool, pgr4_native_profile);
 REXCVAR_DEFINE_INT32(pgr4_d3d_stats_frames, 150, "PGR4 native",
                      "Frames per summary line in the log (0 = off)");
 REXCVAR_DEFINE_BOOL(pgr4_d3d_tap_check, false, "PGR4 native",
@@ -279,6 +281,9 @@ struct Tap {
 Tap g_tap;
 std::atomic<uint64_t> g_calls[kFnCount];
 std::atomic<uint32_t> g_skip{0};
+// Pass-through hooks (IsPassThrough) take OnHook's path only while the tap decodes the stream or
+// the profiler times the guest D3D; otherwise they jump straight to the original.
+std::atomic<bool> g_hook_all{false};
 std::atomic<uint64_t> g_tap_counts[3];  // draws, aux, resolves (cumulative, for stream stats)
 
 struct CallFrame {
@@ -724,6 +729,7 @@ void PollControl(Tap& t, uint8_t* base) {
         t.in_packet = false;
       }
       t.enabled = on;
+      g_hook_all.store(on || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
     }
     REXLOG_INFO("PGR4 D3D control: {} (skip mask {})", l, g_skip.load());
   }
@@ -820,6 +826,7 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
       t.cursor = t.device ? Load32(base, t.device + kDevPush) : 0;
       t.enabled = REXCVAR_GET(pgr4_d3d_tap);
       t.check = t.enabled && REXCVAR_GET(pgr4_d3d_tap_check);
+      g_hook_all.store(t.enabled || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
       g_skip.store(ParseSkip(REXCVAR_GET(pgr4_d3d_skip)));
       REXLOG_INFO("PGR4 D3D: device {:08X}, push {:08X}, tap {}{}, {} hooked functions", t.device,
                   t.cursor, t.enabled ? "on" : "off", t.check ? " (state check)" : "", uint32_t(kFnCount));
@@ -879,7 +886,7 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
 // game draws. Other hooked functions do not count as outer calls (BeginTiling fn_826D1C38
 // clears through a nested ClearF, which must reach OnClear). A top-level BeginVertices only
 // reserves space: the game writes the vertices after it returns, so its OnDraw is held until
-// the entry of the next hooked call.
+// the entry of RestorePush (EndVertices) or of the next hooked call that is not a pass-through.
 enum NativeClass : uint8_t { kNatNone, kNatDraw, kNatClear, kNatResolve, kNatSwap, kNatCount };
 
 constexpr NativeClass NativeClassOf(Cat c) {
@@ -901,7 +908,7 @@ thread_local pgr4::native::TilingCall t_tiling_call = pgr4::native::TilingCall::
 // Hooked functions that neither the renderer nor the state tracker needs to see: no draw,
 // clear, resolve or Swap, no state flush (d3d_state.h IsStateFlushingFn: these plus
 // fn_826D6610), not the tiling bracket and not CreateDevice. Without the tap they run
-// straight through.
+// straight through, and without the profiler too they skip OnHook (HasFastPath).
 constexpr bool IsPassThrough(FnId id) {
   if (NativeClassOf(kFns[id].cat) != kNatNone) return false;
   switch (kFns[id].addr) {
@@ -909,6 +916,10 @@ constexpr bool IsPassThrough(FnId id) {
     default: return true;
   }
 }
+
+// The pass-through hooks with a fast path. RestorePush (EndVertices) keeps OnHook's: the draw a
+// top-level BeginVertices holds is queued at its entry, once the game has written the vertices.
+constexpr bool HasFastPath(FnId id) { return IsPassThrough(id) && kFns[id].addr != 0x826CFF00u; }
 
 // Runs a hooked guest D3D function. The outermost one is timed as profile::kGuestD3d (nested
 // hooked calls and their tracking are inside that time).
@@ -933,7 +944,8 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   namespace nat = pgr4::native;
   nat::NativeRenderer* r = nat::NativeRenderer::Get();
   if (IsPassThrough(id) && !g_tap.enabled) {
-    if (t_pending_vertices && r) {
+    // A held BeginVertices draw is queued where the fast path would queue it too.
+    if (!HasFastPath(id) && t_pending_vertices && r) {
       t_pending_vertices = false;
       r->OnDraw(base, t_pending_args);
     }
@@ -968,7 +980,7 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
     OnCall(id, ctx, base, run);
     return;
   }
-  if (t_pending_vertices) {
+  if (t_pending_vertices && !HasFastPath(id)) {
     t_pending_vertices = false;
     r->OnDraw(base, t_pending_args);
   }
@@ -1027,9 +1039,15 @@ extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint6
   return 9;
 }
 
-#define D3D_FN(a, n, c)        \
-  REX_EXTERN(__imp__sub_##a);  \
-  REX_HOOK_RAW(sub_##a) { OnHook(kFn_##a, ctx, base, __imp__sub_##a); }
+#define D3D_FN(a, n, c)                                                  \
+  REX_EXTERN(__imp__sub_##a);                                            \
+  REX_HOOK_RAW(sub_##a) {                                                \
+    if constexpr (HasFastPath(kFn_##a)) {                                \
+      if (!g_hook_all.load(std::memory_order_relaxed)) [[likely]]        \
+        return __imp__sub_##a(ctx, base);                                \
+    }                                                                    \
+    OnHook(kFn_##a, ctx, base, __imp__sub_##a);                          \
+  }
 #include "d3d_surface.inc"
 #undef D3D_FN
 
