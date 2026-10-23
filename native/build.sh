@@ -43,6 +43,8 @@
 # profile goes stale only where the code changes; clang warns per file and compiles the changed
 # functions without it. Like --march, a change of profile rebuilds the game in full.
 #
+# --force rebuilds the codegen tool (sdk) and regenerates all game code (game).
+#
 # Needs clang-cl, lld-link and the llvm-* tools, cmake, ninja, python3, git and PowerShell
 # (MTR's tools/apply_game_patches.ps1 runs as `powershell`). When clang-cl is not on PATH the
 # script re-runs itself in the distrobox container named by $PGR4_DISTROBOX (default pgr4dev).
@@ -340,14 +342,17 @@ except FileNotFoundError:
 if not same:
     open(dst, "w", encoding="utf-8", newline="\n").write(new)
 PY
-  local stamp=$tree/generated/default/codegen.build.stamp
+  local stamp=$tree/generated/default/codegen.build.stamp ignore_stamp=()
+  # Codegen skips a module whose inputs it fingerprinted before, and the fingerprint leaves out
+  # the codegen tool itself: a rebuilt tool has to regenerate past it.
+  [[ $force == 1 || ($host_rexglue -nt $stamp && -f $stamp) ]] && ignore_stamp=(--ignore-stamp)
   [[ $force == 1 ]] && rm -f "$stamp"
   # Codegen rewrites its stamp even when its output does not change, and every generated object
   # depends on the stamp (through MTR's patch step), so a run with the inputs in codegen.d
   # unchanged would recompile all generated code.
   if [[ ! -f $stamp || $manifest -nt $stamp || $image/default.xex -nt $stamp ||
         $image/default.xexp -nt $stamp || $host_rexglue -nt $stamp ]]; then
-    (cd "$tree" && "$host_rexglue" codegen "$manifest")
+    (cd "$tree" && "$host_rexglue" codegen "${ignore_stamp[@]}" "$manifest")
   fi
   # As in build.ps1: MTR's patch script matches ctx.r31-style text that the options above turn
   # into locals. prep restores MTR's original each time; the rewrite keeps the original's

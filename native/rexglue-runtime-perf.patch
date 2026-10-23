@@ -2819,3 +2819,19 @@ index c7c440d..f20338e 100644
  // Check if the analog inputs exceed their thresholds to become a button press
  // and build the bitfield.
  inline uint64_t SDLInputDriver::AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const {
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index b2d70f5..a46ff43 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -49,8 +49,9 @@ bool build_eieio(BuilderContext& ctx) {
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // Xenon's 16-cycle delay sits in spin-wait loops. PAUSE (ISB on ARM) is the host's spin-wait
++  // hint: the loop draws less power and leaves the shared core to its SMT sibling.
++  ctx.println("\tsimde_mm_pause();");
+   return true;
+ }
+ 
