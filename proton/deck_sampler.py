@@ -8,10 +8,14 @@ APU power, total CPU load and the CPU time of each of the game's threads.
       evicted and requested VRAM (MiB) and its GPU time (ms, cumulative) from its DRM clients'
       fdinfo, its resident and virtual memory and the anonymous, file and shared parts of the
       resident memory (MiB, for leaks: host allocations are anonymous, guest memory is a shared
-      mapping), then one "tid:name:jiffies" field per game thread (cumulative CPU time).
-      Older files lack the memory or the CPU MHz columns; summary reads them too.
+      mapping), then one "tid:name:jiffies" field per game thread (cumulative CPU time) and, every
+      PROCESS_EVERY samples, one "P<pid>:name:jiffies" field per other process (its own CPU time
+      and its reaped children's, so short-lived tools count towards whoever started them).
+      Older files lack the memory, the CPU MHz or the process columns; summary reads them too.
   deck_sampler.py summary <csv> <start HH:MM:SS> [seconds=40]
-      Means over the window and the busiest threads in it, in % of one core.
+      Means over the window and the busiest game threads and other processes in it, in % of one
+      core. The other processes show what else competes for the APU's power: wineserver and
+      winedevice for the game's system calls and devices, compositors, tools left running.
 
 Reads sysfs and procfs only: gpu_busy_percent, mem_info_vram_used, mem_info_gtt_used and the
 amdgpu hwmon (freq1_input, power1_average), gpu_metrics (the SMU's CPU/GFX power split and throttle
@@ -33,6 +37,7 @@ import time
 HZ = os.sysconf("SC_CLK_TCK")
 NUMBERS = 24  # numeric fields after the time stamp in the newest format
 COMPOSITORS = ("kwin_wayland", "gamescope", "gamescope-wl", "Xwayland")
+PROCESS_EVERY = 10  # samples between snapshots of every process's CPU time
 
 
 def amdgpu_paths():
@@ -141,9 +146,11 @@ def process_memory(pid: str):
     return [out[k] for k in MEMORY_KEYS]
 
 
-def thread_times(pid: str):
+def stat_times(pattern: str, children: bool):
+    """(id, name, jiffies) for each /proc stat file matching `pattern`: utime + stime, plus the
+    reaped children's cutime + cstime with `children`."""
     out = []
-    for stat in glob.glob(f"/proc/{pid}/task/*/stat"):
+    for stat in glob.glob(pattern):
         try:
             with open(stat) as f:
                 s = f.read()
@@ -151,9 +158,18 @@ def thread_times(pid: str):
             continue
         name = s[s.index("(") + 1:s.rindex(")")].replace(":", "_").replace(",", "_")
         fields = s[s.rindex(")") + 2:].split()
-        tid = stat.split("/")[4]
-        out.append(f"{tid}:{name}:{int(fields[11]) + int(fields[12])}")
+        jiffies = sum(int(x) for x in fields[11:15 if children else 13])
+        out.append((stat.split("/")[-2], name, jiffies))
     return out
+
+
+def thread_times(pid: str):
+    return [f"{tid}:{name}:{j}" for tid, name, j in stat_times(f"/proc/{pid}/task/*/stat", False)]
+
+
+def process_times(game: str):
+    return [f"P{pid}:{name}:{j}" for pid, name, j in stat_times("/proc/[0-9]*/stat", True)
+            if pid != game]
 
 
 def record(args) -> None:
@@ -190,6 +206,8 @@ def record(args) -> None:
                    str(cpu_mhz()), str(read_int(vram) >> 20), str(read_int(gtt) >> 20),
                    *map(str, game), *(f"{w:.2f}" for w in watts), str(throttle & 0xFFFF),
                    str(compositor_ms), *threads]
+            if sample % PROCESS_EVERY == 1:
+                row += process_times(pid)
             out.write(",".join(row) + "\n")
 
 
@@ -237,23 +255,33 @@ def summary(args) -> None:
         if comp_ms > 0:
             print(f"  compositors' GPU time {100.0 * comp_ms / 1000.0 / secs:.0f} % of the window (fdinfo)")
 
-    def parse(fields):
+    def parse(fields, processes):
         d = {}
         for f in fields:
-            tid, name, j = f.split(":")
-            d[tid] = (name, int(j))
+            if f.startswith("P") == processes:
+                tid, name, j = f.split(":")
+                d[tid] = (name, int(j))
         return d
 
-    first, last = parse(sel[0][-1]), parse(sel[-1][-1])
-    load = []
-    for tid, (name, j) in last.items():
-        j0 = first.get(tid, (name, j))[1]
-        load.append((100.0 * (j - j0) / HZ / secs, tid, name))
-    load.sort(reverse=True)
-    total = sum(l[0] for l in load)
-    print(f"  game threads: {total:.0f} % of one core in total, {len(load)} threads")
+    def busiest(first, last, secs):
+        load = []
+        for tid, (name, j) in last.items():
+            j0 = first.get(tid, (name, j))[1]
+            load.append((100.0 * (j - j0) / HZ / secs, tid, name))
+        return sorted(load, reverse=True)
+
+    load = busiest(parse(sel[0][-1], False), parse(sel[-1][-1], False), secs)
+    print(f"  game threads: {sum(l[0] for l in load):.0f} % of one core in total, {len(load)} threads")
     for pct, tid, name in load[:8]:
         print(f"  {pct:5.1f} %  {name} ({tid})")
+    snaps = [r for r in sel if any(x.startswith("P") for x in r[-1])]
+    if len(snaps) >= 2:
+        span = (snaps[-1][0] - snaps[0][0]).total_seconds()
+        load = busiest(parse(snaps[0][-1], True), parse(snaps[-1][-1], True), span)
+        print(f"  other processes over {span:.0f} s: {sum(l[0] for l in load):.0f} % of one core in total")
+        for pct, pid, name in load[:8]:
+            if pct >= 0.5:
+                print(f"  {pct:5.1f} %  {name} ({pid[1:]})")
 
 
 def main() -> None:

@@ -51,6 +51,10 @@ class Module:
         i = bisect.bisect_right(self.rvas, rva) - 1
         return self.names[i] if i >= 0 else f"{self.name}+{rva:#x}"
 
+    def start(self, rva: int) -> int:
+        i = bisect.bisect_right(self.rvas, rva) - 1
+        return self.rvas[i] if i >= 0 else 0
+
 
 def image_size(map_path: str) -> int:
     """SizeOfImage of the PE next to the map file (same name, .exe or .dll); 0 if not found."""
@@ -173,6 +177,9 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--threads", type=int, default=6)
     ap.add_argument("--undname", default=shutil.which("llvm-undname") or "")
+    ap.add_argument("--annotate", metavar="TEXT",
+                    help="also list the busiest instructions (RVA, offset in the function) of the "
+                         "mapped functions whose name contains TEXT, for llvm-objdump")
     args = ap.parse_args()
 
     modules = [Module(p) for p in args.module_maps]
@@ -193,6 +200,7 @@ def main() -> None:
     by_thread = collections.defaultdict(collections.Counter)
     by_symbol = collections.Counter()
     by_module = collections.Counter()
+    by_ip = collections.Counter()
     names = {}
     total = 0
     for line in script.stdout.splitlines():
@@ -203,6 +211,9 @@ def main() -> None:
         mod = next((x for x in modules if x.base <= ip < x.end), None)
         if mod:
             key = (mod.name, mod.lookup(ip - mod.base))
+            if args.annotate and args.annotate in key[1]:
+                rva = ip - mod.base
+                by_ip[(mod.name, key[1], mod.start(rva), rva)] += 1
         elif ip >= 0xFFFF800000000000:
             key = ("[kernel]", "[kernel]")
         else:
@@ -237,6 +248,15 @@ def main() -> None:
         n = sum(counter.values())
         print(f"{thread}: {100.0 * n / total:.1f} % of samples (% of the thread's below)")
         show(counter, args.top, n)
+    if by_ip:
+        functions = collections.Counter()
+        for (mod, sym, start, _), c in by_ip.items():
+            functions[(mod, sym, start)] += c
+        for (mod, sym, start), n in functions.most_common(8):
+            print(f"{names.get(sym, sym)[:100]} [{mod}] at RVA {start:#x}: {n} samples")
+            ips = [(rva, c) for (m, s, _, rva), c in by_ip.items() if (m, s) == (mod, sym)]
+            for rva, c in sorted(ips, key=lambda x: -x[1])[:args.top]:
+                print(f"  {100.0 * c / n:5.1f} %  RVA {rva:#x}  +{rva - start:#x}")
 
 
 if __name__ == "__main__":

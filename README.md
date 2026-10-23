@@ -379,6 +379,12 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   which stalled the game, while the glitch catcher already keeps the last 5 s in memory and
   writes them out at each whole-image jump and each F12 mark; `marks.py` and `flicker.py` read
   those dumps.
+- `deck_sampler.py` snapshots every process's CPU time every 5 s, and its summary lists the
+  busiest processes besides the game: what else draws on the APU's 15 W. td-72 ran the same
+  build as td-73 while this session's agents worked beside it: race 78.2 fps, 1 % low 40.6, 6
+  hitches, GPU clock 737 MHz, against 80.8, 49.7, 4 and 771 MHz; the session took about a
+  quarter of a core. `perf_symbols.py --annotate TEXT` lists the busiest instructions of the
+  functions whose name contains TEXT, by offset, for `llvm-objdump`.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -628,7 +634,8 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 | `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
 
 It also has a texture untiling harness and an offline shader translation test. `proton/` has the
-Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads) and
+Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads and
+other processes) and
 `pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls and instruction cache
 refills per thread) and `server_requests.py` (`deck-run.sh --server-trace`: wineserver requests per
 thread and second, by request).
