@@ -488,7 +488,23 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   the same time at any frame rate.
   `native/tools/pacing.py` reports the time steps, the shown intervals, the latency and the
   mismatch; `deck-run.sh` runs it after each race.
-
+- The latency follows the pipeline's time instead of the frame count
+  (`--pgr4_native_low_latency`, `frame_pacer.h`). Each frame begins a delay after its gate
+  opens: the time recent frames waited between the GPU finishing them (the frame fence, which
+  the pacer thread now waits on beside the waitable) and the display showing them, less
+  `--pgr4_native_latency_margin_us` (4 ms). This is DXVK's latency sleep measured against the
+  display, since under gamescope's limiter the game cannot know the frame interval. The
+  estimate drops at once on a slower frame and rises 1 ms a second, because the slowest frames
+  come seconds apart (td-114: a delay from the last 64 frames made 55 frames late at 90 Hz). A
+  frame shown more than 3 slots late (a loading screen) starts the estimate over (td-117: the
+  delay climbed back for seconds after each one). Every 10 s the delay eases down by half an
+  interval for a few frames, so a pace the delay set itself (frames just late enough to fill
+  every other slot) is told from a frame limit. td-118 (limit 45): 31 ms from a frame's start
+  to its display (66.6 ms, td-111), no frame late, time step minus shown interval sd 0.46 ms,
+  APU 7.2 W. td-119 (90 Hz): 26.6 ms (33.3, td-107), race 87.8 fps, 1 % low 57.9 (88.0, 56.1);
+  of its 28 late frames, 25 came in a stretch of 12-17 ms game-thread frames under the power
+  limit (no delay applied: the frames began late without sleeping), 3 had finished on the GPU
+  two intervals before they were shown. `pacing.py` adds the wait and the delay.
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
@@ -715,7 +731,8 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |
 | `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) |
 | `--pgr4_native_frame_latency=<n>` | 3 | Primary mode: the game thread begins a frame once the display showed the frame n before it (1-3; 0: the game's own vblank pacing) |
-| `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
+| `--pgr4_native_low_latency` | true | With the frames paced on the display: begin each frame as late as the time recent frames waited for the display allows, so a frame limit lowers the latency |
+| `--pgr4_native_latency_margin_us=<n>` | 4000 | With `--pgr4_native_low_latency`: how long before the display shows a frame the GPU should have finished it || `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
 | `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
 | `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
@@ -759,7 +776,8 @@ and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
   with the pad column to tell them from look-backs.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
-  work per frame.
+  work per frame. Most frames shown late at 90 Hz now come in stretches of 12-17 ms game-thread
+  frames under the power limit, the rest from single GPU spikes (td-119).
 - Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
   pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
   compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
@@ -771,10 +789,7 @@ and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
   shortcut's pipelines, adds nothing measurable (td-95). Ideas: smaller DXBC from the translator,
   fewer compile threads once the frame is shown.
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
-- Steam Deck: a latency that follows the pipeline's time instead of a fixed frame count, so a
-  frame limit lowers it (66.6 ms at 45 fps with 3 frames, td-111) instead of raising it.
-  DXVK's built-in latency sleep knows the frame interval; under gamescope's limiter the game
-  does not, and must find it from the display without locking onto a slower cadence it caused.
+
 
 ## Tooling and agents
 
