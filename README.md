@@ -729,6 +729,16 @@ and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
   work per frame.
+- Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
+  pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
+  compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
+  and neither has a Quebec snow race the bench never ran (td-91: 90.0 fps, 1 % low 67.7); a play
+  session's store (7862 pipelines) prewarms in the menus in about 100 s (td-92). During a wait the
+  GPU idles and its clock falls to 200-500 MHz while the compile threads take 10-13 W, so the next
+  two or three frames take 23-39 ms on the GPU (td-96, 10 ms clock samples). The compile time is
+  Mesa's (57 %) and vkd3d-proton's (43 %, td-94); Steam's Fossilize layer, which records the
+  shortcut's pipelines, adds nothing measurable (td-95). Ideas: smaller DXBC from the translator,
+  fewer compile threads once the frame is shown.
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
 
 ## Tooling and agents
