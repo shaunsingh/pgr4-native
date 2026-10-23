@@ -877,10 +877,8 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
   const ResolvedImage* image = nullptr;
   if (tex) {
     std::memcpy(fetch, swap.fetch, sizeof(fetch));
-    // The object holds the D3D's virtual address; the GPU (and the Resolver) use the physical
-    // one: low 29 bits, plus 4 KiB for the 0xE0000000 view (as the D3D converts it).
-    const uint32_t a = fetch[1] & 0xFFFFF000u;
-    const uint32_t phys = (a & 0x1FFFFFFFu) + ((((a >> 20) & 0xFFFu) + 0x200u) & 0x1000u);
+    // The object holds the D3D's virtual address; the GPU (and the Resolver) use the physical one.
+    const uint32_t phys = GpuAddress(fetch[1] & 0xFFFFF000u);
     fetch[1] = (fetch[1] & 0xFFFu) | phys;
     image = renderer_.resolver().Find(phys);
   }

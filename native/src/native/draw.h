@@ -175,8 +175,8 @@ class DrawRenderer {
  private:
   struct Impl;
   NativeRenderer& renderer_;
+  Stats stats_;  // before impl_, which keeps a reference to it
   std::unique_ptr<Impl> impl_;
-  Stats stats_;
 };
 
 }  // namespace pgr4::native

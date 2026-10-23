@@ -19,6 +19,13 @@ inline uint8_t* HostPtr(uint8_t* base, uint32_t a) {
   return base + a + rex::memory::detail::PhysicalHostOffset(a);
 }
 
+// The physical address the GPU sees for guest virtual address `a`, as the D3D computes it (the
+// index base in sub_826D0340, Resolve's destination in sub_826CBEE0): the low 29 bits, plus 4 KiB
+// in the 0xE0000000 view.
+constexpr uint32_t GpuAddress(uint32_t a) {
+  return (a & 0x1FFFFFFFu) + ((((a >> 20) & 0xFFFu) + 0x200u) & 0x1000u);
+}
+
 // Big-endian guest values.
 inline uint16_t Load16(const uint8_t* base, uint32_t a) {
   return rex::memory::load_and_swap<uint16_t>(HostPtr(base, a));

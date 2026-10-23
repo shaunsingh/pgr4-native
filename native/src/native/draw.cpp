@@ -441,20 +441,17 @@ constexpr D3D12_BLEND_OP kD3DBlendOp[8] = {
 
 // ---- samplers ----
 
+// Every sampler field the guest's fetch constant and shader binding select, packed losslessly.
 struct SamplerKey {
-  uint8_t clamp_x, clamp_y, clamp_z, border;
-  uint8_t aniso, mag_linear, min_linear, mip_linear;
-  uint8_t mip_base_map, mip_min_level, pad[2];
-  bool operator==(const SamplerKey& o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
+  uint32_t clamp_x : 3 = 0, clamp_y : 3 = 0, clamp_z : 3 = 0;  // xenos::ClampMode
+  uint32_t border : 2 = 0;                                     // xenos::BorderColor
+  uint32_t aniso : 3 = 0;                                      // xenos::AnisoFilter
+  uint32_t mag_linear : 1 = 0, min_linear : 1 = 0, mip_linear : 1 = 0, mip_base_map : 1 = 0;
+  uint32_t mip_min_level : 4 = 0;  // below xenos::kTextureMaxMips
+  uint32_t reserved : 10 = 0;
+  uint32_t value() const { return std::bit_cast<uint32_t>(*this); }
 };
-static_assert(sizeof(SamplerKey) == 12);
-uint64_t SamplerKeyValue(const SamplerKey& k) {
-  uint64_t v = 0;
-  std::memcpy(&v, &k, 8);
-  uint32_t hi = 0;
-  std::memcpy(&hi, reinterpret_cast<const uint8_t*>(&k) + 8, 4);
-  return v ^ (uint64_t(hi) * 0x9E3779B97F4A7C15ull);
-}
+static_assert(sizeof(SamplerKey) == sizeof(uint32_t));
 
 xenos::ClampMode NormalizeClampMode(xenos::ClampMode m) {
   if (m == xenos::ClampMode::kClampToHalfway) return xenos::ClampMode::kClampToEdge;
@@ -471,17 +468,17 @@ SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBind
   cx = NormalizeClampMode(cx);
   cy = NormalizeClampMode(cy);
   cz = NormalizeClampMode(cz);
-  k.clamp_x = uint8_t(cx);
-  k.clamp_y = uint8_t(cy);
-  k.clamp_z = uint8_t(cz);
+  k.clamp_x = uint32_t(cx);
+  k.clamp_y = uint32_t(cy);
+  k.clamp_z = uint32_t(cz);
   k.border = (xenos::ClampModeUsesBorder(cx) || xenos::ClampModeUsesBorder(cy) ||
               xenos::ClampModeUsesBorder(cz))
-                 ? uint8_t(fetch.border_color)
-                 : uint8_t(xenos::BorderColor::k_ABGR_Black);
+                 ? uint32_t(fetch.border_color)
+                 : uint32_t(xenos::BorderColor::k_ABGR_Black);
   uint32_t mip_min_level, mip_max_level;
   texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
                                                  &mip_min_level, &mip_max_level);
-  k.mip_min_level = uint8_t(mip_min_level);
+  k.mip_min_level = mip_min_level;
   auto mag = binding.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter
                                                                         : binding.mag_filter;
   auto min = binding.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter
@@ -522,9 +519,9 @@ D3D12_SAMPLER_DESC SamplerDesc(const SamplerKey& k) {
       D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
       D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
   };
-  d.AddressU = kAddress[k.clamp_x & 7];
-  d.AddressV = kAddress[k.clamp_y & 7];
-  d.AddressW = kAddress[k.clamp_z & 7];
+  d.AddressU = kAddress[k.clamp_x];
+  d.AddressV = kAddress[k.clamp_y];
+  d.AddressW = kAddress[k.clamp_z];
   d.MipLODBias = 0.0f;
   d.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   switch (xenos::BorderColor(k.border)) {
@@ -740,7 +737,7 @@ struct DrawRenderer::Impl {
   // Each texture resource's views: (XXH3 of the SRV desc, table index). The views of a texture
   // the cache evicts go back to free_views (ReleaseViews).
   std::unordered_map<ID3D12Resource*, std::vector<std::pair<uint64_t, uint32_t>>> srv_views;
-  std::unordered_map<uint64_t, uint32_t> sampler_indices;  // SamplerKeyValue
+  std::unordered_map<uint32_t, uint32_t> sampler_indices;  // SamplerKey::value()
   // Direct-mapped memo in front of srv_views: (resource, component mapping, signed, fetch
   // dimension) -> descriptor index; a hit skips TextureDescriptor's desc build, XXH3 and map
   // lookup. Every other field of the SRV desc (format, view dimension, mips, array size) is fixed
@@ -1914,7 +1911,7 @@ void DrawRenderer::Impl::ReleaseViews(const std::vector<ID3D12Resource*>& resour
 }
 
 uint32_t DrawRenderer::Impl::SamplerDescriptor(const SamplerKey& k) {
-  const uint64_t key = SamplerKeyValue(k);
+  const uint32_t key = k.value();
   auto it = sampler_indices.find(key);
   if (it != sampler_indices.end()) return it->second;
   if (samplers_allocated >= kSamplerHeapSize) {

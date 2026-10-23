@@ -67,6 +67,8 @@
 #include <mutex>
 #include <thread>
 
+#include "win_handle.h"
+
 namespace pgr4::native {
 
 class FramePacer {
@@ -151,20 +153,20 @@ class FramePacer {
   const bool low_latency_;
   const int64_t margin_ns_;
   std::FILE* const log_;
-  HANDLE waitable_ = nullptr;     // render thread: the attached swapchain's
-  ID3D12Fence* fence_ = nullptr;  // render thread: with waitable_
-  const HANDLE thread_stop_;      // Detach ends the waiting thread with it
-  const HANDLE fence_event_;      // set when the GPU finished the oldest present not seen ready
-  std::thread thread_;            // waits on waitable_ and fence_event_ from Attach to Detach
-  uint64_t swaps_ = 0;            // render thread: Presented and RetireUnshown calls
-  uint64_t queued_ = 0;           // game thread: frames WaitToBegin was called for
+  UniqueHandle waitable_;           // render thread: the attached swapchain's
+  ID3D12Fence* fence_ = nullptr;    // render thread: with waitable_
+  const UniqueHandle thread_stop_;  // Detach ends the waiting thread with it
+  const UniqueHandle fence_event_;  // set when the GPU finished the oldest present not seen ready
+  std::thread thread_;              // waits on waitable_ and fence_event_ from Attach to Detach
+  uint64_t swaps_ = 0;              // render thread: Presented and RetireUnshown calls
+  uint64_t queued_ = 0;             // game thread: frames WaitToBegin was called for
 
   // Sleeps with sub-millisecond precision: Wine's NtDelayExecution sleeps in the process (a
   // waitable timer is a wineserver object there); on Windows it rounds up to the timer period
   // and a high-resolution waitable timer does not.
   using NtDelayExecutionFn = LONG(WINAPI*)(BOOLEAN alertable, const LARGE_INTEGER* timeout);
   NtDelayExecutionFn delay_execution_ = nullptr;
-  HANDLE sleep_timer_ = nullptr;
+  UniqueHandle sleep_timer_;
 
   std::mutex mutex_;
   std::condition_variable retired_cv_;

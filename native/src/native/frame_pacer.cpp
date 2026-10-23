@@ -17,25 +17,22 @@ FramePacer::FramePacer(const Options& options)
       low_latency_(options.low_latency),
       margin_ns_(int64_t(options.latency_margin_ns)),
       log_(options.log),
-      thread_stop_(CreateEventW(nullptr, FALSE, FALSE, nullptr)),
-      fence_event_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+      thread_stop_(CreateAutoResetEvent()),
+      fence_event_(CreateAutoResetEvent()) {
   lag_ns_.fill(kNoLag);
   const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
   if (ntdll && GetProcAddress(ntdll, "wine_get_version"))
     delay_execution_ =
         reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
   if (!delay_execution_)
-    sleep_timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                          TIMER_ALL_ACCESS);
+    sleep_timer_.reset(CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS));
   if (log_) std::fprintf(log_, "present,frame,ready_ms,shown_ms,delay_ms\n");
 }
 
 FramePacer::~FramePacer() {
   Stop();
   Detach();
-  CloseHandle(thread_stop_);
-  CloseHandle(fence_event_);
-  if (sleep_timer_) CloseHandle(sleep_timer_);
   if (log_) std::fclose(log_);
 }
 
@@ -43,14 +40,14 @@ void FramePacer::Attach(HANDLE waitable, ID3D12Fence* fence) {
   // The waitable starts with counts no present stands for (the swapchain's maximum frame
   // latency); no Present has run yet, so taking them all leaves one count per shown present.
   while (WaitForSingleObjectEx(waitable, 0, FALSE) == WAIT_OBJECT_0) {}
-  waitable_ = waitable;
+  waitable_.reset(waitable);
   fence_ = fence;
   thread_ = std::thread([this] { Run(); });
 }
 
 void FramePacer::Detach() {
   if (!waitable_) return;
-  SetEvent(thread_stop_);
+  SetEvent(thread_stop_.get());
   thread_.join();
   {
     // The released swapchain completed its presents, whether it signalled them or not.
@@ -60,8 +57,7 @@ void FramePacer::Detach() {
     ResetControlLocked();
   }
   retired_cv_.notify_one();
-  CloseHandle(waitable_);
-  waitable_ = nullptr;
+  waitable_.reset();
   fence_ = nullptr;
 }
 
@@ -69,7 +65,7 @@ void FramePacer::Presented(uint64_t fence_value) {
   std::lock_guard<std::mutex> lock(mutex_);
   presents_[presented_++ % kRing] = {++swaps_, fence_value, 0};
   if (ready_ + 1 == presented_ && fence_) {
-    fence_->SetEventOnCompletion(fence_value, fence_event_);
+    fence_->SetEventOnCompletion(fence_value, fence_event_.get());
     armed_ = fence_value;
   }
 }
@@ -86,7 +82,7 @@ void FramePacer::RetireUnshown() {
 void FramePacer::Run() {
   SetThreadDescription(GetCurrentThread(), L"PGR4 native pacer");
   // The fence first: when both are set, a frame is seen finished before it is seen shown.
-  const HANDLE handles[] = {fence_event_, waitable_, thread_stop_};
+  const HANDLE handles[] = {fence_event_.get(), waitable_.get(), thread_stop_.get()};
   for (;;) {
     const DWORD r = WaitForMultipleObjectsEx(3, handles, FALSE, INFINITE, FALSE);
     if (r != WAIT_OBJECT_0 && r != WAIT_OBJECT_0 + 1) break;
@@ -119,7 +115,7 @@ void FramePacer::OnFenceLocked(uint64_t now_ns) {
     presents_[ready_++ % kRing].ready_ns = now_ns;
   if (ready_ < presented_ && armed_ != presents_[ready_ % kRing].fence) {
     armed_ = presents_[ready_ % kRing].fence;
-    fence_->SetEventOnCompletion(armed_, fence_event_);
+    fence_->SetEventOnCompletion(armed_, fence_event_.get());
   }
 }
 
@@ -219,8 +215,9 @@ void FramePacer::SleepUntil(uint64_t deadline_ns) const {
   due.QuadPart = -int64_t((deadline_ns - now + 99) / 100);  // relative, in 100 ns units
   if (delay_execution_) {
     delay_execution_(FALSE, &due);
-  } else if (sleep_timer_ && SetWaitableTimer(sleep_timer_, &due, 0, nullptr, nullptr, FALSE)) {
-    WaitForSingleObject(sleep_timer_, INFINITE);
+  } else if (sleep_timer_ &&
+             SetWaitableTimer(sleep_timer_.get(), &due, 0, nullptr, nullptr, FALSE)) {
+    WaitForSingleObject(sleep_timer_.get(), INFINITE);
   } else {
     Sleep(DWORD((deadline_ns - now) / 1'000'000));
   }

@@ -21,11 +21,6 @@ REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
 namespace pgr4::native {
 namespace {
 
-// Virtual -> physical the way the D3D computes GPU addresses (e.g. sub_826D0340's index base).
-inline uint32_t GpuAddress(uint32_t a) {
-  return (a & 0x1FFFFFFFu) + ((((a >> 20) & 0xFFFu) + 0x200u) & 0x1000u);
-}
-
 // Register blocks the draw functions flush with sub_826DDC90, (device offset, first register,
 // registers, dirty mask (device + 8 * mask), the mask bit of the first register, registers per
 // bit). The counts are the dirty-mask widths in sub_826D0340 (the shadow areas between the

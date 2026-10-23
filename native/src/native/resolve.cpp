@@ -9,6 +9,7 @@
 #include "guest_memory.h"
 #include "renderer.h"
 #include "texture_layout.h"
+#include "win_handle.h"
 
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -469,12 +470,16 @@ void CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParam
 // Decoding
 
 bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out) {
-  static uint32_t log_tex = 0, log_cmd = 0, log_packed = 0, log_fmt = 0;
+  static uint32_t log_tex = 0, log_cmd = 0, log_packed = 0, log_fmt = 0, log_level = 0;
   ResolveParams p;
   const uint32_t device = args.device;
   const uint32_t flags = args.r[1];
   const uint32_t rect_ptr = args.r[2], tex = args.r[3], point_ptr = args.r[4];
   const uint32_t level = args.r[5], slice = args.r[6], color_ptr = args.r[7];
+  if (level >= xenos::kTextureMaxMips) {
+    PGR4_LOG_ONCE(log_level, "PGR4 native resolve: destination level {} out of range", level);
+    return false;
+  }
   p.regs = SurfaceRegsFromDevice(base, device);
   p.source = flags & 7;
   if (p.source > 4) {
@@ -535,17 +540,15 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
   p.dest_width = std::max(1u, key.width >> level);
   p.dest_height = std::max(1u, key.height >> level);
   // Destination address of the level and slice. The texture object holds virtual addresses;
-  // the D3D (sub_826CBEE0) makes them physical the way the 0xE0000000 view maps: low 29 bits
-  // plus 4 KiB for addresses at or above 0xE0000000. That is also the physical address the
-  // GPU-side fetch constant (and so the texture cache) sees.
-  auto d3d_phys = [](uint32_t a) { return (a & 0x1FFFFFFFu) + ((((a >> 20) + 0x200u) & 0x1000u)); };
+  // GpuAddress is also the physical address the GPU-side fetch constant (and so the texture
+  // cache) sees.
   const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
       key.dimension, key.pitch, key.width, key.height, key.depth_or_array_size, key.tiled,
       rex::graphics::GetBaseFormat(xenos::TextureFormat(fetch_format)), key.packed_mips, true,
       std::max(level, key.mip_max_level));
   const texture_util::TextureGuestLayout::Level* lv;
   if (level == 0) {
-    p.dest_base = d3d_phys(fetch[1] & 0xFFFFF000u);
+    p.dest_base = GpuAddress(fetch[1] & 0xFFFFF000u);
     lv = &layout.base;
   } else {
     if (layout.packed_level != UINT32_MAX && level >= layout.packed_level) {
@@ -554,7 +557,7 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
                     level);
       return false;
     }
-    p.dest_base = d3d_phys(fetch[5] & 0xFFFFF000u) + layout.mip_offsets_bytes[level];
+    p.dest_base = GpuAddress(fetch[5] & 0xFFFFF000u) + layout.mip_offsets_bytes[level];
     lv = &layout.mips[level];
   }
   p.dest_base += lv->array_slice_stride_bytes * slice;
@@ -961,10 +964,10 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   // Descriptors: t0 = color / depth plane, t1 = stencil plane, u0 = the image's UINT view,
   // u1 = its float view (B5G6R5) or the depth float image; null where unused.
   if (heap_next_ + kViewsPerResolve > kHeapPerFrame) {
-    PGR4_LOG_ONCE(log_heap,
-                  "PGR4 native resolve: more than {} resolves in a frame; descriptors wrap",
+    // The frame's earlier dispatches read their descriptors when the GPU runs them.
+    PGR4_LOG_ONCE(log_heap, "PGR4 native resolve: more than {} resolves in a frame; skipped",
                   kHeapPerFrame / kViewsPerResolve);
-    heap_next_ = 0;
+    return false;
   }
   const uint32_t slot = uint32_t(frame_ % kHeapSlots) * kHeapPerFrame + heap_next_;
   heap_next_ += kViewsPerResolve;
@@ -1484,18 +1487,22 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       ID3D12CommandList* lists[] = {list.Get()};
       queue->ExecuteCommandLists(1, lists);
       queue->Signal(fence.Get(), ++fence_value);
-      HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-      fence->SetEventOnCompletion(fence_value, ev);
-      WaitForSingleObject(ev, 5000);
-      CloseHandle(ev);
+      const UniqueHandle done = CreateAutoResetEvent();
+      if (!done || FAILED(fence->SetEventOnCompletion(fence_value, done.get())) ||
+          WaitForSingleObject(done.get(), 5000) != WAIT_OBJECT_0) {
+        REXLOG_ERROR("PGR4 native resolve selftest: {} {}: the GPU did not finish", mode_name,
+                     c.name);
+        return false;
+      }
       uint32_t bad = 0, first_bad[2] = {}, first_x = 0, first_y = 0;
       float r32f_seen = 0;
       if (img) {
-        const uint8_t* data = nullptr;
-        readback[0]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)));
-        const uint8_t* fdata = nullptr;
-        if (readback[1])
-          readback[1]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&fdata)));
+        void* mapped[2] = {};
+        if (Failed(readback[0]->Map(0, nullptr, &mapped[0]), "selftest Map") ||
+            (readback[1] && Failed(readback[1]->Map(0, nullptr, &mapped[1]), "selftest Map")))
+          return false;
+        const auto* data = static_cast<const uint8_t*>(mapped[0]);
+        const auto* fdata = static_cast<const uint8_t*>(mapped[1]);
         for (uint32_t y = 0; y < h; ++y) {
           for (uint32_t x = 0; x < w; ++x) {
             const uint8_t* t = data + size_t(py + y) * row_pitch + size_t(px + x) * bpp;

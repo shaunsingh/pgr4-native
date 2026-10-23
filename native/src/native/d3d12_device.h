@@ -31,6 +31,8 @@
 #include <memory>
 #include <thread>
 
+#include "win_handle.h"
+
 namespace pgr4::native {
 
 using Microsoft::WRL::ComPtr;
@@ -135,7 +137,7 @@ class D3D12Device {
   ComPtr<ID3D12Device> device_;
   ComPtr<ID3D12CommandQueue> queue_;
   ComPtr<ID3D12Fence> fence_;
-  HANDLE fence_event_ = nullptr;
+  UniqueHandle fence_event_;
   uint64_t next_fence_ = 1;
   ComPtr<ID3D12CommandAllocator> allocators_[kFramesInFlight];
   uint64_t slot_fence_[kFramesInFlight] = {};

@@ -57,7 +57,6 @@ D3D12Device::~D3D12Device() {
   if (device_) WaitIdle();
   if (HWND h = hwnd_.load()) PostMessageW(h, WM_CLOSE, 1, 0);
   if (window_thread_.joinable()) window_thread_.join();
-  if (fence_event_) CloseHandle(fence_event_);
 }
 
 LRESULT CALLBACK D3D12Device::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -170,7 +169,11 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
   if (Failed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.GetAddressOf())),
              "CreateFence"))
     return false;
-  fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  fence_event_ = CreateAutoResetEvent();
+  if (!fence_event_) {
+    REXLOG_ERROR("PGR4 native: CreateEvent failed: error {}", GetLastError());
+    return false;
+  }
   for (auto& a : allocators_)
     if (Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                                                IID_PPV_ARGS(a.GetAddressOf())),
@@ -288,8 +291,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {
 
 void D3D12Device::WaitFence(uint64_t value) {
   if (fence_->GetCompletedValue() >= value) return;
-  fence_->SetEventOnCompletion(value, fence_event_);
-  WaitForSingleObject(fence_event_, INFINITE);
+  fence_->SetEventOnCompletion(value, fence_event_.get());
+  WaitForSingleObject(fence_event_.get(), INFINITE);
 }
 
 void D3D12Device::WaitIdle() {
