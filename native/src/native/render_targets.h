@@ -1,11 +1,11 @@
-// pgr4-native PGR4 native renderer (M2 owner #5): host render targets for the guest's EDRAM
+// pgr4-native PGR4 native renderer: host render targets for the guest's EDRAM
 // surfaces, and the guest Clear calls.
 //
 // No EDRAM emulation and no tiles: every guest surface (RB_SURFACE_INFO pitch and MSAA,
 // RB_COLOR_INFO / RB_DEPTH_INFO base and format) gets one host render target at full size,
 // whatever predicated tiling the guest D3D does behind the API.
 //
-// Aliasing (tools/rt_passes.py over the M1 menu and race traces): PGR4 reuses EDRAM base 0
+// Aliasing (tools/rt_passes.py over tap traces of the menus and the race): PGR4 reuses EDRAM base 0
 // for most passes of a frame (shadow-map depth, the 128x128 mip chain, the 1280x720 2x scene,
 // the 1x post chain, 80-pitch luminance reductions, the UI), and the 256x256 4x cube faces
 // sit at color base 224 over depth base 0. Every surface use starts with a Clear/ClearF of
@@ -133,10 +133,9 @@ class RenderTargets {
   // RENDER_TARGET / DEPTH_WRITE into `list`; the caller sets the RTVs/DSV from `out`.
   bool Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t color_mask, bool depth_used, uint32_t height, BoundTargets* out);
 
-  // Guest Clear / ClearF (HookFn kClear / kClearF), after the guest call returned: clears the
-  // host targets of the surfaces bound in the device's register shadow.
-  void OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base, const HookArgs& args);
-  // OnClear's decoding half (reads guest memory only); false: nothing to clear.
+  // Guest Clear / ClearF (HookFn kClear / kClearF), after the guest call returned: the surfaces
+  // bound in the device's register shadow and the clear values (reads guest memory only);
+  // false: nothing to clear. Clear then clears their host targets.
   static bool DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out);
   void Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
              uint32_t bound_colors, bool depth_bound, uint32_t height, const ClearParams& p);
@@ -159,10 +158,8 @@ class RenderTargets {
   void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
   static constexpr uint64_t kMaxAge = 120;
 
-  size_t count() const { return targets_.size(); }
   // The draw log (DrawRenderer) while one is open: target creations and EDRAM fills applied.
   void SetLog(std::FILE* log) { log_ = log; }
-  uint64_t recreated() const { return recreated_; }
 
   // Host DXGI formats of a guest color / depth render target format (UNKNOWN if unsupported).
   static DXGI_FORMAT ColorFormat(uint32_t color_format);
@@ -212,7 +209,6 @@ class RenderTargets {
     uint64_t fence;
   };
   std::vector<Retired> retired_;
-  uint64_t recreated_ = 0;
   uint64_t frame_ = 0, frame_fence_ = 0;
   std::vector<EdramFill> fills_;  // oldest first
   uint64_t fill_seq_ = 0;

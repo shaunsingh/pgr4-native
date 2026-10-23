@@ -1,7 +1,10 @@
 // pgr4-native PGR4 native renderer: Xenos register state per draw from the guest D3D device.
 // See d3d_state.h for the model; the evidence (disassembly of the base-disc D3D library in the
-// generated code, M1 trace comparisons) is in the development notes, "Renderer decision".
+// generated code, trace comparisons with --pgr4_d3d_tap) is in the development notes, "Renderer
+// decision".
 #include "d3d_state.h"
+
+#include "guest_memory.h"
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -18,25 +21,6 @@ REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
 namespace pgr4::native {
 namespace {
 
-// Guest virtual memory as the generated code addresses it (the 0xE0000000 view is 4 KiB higher).
-inline const uint8_t* Host(const uint8_t* base, uint32_t a) {
-  return base + a + (a >= 0xE0000000u ? 0x1000u : 0u);
-}
-inline uint32_t Load32(const uint8_t* base, uint32_t a) {
-  uint32_t v;
-  std::memcpy(&v, Host(base, a), 4);
-  return __builtin_bswap32(v);
-}
-inline uint16_t Load16(const uint8_t* base, uint32_t a) {
-  uint16_t v;
-  std::memcpy(&v, Host(base, a), 2);
-  return __builtin_bswap16(v);
-}
-inline uint64_t Load64(const uint8_t* base, uint32_t a) {
-  uint64_t v;
-  std::memcpy(&v, Host(base, a), 8);
-  return __builtin_bswap64(v);
-}
 // Virtual -> physical the way the D3D computes GPU addresses (e.g. sub_826D0340's index base).
 inline uint32_t GpuAddress(uint32_t a) {
   return (a & 0x1FFFFFFFu) + ((((a >> 20) & 0xFFFu) + 0x200u) & 0x1000u);
@@ -90,7 +74,7 @@ constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 }  // namespace
 
 void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count) {
-  const uint8_t* p = Host(base, src);
+  const uint8_t* p = HostPtr(base, src);
   auto put_raw = [&](uint32_t i) {
     uint32_t v;
     std::memcpy(&v, p + i * 4, 4);
@@ -141,7 +125,7 @@ void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn
   static bool seen[kGuestRegisterCount] = {};
   ++checks;
   for (const Block& b : kRegisterBlocks) {
-    const uint8_t* p = Host(base, device + b.offset);
+    const uint8_t* p = HostPtr(base, device + b.offset);
     for (uint32_t i = 0; i < b.count; ++i) {
       const uint32_t reg = b.reg + i;
       uint32_t v;
@@ -196,7 +180,7 @@ void GuestStateTracker::LoadLiterals(const uint8_t* base, uint32_t table, uint32
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device) {
   CallEntry e;
   for (uint32_t i = 0; i < 6; ++i) e.dirty[i] = Load64(base, device + dev::kDirtyMasks + i * 8);
-  e.vertex_stride_dwords = *Host(base, device + 11824);
+  e.vertex_stride_dwords = *HostPtr(base, device + 11824);
   return e;
 }
 
@@ -212,7 +196,7 @@ bool IsStateFlushingFn(uint32_t addr) {
 }
 
 GuestStateTracker& GuestState() {
-  static GuestStateTracker* tracker = new GuestStateTracker();  // 80 KB, never freed
+  static GuestStateTracker* tracker = new GuestStateTracker();  // 160 KB, never freed
   return *tracker;
 }
 
@@ -225,7 +209,7 @@ void GuestStateTracker::Attach(const uint8_t* base, uint32_t device) {
   Copy(0x4400, base, device + dev::kPsConstants, 1024);
   for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
   vs_ = ps_ = {};
-  inline_vertices_ = inline_bytes_ = 0;
+  inline_vertices_ = 0;
 }
 
 void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const CallEntry& e,
@@ -243,7 +227,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
 
   // Float constants: only the 4-vec4 groups whose dirty bit the call cleared reached the GPU
   // (sub_826DE030; bit 63 - k = constants 4k..4k+3). The rest of the shadow may hold values
-  // the game wrote without a dirty bit (c247-c255 in the M1 traces).
+  // the game wrote without a dirty bit (c247-c255 in the tap traces).
   for (uint32_t m = 0; m < 2; ++m) {
     uint64_t now = Load64(base, device + dev::kDirtyMasks + m * 8);
     uint64_t flushed = e.dirty[m] & ~now;
@@ -256,7 +240,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   }
 
   // Register blocks, clip planes, fetch and bool/loop constants: at the end of every flushing
-  // call the shadow equals what the GPU has for these (the M1 traces show no other
+  // call the shadow equals what the GPU has for these (the tap traces show no other
   // differences: the draw flushes whatever is dirty, and Clear/Resolve re-dirty what they
   // overwrite in the stream, so the next draw restores it). A game draw changes only what was
   // dirty at its entry and what its shader load wrote; Clear, Resolve, Swap and the D3D's own
@@ -312,7 +296,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
         uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
         uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
         vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)), Load32(base, sub + 876) >> 2};
-        vs_.binding = XXH3_64bits(Host(base, vs + 416 * variant + 40), 24);
+        vs_.binding = XXH3_64bits(HostPtr(base, vs + 416 * variant + 40), 24);
       }
       if (rebind & (kVsRebind | kPsRebind)) LoadLiterals(base, vs + 872, Load32(base, vs + 32));
     } else {
@@ -332,7 +316,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     case kFnDrawIndexed:   // VGT_INDX_OFFSET = BaseVertexIndex
     case kFnDrawVertices:  // VGT_INDX_OFFSET = StartVertex
       Put(0x2102, r[2]);
-      inline_vertices_ = inline_bytes_ = 0;
+      inline_vertices_ = 0;
       break;
     case kFnDrawIndx2Split:  // Swap's internal draw
       Put(0x2102, 0);
@@ -353,7 +337,6 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
       Put(f + 5, 0x10000002u | (((bytes >> 2) & 0xFFFFFFu) << 2));
       inline_fetch_ = true;
       inline_vertices_ = GpuAddress(p);
-      inline_bytes_ = bytes;
       break;
     }
     default:
@@ -380,7 +363,7 @@ void GuestStateTracker::AfterImmediateVs(const uint8_t* base, const uint32_t r[8
     return;
   }
   vs_imm_pending_.resize(dwords);
-  std::memcpy(vs_imm_pending_.data(), Host(base, start), size_t(dwords) * 4);
+  std::memcpy(vs_imm_pending_.data(), HostPtr(base, start), size_t(dwords) * 4);
   vs_imm_pending_ref_ = {vs, GpuAddress(start), dwords, nullptr, ++vs_imm_seq_};
   vs_imm_pending_valid_ = true;
 }
@@ -398,9 +381,7 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, cons
       s->base_vertex = a.r[2];
       s->count = a.r[4];
       s->indexed = true;
-      uint32_t ib = Load32(base, device + dev::kIndexBuffer);
-      s->index_buffer = ib;
-      if (ib) {
+      if (const uint32_t ib = Load32(base, device + dev::kIndexBuffer)) {
         uint32_t d0 = Load32(base, ib);
         s->index_32bit = d0 >> 31;
         s->index_endian = (d0 >> 29) & 3;
@@ -418,16 +399,12 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, cons
       s->primitive = a.r[1] & 0x3F;
       s->count = a.r[2];
       s->inline_vertices = inline_vertices_;
-      s->inline_bytes = inline_bytes_;
       break;
     default:
       return false;
   }
   s->vs = vs_;
   s->ps = ps_;
-  s->vertex_decl = Load32(base, device + dev::kVertexDecl);
-  for (uint32_t i = 0; i < 4; ++i) s->color_surface[i] = Load32(base, device + dev::kRenderTargets + i * 4);
-  s->depth_surface = Load32(base, device + dev::kDepthStencil);
   return true;
 }
 
@@ -450,10 +427,6 @@ uint32_t GuestStateTracker::CompareWithTap(const uint32_t* tap_regs, const uint8
     if (per_reg) ++per_reg[r];
   }
   return bad;
-}
-
-bool ReadDrawState(const uint8_t* guest_base, uint32_t device_addr, const DrawArgs& args, DrawState* out) {
-  return GuestState().ReadDrawState(guest_base, device_addr, args, out);
 }
 
 }  // namespace pgr4::native

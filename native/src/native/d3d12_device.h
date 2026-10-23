@@ -1,7 +1,7 @@
 // pgr4-native PGR4 native renderer: the app's own D3D12 queue, fence, frame command lists and a
 // window with its own swapchain, separate from ReXGlue's presenter and the Xenos plugin.
 //
-// Two window modes: the debug window (a top-level window beside the game's, M2), or, with
+// Two window modes: the debug window (a top-level window beside the game's), or, with
 // --pgr4_native_primary, a disabled child window covering the game window's client area (the
 // SDK's own window and swapchain stay underneath; keyboard focus and input stay with the game
 // window, and the child follows its client size).
@@ -18,6 +18,7 @@
 #endif
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #undef DrawState  // winuser.h maps it to DrawStateA/W; d3d_state.h's struct has that name
@@ -142,5 +143,34 @@ class D3D12Device {
 
 // Logs a failed HRESULT with the call text; returns true when it failed.
 bool Failed(HRESULT hr, const char* what);
+
+// A barrier moving every subresource of `resource` from `before` to `after`.
+inline D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* resource,
+                                                D3D12_RESOURCE_STATES before,
+                                                D3D12_RESOURCE_STATES after) {
+  D3D12_RESOURCE_BARRIER b = {};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition.pResource = resource;
+  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  b.Transition.StateBefore = before;
+  b.Transition.StateAfter = after;
+  return b;
+}
+
+// A buffer of `size` bytes.
+constexpr D3D12_RESOURCE_DESC BufferDesc(uint64_t size,
+                                         D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
+  return {D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+          D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
+}
+
+// A committed buffer of `size` bytes on a heap of `type`, created in `state`. Logs `what` and
+// returns false on failure.
+bool CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t size,
+                  D3D12_RESOURCE_STATES state, const char* what, ComPtr<ID3D12Resource>* out);
+
+// D3DCompile from d3dcompiler_47.dll (Windows 10/11 and Proton ship it), loaded on the first call;
+// nullptr (logged) without it.
+pD3DCompile D3DCompiler();
 
 }  // namespace pgr4::native

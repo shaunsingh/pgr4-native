@@ -2,6 +2,7 @@
 #include "guest_d3d.h"
 
 #include "d3d_state.h"
+#include "guest_memory.h"
 #include "renderer.h"
 
 #include <rex/logging.h>
@@ -17,15 +18,6 @@ REX_EXTERN(sub_826DEDC8);
 
 namespace pgr4::native::guest_d3d {
 namespace {
-
-inline uint8_t* Host(uint8_t* base, uint32_t a) {
-  return base + a + (a >= 0xE0000000u ? 0x1000u : 0u);
-}
-inline uint64_t Load64(uint8_t* base, uint32_t a) {
-  uint64_t v;
-  std::memcpy(&v, Host(base, a), 8);
-  return __builtin_bswap64(v);
-}
 
 // Device byte +10940, bit 0: predicated tiling is on. The original then writes the draw packet
 // in its predicated form and records its address in the tile list at +13232 for the per-tile
@@ -55,11 +47,11 @@ bool DrawIndexed(PPCContext& ctx, uint8_t* base) {
   if (!device || !NativeRenderer::Get()) return false;
   static uint64_t calls = 0, tiled = 0;
   ++calls;
-  tiled += *Host(base, device + kTilingFlags) & 1;
+  tiled += *HostPtr(base, device + kTilingFlags) & 1;
   if (calls == 1 || (calls >= 1024 && (calls & (calls - 1)) == 0))
     REXLOG_INFO("PGR4 native: replaced DrawIndexedVertices {} times ({} with predicated tiling)",
                 calls, tiled);
-  uint8_t* masks = Host(base, device + dev::kDirtyMasks);
+  uint8_t* masks = HostPtr(base, device + dev::kDirtyMasks);
   // Same order as the original: the constant masks are cleared before the shader load (which
   // may dirty constants again), the register masks after it.
   std::memset(masks, 0, 16);

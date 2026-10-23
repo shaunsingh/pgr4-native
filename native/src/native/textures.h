@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #4): guest texture fetch constants -> D3D12 textures.
+// pgr4-native PGR4 native renderer: guest texture fetch constants -> D3D12 textures.
 //
 // TextureCache keeps one host texture per TextureKey (texture_layout.h: base/mip address,
 // size, pitch, format, endianness, tiling, packed mips, mip count). Get() returns the texture
@@ -19,7 +19,7 @@
 // invalidation callback runs on any guest thread that faults on a watched page.
 #pragma once
 
-#include "resolve.h"  // ResolvedImage (resolve module, M2 owner #5)
+#include "resolve.h"  // ResolvedImage
 #include "texture_layout.h"
 #include "upload_pool.h"
 
@@ -245,7 +245,7 @@ class TextureCache {
     TextureBinding binding;
   };
   static constexpr uint32_t kGetMemoBits = 10;
-  std::unique_ptr<GetMemo[]> get_memo_{new GetMemo[size_t(1) << kGetMemoBits]};
+  std::unique_ptr<GetMemo[]> get_memo_ = std::make_unique<GetMemo[]>(size_t(1) << kGetMemoBits);
   std::atomic<uint64_t> change_epoch_{1};
   // MarkCapture stamps handed out, stored once per draw: on a cache line of its own, as the
   // render thread reads the members around it for every texture it binds.

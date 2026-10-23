@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #6): guest Swap -> the debug window, and captures.
+// pgr4-native PGR4 native renderer: guest Swap -> the debug window, and captures.
 //
 // OnSwap reads the front buffer texture of the guest Swap (r4, a D3DBaseTexture; fetch
 // constant at +28, the same object the frame's last Resolve wrote), finds its host image in the
@@ -6,11 +6,11 @@
 // constant's swizzle and the display controller's gamma ramp (present.cpp). Without a
 // resolved image the back buffer is cleared to black.
 //
-// Captures (oracle for M2): --pgr4_native_capture_dir (empty by default: no requests polled)
-// and either the file <dir>\capture.request (deleted when taken, read every 16 frames), a mark
-// (F12), or --pgr4_native_capture_frame=N. A request
-// at Swap F-1 switches the Xenos plugin to full readback (HoldFullReadback in resolve.h; with
-// "fast" guest memory holds the previous frame's resolves) and captures frame F:
+// Captures (the image check against Xenos): --pgr4_native_capture_dir (empty by default: no
+// requests polled) and either the file <dir>\capture.request (deleted when taken, read every 16
+// frames), a mark (F12), or --pgr4_native_capture_frame=N. A request at Swap F-1 switches the
+// Xenos plugin to full readback (HoldFullReadback in resolve.h; with "fast" guest memory holds
+// the previous frame's resolves) and captures frame F:
 //   f<F>-native.png  the native front buffer (read back after the frame's fence)
 //   f<F>-xenos.png   the same front buffer as the Xenos plugin wrote it into guest memory
 //                    (read after the guest thread was held in the Swap hook for
@@ -77,7 +77,7 @@ class Presenter {
   // In NativeRenderer::OnSwap after EndFrame: finishes a pending capture (with the Xenos copy:
   // waits for the frame's fence, holds the guest thread, reads guest memory, writes the PNGs;
   // without it: hands a completed frame's image to a thread that writes its PNG).
-  void AfterEndFrame(const uint8_t* base);
+  void AfterEndFrame();
 
   bool front_buffer_found() const { return last_found_; }
   const LumaProbe& luma_probe() const;

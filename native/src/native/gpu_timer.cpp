@@ -141,18 +141,8 @@ bool GpuTimer::Initialize(ID3D12Device* device, ID3D12CommandQueue* queue, uint3
   if (Failed(device->CreateQueryHeap(&qd, IID_PPV_ARGS(heap_.GetAddressOf())),
              "CreateQueryHeap(timestamp)"))
     return false;
-  D3D12_HEAP_PROPERTIES hp = {};
-  hp.Type = D3D12_HEAP_TYPE_READBACK;
-  D3D12_RESOURCE_DESC rd = {};
-  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  rd.Width = uint64_t(qd.Count) * sizeof(uint64_t);
-  rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-  rd.SampleDesc.Count = 1;
-  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(readback_.GetAddressOf())),
-             "CreateCommittedResource(timestamp readback)"))
+  if (!CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, uint64_t(qd.Count) * sizeof(uint64_t),
+                    D3D12_RESOURCE_STATE_COPY_DEST, "timestamp readback", &readback_))
     return false;
   frames_.resize(slots);
   for (Frame& f : frames_) f.spans.reserve(kMaxSpans);

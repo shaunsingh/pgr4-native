@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer, milestone 1 (design A): guest D3D API hooks and frame trace.
+// pgr4-native PGR4 native renderer: guest D3D API hooks and frame trace.
 //
 // Every function in d3d_surface.inc (the XDK D3D entry points PGR4's game code calls, plus the
 // internal draw builders and MakeSpace) is overridden with a REX_HOOK_RAW that forwards to the
@@ -22,12 +22,13 @@
 //   tap on|off             stop or resume decoding (hooks keep counting and forwarding)
 //
 // With --pgr4_native the draw, clear, resolve and Swap hooks also call the native D3D12
-// renderer (src/native/renderer.h) after the guest function returned (milestone 2).
+// renderer (src/native/renderer.h) after the guest function returned.
 //
-// Built only into the pgr4-native native checkout (native/build.ps1).
+// Built only into the pgr4-native native checkout (native/build.sh, native/build.ps1).
 
 #include "native/d3d_state.h"
 #include "native/guest_d3d.h"
+#include "native/guest_memory.h"
 #include "native/profile.h"
 #include "native/renderer.h"
 
@@ -116,13 +117,7 @@ uint32_t SkipClassOf(FnId id) {
 constexpr uint32_t kRegCount = 0x5000;
 constexpr uint32_t kDevPush = 48;  // last written dword; the limit is at device+56
 
-// Same address translation as the generated code (REX_PHYS_HOST_OFFSET): the 0xE0000000 view
-// of physical memory sits 4 KiB higher in the host mapping. The D3D's push buffer can live there.
-inline uint32_t Load32(const uint8_t* base, uint32_t a) {
-  uint32_t v;
-  std::memcpy(&v, base + a + (a >= 0xE0000000u ? 0x1000u : 0u), 4);
-  return __builtin_bswap32(v);
-}
+using pgr4::native::Load32;  // the D3D's push buffer can live in the 0xE0000000 view
 
 uint64_t Fnv(const uint32_t* d, size_t n, uint64_t h = 1469598103934665603ull) {
   for (size_t i = 0; i < n; ++i) {

@@ -2,11 +2,11 @@
 // blocks, sub-allocated linearly and recycled once the GPU finished the frame that used them.
 // Used for vertex/index data and constants (draw.cpp) and texture uploads (textures.cpp).
 //
-// Threading: one thread (the renderer's On* calls).
+// Threading: one thread per pool (with the render thread, draw.cpp's vertex pool is the guest
+// thread's and the others are the render thread's; renderer.h).
 #pragma once
 
-#include <d3d12.h>
-#include <wrl/client.h>
+#include "d3d12_device.h"
 
 #include <rex/logging.h>
 
@@ -90,12 +90,7 @@ class UploadPool {
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
     if (cpu_cached_)
       hp = {D3D12_HEAP_TYPE_CUSTOM, D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0};
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = size;
-    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const D3D12_RESOURCE_DESC rd = BufferDesc(size);
     HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                   IID_PPV_ARGS(&b->resource));

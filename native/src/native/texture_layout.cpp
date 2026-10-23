@@ -77,7 +77,7 @@ constexpr uint32_t kRBGG = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, B, G, G);
 using C = TextureConversion;
 // Same DXGI formats and load conversions as D3D12TextureCache::host_formats_ (non-decompressing
 // path; BCn with unaligned sizes needs D3D12 UnalignedBlockTexturesSupported, checked by the
-// cache). Formats not listed are not used by PGR4's menus and race (M1 traces) and are
+// cache). Formats not listed are not used by PGR4's menus and race (tap traces) and are
 // reported as unsupported.
 const HostFormat kFormats[] = {
     // k_8

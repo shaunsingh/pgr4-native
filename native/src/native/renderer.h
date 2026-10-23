@@ -1,12 +1,13 @@
-// pgr4-native PGR4 native renderer (design A, milestone 2): host of the native D3D12 path.
+// pgr4-native PGR4 native renderer: host of the native D3D12 path.
 //
-// The guest D3D hooks in pgr4_d3d_trace.cpp forward every call to the guest D3D (the Xenos
-// plugin keeps rendering as the oracle) and, with --pgr4_native, then call the NativeRenderer
-// entry points below with the guest device and the call's arguments. Only the outermost
+// The guest D3D hooks in pgr4_d3d_trace.cpp forward every call to the guest D3D (without
+// --pgr4_native_primary the Xenos plugin keeps rendering, as the oracle) and, with
+// --pgr4_native, then call the NativeRenderer entry points below with the guest device and the
+// call's arguments. Only the outermost
 // draw/clear/resolve/Swap call is passed on (the D3D's internal clear, copy and Swap quads are
 // not game draws); a top-level BeginVertices reaches OnDraw at the entry of the next hooked
-// call, once the game has written its vertices. The renderer owns its
-// own D3D12 queue, a debug window and a swapchain, separate from ReXGlue's presenter.
+// call, once the game has written its vertices. The renderer owns its own D3D12 queue, window
+// and swapchain, separate from ReXGlue's presenter (d3d12_device.h).
 //
 // Threading: the guest D3D device is used by one guest thread at a time; all On* entry points
 // are called on that thread, after the original guest function returned, and are serialized
@@ -22,10 +23,6 @@
 // that thread (DrawRenderer's vertex upload pool and shader lookup stay on the guest thread).
 // The guest thread blocks at Swap while the render thread is more than one frame behind, and
 // waits for the render thread to finish the Swaps around a capture (present.h).
-//
-// Owner: Integrator (M2 owner #1). Other modules (d3d_state, shader_*, textures,
-// render_targets, resolve, draw, present) plug in behind these calls; ask the owner for
-// changes to this header.
 #pragma once
 
 #include <rex/cvar.h>
@@ -81,7 +78,7 @@ enum class TilingCall : uint8_t { kNone, kBegin, kEnd };
 // Raw PPC arguments of one hooked call. Integer arguments in r3..r10 and float arguments in
 // f1..f4 are captured at entry, before the guest function runs (it clobbers them).
 // Argument meaning follows the XDK D3DDevice_* signatures [INFERENCE, check against the
-// M1 traces' `C` lines before relying on one]:
+// tap traces' `C` lines before relying on one]:
 //   DrawIndexedVertices(dev, prim, base_vertex, start_index, index_count)
 //   DrawVertices(dev, prim, start_vertex, vertex_count)
 //   DrawVerticesUP(dev, prim, vertex_count, data_ptr, stride)
@@ -159,10 +156,10 @@ class NativeRenderer {
   bool Initialize();
   void WriteCsv(const FrameStats& s, uint64_t frame_ns);
   // Starts a frame's module state (RenderTargets/Resolver BeginFrame) at its first On* call.
-  void BeginFrame(const uint8_t* base) {
-    if (!frame_begun_) BeginFrameModules(base);
+  void BeginFrame() {
+    if (!frame_begun_) BeginFrameModules();
   }
-  void BeginFrameModules(const uint8_t* base);
+  void BeginFrameModules();
   // The recording half of the On* calls (on the guest thread, or the render thread).
   void ExecuteDraw(const DrawState& state, const DrawPrep* prep);
   void ExecuteClear(const ClearCall& clear);
@@ -171,6 +168,8 @@ class NativeRenderer {
   // After a draw: submits the frame so far once --pgr4_native_submit_draws draws were recorded
   // since the last submission.
   void SubmitEarly();
+  // A failed submission or present: logs and turns the native path off for the rest of the run.
+  void Fail();
   // Render thread mode.
   struct Queue;
   void QueueDraw(const uint8_t* base, const HookArgs& args);
@@ -179,16 +178,15 @@ class NativeRenderer {
   void QueueSwap(const uint8_t* base, const HookArgs& args);
   void RenderThreadMain();
 
-  const uint8_t* base_ = nullptr;  // guest memory base (constant; set before first use)
   std::unique_ptr<Queue> queue_;   // render thread mode only
 
   std::unique_ptr<D3D12Device> device_;
   std::unique_ptr<RenderTargets> rt_;
   std::unique_ptr<Resolver> resolver_;
   std::unique_ptr<TextureCache> textures_;
-  std::unique_ptr<DrawRenderer> draw_;   // draw.h (DrawPresent)
-  std::unique_ptr<Presenter> present_;   // present.h (DrawPresent)
-  GpuTimer* gpu_timer_ = nullptr;        // device_'s, with --pgr4_native_gpu_timing
+  std::unique_ptr<DrawRenderer> draw_;
+  std::unique_ptr<Presenter> present_;
+  GpuTimer* gpu_timer_ = nullptr;  // device_'s, with --pgr4_native_gpu_timing
   bool frame_begun_ = false;
   uint64_t frame_index_ = 0;
   uint64_t frame_start_ns_ = 0;

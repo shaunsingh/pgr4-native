@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #5): guest Resolve -> host texture copies.
+// pgr4-native PGR4 native renderer: guest Resolve -> host texture copies.
 //
 // A guest Resolve(Flags, pSourceRect, pDestTexture, pDestPoint, DestLevel, DestSliceOrFace,
 // pClearColor, ClearZ, ClearStencil, pParameters) copies a rectangle of a render target
@@ -17,9 +17,8 @@
 // 8; NULL dest point = (0, 0); sample select from Flags bits 4-6 (0 = by the surface's MSAA:
 // 1x sample 0, 2x average of 2, 4x average of 4); exponent bias from Flags bits 26-31;
 // red/blue swap when the destination's swizzle X is not R; raw copies for depth, conversion
-// for color. During M2 the guest Resolve also runs (Xenos is the oracle), so OnResolve
-// compares the decoded copy registers with the ones the D3D wrote into its register shadow
-// and counts mismatches (shadow_mismatches()).
+// for color. The guest Resolve runs first, so DecodeResolve also compares the decoded copy
+// registers with the ones the D3D wrote into its register shadow and logs mismatches.
 //
 // Oracle dumps (--pgr4_native_resolve_dump=<dir>): creating <dir>\dump.request arms a dump of
 // the next frame's resolves: for each, the native texels (`f<F>-r<i>-native.bin`, tight rows),
@@ -29,7 +28,7 @@
 // resolves twice into one address, every entry's guest copy is the last write.
 // tools/compare_resolves.py untiles and compares them.
 //
-// Pipeline state: OnResolve sets its own compute root signature, PSO and shader-visible
+// Pipeline state: Resolve sets its own compute root signature, PSO and shader-visible
 // descriptor heap on the command list; callers that draw afterwards must set theirs again.
 #pragma once
 
@@ -91,7 +90,8 @@ struct ResolveParams {
   uint8_t clear_stencil = 0;
 };
 
-// Decodes a Resolve hook call (`args` = r3..r10, f1, sp at entry; guest memory at `base`).
+// Decodes a Resolve hook call (`args` = r3..r10, f1, sp at entry; guest memory at `base`), after
+// the guest Resolve returned, and logs where its copy registers in the D3D's shadow disagree.
 // Returns false (and logs once per reason) for what is not supported yet: packed mip tails,
 // 3D destinations, copy commands other than raw/convert.
 bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out);
@@ -113,14 +113,12 @@ class Resolver {
   bool Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12CommandQueue* queue);
 
   // Once per frame before recording it, like RenderTargets::BeginFrame (handles dumps too).
-  void BeginFrame(const uint8_t* base, uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
+  void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
 
   // In NativeRenderer::OnSwap after EndFrame: for a dumped frame, holds the guest thread for
   // --pgr4_native_capture_hold_ms and copies the guest memory of its resolves.
-  void AfterSwap(const uint8_t* base);
+  void AfterSwap();
 
-  // After the guest Resolve returned.
-  void OnResolve(ID3D12GraphicsCommandList* list, const uint8_t* base, const HookArgs& args);
   bool Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p);
 
   // The last resolve into this guest physical address, or nullptr.
@@ -131,10 +129,6 @@ class Resolver {
   void SetChangedCallback(std::function<void(uint32_t guest_phys_base)> f) { changed_ = std::move(f); }
   // With GPU timing: Resolve marks its phases (GpuTimer::ResolvePhase).
   void set_gpu_timer(GpuTimer* timer) { timer_ = timer; }
-
-  uint64_t resolves() const { return resolves_; }
-  uint64_t failures() const { return failures_; }
-  uint64_t shadow_mismatches() const { return shadow_mismatches_; }
 
   // Clears host targets of the formats PGR4 resolves from (8888, 7e3, 16F, 32F, D24FS8/D24S8;
   // 1x/2x/4x) to known values, resolves them into the destination formats PGR4 uses on its own
@@ -155,10 +149,9 @@ class Resolver {
   struct Dump;
   bool CreatePipelines();
   Image* GetImage(const ResolveParams& p);
-  void CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParams& p);
   void DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, Image* img,
                   uint32_t width, uint32_t height);
-  void DumpBeginFrame(const uint8_t* base, uint64_t completed_fence);
+  void DumpBeginFrame(uint64_t completed_fence);
 
   ID3D12Device* device_ = nullptr;
   RenderTargets* targets_ = nullptr;
@@ -171,7 +164,7 @@ class Resolver {
   std::unordered_map<uint32_t, Destination> destinations_;
   size_t image_count_ = 0;
   uint64_t frame_ = 0, frame_fence_ = 0;
-  uint64_t resolves_ = 0, failures_ = 0, shadow_mismatches_ = 0, seq_ = 0;
+  uint64_t seq_ = 0;
   std::function<void(uint32_t)> changed_;
   std::unique_ptr<Dump> dump_;
   GpuTimer* timer_ = nullptr;

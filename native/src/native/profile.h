@@ -1,8 +1,8 @@
 // pgr4-native PGR4 native renderer: per-stage CPU time of the draw path (--pgr4_native_profile).
 //
 // Stage boundaries are timestamped with RDTSC (a few ns each, unlike QueryPerformanceCounter);
-// NativeRenderer calibrates ticks to ns once per frame against NowNs and appends one µs column
-// per stage to the native CSV. Off by default: then each Mark is one predictable branch.
+// NativeRenderer converts ticks to µs at the TSC rate measured since start-up and appends one
+// column per stage to the native CSV. Off by default: then each Mark is one predictable branch.
 //
 // Threading: one State per thread. With the render thread (renderer.h) the guest thread's
 // stages (read_state, cap_*, track, imm_vs) are handed to the render thread at each Swap and
@@ -17,7 +17,7 @@ namespace pgr4::native::profile {
 
 enum Stage : uint32_t {
   // NativeRenderer::OnDraw / DrawRenderer::Impl::Draw, in order.
-  kReadState,   // BeginFrame + ReadDrawState
+  kReadState,   // ReadDrawState
   kShaders,     // shader memo/Load + SelectModifications + checks
   kSetup,       // primitive, index buffer, scissor/viewport, rasterization
   kRtBind,      // RenderTargets::Bind
@@ -89,7 +89,7 @@ inline void Count(Counter c) { ++g.counters[c]; }
 
 inline uint64_t Now() { return __rdtsc(); }
 
-// Starts a run of stages at `now`.
+// Starts a run of stages.
 inline void Begin() {
   if (g.on) g.last = Now();
 }

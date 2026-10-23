@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #5): guest Resolve -> host texture. See resolve.h.
+// pgr4-native PGR4 native renderer: guest Resolve -> host texture. See resolve.h.
 //
 // Format packing follows ReXGlue/Xenia's resolve shaders and xenos.h conversions (BSD-3,
 // Copyright Xenia/ReXGlue developers): 7e3 and 20e4 float encodings, unorm rounding, the
@@ -6,12 +6,14 @@
 #include "resolve.h"
 
 #include "gpu_timer.h"
+#include "guest_memory.h"
 #include "renderer.h"
 #include "texture_layout.h"
 
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
 
 #include <d3dcompiler.h>
 
@@ -49,18 +51,6 @@ constexpr uint32_t kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
 constexpr D3D12_RESOURCE_STATES kImageReadState =
     D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-inline uint32_t Load32(const uint8_t* base, uint32_t a) {
-  uint32_t v;
-  std::memcpy(&v, base + a + (a >= 0xE0000000u ? 0x1000u : 0u), 4);
-  return __builtin_bswap32(v);
-}
-inline float LoadF(const uint8_t* base, uint32_t a) {
-  uint32_t v = Load32(base, a);
-  float f;
-  std::memcpy(&f, &v, 4);
-  return f;
-}
 
 #define PGR4_LOG_ONCE(counter, ...)        \
   do {                                     \
@@ -395,9 +385,6 @@ struct ShaderConstants {
 };
 static_assert(sizeof(ShaderConstants) == 48);
 
-using PFN_D3DCompile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
-                                        LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
-
 // What a copy pipeline is compiled for: the generic ones read the resolve's parameters from the
 // root constants, a specialized one has them compiled in (kShader's SPEC_* macros).
 struct PipelineSpec {
@@ -416,14 +403,25 @@ struct PipelineSpec {
            uint64_t(uint32_t(exp_bias) & 63) << 32;
   }
 };
-D3D12_RESOURCE_BARRIER Barrier(ID3D12Resource* r, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = r;
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  b.Transition.StateBefore = before;
-  b.Transition.StateAfter = after;
-  return b;
+
+// RB_COPY_DEST_BASE / RB_COPY_DEST_PITCH (0x2319, 0x231A) in the shadow block 0x2300 at
+// device+10680, as the guest Resolve that just ran left them, against the decoded copy. The
+// Resolve zeroes RB_COPY_CONTROL and RB_COPY_DEST_INFO there afterwards, so those are checked
+// offline against the trace (the dump's copy_control/dest_info vs the trace's RESOLVE lines,
+// compare_resolves.py --trace).
+void CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParams& p) {
+  const uint32_t b = device + 10680 + 0x19 * 4;
+  const uint32_t dest = Load32(base, b), pitch = Load32(base, b + 4);
+  // The D3D moves the base by the tiled offset of the rectangle origin minus the dest point;
+  // only the unshifted case is compared.
+  const bool origin = p.x0 == p.dest_x && p.y0 == p.dest_y;
+  // RB_COPY_DEST_PITCH's height is the level height minus the dest point's y (r18 in the D3D).
+  if ((!origin || dest == p.dest_base) && ((pitch >> 16) & 0x3FFF) == p.dest_height - uint32_t(p.dest_y)) return;
+  static uint32_t logged = 0;
+  if (logged++ < 16)
+    REXLOG_WARN("PGR4 native resolve: decode vs D3D shadow: dest {:08X}/{:08X} pitch {:08X} (decoded {}x{}, "
+                "rect {},{}-{},{} point {},{})",
+                dest, p.dest_base, pitch, p.dest_width, p.dest_height, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y);
 }
 
 }  // namespace
@@ -538,9 +536,9 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
   p.clear_flags = flags & 0x300;
   if (p.clear_flags) {
     if (color_ptr) {
-      for (int i = 0; i < 4; ++i) p.clear_color[i] = LoadF(base, color_ptr + 4 * i);
+      for (int i = 0; i < 4; ++i) p.clear_color[i] = LoadFloat(base, color_ptr + 4 * i);
     } else {
-      const float c = LoadF(base, 0x82258A0Cu);
+      const float c = LoadFloat(base, 0x82258A0Cu);
       for (float& v : p.clear_color) v = c;
     }
     p.clear_depth = float(args.f[0]);
@@ -558,6 +556,7 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
       }
     }
   }
+  CheckAgainstShadow(base, device, p);
   *out = p;
   return true;
 }
@@ -616,7 +615,7 @@ struct Resolver::Pipelines {
   };
 
   ID3D12Device* device = nullptr;
-  PFN_D3DCompile compile = nullptr;
+  pD3DCompile compile = nullptr;
   ComPtr<ID3D12RootSignature> root_signature;
   ComPtr<ID3D12PipelineState> generic[4];  // [depth][msaa]
   Specialize specialize = Specialize::kAsync;
@@ -775,13 +774,8 @@ bool Resolver::CreatePipelines() {
              "resolve CreateRootSignature"))
     return false;
 
-  // d3dcompiler_47.dll ships with Windows 10/11 (and Proton); the shader is tiny.
-  HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
-  pl.compile = dll ? reinterpret_cast<PFN_D3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
-  if (!pl.compile) {
-    REXLOG_ERROR("PGR4 native resolve: d3dcompiler_47.dll / D3DCompile not found");
-    return false;
-  }
+  pl.compile = D3DCompiler();
+  if (!pl.compile) return false;
   for (int depth = 0; depth < 2; ++depth) {
     for (int msaa = 0; msaa < 2; ++msaa) {
       PipelineSpec s;
@@ -850,41 +844,11 @@ const ResolvedImage* Resolver::Find(uint32_t guest_phys_base) const {
   return &it->second.current->view;
 }
 
-void Resolver::BeginFrame(const uint8_t* base, uint64_t frame, uint64_t frame_fence, uint64_t completed_fence) {
+void Resolver::BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence) {
   frame_ = frame;
   frame_fence_ = frame_fence;
   heap_next_ = 0;
-  if (dump_) DumpBeginFrame(base, completed_fence);
-}
-
-void Resolver::OnResolve(ID3D12GraphicsCommandList* list, const uint8_t* base, const HookArgs& args) {
-  ResolveParams p;
-  if (!DecodeResolve(base, args, &p)) {
-    ++failures_;
-    return;
-  }
-  CheckAgainstShadow(base, args.device, p);
-  if (!Resolve(list, p)) ++failures_;
-}
-
-void Resolver::CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParams& p) {
-  // RB_COPY_DEST_BASE / RB_COPY_DEST_PITCH (0x2319, 0x231A) in the shadow block 0x2300 at
-  // device+10680, as the guest Resolve that just ran left them. It zeroes RB_COPY_CONTROL and
-  // RB_COPY_DEST_INFO there afterwards, so those are checked offline against the trace
-  // (the dump's copy_control/dest_info vs the trace's RESOLVE lines, compare_resolves.py --trace).
-  const uint32_t b = device + 10680 + 0x19 * 4;
-  const uint32_t dest = Load32(base, b), pitch = Load32(base, b + 4);
-  // The D3D moves the base by the tiled offset of the rectangle origin minus the dest point;
-  // only the unshifted case is compared.
-  const bool origin = p.x0 == p.dest_x && p.y0 == p.dest_y;
-  // RB_COPY_DEST_PITCH's height is the level height minus the dest point's y (r18 in the D3D).
-  if ((!origin || dest == p.dest_base) && ((pitch >> 16) & 0x3FFF) == p.dest_height - uint32_t(p.dest_y)) return;
-  ++shadow_mismatches_;
-  static uint32_t logged = 0;
-  if (logged++ < 16)
-    REXLOG_WARN("PGR4 native resolve: decode vs D3D shadow: dest {:08X}/{:08X} pitch {:08X} (decoded {}x{}, "
-                "rect {},{}-{},{} point {},{})",
-                dest, p.dest_base, pitch, p.dest_width, p.dest_height, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y);
+  if (dump_) DumpBeginFrame(completed_fence);
 }
 
 static uint32_t CopyControlOf(const ResolveParams& p) {
@@ -975,13 +939,13 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   uint32_t nb = 0;
   constexpr D3D12_RESOURCE_STATES kSourceState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   if (rt->state != kSourceState) {
-    bs[nb++] = Barrier(rt->resource.Get(), rt->state, kSourceState);
+    bs[nb++] = TransitionBarrier(rt->resource.Get(), rt->state, kSourceState);
     rt->state = kSourceState;
   }
   if (img->state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-    bs[nb++] = Barrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    bs[nb++] = TransitionBarrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (img->depth_r32f)
-      bs[nb++] = Barrier(img->depth_r32f.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   if (nb) list->ResourceBarrier(nb, bs);
   ShaderConstants c = {};
@@ -1008,8 +972,8 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
 
   if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p, GpuTimer::kResolveRelease));
   nb = 0;
-  bs[nb++] = Barrier(img->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
-  if (img->depth_r32f) bs[nb++] = Barrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
+  bs[nb++] = TransitionBarrier(img->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
+  if (img->depth_r32f) bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
   list->ResourceBarrier(nb, bs);
   img->state = kImageReadState;
   img->view.width = std::max(img->view.width, uint32_t(dx) + w);
@@ -1017,7 +981,6 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   img->view.seq = ++seq_;
   destinations_[p.dest_base].current = img;
   if (changed_) changed_(p.dest_base);
-  ++resolves_;
 
   if (dump_ && dump_->recording) DumpRecord(list, p, img, uint32_t(dx) + w, uint32_t(dy) + h);
 
@@ -1051,19 +1014,8 @@ void Resolver::DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& 
   e.height = height;
   e.bpp = 1u << DestBppLog2(p.dest_format);
   e.row_pitch = (width * e.bpp + kPitchAlign - 1) & ~(kPitchAlign - 1);
-  D3D12_RESOURCE_DESC bd = {};
-  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  bd.Width = uint64_t(e.row_pitch) * height;
-  bd.Height = 1;
-  bd.DepthOrArraySize = 1;
-  bd.MipLevels = 1;
-  bd.SampleDesc.Count = 1;
-  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  D3D12_HEAP_PROPERTIES hp = {};
-  hp.Type = D3D12_HEAP_TYPE_READBACK;
-  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                              nullptr, IID_PPV_ARGS(&e.readback)),
-             "resolve dump readback"))
+  if (!CreateBuffer(device_, D3D12_HEAP_TYPE_READBACK, uint64_t(e.row_pitch) * height,
+                    D3D12_RESOURCE_STATE_COPY_DEST, "resolve dump readback", &e.readback))
     return;
   D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
   src.pResource = img->texture.Get();
@@ -1076,16 +1028,16 @@ void Resolver::DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& 
   d.entries.push_back(std::move(e));
 }
 
-void Resolver::AfterSwap(const uint8_t* base) {
+void Resolver::AfterSwap() {
   if (!dump_ || !dump_->recording) return;
   Dump& d = *dump_;
   d.recording = false;
   // The guest thread is in the dumped frame's Swap: let the Xenos plugin's GPU thread execute
   // the frame (its resolves read back synchronously, HoldFullReadback) before reading memory.
   Sleep(DWORD(std::max(0, REXCVAR_GET(pgr4_native_capture_hold_ms))));
+  const uint8_t* physical = rex::system::kernel_memory()->physical_membase();
   for (Dump::Entry& e : d.entries) {
-    // Physical memory through the 0xA0000000 view (64 KiB pages; maps all of it).
-    const uint8_t* g = base + 0xA0000000u + e.p.dest_base;
+    const uint8_t* g = physical + e.p.dest_base;
     e.guest.assign(g, g + e.p.dest_extent_bytes);
   }
   d.guest_read = true;
@@ -1093,8 +1045,7 @@ void Resolver::AfterSwap(const uint8_t* base) {
   REXLOG_INFO("PGR4 native resolve: read guest memory of {} resolves of frame {}", d.entries.size(), d.frame);
 }
 
-void Resolver::DumpBeginFrame(const uint8_t* base, uint64_t completed_fence) {
-  (void)base;
+void Resolver::DumpBeginFrame(uint64_t completed_fence) {
   Dump& d = *dump_;
   const std::string prefix = "f" + std::to_string(d.frame);
   if (d.guest_read && completed_fence >= d.fence) {
@@ -1250,20 +1201,9 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       const uint32_t row_pitch = (kDestW * bpp + kPitchAlign - 1) & ~(kPitchAlign - 1);
       ComPtr<ID3D12Resource> readback[2];
       if (img) {
-        D3D12_RESOURCE_DESC bd = {};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = uint64_t(row_pitch) * kDestH;
-        bd.Height = 1;
-        bd.DepthOrArraySize = 1;
-        bd.MipLevels = 1;
-        bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES hp = {};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
         for (int k = 0; k < (img->depth_r32f ? 2 : 1); ++k) {
-          if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                      nullptr, IID_PPV_ARGS(&readback[k])),
-                     "selftest readback"))
+          if (!CreateBuffer(device_, D3D12_HEAP_TYPE_READBACK, uint64_t(row_pitch) * kDestH,
+                            D3D12_RESOURCE_STATE_COPY_DEST, "selftest readback", &readback[k]))
             return false;
           D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
           src.pResource = k ? img->depth_r32f.Get() : img->texture.Get();

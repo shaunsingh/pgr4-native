@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #6): one guest draw -> one host D3D12 draw.
+// pgr4-native PGR4 native renderer: one guest draw -> one host D3D12 draw.
 //
 // Per draw (DrawRenderer::OnDraw, after ReadDrawState):
 //   - shaders: ShaderCache::Load of the bound VS/PS ucode, SelectModifications (the Xenos
@@ -24,8 +24,9 @@
 //   - render targets from RenderTargets::Bind (RTResolve); viewport, scissor, blend factor
 //     and stencil reference (port of draw_util::GetHostViewportInfo / GetScissor).
 //
-// Not handled (counted in Stats and skipped): memexport, tessellation, host-converted index
-// buffers (triangle fans, line loops, primitive reset with an index other than 0xFFFF).
+// Not handled (counted in Stats::unsupported and dropped): memexport, tessellation, line loops
+// and other primitive types needing converted indices, and primitive reset with a 16-bit index
+// other than 0xFFFF.
 //
 // Threading: the renderer's On* calls only (one guest thread). With the render thread
 // (renderer.h, --pgr4_native_render_thread) the work is split: Prepare and EndFramePrepare run
@@ -83,7 +84,7 @@ class DrawRenderer {
  public:
   struct Stats {
     uint64_t draws = 0;           // issued host draws
-    uint64_t skipped = 0;         // dropped like the plugin does (EDRAM copy, nothing rasterizes)
+    uint64_t skipped = 0;         // dropped like the plugin does: nothing to draw or write
     uint64_t unsupported = 0;     // see the header comment; logged once per reason
     uint64_t failed = 0;          // shader/PSO/RT/upload failures
     uint64_t pso_created = 0;
@@ -127,7 +128,7 @@ class DrawRenderer {
 
   // After a successful ReadDrawState for the draw. Records into renderer.command_list().
   // `prep` (render thread): what Prepare made for this draw on the guest thread.
-  void OnDraw(const uint8_t* base, const DrawState& state, const DrawPrep* prep = nullptr);
+  void OnDraw(const DrawState& state, const DrawPrep* prep = nullptr);
 
   // Guest thread, render thread mode: shader lookup and vertex/index copies for `state` (whose
   // regs are the tracker's, current). Copies go to the end of `copies`; upload memory is

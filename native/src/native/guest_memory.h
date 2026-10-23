@@ -1,0 +1,36 @@
+// pgr4-native PGR4 native renderer: guest memory as the generated code addresses it.
+#pragma once
+
+#include <rex/memory/utils.h>
+#include <rex/system/xmemory.h>
+#undef DrawState  // winuser.h (via rex/platform.h) maps it to DrawStateA/W; d3d_state.h's struct
+
+#include <bit>
+#include <cstdint>
+
+namespace pgr4::native {
+
+// The host address of guest virtual address `a`, translated like the generated code's loads and
+// stores (on Windows the 0xE0000000 view of physical memory sits 4 KiB higher in the mapping).
+inline const uint8_t* HostPtr(const uint8_t* base, uint32_t a) {
+  return base + a + rex::memory::detail::PhysicalHostOffset(a);
+}
+inline uint8_t* HostPtr(uint8_t* base, uint32_t a) {
+  return base + a + rex::memory::detail::PhysicalHostOffset(a);
+}
+
+// Big-endian guest values.
+inline uint16_t Load16(const uint8_t* base, uint32_t a) {
+  return rex::memory::load_and_swap<uint16_t>(HostPtr(base, a));
+}
+inline uint32_t Load32(const uint8_t* base, uint32_t a) {
+  return rex::memory::load_and_swap<uint32_t>(HostPtr(base, a));
+}
+inline uint64_t Load64(const uint8_t* base, uint32_t a) {
+  return rex::memory::load_and_swap<uint64_t>(HostPtr(base, a));
+}
+inline float LoadFloat(const uint8_t* base, uint32_t a) {
+  return std::bit_cast<float>(Load32(base, a));
+}
+
+}  // namespace pgr4::native

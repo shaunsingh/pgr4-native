@@ -30,6 +30,26 @@ bool Failed(HRESULT hr, const char* what) {
   return true;
 }
 
+bool CreateBuffer(ID3D12Device* device, D3D12_HEAP_TYPE type, uint64_t size,
+                  D3D12_RESOURCE_STATES state, const char* what, ComPtr<ID3D12Resource>* out) {
+  const D3D12_HEAP_PROPERTIES heap = {type};
+  const D3D12_RESOURCE_DESC desc = BufferDesc(size);
+  return !Failed(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                                 IID_PPV_ARGS(out->ReleaseAndGetAddressOf())),
+                 what);
+}
+
+pD3DCompile D3DCompiler() {
+  static const pD3DCompile compile = [] {
+    const HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
+    const auto fn =
+        dll ? reinterpret_cast<pD3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
+    if (!fn) REXLOG_ERROR("PGR4 native: d3dcompiler_47.dll / D3DCompile not found");
+    return fn;
+  }();
+  return compile;
+}
+
 D3D12Device::~D3D12Device() {
   if (device_) WaitIdle();
   if (HWND h = hwnd_.load()) PostMessageW(h, WM_CLOSE, 1, 0);

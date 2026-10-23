@@ -1,8 +1,9 @@
-// pgr4-native PGR4 native renderer (M2 owner #6): Swap -> debug window, front buffer captures.
+// pgr4-native PGR4 native renderer: Swap -> debug window, front buffer captures.
 // See present.h.
 #include "present.h"
 
 #include "d3d12_device.h"
+#include "guest_memory.h"
 #include "resolve.h"
 #include "texture_layout.h"
 
@@ -14,9 +15,8 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
-#include <d3dcompiler.h>
-
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -58,12 +58,6 @@ namespace pgr4::native {
 namespace xenos = rex::graphics::xenos;
 
 namespace {
-
-inline uint32_t Load32(const uint8_t* base, uint32_t a) {
-  uint32_t v;
-  std::memcpy(&v, base + a + (a >= 0xE0000000u ? 0x1000u : 0u), 4);
-  return __builtin_bswap32(v);
-}
 
 // The display controller's gamma ramp, as the Xenos command processor holds it from the guest's
 // DC_LUT register writes: 128 PWL entries per channel (DC_LUT_PWL_DATA: base 0:15, delta
@@ -132,24 +126,20 @@ double PwlOut(const uint32_t* words, uint32_t channel, uint32_t x) {
   return std::min(1.0, ((w & 0xFFFFu) + (x & 7u) * (w >> 16) / 8.0) / 65472.0);
 }
 
-using PFN_D3DCompile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*,
-                                        ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**,
-                                        ID3DBlob**);
-
 // ---- PNG (stored deflate blocks; no compression library needed) ----
 
-uint32_t Crc32(const uint8_t* p, size_t n, uint32_t crc = 0xFFFFFFFFu) {
-  static uint32_t table[256];
-  static bool init = false;
-  if (!init) {
-    for (uint32_t i = 0; i < 256; ++i) {
-      uint32_t c = i;
-      for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-      table[i] = c;
-    }
-    init = true;
+constexpr std::array<uint32_t, 256> kCrcTable = [] {
+  std::array<uint32_t, 256> table{};
+  for (uint32_t i = 0; i < 256; ++i) {
+    uint32_t c = i;
+    for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+    table[i] = c;
   }
-  for (size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+  return table;
+}();
+
+uint32_t Crc32(const uint8_t* p, size_t n, uint32_t crc = 0xFFFFFFFFu) {
+  for (size_t i = 0; i < n; ++i) crc = kCrcTable[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
   return crc;
 }
 
@@ -304,8 +294,8 @@ struct Presenter::Impl {
     uint64_t frame = 0, time_us = 0;
   };
   static_assert(sizeof(RecordHeader) == 32);
-  // On the recorder's thread: the frames it is handed, in a ring, and the whole-image jumps of
-  // native/tools/flicker.py --jumps found as they arrive (a frame whose mean block difference from
+  // On the glitch catcher's thread: the frames it is handed, in a ring, and the whole-image jumps
+  // of native/tools/flicker.py --jumps found as they arrive (a frame whose mean block difference from
   // the one before is at least 6x the median of the last kSteps and 15, followed within kMaxLen
   // frames by one that is back near the frame before).
   struct Catcher {
@@ -337,7 +327,7 @@ struct Presenter::Impl {
     void Mark(uint64_t frame);
     void Dump(uint64_t from, uint64_t to, const char* kind, uint64_t label);
   };
-  struct Recorder {
+  struct GlitchCatch {
     bool on = false, failed = false;
     Catcher catcher;
     std::atomic<uint64_t> mark_request{0};  // frame + 1: dump the catcher's ring
@@ -361,7 +351,7 @@ struct Presenter::Impl {
 
     bool Start(ID3D12Device* device, uint32_t w, uint32_t h);
     void Push(const Slot& s, uint32_t slot);
-    // Hands the slot's previous frame to the recorder's thread (its fence was waited for), every
+    // Hands the slot's previous frame to the catcher's thread (its fence was waited for), every
     // Swap.
     void Collect(uint32_t slot) {
       if (!slots[slot].recorded) return;
@@ -370,16 +360,16 @@ struct Presenter::Impl {
     }
     void Write();
     void Stop();
-  } rec;
+  } glitch;
 
   explicit Impl(NativeRenderer& renderer) : r(renderer) {}
   ~Impl() {
-    rec.Stop();
-    if (rec.writer.joinable()) rec.writer.join();
+    glitch.Stop();
+    if (glitch.writer.joinable()) glitch.writer.join();
     if (capture.writer.joinable()) capture.writer.join();
   }
   // In the blit's state (root signature, pipeline, source and ramp bound): records this frame
-  // (after Recorder::Collect of the slot).
+  // for the glitch catcher (after GlitchCatch::Collect of the slot).
   void Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih, uint32_t ramp_mode);
   // Reads the slot's previous rows into probe_result, then records this frame's copies.
   void Probe(ID3D12GraphicsCommandList* list, uint32_t slot, const ResolvedImage& image,
@@ -391,7 +381,7 @@ struct Presenter::Impl {
   bool CaptureRequested(uint64_t frame);
   // With the Xenos copy: waits for the frame, holds the guest thread while the plugin finishes
   // it, reads both images and writes the PNGs and their PSNR.
-  void FinishCapture(const uint8_t* base);
+  void FinishCapture();
   // Without it, once the frame has completed: the native PNG, on capture.writer.
   void WriteCapture();
 
@@ -405,12 +395,8 @@ struct Presenter::Impl {
 
 bool Presenter::Impl::Initialize() {
   ID3D12Device* device = r.d3d12();
-  HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
-  auto compile = dll ? reinterpret_cast<PFN_D3DCompile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
-  if (!compile) {
-    REXLOG_ERROR("PGR4 native present: d3dcompiler_47.dll / D3DCompile not found");
-    return false;
-  }
+  const pD3DCompile compile = D3DCompiler();
+  if (!compile) return false;
   ComPtr<ID3DBlob> vs, ps, err;
   if (FAILED(compile(kBlitHlsl, sizeof(kBlitHlsl) - 1, "blit", nullptr, nullptr, "vs", "vs_5_1", 0,
                      0, &vs, &err)) ||
@@ -458,19 +444,12 @@ bool Presenter::Impl::Initialize() {
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)), "present heap")) return false;
   heap_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   {
-    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = uint64_t(kRampSlotBytes) * D3D12Device::kFramesInFlight;
-    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     void* p = nullptr;
     const D3D12_RANGE none = {0, 0};
-    if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                               IID_PPV_ARGS(&ramp_buffer)),
-               "present gamma ramp buffer") ||
+    if (!CreateBuffer(device, D3D12_HEAP_TYPE_UPLOAD,
+                      uint64_t(kRampSlotBytes) * D3D12Device::kFramesInFlight,
+                      D3D12_RESOURCE_STATE_GENERIC_READ, "present gamma ramp buffer",
+                      &ramp_buffer) ||
         Failed(ramp_buffer->Map(0, &none, &p), "present gamma ramp map"))
       return false;
     ramp_mapped = static_cast<uint8_t*>(p);
@@ -481,12 +460,12 @@ bool Presenter::Impl::Initialize() {
     std::filesystem::create_directories(capture_dir, ec);
     capture_request = capture_dir / "capture.request";
   }
-  rec.catcher.prefix = REXCVAR_GET(pgr4_native_glitch_catch);
-  rec.on = !rec.catcher.prefix.empty();
+  glitch.catcher.prefix = REXCVAR_GET(pgr4_native_glitch_catch);
+  glitch.on = !glitch.catcher.prefix.empty();
   return true;
 }
 
-bool Presenter::Impl::Recorder::Start(ID3D12Device* device, uint32_t w, uint32_t h) {
+bool Presenter::Impl::GlitchCatch::Start(ID3D12Device* device, uint32_t w, uint32_t h) {
   width = w;
   height = h;
   pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
@@ -501,37 +480,28 @@ bool Presenter::Impl::Recorder::Start(ID3D12Device* device, uint32_t w, uint32_t
   td.Format = D3D12Device::kBackBufferFormat;
   td.SampleDesc.Count = 1;
   td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-  D3D12_HEAP_PROPERTIES rp = {D3D12_HEAP_TYPE_READBACK};
-  D3D12_RESOURCE_DESC rd = {};
-  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  rd.Width = slot_bytes * D3D12Device::kFramesInFlight;
-  rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-  rd.SampleDesc.Count = 1;
-  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
   void* p = nullptr;
   if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
                                              D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
                                              IID_PPV_ARGS(&target)),
-             "record target") ||
-      Failed(device->CreateCommittedResource(&rp, D3D12_HEAP_FLAG_NONE, &rd,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&readback)),
-             "record readback") ||
-      Failed(readback->Map(0, nullptr, &p), "record readback map") ||
-      Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)), "record heap"))
+             "glitch catch target") ||
+      !CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, slot_bytes * D3D12Device::kFramesInFlight,
+                    D3D12_RESOURCE_STATE_COPY_DEST, "glitch catch readback", &readback) ||
+      Failed(readback->Map(0, nullptr, &p), "glitch catch readback map") ||
+      Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)), "glitch catch heap"))
     return false;
   mapped = static_cast<const uint8_t*>(p);
   device->CreateRenderTargetView(target.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
   writer = std::thread([this] { Write(); });
-  SetThreadDescription(writer.native_handle(), L"PGR4 native recorder");
+  SetThreadDescription(writer.native_handle(), L"PGR4 native glitch catch");
   REXLOG_INFO("PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
               "{}glitch-<frame>.rec",
               Catcher::kRing, w, h, catcher.prefix);
   return true;
 }
 
-void Presenter::Impl::Recorder::Push(const Slot& s, uint32_t slot) {
+void Presenter::Impl::GlitchCatch::Push(const Slot& s, uint32_t slot) {
   std::vector<uint8_t> buf;
   {
     std::lock_guard<std::mutex> lock(mutex);
@@ -562,7 +532,7 @@ void Presenter::Impl::Recorder::Push(const Slot& s, uint32_t slot) {
   cv.notify_one();
 }
 
-void Presenter::Impl::Recorder::Write() {
+void Presenter::Impl::GlitchCatch::Write() {
   std::unique_lock<std::mutex> lock(mutex);
   for (;;) {
     cv.wait(lock, [this] { return stopping || !queue.empty(); });
@@ -674,7 +644,7 @@ void Presenter::Impl::Catcher::Dump(uint64_t from, uint64_t to, const char* kind
               ok ? "written to" : "failed writing", path);
 }
 
-void Presenter::Impl::Recorder::Stop() {
+void Presenter::Impl::GlitchCatch::Stop() {
   {
     std::lock_guard<std::mutex> lock(mutex);
     stopping = true;
@@ -684,46 +654,40 @@ void Presenter::Impl::Recorder::Stop() {
 
 void Presenter::Impl::Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih,
                              uint32_t ramp_mode) {
-  Recorder& c = rec;
-  const uint64_t frame = r.frame_index();
-  Recorder::Slot& s = c.slots[slot];
-  if (c.failed) return;
+  GlitchCatch& g = glitch;
+  if (g.failed) return;
   const uint32_t w = uint32_t(iw) / 2, h = uint32_t(ih) / 2;
-  if (!c.target && !c.Start(r.d3d12(), w, h)) {
-    c.failed = true;
+  if (!g.target && !g.Start(r.d3d12(), w, h)) {
+    g.failed = true;
     return;
   }
-  if (w != c.width || h != c.height) return;  // an image of another size: not recorded
+  if (w != g.width || h != g.height) return;  // an image of another size: not recorded
   const struct {
     float image_size[2];
     uint32_t ramp_mode, point_sampled;
   } constants = {{iw, ih}, ramp_mode, 0};
   list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
-  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = c.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g.rtv_heap->GetCPUDescriptorHandleForHeapStart();
   list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
   const D3D12_VIEWPORT vp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
   const D3D12_RECT sc = {0, 0, LONG(w), LONG(h)};
   list->RSSetViewports(1, &vp);
   list->RSSetScissorRects(1, &sc);
   list->DrawInstanced(3, 1, 0, 0);
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = c.target.Get();
-  b.Transition.Subresource = 0;
-  b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-  b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  D3D12_RESOURCE_BARRIER b = TransitionBarrier(g.target.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                               D3D12_RESOURCE_STATE_COPY_SOURCE);
   list->ResourceBarrier(1, &b);
   D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-  dst.pResource = c.readback.Get();
+  dst.pResource = g.readback.Get();
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  dst.PlacedFootprint.Offset = c.slot_bytes * slot;
-  dst.PlacedFootprint.Footprint = {D3D12Device::kBackBufferFormat, w, h, 1, c.pitch};
-  src.pResource = c.target.Get();
+  dst.PlacedFootprint.Offset = g.slot_bytes * slot;
+  dst.PlacedFootprint.Footprint = {D3D12Device::kBackBufferFormat, w, h, 1, g.pitch};
+  src.pResource = g.target.Get();
   src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
   list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
   list->ResourceBarrier(1, &b);
-  s = {frame, NowNs() / 1000, true};
+  g.slots[slot] = {r.frame_index(), NowNs() / 1000, true};
 }
 
 bool Presenter::Impl::WriteRamp(RampMode mode, uint32_t slot) {
@@ -822,8 +786,7 @@ void Presenter::Impl::WriteCapture() {
   });
 }
 
-void Presenter::Impl::FinishCapture(const uint8_t* base) {
-  (void)base;
+void Presenter::Impl::FinishCapture() {
   Capture& c = capture;
   c.pending = false;
   r.device().WaitFence(c.fence);
@@ -936,16 +899,12 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
 
   uint32_t mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   if (last_found_) mapping = GuestToHostComponentMapping((fetch[3] >> 1) & 0xFFF, host->host_swizzle);
-  if (m.rec.on) m.rec.Collect(d.frame_slot());
+  if (m.glitch.on) m.glitch.Collect(d.frame_slot());
   // A held frame (DrawRenderer::FrameIncomplete) never reaches the screen: it is neither blitted
   // nor recorded, so the glitch catcher and the luma probe see what was shown.
   if (shown) {
-    D3D12_RESOURCE_BARRIER b = {};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = d.back_buffer();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_RESOURCE_BARRIER b = TransitionBarrier(d.back_buffer(), D3D12_RESOURCE_STATE_PRESENT,
+                                                 D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ResourceBarrier(1, &b);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.back_buffer_rtv();
     // Black bars around the aspect-fit image (and a black frame when there is no image).
@@ -992,7 +951,7 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
       list->RSSetScissorRects(1, &sc);
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       list->DrawInstanced(3, 1, 0, 0);
-      if (m.rec.on) m.Record(list, ramp_slot, iw, ih, constants.ramp_mode);
+      if (m.glitch.on) m.Record(list, ramp_slot, iw, ih, constants.ramp_mode);
     }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
@@ -1006,8 +965,8 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
   Impl::Capture& c = m.capture;
   if (!c.armed && (swap.capture_request < 0 ? m.CaptureRequested(renderer_.frame_index())
                                             : swap.capture_request > 0)) {
-    if (m.rec.on)
-      m.rec.mark_request.store(renderer_.frame_index() + 1, std::memory_order_relaxed);
+    if (m.glitch.on)
+      m.glitch.mark_request.store(renderer_.frame_index() + 1, std::memory_order_relaxed);
     c.armed = true;
     c.xenos = REXCVAR_GET(pgr4_native_capture_xenos);
     if (c.xenos) {
@@ -1026,17 +985,8 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
     const D3D12_RESOURCE_DESC desc = image->texture->GetDesc();
     UINT64 total = 0;
     device->GetCopyableFootprints(&desc, 0, 1, 0, &c.footprint, nullptr, nullptr, &total);
-    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = total;
-    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                               IID_PPV_ARGS(&c.readback)),
-               "capture readback")) {
+    if (!CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST,
+                      "capture readback", &c.readback)) {
       if (c.xenos) HoldFullReadback(false);
       return;
     }
@@ -1065,18 +1015,10 @@ void Presenter::Impl::Probe(ID3D12GraphicsCommandList* list, uint32_t slot,
   // A row of the widest texture each, so the buffer never grows while a slot is in flight.
   constexpr uint32_t kRowBytes = 8192 * 4;
   if (!probe_buffer) {
-    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = uint64_t(kRowBytes) * kProbeRows * D3D12Device::kFramesInFlight;
-    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     void* mapped = nullptr;
-    if (Failed(r.d3d12()->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                  IID_PPV_ARGS(&probe_buffer)),
-               "luma probe readback") ||
+    if (!CreateBuffer(r.d3d12(), D3D12_HEAP_TYPE_READBACK,
+                      uint64_t(kRowBytes) * kProbeRows * D3D12Device::kFramesInFlight,
+                      D3D12_RESOURCE_STATE_COPY_DEST, "luma probe readback", &probe_buffer) ||
         FAILED(probe_buffer->Map(0, nullptr, &mapped))) {
       probe_buffer.Reset();
       return;
@@ -1124,10 +1066,10 @@ const LumaProbe& Presenter::luma_probe() const { return impl_->probe_result; }
 
 bool Presenter::capture_holds_guest() const { return REXCVAR_GET(pgr4_native_capture_xenos); }
 
-void Presenter::AfterEndFrame(const uint8_t* base) {
+void Presenter::AfterEndFrame() {
   Impl& m = *impl_;
   if (!m.capture.pending) return;
-  if (m.capture.xenos) m.FinishCapture(base);
+  if (m.capture.xenos) m.FinishCapture();
   else if (renderer_.device().completed_fence() >= m.capture.fence) m.WriteCapture();
 }
 

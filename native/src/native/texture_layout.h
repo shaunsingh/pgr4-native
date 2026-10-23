@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #4, textures): the CPU side of guest textures.
+// pgr4-native PGR4 native renderer: the CPU side of guest textures.
 //
 // Pure functions with no D3D12 objects and no ReXGlue runtime state, so the standalone harness
 // (tools/texture_harness.cpp) can run them on guest-memory dumps:

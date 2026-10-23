@@ -582,12 +582,7 @@ void TextureCache::StartSpareHeap() {
 void TextureCache::Transition(Texture& t, ID3D12GraphicsCommandList* list,
                               D3D12_RESOURCE_STATES to) {
   if (t.state == to) return;
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = t.resource.Get();
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  b.Transition.StateBefore = t.state;
-  b.Transition.StateAfter = to;
+  const D3D12_RESOURCE_BARRIER b = TransitionBarrier(t.resource.Get(), t.state, to);
   list->ResourceBarrier(1, &b);
   t.state = to;
 }

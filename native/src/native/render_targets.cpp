@@ -1,7 +1,8 @@
-// pgr4-native PGR4 native renderer (M2 owner #5): host render targets and Clear. See
-// render_targets.h for the model (one host target per guest surface, no EDRAM emulation).
+// pgr4-native PGR4 native renderer: host render targets and Clear. See render_targets.h for the
+// model (one host target per guest surface, no EDRAM emulation).
 #include "render_targets.h"
 
+#include "guest_memory.h"
 #include "renderer.h"
 
 #include <rex/logging.h>
@@ -17,19 +18,6 @@ constexpr uint32_t kMaxViews = 256;   // RTVs and DSVs each; PGR4 uses ~20 surfa
 constexpr uint32_t kNullRtvs = 3;     // null RTVs for 1, 2 and 4 samples, at the heap's start
 constexpr uint32_t kEdramTiles = 2048;  // 10 MiB of 80x16-sample tiles
 constexpr uint32_t kMaxHeight = 2048;
-
-// Same translation as the generated code: the 0xE0000000 view sits 4 KiB higher on the host.
-inline uint32_t Load32(const uint8_t* base, uint32_t a) {
-  uint32_t v;
-  std::memcpy(&v, base + a + (a >= 0xE0000000u ? 0x1000u : 0u), 4);
-  return __builtin_bswap32(v);
-}
-inline float LoadF(const uint8_t* base, uint32_t a) {
-  uint32_t v = Load32(base, a);
-  float f;
-  std::memcpy(&f, &v, 4);
-  return f;
-}
 
 uint32_t SamplesOf(uint32_t surface_info) {
   uint32_t m = (surface_info >> 16) & 3;
@@ -110,17 +98,6 @@ int32_t MapSpan(uint32_t base, uint32_t pitch, const GridSpan& s, const EdramGri
   if (rb > full) out[n++] = {0, p * 80, full * 16, rb * 16};
   if (b % p) out[n++] = {0, b % p * 80, rb * 16, rb * 16 + 16};
   return n;
-}
-
-D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* r, D3D12_RESOURCE_STATES before,
-                                         D3D12_RESOURCE_STATES after) {
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = r;
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  b.Transition.StateBefore = before;
-  b.Transition.StateAfter = after;
-  return b;
 }
 
 }  // namespace
@@ -339,7 +316,6 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     if (std::min(height, kMaxHeight) > rt->height) {
       // Taller than anything this surface had: a new, taller target. The old content is lost
       // (not seen in PGR4's traces: every surface is created at its EDRAM height or more).
-      ++recreated_;
       REXLOG_WARN("PGR4 native RT: growing {} base {} pitch {} x{} from {} to {} rows", depth ? "depth" : "color",
                   base, pitch, samples, rt->height, want);
       if (!Create(rt, want)) return nullptr;
@@ -408,11 +384,6 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
   return true;
 }
 
-void RenderTargets::OnClear(ID3D12GraphicsCommandList* list, const uint8_t* base, const HookArgs& args) {
-  ClearCall c;
-  if (DecodeClear(base, args, &c)) Clear(list, c.regs, c.bound_colors, c.depth_bound, c.height, c.p);
-}
-
 bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out) {
   ClearParams& p = out->p;
   auto read_rect = [&](uint32_t a) {
@@ -443,7 +414,7 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
     // argument slot (sub_826D1250 reads the stencil from r8).
     p.flags = args.r[1];
     if (args.r[3])
-      for (int i = 0; i < 4; ++i) p.color[i] = LoadF(base, args.r[3] + 4 * i);
+      for (int i = 0; i < 4; ++i) p.color[i] = LoadFloat(base, args.r[3] + 4 * i);
     p.depth = float(args.f[0]);
     p.stencil = uint8_t(args.r[5]);
     if (args.r[2]) {
@@ -474,8 +445,8 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
   out->depth_bound = Load32(base, device + kDevDepthSurface) != 0;
   // The surfaces' height is not in the registers; the viewport bottom is the best hint
   // (PA_CL_VPORT_YSCALE 0x2111, YOFFSET 0x2112). Targets are at least their EDRAM height.
-  const float ys = LoadF(base, device + kDevShadow2100 + 0x11 * 4);
-  const float yo = LoadF(base, device + kDevShadow2100 + 0x12 * 4);
+  const float ys = LoadFloat(base, device + kDevShadow2100 + 0x11 * 4);
+  const float yo = LoadFloat(base, device + kDevShadow2100 + 0x12 * 4);
   float bottom = std::fabs(ys) + yo;
   uint32_t height = (bottom > 0.0f && bottom <= float(kMaxHeight)) ? uint32_t(std::ceil(bottom)) : 0;
   for (const D3D12_RECT& r : p.rects) height = std::max(height, uint32_t(std::max<LONG>(r.bottom, 0)));

@@ -385,6 +385,22 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   hitches, GPU clock 737 MHz, against 80.8, 49.7, 4 and 771 MHz; the session took about a
   quarter of a core. `perf_symbols.py --annotate TEXT` lists the busiest instructions of the
   functions whose name contains TEXT, by offset, for `llvm-objdump`.
+- A cleanup pass over the renderer's C++, with no change in what it draws. Dead code went: draw
+  state fields and device offsets nothing read, the render targets' and resolver's own
+  `OnClear`/`OnResolve` paths and counters, coherency counters nothing reported, unused `base`
+  parameters (and the renderer's copy of the guest memory base, stored at every hook call for
+  one debug dump), and the viewport math of draws dropped before they use it. Guest memory
+  reads go through one header (`guest_memory.h`: the SDK's host address translation and
+  byte-swapped loads) instead of four copies, and barriers, buffer descriptions, committed
+  buffers and the D3DCompile loader through helpers in `d3d12_device.h` instead of a dozen
+  hand-written copies. The glitch catcher's parts lost the removed recorder's names, the PNG
+  CRC table is built at compile time, arrays come from `make_unique` (the 512 MB coherency
+  shadow from `make_unique_for_overwrite`), and the debug toggle the game thread reads is an
+  atomic. td-74: race 82.4 fps, 1 % low 56.6, 0 hitches, GPU clock 816 MHz (td-65, the last
+  run without a server trace: 80.0, 51.2, 0). It is also the first run of the input and
+  tracker changes without the trace, so no run measures the cleanup on its own. The PGO
+  profile is stale in the changed functions, which clang compiles without it, until it is
+  taken again.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -616,7 +632,10 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
 
 With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
-(`--gpu_skip_draws`, added by `native/rexglue-native-primary.patch`).
+(`--gpu_skip_draws`, added by `native/rexglue-native-primary.patch`). The debug flags not in
+the table (resolve dumps and self-test, the watch, texture and state tracker checks, the tap's
+trace, frame CSV and draw skips, the debug window's size) are described where they are defined,
+in the `REXCVAR_DEFINE_*` lines of `native/src`.
 
 ## Tools
 
@@ -635,20 +654,19 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 
 It also has a texture untiling harness and an offline shader translation test. `proton/` has the
 Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads and
-other processes) and
-`pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls and instruction cache
-refills per thread) and `server_requests.py` (`deck-run.sh --server-trace`: wineserver requests per
-thread and second, by request).
+other processes), `pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls
+and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
+--server-trace`: wineserver requests per thread and second, by request).
 
 ## What's next
 
 - Check the other single-frame geometry glitches against the in-place rebind fix: about 10 s
   into the St Petersburg race, in about one run in three, the sky turned red and the far
-  buildings broke into shards while near geometry stayed right. The single frames of play where the cockpit
-  turned white and broke up were the look-back camera; whether its view of the rear interior
-  is right is still to be compared with Xenos (the chase view's look-back matches it at
-  45-47 dB, td-21). Shards near AI cars and in the garage need a play session with the pad
-  column to tell them from look-backs.
+  buildings broke into shards while near geometry stayed right. The single frames of play
+  where the cockpit turned white and broke up were the look-back camera; whether its view of
+  the rear interior is right is still to be compared with Xenos (the chase view's look-back
+  matches it at 45-47 dB, td-21). Shards near AI cars and in the garage need a play session
+  with the pad column to tell them from look-backs.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
   work per frame.

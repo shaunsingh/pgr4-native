@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (M2 owner #6): guest draws -> host D3D12 draws. See draw.h.
+// pgr4-native PGR4 native renderer: guest draws -> host D3D12 draws. See draw.h.
 //
 // Ports (BSD-3, Xenia / ReXGlue): d3d12::PipelineCache::GetCurrentStateDescription and
 // CreateD3D12Pipeline (pipeline state), D3D12CommandProcessor::IssueDraw,
@@ -134,6 +134,12 @@ constexpr uint32_t kSamplerHeapSize = 2048;
 // indices in b4 count from here): 0 null 2D array, 1 null 3D, 2 null cube, then textures.
 constexpr uint32_t kViewTableStart = 2;
 constexpr uint32_t kNull2DArray = 0, kNull3D = 1, kNullCube = 2, kFirstTexture = 3;
+// The null view standing in for a view of dimension `dim`.
+constexpr uint32_t NullView(D3D12_SRV_DIMENSION dim) {
+  return dim == D3D12_SRV_DIMENSION_TEXTURECUBE ? kNullCube
+         : dim == D3D12_SRV_DIMENSION_TEXTURE3D ? kNull3D
+                                                : kNull2DArray;
+}
 constexpr D3D12_RESOURCE_STATES kSharedReadState =
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
     D3D12_RESOURCE_STATE_INDEX_BUFFER;
@@ -716,8 +722,8 @@ struct DrawRenderer::Impl {
   uint32_t view_stride = 0, sampler_stride = 0;
   D3D12_CPU_DESCRIPTOR_HANDLE view_cpu{}, sampler_cpu{};
   D3D12_GPU_DESCRIPTOR_HANDLE view_gpu{}, sampler_gpu{};
-  uint32_t views_allocated = kFirstTexture;  // heap indices handed out so far
-  std::vector<uint32_t> free_views;          // heap indices of evicted textures' views
+  uint32_t views_allocated = kViewTableStart + kFirstTexture;  // heap indices handed out so far
+  std::vector<uint32_t> free_views;  // heap indices of evicted textures' views
   uint32_t samplers_allocated = 0;
   // Each texture resource's views: (XXH3 of the SRV desc, table index). The views of a texture
   // the cache evicts go back to free_views (ReleaseViews).
@@ -735,7 +741,7 @@ struct DrawRenderer::Impl {
     uint32_t index = 0;
   };
   static constexpr uint32_t kSrvMemoBits = 12;
-  std::unique_ptr<SrvMemo[]> srv_memo{new SrvMemo[size_t(1) << kSrvMemoBits]};
+  std::unique_ptr<SrvMemo[]> srv_memo = std::make_unique<SrvMemo[]>(size_t(1) << kSrvMemoBits);
   // Direct-mapped memo in front of GetSamplerKey + sampler_indices: (6 fetch dwords, binding
   // mag/min/mip/aniso) -> sampler index; the sampler key is a function of exactly those.
   struct SamplerMemo {
@@ -744,7 +750,8 @@ struct DrawRenderer::Impl {
     uint32_t index = 0;
   };
   static constexpr uint32_t kSamplerMemoBits = 10;
-  std::unique_ptr<SamplerMemo[]> sampler_memo{new SamplerMemo[size_t(1) << kSamplerMemoBits]};
+  std::unique_ptr<SamplerMemo[]> sampler_memo =
+      std::make_unique<SamplerMemo[]>(size_t(1) << kSamplerMemoBits);
   // Fetch constants a shader reads (texture and sampler bindings), its descriptor table size and
   // its last BindMemo entry (checked before hashing), direct-mapped by shader.
   struct BindMemo;
@@ -780,7 +787,8 @@ struct DrawRenderer::Impl {
     TextureHandle entry[kMaxBound];
   };
   static constexpr uint32_t kBindMemoSetBits = 11;
-  std::unique_ptr<BindMemo[]> bind_memo{new BindMemo[size_t(2) << kBindMemoSetBits]};
+  std::unique_ptr<BindMemo[]> bind_memo =
+      std::make_unique<BindMemo[]>(size_t(2) << kBindMemoSetBits);
   uint64_t bind_clock = 0;
 
   // Pipelines by PipelineKey hash. With --pgr4_native_async_pipelines new ones compile on
@@ -921,7 +929,6 @@ struct DrawRenderer::Impl {
   D3D12_INDEX_BUFFER_VIEW bound_ibv{};
   CachedCbv cb_system, cb_float_vs, cb_float_ps, cb_bool_loop, cb_fetch, cb_desc_vs, cb_desc_ps;
 
-  // Logged once.
   // Oracle toggles from <capture dir>\draw-debug.txt (with --pgr4_native_capture_dir)
   // ("<mask> [max_draws] [skip_from] [skip_to] [shader hash]..."), read every 15 frames:
   // 1 depth/stencil off, 2 culling off, 4 blending off, 8 alpha test off, 16 log the next frame's
@@ -930,6 +937,7 @@ struct DrawRenderer::Impl {
   // draws whose vertex or pixel shader ucode hash is listed are skipped (selected with 128).
   // Hashes stay stable across frames where draw indices do not.
   uint32_t debug_mask = 0, debug_max_draws = 0, frame_draws = 0, debug_poll = 0;
+  std::atomic<bool> upload_every_draw{false};  // debug_mask & 32, for RequestRange's thread
   uint32_t debug_skip_from = 0, debug_skip_to = 0;
   std::string debug_path;  // empty without --pgr4_native_capture_dir: not polled
   std::array<uint64_t, 8> debug_hashes{};
@@ -953,9 +961,10 @@ struct DrawRenderer::Impl {
   void SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets, uint32_t draw_index);
   void Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem);
   void WriteSnapshots(uint64_t completed_fence);
+  // DRAW_LOG_ONCE: the message was logged.
   bool log_memexport = false, log_tess = false, log_reset = false, log_prim = false,
        log_vfetch = false, log_pso = false, log_rt = false, log_upload = false,
-       log_shader = false, log_heap = false, log_index = false;
+       log_shader = false, log_heap = false;
 
   Impl(NativeRenderer& renderer, DrawRenderer::Stats& s) : r(renderer), stats(s) {}
   ~Impl() {
@@ -979,7 +988,7 @@ struct DrawRenderer::Impl {
   }
 
   bool Initialize();
-  void Draw(const uint8_t* base, const DrawState& s, const DrawPrep* prep);
+  void Draw(const DrawState& s, const DrawPrep* prep);
   DxbcShader* LoadShader(ShaderMemo* table, ShaderMemo*& last, const ShaderRef& ref,
                          xenos::ShaderType type);
   // Copies go to the end of `out`.
@@ -1149,10 +1158,11 @@ struct DrawRenderer::Impl {
   // --pgr4_native_coherency_check; RequestRange's thread only.
   struct Coherency {
     // What shared memory holds once the copies recorded so far are done, in Prepare order.
-    std::unique_ptr<uint8_t[]> shadow{new uint8_t[kSharedMemorySize]};
+    std::unique_ptr<uint8_t[]> shadow =
+        std::make_unique_for_overwrite<uint8_t[]>(kSharedMemorySize);
     // watch_frame + 1 when a page last matched guest memory, per request and at the Swap.
-    std::unique_ptr<uint32_t[]> checked{new uint32_t[kPageCount]()};
-    std::unique_ptr<uint32_t[]> swap_checked{new uint32_t[kPageCount]()};
+    std::unique_ptr<uint32_t[]> checked = std::make_unique<uint32_t[]>(kPageCount);
+    std::unique_ptr<uint32_t[]> swap_checked = std::make_unique<uint32_t[]>(kPageCount);
     struct Range {
       uint32_t start, length;
       uint8_t slot;
@@ -1161,7 +1171,7 @@ struct DrawRenderer::Impl {
     // Every byte range the current copy segment's draws read (SegmentReads is conservative).
     std::vector<std::pair<uint32_t, uint32_t>> segment_reads;
     uint8_t slot = 0xFF;  // vertex fetch constant being requested, 0xFF: indices
-    uint64_t stale = 0, racy = 0, late = 0, segment_misses = 0;  // pages, since the last Swap
+    uint64_t stale = 0, late = 0;  // pages, since the last Swap
     uint32_t logged = 0, late_logged = 0;
     std::vector<std::pair<uint32_t, uint32_t>> frame_copies;  // (start, size) since the Swap
   };
@@ -1217,14 +1227,9 @@ bool DrawRenderer::Impl::Initialize() {
   root_signature = CreateBindlessRootSignature(device);
   if (!root_signature) return false;
 
-  D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
-  D3D12_RESOURCE_DESC rd = {};
-  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  rd.Width = kSharedMemorySize;
-  rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-  rd.SampleDesc.Count = 1;
-  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  const D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
+  const D3D12_RESOURCE_DESC rd =
+      BufferDesc(kSharedMemorySize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   // Tier 2: reads of chunks without memory return zero, as in a committed buffer never written.
   D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
   shared_tiled = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
@@ -1241,20 +1246,17 @@ bool DrawRenderer::Impl::Initialize() {
   }
   shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
   shared_gpu = shared->GetGPUVirtualAddress();
-  valid.reset(new std::atomic<uint64_t>[kPageCount / 64]);
-  for (uint32_t i = 0; i < kPageCount / 64; ++i) valid[i].store(0, std::memory_order_relaxed);
-  hot.reset(new std::atomic<uint64_t>[kPageCount / 64]);
-  for (uint32_t i = 0; i < kPageCount / 64; ++i) hot[i].store(0, std::memory_order_relaxed);
-  armed_frame.reset(new std::atomic<uint32_t>[kPageCount]);
-  for (uint32_t i = 0; i < kPageCount; ++i) armed_frame[i].store(0, std::memory_order_relaxed);
-  write_frame.reset(new std::atomic<uint32_t>[kPageCount]);
-  for (uint32_t i = 0; i < kPageCount; ++i) write_frame[i].store(0, std::memory_order_relaxed);
-  quick_rewrites.reset(new std::atomic<uint8_t>[kPageCount]);
-  for (uint32_t i = 0; i < kPageCount; ++i) quick_rewrites[i].store(0, std::memory_order_relaxed);
-  hot_hash.reset(new uint64_t[kPageCount]());
-  hot_hashes.reset(new uint16_t[kPageCount]());
-  segment_word_epoch.reset(new uint32_t[kPageCount / 64]());
-  segment_pages.reset(new uint64_t[kPageCount / 64]());
+  // Zeroed: make_unique value-initializes, and std::atomic's default constructor value-initializes
+  // its value (C++20).
+  valid = std::make_unique<std::atomic<uint64_t>[]>(kPageCount / 64);
+  hot = std::make_unique<std::atomic<uint64_t>[]>(kPageCount / 64);
+  armed_frame = std::make_unique<std::atomic<uint32_t>[]>(kPageCount);
+  write_frame = std::make_unique<std::atomic<uint32_t>[]>(kPageCount);
+  quick_rewrites = std::make_unique<std::atomic<uint8_t>[]>(kPageCount);
+  hot_hash = std::make_unique<uint64_t[]>(kPageCount);
+  hot_hashes = std::make_unique<uint16_t[]>(kPageCount);
+  segment_word_epoch = std::make_unique<uint32_t[]>(kPageCount / 64);
+  segment_pages = std::make_unique<uint64_t[]>(kPageCount / 64);
   if (const std::string& path = REXCVAR_GET(pgr4_native_watch_trace); !path.empty())
     trace.file = std::fopen(path.c_str(), "wb");
   if (REXCVAR_GET(pgr4_native_coherency_check)) {
@@ -1316,7 +1318,6 @@ bool DrawRenderer::Impl::Initialize() {
   nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
   nd.TextureCube.MipLevels = 1;
   device->CreateShaderResourceView(nullptr, &nd, view_at(kViewTableStart + kNullCube));
-  views_allocated = kViewTableStart + kFirstTexture;
   r.textures().SetEvictCallback(
       [this](const std::vector<ID3D12Resource*>& resources) { ReleaseViews(resources); });
   REXLOG_INFO("PGR4 native draw: up (shared memory 512 MB {}, bindless heaps {} views / {} samplers)",
@@ -1432,12 +1433,7 @@ void DrawRenderer::Impl::ResetListState() {
 void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
                                           D3D12_RESOURCE_STATES to) {
   if (shared_state == to) return;
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  b.Transition.pResource = shared.Get();
-  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  b.Transition.StateBefore = shared_state;
-  b.Transition.StateAfter = to;
+  const D3D12_RESOURCE_BARRIER b = TransitionBarrier(shared.Get(), shared_state, to);
   list->ResourceBarrier(1, &b);
   shared_state = to;
 }
@@ -1450,7 +1446,7 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
                   start, length);
     return false;
   }
-  const bool exact = !watch || (debug_mask & 32);  // 32: upload every draw
+  const bool exact = !watch || upload_every_draw.load(std::memory_order_relaxed);
   if (preparing) draw_reads.push_back({start, start + length, exact});
   const uint64_t fence = upload_fence;
   auto copy = [&](uint32_t from, uint32_t size) {
@@ -1592,10 +1588,7 @@ void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
         is_hot ? (XXH3_64bits(membase + (size_t(p) << kPageShift), 1u << kPageShift) | 1) !=
                      hot_hash[p]
                : !is_valid;
-    if (written_since) {
-      ++c.racy;
-      continue;
-    }
+    if (written_since) continue;
     ++c.stale;
     uint32_t differ = 0, first = UINT32_MAX;
     for (uint32_t i = lo; i < hi; ++i)
@@ -1619,7 +1612,6 @@ void DrawRenderer::Impl::CheckSegmentCopy(uint32_t from, uint32_t size) {
   for (const auto& [b, e] : c.segment_reads) {
     if (!(b < end && from < e)) continue;
     if (segment_conflict) return;
-    ++c.segment_misses;
     if (LogCoherency())
       REXLOG_WARN("PGR4 native coherency: frame {} copy {:08X}+{:X} overwrites {:08X}-{:08X}, read "
                   "earlier in its copy segment, without a new segment",
@@ -1853,16 +1845,10 @@ uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
       break;
   }
   if (tb.is_signed) {
-    if (b.srv_signed_format == DXGI_FORMAT_UNKNOWN)
-      return dim == D3D12_SRV_DIMENSION_TEXTURECUBE ? kNullCube
-             : dim == D3D12_SRV_DIMENSION_TEXTURE3D ? kNull3D
-                                                    : kNull2DArray;
+    if (b.srv_signed_format == DXGI_FORMAT_UNKNOWN) return NullView(dim);
     desc.Format = b.srv_signed_format;
   }
-  D3D12_SHADER_RESOURCE_VIEW_DESC key_desc;
-  std::memset(&key_desc, 0, sizeof(key_desc));
-  key_desc = desc;
-  const uint64_t key = XXH3_64bits(&key_desc, sizeof(key_desc));
+  const uint64_t key = XXH3_64bits(&desc, sizeof(desc));
   std::vector<std::pair<uint64_t, uint32_t>>& views = srv_views[b.resource];
   for (const auto& [view_key, index] : views)
     if (view_key == key) return index;
@@ -1874,9 +1860,7 @@ uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
     heap_index = views_allocated++;
   } else {
     DRAW_LOG_ONCE(log_heap, "PGR4 native draw: view heap full ({} descriptors)", kViewHeapSize);
-    return dim == D3D12_SRV_DIMENSION_TEXTURECUBE ? kNullCube
-           : dim == D3D12_SRV_DIMENSION_TEXTURE3D ? kNull3D
-                                                  : kNull2DArray;
+    return NullView(dim);
   }
   D3D12_CPU_DESCRIPTOR_HANDLE h = view_cpu;
   h.ptr += size_t(heap_index) * view_stride;
@@ -2259,8 +2243,7 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
   profile::Mark(profile::kCapVertices);
 }
 
-void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const DrawPrep* prep) {
-  (void)base;
+void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   ID3D12GraphicsCommandList* list = r.command_list();
   if (list_frame != r.frame_index()) {
     // A new frame's list: nothing is bound, cached constants of older frames may be reused.
@@ -2327,25 +2310,17 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     ps = ps_bools.Get(ps, bools);
   }
 
+  // SelectModifications reads only prim_type; the index count would defeat mods_memo.
   reg::VGT_DRAW_INITIATOR initiator;
   initiator.value = 0;
   initiator.prim_type = prim;
-  initiator.source_select = s.indexed ? xenos::SourceSelect::kDMA : xenos::SourceSelect::kAutoIndex;
-  initiator.index_size = s.index_32bit ? xenos::IndexFormat::kInt32 : xenos::IndexFormat::kInt16;
-  initiator.num_indices = s.count & 0xFFFF;
 
   ShaderDrawRegs sdr;
   sdr.sq_program_cntl = regs[XE_GPU_REG_SQ_PROGRAM_CNTL];
   sdr.sq_context_misc = regs[XE_GPU_REG_SQ_CONTEXT_MISC];
   sdr.sq_interpolator_cntl = regs[XE_GPU_REG_SQ_INTERPOLATOR_CNTL];
   sdr.pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
-  {
-    // SelectModifications reads only prim_type; the index count would defeat mods_memo.
-    reg::VGT_DRAW_INITIATOR prim_only;
-    prim_only.value = 0;
-    prim_only.prim_type = prim;
-    sdr.vgt_draw_initiator = prim_only.value;
-  }
+  sdr.vgt_draw_initiator = initiator.value;
   sdr.vgt_output_path_cntl = regs[XE_GPU_REG_VGT_OUTPUT_PATH_CNTL];
   sdr.pa_su_sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
   sdr.rb_modecontrol = regs[XE_GPU_REG_RB_MODECONTROL];
@@ -2394,7 +2369,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   const bool rasterization = IsRasterizationPotentiallyDone(regs, polygonal);
 
   // Host primitive (the plugin's primitive processor on D3D12: points, rectangles and quads go
-  // through a geometry shader; fans and line loops need converted indices).
+  // through a geometry shader, triangle fans through converted indices).
   D3D_PRIMITIVE_TOPOLOGY topology;
   switch (prim) {
     case xenos::PrimitiveType::kPointList: topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST; break;
@@ -2414,8 +2389,7 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
       topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
       break;
     default:
-      DRAW_LOG_ONCE(log_prim, "PGR4 native draw: primitive type {} unsupported (fans/loops need "
-                              "converted indices)", s.primitive);
+      DRAW_LOG_ONCE(log_prim, "PGR4 native draw: primitive type {} unsupported", s.primitive);
       ++stats.unsupported;
       return;
   }
@@ -2464,10 +2438,6 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
   const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
   const uint32_t color_mask = ps ? GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
   const bool depth_used = rasterization && (depth_control.z_enable || depth_control.stencil_enable);
-  Scissor scissor;
-  HostScissor(regs, scissor);
-  ViewportInfo vp;
-  HostViewportInfo(regs, ps && ps->writes_depth(), vp);
   uint32_t rt_mask = 0;
   for (uint32_t i = 0; i < 4; ++i)
     if ((color_mask >> (4 * i)) & 0xF) rt_mask |= 1u << i;
@@ -2475,6 +2445,10 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
     ++stats.skipped;  // nothing to write (no occlusion query emulation yet)
     return;
   }
+  Scissor scissor;
+  HostScissor(regs, scissor);
+  ViewportInfo vp;
+  HostViewportInfo(regs, ps && ps->writes_depth(), vp);
   const uint32_t height = std::clamp(scissor.offset[1] + scissor.extent[1], 1u, 2048u);
   profile::Mark(profile::kSetup);
   BoundTargets targets;
@@ -3263,18 +3237,8 @@ void DrawRenderer::Impl::Snapshot(ID3D12GraphicsCommandList* list, RenderTarget*
   uint64_t total = 0;
   // Subresource 0: the color target, or a depth target's depth plane.
   device->GetCopyableFootprints(&desc, 0, 1, 0, &s.layout, &s.rows, &s.row_bytes, &total);
-  D3D12_HEAP_PROPERTIES hp = {};
-  hp.Type = D3D12_HEAP_TYPE_READBACK;
-  D3D12_RESOURCE_DESC bd = {};
-  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  bd.Width = total;
-  bd.Height = 1;
-  bd.DepthOrArraySize = 1;
-  bd.MipLevels = 1;
-  bd.SampleDesc.Count = 1;
-  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&s.readback))))
+  if (!CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST,
+                    "snapshot readback", &s.readback))
     return;
   const D3D12_RESOURCE_STATES state = rt->state;
   RenderTargets::Transition(list, rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -3320,8 +3284,8 @@ DrawRenderer::~DrawRenderer() = default;
 
 bool DrawRenderer::Initialize() { return impl_->Initialize(); }
 
-void DrawRenderer::OnDraw(const uint8_t* base, const DrawState& state, const DrawPrep* prep) {
-  impl_->Draw(base, state, prep);
+void DrawRenderer::OnDraw(const DrawState& state, const DrawPrep* prep) {
+  impl_->Draw(state, prep);
 }
 
 void DrawRenderer::Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep* prep,
@@ -3363,16 +3327,8 @@ void DrawRenderer::BeforeSubmit() {
     job->readback = std::move(m.coherency_readbacks.back());
     m.coherency_readbacks.pop_back();
   } else {
-    D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_READBACK};
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = Impl::kCoherencyReadback;
-    rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(m.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                 IID_PPV_ARGS(&job->readback))))
+    if (!CreateBuffer(m.device, D3D12_HEAP_TYPE_READBACK, Impl::kCoherencyReadback,
+                      D3D12_RESOURCE_STATE_COPY_DEST, "coherency readback", &job->readback))
       return;
   }
   ID3D12GraphicsCommandList* list = m.r.command_list();
@@ -3501,6 +3457,7 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     if ((mask & 256) && !(impl_->debug_mask & 256))
       impl_->snap_pending = hash_count ? (1u << hash_count) - 1 : 1u << 31;
     impl_->debug_mask = mask;
+    impl_->upload_every_draw.store(mask & 32, std::memory_order_relaxed);
     impl_->debug_max_draws = max_draws;
     impl_->debug_skip_from = skip_from;
     impl_->debug_skip_to = skip_to;

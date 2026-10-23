@@ -1,4 +1,4 @@
-// pgr4-native PGR4 native renderer (design A, milestone 2): NativeRenderer host.
+// pgr4-native PGR4 native renderer: NativeRenderer host.
 #include "renderer.h"
 
 #include "d3d12_device.h"
@@ -357,10 +357,10 @@ ID3D12CommandQueue* NativeRenderer::queue() const { return device_->queue(); }
 ID3D12GraphicsCommandList* NativeRenderer::command_list() const { return device_->command_list(); }
 uint64_t NativeRenderer::frame_fence() const { return device_->frame_fence(); }
 
-void NativeRenderer::BeginFrameModules(const uint8_t* base) {
+void NativeRenderer::BeginFrameModules() {
   const uint64_t fence = device_->frame_fence(), done = device_->completed_fence();
   rt_->BeginFrame(frame_index_, fence, done);
-  resolver_->BeginFrame(base, frame_index_, fence, done);
+  resolver_->BeginFrame(frame_index_, fence, done);
   frame_begun_ = true;
 }
 
@@ -438,10 +438,9 @@ void NativeRenderer::QueueDraw(const uint8_t* base, const HookArgs& args) {
   const uint64_t t0 = NowNs();
   profile::Begin();
   Queue& q = *queue_;
-  base_ = base;
   Queue::Batch& b = *q.current;
   Queue::DrawCmd& d = b.draws.emplace_back();
-  const bool ok = ReadDrawState(base, args.device, args, &d.state);
+  const bool ok = GuestState().ReadDrawState(base, args.device, args, &d.state);
   profile::Mark(profile::kReadState);
   if (!ok) {
     b.draws.pop_back();
@@ -467,7 +466,6 @@ void NativeRenderer::QueueClear(const uint8_t* base, const HookArgs& args) {
   const uint64_t t0 = NowNs();
   profile::Scope scope(profile::kCapRecord);
   Queue& q = *queue_;
-  base_ = base;
   Queue::Batch& b = *q.current;
   ClearCall& c = b.clears.emplace_back();
   if (RenderTargets::DecodeClear(base, args, &c))
@@ -481,7 +479,6 @@ void NativeRenderer::QueueResolve(const uint8_t* base, const HookArgs& args) {
   const uint64_t t0 = NowNs();
   profile::Scope scope(profile::kCapRecord);
   Queue& q = *queue_;
-  base_ = base;
   Queue::Batch& b = *q.current;
   ResolveParams& p = b.resolves.emplace_back();
   if (DecodeResolve(base, args, &p))
@@ -494,7 +491,6 @@ void NativeRenderer::QueueResolve(const uint8_t* base, const HookArgs& args) {
 void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
   const uint64_t t0 = NowNs();
   Queue& q = *queue_;
-  base_ = base;
   Queue::Batch& b = *q.current;
   Queue::SwapCmd& s = b.swaps.emplace_back();
   Presenter::ReadSwap(base, args, &s.call);
@@ -540,52 +536,28 @@ void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
 
 void NativeRenderer::OnDraw(const uint8_t* base, const HookArgs& args) {
   if (queue_) return QueueDraw(base, args);
-  const uint64_t t0 = NowNs();
   profile::Begin();
-  BeginFrame(base);
-  ++stats_.draws;
   DrawState state;
-  const bool ok = ReadDrawState(base, args.device, args, &state);
+  const bool ok = GuestState().ReadDrawState(base, args.device, args, &state);
   profile::Mark(profile::kReadState);
-  if (ok) {
-    if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyDraw(state.regs));
-    draw_->OnDraw(base, state);
-    SubmitEarly();
-  } else {
+  if (ok)
+    ExecuteDraw(state, nullptr);
+  else
     ++stats_.state_fail;
-  }
-  stats_.draw_ns += NowNs() - t0;
 }
 
 void NativeRenderer::OnClear(const uint8_t* base, const HookArgs& args) {
   if (queue_) return QueueClear(base, args);
-  const uint64_t t0 = NowNs();
-  BeginFrame(base);
-  ++stats_.clears;
-  if (ClearCall c; RenderTargets::DecodeClear(base, args, &c)) {
-    if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyClear(c));
-    draw_->LogClear(c);
-    rt_->Clear(device_->command_list(), c.regs, c.bound_colors, c.depth_bound, c.height, c.p);
-  }
-  stats_.clear_ns += NowNs() - t0;
+  if (ClearCall c; RenderTargets::DecodeClear(base, args, &c)) ExecuteClear(c);
 }
 
 void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
   if (queue_) return QueueResolve(base, args);
-  const uint64_t t0 = NowNs();
-  BeginFrame(base);
-  ++stats_.resolves;
-  if (ResolveParams p; gpu_timer_ && DecodeResolve(base, args, &p))
-    gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyResolve(p));
-  // Sets its own compute root signature, pipeline and descriptor heap on the list.
-  resolver_->OnResolve(device_->command_list(), base, args);
-  draw_->InvalidateListState();
-  stats_.resolve_ns += NowNs() - t0;
+  if (ResolveParams p; DecodeResolve(base, args, &p)) ExecuteResolve(p);
 }
 
 void NativeRenderer::OnSwap(const uint8_t* base, const HookArgs& args) {
   if (queue_) return QueueSwap(base, args);
-  base_ = base;
   SwapCall swap;
   Presenter::ReadSwap(base, args, &swap);
   stats_.pad = rex_xam_take_frame_pad();
@@ -598,7 +570,7 @@ void NativeRenderer::OnSwap(const uint8_t* base, const HookArgs& args) {
 void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
   const uint64_t t0 = NowNs();
   profile::Begin();
-  BeginFrame(base_);
+  BeginFrame();
   ++stats_.draws;
   if (gpu_timer_) {
     uint64_t key;
@@ -610,14 +582,14 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     }
     gpu_timer_->Pass(device_->command_list(), key);
   }
-  draw_->OnDraw(base_, state, prep);
+  draw_->OnDraw(state, prep);
   SubmitEarly();
   stats_.draw_ns += NowNs() - t0;
 }
 
 void NativeRenderer::ExecuteClear(const ClearCall& c) {
   const uint64_t t0 = NowNs();
-  BeginFrame(base_);
+  BeginFrame();
   ++stats_.clears;
   if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyClear(c));
   draw_->LogClear(c);
@@ -627,10 +599,11 @@ void NativeRenderer::ExecuteClear(const ClearCall& c) {
 
 void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   const uint64_t t0 = NowNs();
-  BeginFrame(base_);
+  BeginFrame();
   ++stats_.resolves;
   if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyResolve(p));
   draw_->LogResolve(p);
+  // Sets its own compute root signature, pipeline and descriptor heap on the list.
   resolver_->Resolve(device_->command_list(), p);
   draw_->InvalidateListState();
   stats_.resolve_ns += NowNs() - t0;
@@ -645,20 +618,21 @@ void NativeRenderer::SubmitEarly() {
   const int32_t every = REXCVAR_GET(pgr4_native_submit_draws);
   if (every <= 0 || stats_.draws - draws_submitted_ < uint64_t(every) || !textures_->UploadsDone())
     return;
-  if (!device_->Submit()) {
-    g_failed = true;
-    REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
-                 frame_index_);
-    return;
-  }
+  if (!device_->Submit()) return Fail();
   draw_->InvalidateListState("submit");
   draws_submitted_ = stats_.draws;
   ++stats_.submits;
 }
 
+void NativeRenderer::Fail() {
+  g_failed = true;
+  REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
+               frame_index_);
+}
+
 void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   const uint64_t t0 = NowNs();
-  BeginFrame(base_);
+  BeginFrame();
   D3D12Device& d = *device_;
   if (gpu_timer_) gpu_timer_->Pass(d.command_list(), GpuTimer::KeyPresent());
   // A scene's first frame without the draws whose pipelines were compiling: the previous frame
@@ -675,12 +649,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   const uint64_t fence = d.frame_fence();
   // The SDK draws XAM dialogs into the game window, under the child window.
   d.SetShown(!rex::kernel::xam::xeXamIsUIActive());
-  if (!d.EndFrame(!incomplete)) {
-    g_failed = true;
-    REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
-                 frame_index_);
-    return;
-  }
+  if (!d.EndFrame(!incomplete)) return Fail();
   const D3D12Device::EndFrameTimes& et = d.end_frame_times();
   stats_.swap_submit_ns = et.submit_ns;
   stats_.swap_present_ns = et.present_ns;
@@ -700,8 +669,8 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   }
   textures_->Retire(completed);
   draw_->EndFrame(completed);
-  resolver_->AfterSwap(base_);
-  present_->AfterEndFrame(base_);
+  resolver_->AfterSwap();
+  present_->AfterEndFrame();
   const uint64_t t1 = NowNs();
   stats_.swap_ns = t1 - t0;
   if (!queue_)
