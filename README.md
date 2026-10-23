@@ -505,7 +505,29 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   of its 28 late frames, 25 came in a stretch of 12-17 ms game-thread frames under the power
   limit (no delay applied: the frames began late without sleeping), 3 had finished on the GPU
   two intervals before they were shown. `pacing.py` adds the wait and the delay.
-## Why a native renderer can beat emulation
+- The pacer's headroom estimate is the least headroom of the last 10 s, in one-second buckets,
+  instead of a minimum released by 1 ms a second. At 30 fps the headroom spans three 33 ms
+  intervals, and after one hitch the released estimate took about 75 s to come back (td-121).
+  The probe for a faster pace backs off: 10 s after the pace was set, then twice the period
+  before, up to 80 s; and at once when a frame is shown sooner than the pace allows, as the first
+  frames are after a limit is lifted. td-122 (limit 30): 22-32 ms from a frame's start to its
+  display, 45 ms for a moment at each probe; time step minus shown interval 0.08 ms in the
+  median and 1.9 ms in 99 % of the frames, so 30 fps is as even as the display allows. td-123
+  (limit 30 lifted 196 s after the launch, `deck-run.sh --limit-at`): the pace followed within about 2 s. At
+  90 Hz the estimate is more cautious than before: 30.7-33.3 ms (26.6 in td-119), with the delay
+  at 0-2.6 ms in the median (5.9). The frames shown late at 90 Hz (td-125, td-126, td-128: 55,
+  36 and 51 of 3450; td-119: 28) are not the pacer's: nearly all come in the same stretch of the
+  route (frames 19290-19600), where the game thread takes 12-15 ms a frame and the render thread
+  8-10 ms. Only less CPU time per frame shows those on time.
+- The motion blur is as long at 90 fps as on the console at 30 FPS. The blur pass (sub_82859FC0)
+  smears each pixel along its reprojection to the previous frame, so it spans one frame's
+  motion, and its per-sample step was tuned for 30 FPS: at 90 fps the blur was a third as long.
+  `title-update/apply_game_patches.patch` now passes the step through `Pgr4MotionBlurStep`,
+  which scales it by 1/30 s over the step of the frame being drawn (the time between two Swap
+  returns, one frame back; it matches the game's own delta time within 0.11 ms in the median,
+  td-125). In the same race at 30 and 90 fps (td-127, td-128) the reprojection moved 2.95 times
+  as far per frame at 30 fps, and the blur (motion times step) matched within 2 % in every 3 s
+  window. The pass costs 0.84 ms of GPU time a frame at 90 fps (td-126).## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
   makes about 3,300 draw calls per frame, and the Xenos plugin executes about 5,500 GPU draws
@@ -776,8 +798,9 @@ and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
   with the pad column to tell them from look-backs.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
-  work per frame. Most frames shown late at 90 Hz now come in stretches of 12-17 ms game-thread
-  frames under the power limit, the rest from single GPU spikes (td-119).
+  work per frame. Most frames shown late at 90 Hz now come in one stretch of the route where the
+  game thread takes 12-15 ms a frame under the power limit, the rest from single GPU spikes
+  (td-119, td-125 to td-128).
 - Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
   pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
   compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
