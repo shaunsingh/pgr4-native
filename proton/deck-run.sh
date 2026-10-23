@@ -13,7 +13,7 @@
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
 #               [--output NAME] [--captures "5 10 15"] [--record "FROM FRAMES"] [--catch]
-#               [--keys FILE]
+#               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -38,6 +38,11 @@
 # --catch keeps the last 2 s of frames in memory instead and writes only the whole-image jumps
 # (and F12's last 2 s) to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch).
 # --keys FILE drives the game with that route_player.py script instead of run/route-stpetersburg.keys.
+# --race-draws N is the median draws per frame that shows the race is on (St Petersburg draws
+# 4000+; a Quebec street race about 2000, its menus 1500-2000).
+# --draw-log FRAMES writes the native renderer's log of every draw, clear and resolve of the
+# FRAMES frames from the race mark on into ~/pgr4-proton/captures-<tag>/draws-f<frame>.txt
+# (about 1.5 MB per race frame), for a structural diff of a glitch frame with its neighbours.
 #
 # <tree> names $PGR4_BUILDS/native-<tree>/run/runtime (PGR4_BUILDS defaults to
 # ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is, so the released
@@ -54,7 +59,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-captures="5 10 15"; record=""; catch=0; keys=""
+captures="5 10 15"; record=""; catch=0; keys=""; race_draws=3000; draw_log=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -77,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --record) record=$2; shift 2 ;;
     --catch) catch=1; shift ;;
     --keys) keys=$(readlink -f "$2"); shift 2 ;;
+    --race-draws) race_draws=$2; shift 2 ;;
+    --draw-log) draw_log=$2; shift 2 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -138,7 +145,11 @@ capdir=$top/captures-$tag
 if [[ $mode == oracle ]]; then
   rm -rf "$capdir"; mkdir -p "$capdir"
   args+=(--pgr4_native --readback_resolve=fast "--pgr4_native_capture_dir=$(win "$capdir")")
+elif (( draw_log > 0 )); then
+  rm -rf "$capdir"; mkdir -p "$capdir"
+  args+=("--pgr4_native_capture_dir=$(win "$capdir")")
 fi
+(( draw_log > 0 )) && args+=("--pgr4_native_draw_log_frames=$draw_log")
 [[ $uncapped == 1 ]] && args+=(--vsync=false --d3d12_present_vsync=false)
 if [[ -n $record ]]; then
   read -r rec_from rec_frames <<<"$record"
@@ -299,18 +310,20 @@ echo "route reached mark race: $ok $(date +%T)"
 [[ $ok == 1 ]] || { tail -5 "$ilog" 2>/dev/null; exit 1; }
 # The route's marks are timed from the window appearing, and a slower load starts the race some
 # seconds after "mark race". The measurement starts when the frames look like a race: a median
-# of 3000+ draws over the last 30 frames (the grid and the menus draw under 3000).
+# of --race-draws (3000) or more over the last 30 frames (the grid and the menus draw fewer).
 if [[ $mode != none ]]; then
   for (( waited = 0; waited < 30; ++waited )); do
-    (( $(recent_draws 30) >= 3000 )) && break
+    (( $(recent_draws 30) >= race_draws )) && break
     nap 1
   done
   draws=$(recent_draws 30)
-  if (( draws < 3000 )); then
-    echo "ROUTE OUT OF STEP $(date +%T): median $draws draws per frame 30 s after the race mark (a race draws 4000+)"
+  if (( draws < race_draws )); then
+    echo "ROUTE OUT OF STEP $(date +%T): median $draws draws per frame 30 s after the race mark (want $race_draws)"
     exit 1
   fi
   echo "race running $(date +%T), $waited s after the route's race mark"
+  # The renderer polls this file every 15 frames; bit 16 starts the draw log.
+  (( draw_log > 0 )) && echo 16 > "$capdir/draw-debug.txt"
 fi
 race_iso=$(date +%Y-%m-%dT%H:%M:%S.%6N%:z)
 race_hms=${race_iso:11:8}

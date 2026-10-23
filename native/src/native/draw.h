@@ -52,6 +52,7 @@ namespace pgr4::native {
 class NativeRenderer;
 struct ClearCall;
 struct CoherencyJob;
+struct ResolveParams;
 
 // Guest memory copied into upload memory, to be copied into shared memory at `dst`.
 struct VertexCopy {
@@ -152,8 +153,9 @@ class DrawRenderer {
   // Resolver does): set everything again at the next draw. A new frame's list is detected
   // without this call.
   void InvalidateListState();
-  // Writes the clear into the draw log while one is open (draw-debug.txt bit 16).
+  // Write the clear or resolve into the draw log while one is open (draw-debug.txt bit 16).
   void LogClear(const ClearCall& c);
+  void LogResolve(const ResolveParams& p);
 
   // At Swap, before EndFrame: the frame skipped draws in a burst of new pipelines (a scene's
   // first frame, before its draws began waiting for them), so it is not worth showing.

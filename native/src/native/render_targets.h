@@ -31,6 +31,7 @@
 #include "d3d12_device.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -159,6 +160,8 @@ class RenderTargets {
   static constexpr uint64_t kMaxAge = 120;
 
   size_t count() const { return targets_.size(); }
+  // The draw log (DrawRenderer) while one is open: target creations and EDRAM fills applied.
+  void SetLog(std::FILE* log) { log_ = log; }
   uint64_t recreated() const { return recreated_; }
 
   // Host DXGI formats of a guest color / depth render target format (UNKNOWN if unsupported).
@@ -213,6 +216,7 @@ class RenderTargets {
   uint64_t frame_ = 0, frame_fence_ = 0;
   std::vector<EdramFill> fills_;  // oldest first
   uint64_t fill_seq_ = 0;
+  std::FILE* log_ = nullptr;
 };
 
 }  // namespace pgr4::native

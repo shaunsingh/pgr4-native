@@ -4,12 +4,17 @@
 #include "gpu_timer.h"
 #include "renderer.h"  // NowNs
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include <algorithm>
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
+
+REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize, false, "PGR4 native",
+                    "Debug: wait for the GPU at the end of every frame, so no frame is in flight "
+                    "while the next one is recorded (slow)");
 
 namespace pgr4::native {
 
@@ -308,6 +313,7 @@ bool D3D12Device::EndFrame(bool present) {
   uint64_t v = next_fence_++;
   if (Failed(queue_->Signal(fence_.Get(), v), "CommandQueue::Signal")) return false;
   slot_fence_[slot_] = v;
+  if (REXCVAR_GET(pgr4_native_gpu_serialize)) WaitFence(v);
   slot_ = (slot_ + 1) % kFramesInFlight;
   back_index_ = swapchain_->GetCurrentBackBufferIndex();
   if (!FollowParentSize()) return false;

@@ -624,6 +624,7 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   BeginFrame(base_);
   ++stats_.resolves;
   if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyResolve(p));
+  draw_->LogResolve(p);
   resolver_->Resolve(device_->command_list(), p);
   draw_->InvalidateListState();
   stats_.resolve_ns += NowNs() - t0;

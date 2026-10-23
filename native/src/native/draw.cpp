@@ -15,6 +15,7 @@
 #include "profile.h"
 #include "render_targets.h"
 #include "renderer.h"
+#include "resolve.h"
 #include "shader_cache.h"
 #include "shader_specialize.h"
 #include "shader_translate.h"
@@ -87,6 +88,14 @@ REXCVAR_DEFINE_BOOL(pgr4_native_coherency_check, false, "PGR4 native",
                     "(stale pages: a write the page watch missed; late pages: data rewritten after "
                     "a draw of the frame read it), and check copy segments against every read. "
                     "Slow (512 MB of host memory, a memcmp of every range read)");
+REXCVAR_DEFINE_INT32(pgr4_native_draw_log_from, -1, "PGR4 native",
+                     "Debug: from this native frame on, log the draws of each frame to "
+                     "<capture dir>/draws-f<frame>.txt, as bit 16 of <capture dir>/draw-debug.txt "
+                     "does from when it is set (-1: off)");
+REXCVAR_DEFINE_INT32(pgr4_native_draw_log_frames, 1, "PGR4 native",
+                     "Frames one draw log trigger (--pgr4_native_draw_log_from or draw-debug.txt "
+                     "bit 16) covers");
+REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);
 
 namespace pgr4::native {
 
@@ -845,15 +854,17 @@ struct DrawRenderer::Impl {
   std::unordered_map<uint32_t, std::vector<uint32_t>> geometry_shaders;
 
   // Shader lookup memo, direct-mapped by ucode address and size (plus the immediate load
-  // sequence): a hit skips ShaderCache::Load's XXH3 over the whole ucode. An entry also keeps
-  // the first and last dwords of the ucode it was made from, so a different shader loaded at
-  // the same address with the same size misses.
+  // sequence and the vertex shader variant's binding): a hit skips ShaderCache::Load's XXH3
+  // over the whole ucode. An entry also keeps the first and last dwords of the ucode it was
+  // made from, so a different shader loaded at the same address with the same size misses.
   struct ShaderMemo {
     static constexpr uint32_t kEntries = 64, kSample = 16;
     uint32_t ucode = 0, dwords = 0, immediate_seq = 0;
+    uint64_t binding = 0;
     uint32_t sample[kSample] = {};
     DxbcShader* shader = nullptr;
   };
+  uint64_t vs_repatches = 0;  // built-in VS variants found patched in place for another declaration
   ShaderMemo vs_memo[ShaderMemo::kEntries], ps_memo[ShaderMemo::kEntries];
   ShaderMemo* vs_last = nullptr;  // the entry the previous draw used
   ShaderMemo* ps_last = nullptr;
@@ -922,7 +933,7 @@ struct DrawRenderer::Impl {
   uint32_t debug_skip_from = 0, debug_skip_to = 0;
   std::array<uint64_t, 8> debug_hashes{};
   uint32_t debug_hash_count = 0;
-  bool draw_log_pending = false;
+  uint32_t draw_log_left = 0;  // frames still to log
   std::FILE* draw_log = nullptr;
   // 256: snapshots instead of skips. After the first draw of the next frame that uses each
   // listed hash (or, with none listed, after draw skip_from), the draw's bound single-sampled
@@ -2142,7 +2153,7 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
   if (!ref.ucode || !ref.dwords) return nullptr;
   // The previous draw's shader again (most draws): no guest memory read, as before the table.
   if (last && last->shader && last->ucode == ref.ucode && last->dwords == ref.dwords &&
-      last->immediate_seq == ref.immediate_seq)
+      last->immediate_seq == ref.immediate_seq && last->binding == ref.binding)
     return last->shader;
   // Declaration-patched vertex shaders (IM_LOAD_IMMEDIATE) come from the tracker's copy.
   const uint32_t* ucode =
@@ -2156,11 +2167,16 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
   last = &memo;
   if (memo.shader && memo.ucode == ref.ucode && memo.dwords == ref.dwords &&
       memo.immediate_seq == ref.immediate_seq &&
-      std::memcmp(memo.sample, sample, sizeof(sample)) == 0)
-    return memo.shader;
+      std::memcmp(memo.sample, sample, sizeof(sample)) == 0) {
+    if (memo.binding == ref.binding) return memo.shader;
+    if (++vs_repatches <= 8)
+      REXLOG_INFO("PGR4 native draw: vertex shader {:08X} ({} dwords) rebound in place at frame {}",
+                  ref.ucode, ref.dwords, r.frame_index());
+  }
   memo.ucode = ref.ucode;
   memo.dwords = ref.dwords;
   memo.immediate_seq = ref.immediate_seq;
+  memo.binding = ref.binding;
   std::memcpy(memo.sample, sample, sizeof(sample));
   ++diag.shader_loads;
   memo.shader = shaders.Load(type, ucode, ref.dwords);
@@ -2648,6 +2664,28 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
                  regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
                  regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
                  key.slope_scaled_depth_bias);
+    // Where the draw's data comes from and the float constants each shader reads (hashed).
+    std::fprintf(draw_log, "  ia=%08X", s.indexed ? s.index_address : 0u);
+    const Shader::ConstantRegisterMap& vmap = vs->constant_register_map();
+    for (uint32_t w = 0; w < 3; ++w)
+      for (uint32_t bits = vmap.vertex_fetch_bitmap[w]; bits; bits &= bits - 1) {
+        const uint32_t index = w * 32 + uint32_t(std::countr_zero(bits));
+        const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(index);
+        std::fprintf(draw_log, " vf%u=%08X+%X", index, vf.address << 2, vf.size << 2);
+      }
+    auto float_hash = [&](const Shader* shader, uint32_t base) {
+      uint64_t h = 0;
+      if (!shader) return h;
+      const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+      for (uint32_t w = 0; w < 4; ++w)
+        for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1)
+          h = XXH3_64bits_withSeed(&regs[base + (w * 64 + uint32_t(std::countr_zero(bits))) * 4],
+                                   16, h);
+      return h;
+    };
+    std::fprintf(draw_log, " cvs=%016llX cps=%016llX\n",
+                 (unsigned long long)float_hash(vs, XE_GPU_REG_SHADER_CONSTANT_000_X),
+                 (unsigned long long)float_hash(ps, XE_GPU_REG_SHADER_CONSTANT_256_X));
   }
   // With dynamic depth bias the polygon offset is not part of the pipeline.
   const float depth_bias = float(key.depth_bias);
@@ -3204,8 +3242,9 @@ void DrawRenderer::Impl::Draw(const uint8_t* base, const DrawState& s, const Dra
 
 void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets,
                                          uint32_t draw_index) {
-  const std::string stem = "C:\\recomp\\logs\\pgr4-native-captures\\snap-f" + std::to_string(r.frame_index()) +
-                           "-d" + std::to_string(draw_index);
+  const std::string stem =
+      (std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) / "snap-f").string() +
+      std::to_string(r.frame_index()) + "-d" + std::to_string(draw_index);
   for (uint32_t i = 0; i < targets.color_count; ++i) Snapshot(list, targets.color[i], stem + "-c" + std::to_string(i));
   Snapshot(list, targets.depth, stem + "-depth");
   snap_fence = r.frame_fence();
@@ -3371,6 +3410,17 @@ void DrawRenderer::LogClear(const ClearCall& c) {
   std::fprintf(f, "\n");
 }
 
+void DrawRenderer::LogResolve(const ResolveParams& p) {
+  std::FILE* f = impl_->draw_log;
+  if (!f) return;
+  std::fprintf(f, "resolve params (after draw %u) src=%u si=%08X ci0=%08X di=%08X rect=%d,%d-%d,%d "
+               "dest=%08X fmt=%u %ux%u at %d,%d clear=%X z=%g stencil=%u edram=%d,%d\n",
+               impl_->frame_draws, p.source, p.regs.surface_info, p.regs.color_info[0],
+               p.regs.depth_info, p.x0, p.y0, p.x1, p.y1, p.dest_base, p.dest_format, p.dest_width,
+               p.dest_height, p.dest_x, p.dest_y, p.clear_flags, p.clear_depth,
+               uint32_t(p.clear_stencil), p.edram_x, p.edram_y);
+}
+
 bool DrawRenderer::FrameIncomplete() const {
   const Impl& m = *impl_;
   return m.pipeline_wait && !m.frame_pending.empty();
@@ -3429,7 +3479,9 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     impl_->debug_poll = 0;
     uint32_t mask = 0, max_draws = 0, skip_from = 0, skip_to = 0, hash_count = 0;
     std::array<uint64_t, 8> hashes{};
-    if (std::FILE* f = std::fopen("C:\\recomp\\logs\\pgr4-native-captures\\draw-debug.txt", "r")) {
+    const std::filesystem::path debug_path =
+        std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) / "draw-debug.txt";
+    if (std::FILE* f = std::fopen(debug_path.string().c_str(), "r")) {
       if (std::fscanf(f, "%u %u %u %u", &mask, &max_draws, &skip_from, &skip_to) < 1) mask = 0;
       unsigned long long h;
       while (hash_count < hashes.size() && std::fscanf(f, "%llx", &h) == 1) hashes[hash_count++] = h;
@@ -3442,8 +3494,9 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
                   mask, max_draws, skip_from, skip_to, hash_count);
     impl_->debug_hashes = hashes;
     impl_->debug_hash_count = hash_count;
-    // Bit 16: log the next frame's draws once (to <capture dir>\draws-f<frame>.txt).
-    if ((mask & 16) && !(impl_->debug_mask & 16)) impl_->draw_log_pending = true;
+    // Bit 16: log the next frames' draws once (to <capture dir>\draws-f<frame>.txt).
+    if ((mask & 16) && !(impl_->debug_mask & 16))
+      impl_->draw_log_left = uint32_t(std::max(REXCVAR_GET(pgr4_native_draw_log_frames), 1));
     if ((mask & 256) && !(impl_->debug_mask & 256))
       impl_->snap_pending = hash_count ? (1u << hash_count) - 1 : 1u << 31;
     impl_->debug_mask = mask;
@@ -3454,12 +3507,20 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   if (impl_->draw_log) {
     std::fclose(impl_->draw_log);
     impl_->draw_log = nullptr;
+    renderer_.render_targets().SetLog(nullptr);
   }
-  if (impl_->draw_log_pending) {
-    impl_->draw_log_pending = false;
-    const std::string path = "C:\\recomp\\logs\\pgr4-native-captures\\draws-f" +
-                             std::to_string(renderer_.frame_index()) + ".txt";
-    impl_->draw_log = std::fopen(path.c_str(), "w");
+  if (const int32_t from = REXCVAR_GET(pgr4_native_draw_log_from);
+      from >= 0 && renderer_.frame_index() == uint64_t(from))
+    impl_->draw_log_left = uint32_t(std::max(REXCVAR_GET(pgr4_native_draw_log_frames), 1));
+  if (impl_->draw_log_left) {
+    --impl_->draw_log_left;
+    const std::filesystem::path dir(REXCVAR_GET(pgr4_native_capture_dir));
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path path =
+        dir / ("draws-f" + std::to_string(renderer_.frame_index()) + ".txt");
+    impl_->draw_log = std::fopen(path.string().c_str(), "w");
+    renderer_.render_targets().SetLog(impl_->draw_log);
   }
   // The next frame's list starts with the shared buffer in whatever state this frame left it;
   // D3D12 keeps resource states across command lists, so no reset of shared_state here.

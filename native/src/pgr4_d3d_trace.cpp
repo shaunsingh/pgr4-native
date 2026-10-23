@@ -64,6 +64,9 @@ REXCVAR_DEFINE_STRING(pgr4_d3d_frame_csv, "", "PGR4 native",
                       "Per-frame counter CSV (frame, calls, draw calls, tap draws, ...)");
 REXCVAR_DEFINE_INT32(pgr4_d3d_stats_frames, 150, "PGR4 native",
                      "Frames per summary line in the log (0 = off)");
+REXCVAR_DEFINE_BOOL(pgr4_d3d_tap_check, false, "PGR4 native",
+                    "With --pgr4_d3d_tap: compare the tracked state with the stream at every draw "
+                    "of every frame and log the frames that differ (slow)");
 
 namespace {
 
@@ -232,6 +235,7 @@ struct FrameCounters {
   uint64_t calls = 0, draw_calls = 0;          // hooked calls; DrawCounter's five builders
   uint64_t tap_draws = 0, tap_aux = 0, tap_resolves = 0;  // predicated / other draw packets
   uint64_t dwords = 0, segments = 0, resyncs = 0, torn = 0, unknown_ops = 0, ibs = 0, zero_pad = 0;
+  uint64_t checked = 0, differ = 0;  // --pgr4_d3d_tap_check: draws compared, draws that differ
 };
 
 struct Tap {
@@ -262,6 +266,9 @@ struct Tap {
   uint64_t state_draws = 0, state_bad_draws = 0, state_shader_bad = 0, state_unchecked = 0;
   uint64_t state_details = 0, state_per_tile = 0;
   bool state_pending = false;  // BeginVertices: compared when RestorePush publishes its packets
+  bool check = false;          // --pgr4_d3d_tap_check
+  std::string check_first;     // the frame's first differing draw
+  uint32_t check_logged = 0;
   std::vector<uint64_t> state_regs = std::vector<uint64_t>(kRegCount);
   std::map<uint32_t, uint64_t> op_counts;
   std::map<uint64_t, ShaderInfo> shaders;                 // key: type<<63 | addr<<20 ^ dwords
@@ -289,13 +296,24 @@ uint32_t ParseSkip(const std::string& s) {
   return m;
 }
 
-__attribute__((format(printf, 2, 3))) void Out(Tap& t, const char* f, ...) {
+void AppendV(std::string& s, const char* f, va_list args) {
   char buf[4096];
+  int n = std::vsnprintf(buf, sizeof(buf), f, args);
+  if (n > 0) s.append(buf, std::min<size_t>(size_t(n), sizeof(buf) - 1));
+}
+
+__attribute__((format(printf, 2, 3))) void Append(std::string& s, const char* f, ...) {
   va_list args;
   va_start(args, f);
-  int n = std::vsnprintf(buf, sizeof(buf), f, args);
+  AppendV(s, f, args);
   va_end(args);
-  if (n > 0) t.out.append(buf, std::min<size_t>(size_t(n), sizeof(buf) - 1));
+}
+
+__attribute__((format(printf, 2, 3))) void Out(Tap& t, const char* f, ...) {
+  va_list args;
+  va_start(args, f);
+  AppendV(t.out, f, args);
+  va_end(args);
 }
 
 bool Tracing(const Tap& t) { return t.tracing; }
@@ -339,7 +357,7 @@ void CompareState(Tap& t, FnId id) {
   const auto& gs = pgr4::native::GuestState();
   if (gs.device() != t.device) {
     ++t.state_unchecked;
-    if (t.state_details < 64) {
+    if (Tracing(t) && t.state_details < 64) {
       ++t.state_details;
       Out(t, "# state_unchecked d=%llu fn=%s tracker_device=%08X tap_device=%08X\n",
           (unsigned long long)t.draw_seq, kFns[id].name, gs.device(), t.device);
@@ -347,6 +365,7 @@ void CompareState(Tap& t, FnId id) {
     return;
   }
   ++t.state_draws;
+  ++t.frame.checked;
   uint32_t bad = gs.CompareWithTap(t.regs, t.written, t.state_regs.data(), &t.state_per_tile);
   const auto& gvs = gs.vs();
   bool vs_bad = t.vs_addr && (gvs.ucode != t.vs_addr || gvs.dwords != t.vs_dwords || gvs.immediate);
@@ -362,20 +381,25 @@ void CompareState(Tap& t, FnId id) {
   if (vs_bad || ps_bad) ++t.state_shader_bad;
   if (!bad && !vs_bad && !ps_bad) return;
   ++t.state_bad_draws;
-  if (t.state_details >= 64) return;
-  ++t.state_details;
-  Out(t, "# state_diff d=%llu fn=%s", (unsigned long long)t.draw_seq, kFns[id].name);
+  ++t.frame.differ;
+  // Traced frames list 64 differing draws; --pgr4_d3d_tap_check keeps each frame's first.
+  const bool detail = Tracing(t) && t.state_details < 64;
+  if (!detail && (Tracing(t) || !t.check_first.empty())) return;
+  if (detail) ++t.state_details;
+  std::string s;
+  Append(s, "d=%llu fn=%s", (unsigned long long)t.draw_seq, kFns[id].name);
   const uint32_t* v = gs.regs();
   uint32_t shown = 0;
   for (uint32_t r = 0x2000; r < kRegCount && shown < 16; ++r) {
     if (t.written[r] != 1 || t.regs[r] == v[r] || pgr4::native::IsTapOnlyRegister(r)) continue;
-    Out(t, " %04X tap=%08X state=%08X", r, t.regs[r], v[r]);
+    Append(s, " %04X tap=%08X state=%08X", r, t.regs[r], v[r]);
     ++shown;
   }
-  if (vs_bad) Out(t, " vs tap=%08X:%u%s state=%08X:%u%s", t.vs_addr, t.vs_dwords, t.vs_addr ? "" : ":imm",
-                  gvs.ucode, gvs.dwords, gvs.immediate ? ":imm" : "");
-  if (ps_bad) Out(t, " ps tap=%08X:%u state=%08X:%u", t.ps_addr, t.ps_dwords, gs.ps().ucode, gs.ps().dwords);
-  Out(t, "\n");
+  if (vs_bad) Append(s, " vs tap=%08X:%u%s state=%08X:%u%s", t.vs_addr, t.vs_dwords, t.vs_addr ? "" : ":imm",
+                     gvs.ucode, gvs.dwords, gvs.immediate ? ":imm" : "");
+  if (ps_bad) Append(s, " ps tap=%08X:%u state=%08X:%u", t.ps_addr, t.ps_dwords, gs.ps().ucode, gs.ps().dwords);
+  if (detail) Out(t, "# state_diff %s\n", s.c_str());
+  else t.check_first = std::move(s);
 }
 
 void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
@@ -748,6 +772,13 @@ void EndFrame(Tap& t, uint8_t* base) {
                 w.unknown_ops, t.enabled ? "on" : "off", g_skip.load());
     w = Window{};
   }
+  if (t.check && c.differ && t.check_logged < 2000) {
+    ++t.check_logged;
+    const pgr4::native::NativeRenderer* r = pgr4::native::NativeRenderer::Get();
+    REXLOG_INFO("PGR4 D3D check: frame {} (native {}): {} of {} draws differ from the stream; first {}",
+                t.frame_index, r ? r->frame_index() : 0, c.differ, c.checked, t.check_first);
+  }
+  t.check_first.clear();
   if (t.tracing) {
     FlushTrace(t);
     t.tracing = false;
@@ -788,9 +819,10 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
       t.device = Load32(base, out);
       t.cursor = t.device ? Load32(base, t.device + kDevPush) : 0;
       t.enabled = REXCVAR_GET(pgr4_d3d_tap);
+      t.check = t.enabled && REXCVAR_GET(pgr4_d3d_tap_check);
       g_skip.store(ParseSkip(REXCVAR_GET(pgr4_d3d_skip)));
-      REXLOG_INFO("PGR4 D3D: device {:08X}, push {:08X}, tap {}, {} hooked functions", t.device,
-                  t.cursor, t.enabled ? "on" : "off", uint32_t(kFnCount));
+      REXLOG_INFO("PGR4 D3D: device {:08X}, push {:08X}, tap {}{}, {} hooked functions", t.device,
+                  t.cursor, t.enabled ? "on" : "off", t.check ? " (state check)" : "", uint32_t(kFnCount));
       return;
     }
     if (forward) original(ctx, base); else ctx.r3.u64 = 0;
@@ -828,16 +860,14 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   const bool jump = id == kFn_826991D0 || id == kFn_82698F78 || id == kFn_82698300 || id == kFn_82697E18;
   Sync(t, base, jump || id == kFn_82699358 || id == kFn_8269A998 || id == kFn_8269A9A8, jump);
   --t_depth;
-  if (Tracing(t)) {
-    Out(t, "R %llu r3=%08X\n", (unsigned long long)seq, ctx.r3.u32);
-    if (t_depth == 0) {
-      if (t.state_pending) {  // BeginVertices' packets are in the stream once RestorePush ran
-        t.state_pending = false;
-        if (id == kFn_8269A998) CompareState(t, kFn_8269A4F8); else ++t.state_unchecked;
-      }
-      if (kFns[id].cat == kDraw) {
-        if (id == kFn_8269A4F8) t.state_pending = true; else CompareState(t, id);
-      }
+  if (Tracing(t)) Out(t, "R %llu r3=%08X\n", (unsigned long long)seq, ctx.r3.u32);
+  if (t_depth == 0 && (Tracing(t) || t.check)) {
+    if (t.state_pending) {  // BeginVertices' packets are in the stream once RestorePush ran
+      t.state_pending = false;
+      if (id == kFn_8269A998) CompareState(t, kFn_8269A4F8); else ++t.state_unchecked;
+    }
+    if (kFns[id].cat == kDraw) {
+      if (id == kFn_8269A4F8) t.state_pending = true; else CompareState(t, id);
     }
   }
   if (id == kFn_82695BE0) EndFrame(t, base);  // Swap

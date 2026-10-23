@@ -238,6 +238,10 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
                  d.Height, int(d.Format), rt->samples, uint32_t(hr));
     return false;
   }
+  if (log_)
+    std::fprintf(log_, "rt created %s base %u pitch %u x%u format %d %ux%u%s\n", rt->depth ? "depth" : "color",
+                 rt->edram_base, rt->pitch, rt->samples, int(rt->view_format), uint32_t(d.Width), height,
+                 rt->resource ? " (grown)" : "");
   Retire(std::move(rt->resource));
   rt->resource = std::move(res);
   rt->state = initial;
@@ -591,6 +595,10 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
     }
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ClearRenderTargetView(rt->view, f.color, nr, rects);
+    if (log_)
+      std::fprintf(log_, "edram fill seq %llu at tile %u pitch %u color %g,%g,%g,%g applied to base %u pitch %u x%u "
+                   "rows %ld-%ld (%u rects)\n", (unsigned long long)f.seq, f.base, f.pitch, f.color[0], f.color[1],
+                   f.color[2], f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom, nr);
     if (log_applied++ < 4)
       REXLOG_INFO("PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} pitch {} x{} rows "
                   "{}-{}", f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom);
@@ -608,6 +616,10 @@ void RenderTargets::BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t co
     if (rt->last_frame + kMaxAge < frame) {
       // Last used kMaxAge frames ago: no list in flight references it, but retire it with the
       // current fence anyway (cheap) so the rule is the same everywhere.
+      if (log_)
+        std::fprintf(log_, "rt dropped %s base %u pitch %u x%u (last used frame %llu)\n",
+                     rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
+                     (unsigned long long)rt->last_frame);
       Retire(std::move(rt->resource));
       (rt->depth ? free_dsv_ : free_rtv_).push_back(rt->view_index);
       it = targets_.erase(it);

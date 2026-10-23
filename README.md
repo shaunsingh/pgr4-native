@@ -223,7 +223,30 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   game read it (`pad_buttons` in hex, `pad_lt`/`pad_rt`, `pad_lx`..`pad_ry` as signed high
   bytes; from XamInputGetState, buttons OR'd over a frame's reads and each axis at its largest
   deflection), so a flash can be checked against the input.
-## Why a native renderer can beat emulation
+- The snow race's flashing frames (Quebec, Subaru 22B): for one or two frames the scenery
+  broke into grey slabs, stripes and smears, or turned black, while the car and HUD stayed
+  right; Xenos drew the same frames correctly (td-34). Neither serializing the GPU, recording
+  on the game thread, unlimited texture memory nor turning off stand-in pipelines stopped it
+  (td-35). A draw log of 3,265 race frames caught one (td-38, frame 23252): against its
+  neighbours, the only change was the vertex shader of 240 draws, with the same address, size,
+  buffers, textures and state. When the D3D binds a vertex shader variant with another vertex
+  declaration and the GPU has finished the frames that loaded it, it patches the variant's
+  vertex fetches in place (sub_826A9718 -> sub_826A8C20) instead of loading a patched copy
+  through the push buffer. The renderer's shader memo, keyed by address and size and checked
+  against the first and last eight dwords, kept the shader translated before the patch, and
+  the draws read their vertices in the wrong layout. Whether the D3D patches in place depends
+  on how far the GPU is behind, so the frames came and went with timing. The state tracker now
+  reads the variant's binding record (declaration id and stream layout) into the shader
+  reference, and the memo misses when it changes. Each run logs its first eight in-place
+  rebinds (`rebound in place at frame N`); td-40 had its eight before the race started. Its
+  130 s of the snow race (driven by hand once the scripted route had left the road) caught no
+  flashing frame, at 85 fps average and a 1 % low of 48 fps.
+- Debug switches used to find it: `--pgr4_native_gpu_serialize`, `--pgr4_native_draw_log_from`
+  and `_draw_log_frames` (draw logs of N frames, with each draw's index and vertex buffers and
+  a hash of the float constants each shader reads; resolves, EDRAM fills and render target
+  creation are logged between the draws), `--pgr4_d3d_tap_check`. `deck-run.sh --draw-log N`
+  logs N frames from the race start; `--race-draws` sets the median draws per frame that
+  shows the race is on (3000, St Petersburg's; the snow route runs with 1000).## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
@@ -446,7 +469,9 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_record=<file>` | off | Record the frames shown at half size (`_record_from`, `_record_frames`, `_record_chunk_frames`) |
 | `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 2 s of frames; write whole-image jumps and F12's 2 s to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
 | `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
-| `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
+| `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
+| `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |
+| `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) || `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
 
 With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
@@ -470,9 +495,9 @@ It also has a texture untiling harness and an offline shader translation test.
 
 ## What's next
 
-- Fix the wrong geometry. On the Deck it shows as a two-frame glitch about 10 s into the St
-  Petersburg race, in about one run in three (the sky turns red and the far buildings break
-  into shards while near geometry stays right). The single frames of play where the cockpit
+- Check the other single-frame geometry glitches against the in-place rebind fix: about 10 s
+  into the St Petersburg race, in about one run in three, the sky turned red and the far
+  buildings broke into shards while near geometry stayed right. The single frames of play where the cockpit
   turned white and broke up were the look-back camera; whether its view of the rear interior
   is right is still to be compared with Xenos (the chase view's look-back matches it at
   45-47 dB, td-21). Shards near AI cars and in the garage need a play session with the pad

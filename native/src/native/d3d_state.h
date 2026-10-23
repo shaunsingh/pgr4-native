@@ -80,12 +80,19 @@ bool IsTapOnlyRegister(uint32_t reg);
 // `immediate` points at a copy of the patched ucode (big-endian dwords, valid until the next
 // immediate VS load reaches a draw), `ucode` is its push-buffer address and `immediate_seq`
 // counts these loads (a cache key: push-buffer addresses get reused).
+//
+// A built-in variant is also patched where it is: once the GPU has finished the frames that
+// loaded it, binding it with another declaration (sub_826A9718) rewrites its vertex fetches in
+// place (sub_826A8C20) and records the declaration in the variant's binding record (vs + 416 *
+// variant: declaration id at +40, stream layout at +48 and +56). `binding` hashes that record;
+// the ucode at `ucode` changes with it while its address, size and first and last dwords stay.
 struct ShaderRef {
   uint32_t object = 0;  // guest D3D shader object (0 = none bound)
   uint32_t ucode = 0;   // physical address of the ucode, big-endian dwords
   uint32_t dwords = 0;
   const uint32_t* immediate = nullptr;
   uint32_t immediate_seq = 0;
+  uint64_t binding = 0;
 };
 
 struct DrawState {

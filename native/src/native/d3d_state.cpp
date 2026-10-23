@@ -5,6 +5,7 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <xxhash.h>
 
 #include <emmintrin.h>
 
@@ -314,6 +315,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
         uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
         uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
         vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)), Load32(base, sub + 876) >> 2};
+        vs_.binding = XXH3_64bits(Host(base, vs + 416 * variant + 40), 24);
       }
       if (rebind & (kVsRebind | kPsRebind)) LoadLiterals(base, vs + 872, Load32(base, vs + 32));
     } else {
