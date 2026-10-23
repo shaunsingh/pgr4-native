@@ -50,7 +50,11 @@ inline uint32_t GpuAddress(uint32_t a) {
 // so bit `top - k` covers the k-th group of `per` registers.
 struct Block {
   uint32_t offset, reg, count;
-  uint8_t mask, top, per;
+  uint8_t mask, top, per, groups;  // groups = count / per, kept here: CopyDirty runs per draw
+  constexpr Block(uint32_t offset, uint32_t reg, uint32_t count, uint8_t mask, uint8_t top,
+                  uint8_t per)
+      : offset(offset), reg(reg), count(count), mask(mask), top(top), per(per),
+        groups(uint8_t(count / per)) {}
 };
 constexpr Block kRegisterBlocks[] = {
     {10368, 0x2000, 16, 2, 57, 1},                  // mask +16 bits 57..42
@@ -93,7 +97,7 @@ void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, ui
     if (v == raw_[reg + i]) return;
     raw_[reg + i] = v;
     regs_[reg + i] = __builtin_bswap32(v);
-    Mark(reg + i);
+    Record(reg + i, regs_[reg + i]);
   };
   // Most of what the flushing calls copy is unchanged: compare 16 registers per branch.
   auto eq4 = [&](uint32_t i) {
@@ -117,8 +121,7 @@ void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, ui
 
 void GuestStateTracker::CopyDirty(const uint8_t* base, uint32_t device, const uint64_t dirty[6]) {
   for (const Block& b : kRegisterBlocks) {
-    const uint32_t groups = b.count / b.per;
-    uint64_t m = (dirty[b.mask] << (63 - b.top)) & ~(~0ull >> groups);  // group g at bit 63 - g
+    uint64_t m = (dirty[b.mask] << (63 - b.top)) & ~(~0ull >> b.groups);  // group g at bit 63 - g
     uint32_t g = 0;
     while (m) {
       const uint32_t skip = uint32_t(__builtin_clzll(m));
@@ -159,21 +162,15 @@ void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn
 }
 
 void GuestStateTracker::TakeChanges(std::vector<RegWrite>* out) {
-  for (uint32_t s = 0; s < kChangedWordGroups; ++s) {
-    uint64_t words = changed_words_[s];
-    changed_words_[s] = 0;
-    while (words) {
-      const uint32_t w = s * 64 + uint32_t(__builtin_ctzll(words));
-      words &= words - 1;
-      uint64_t bits = changed_[w];
-      changed_[w] = 0;
-      while (bits) {
-        const uint32_t reg = w * 64 + uint32_t(__builtin_ctzll(bits));
-        bits &= bits - 1;
-        out->push_back({reg, regs_[reg]});
-      }
-    }
+  if (!recording_) {
+    recording_ = true;
+    changes_.reserve(4096);
+    for (uint32_t reg = 0; reg < kGuestRegisterCount; ++reg)
+      if (regs_[reg]) out->push_back({reg, regs_[reg]});
+    return;
   }
+  out->insert(out->end(), changes_.begin(), changes_.end());
+  changes_.clear();
 }
 
 // sub_826DEBD8: a shader object's literal constants, LOAD_ALU_CONSTANT'd from guest memory into

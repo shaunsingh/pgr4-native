@@ -247,7 +247,7 @@ std::pair<uint32_t, uint32_t> TextureCache::Invalidate(uint32_t start, uint32_t 
   bool any = false;
   {
     std::lock_guard<std::mutex> lock(watch_mutex_);
-    const uint64_t mark = capture_seq_.load(std::memory_order_acquire);
+    const uint64_t mark = capture_seq_.value.load(std::memory_order_acquire);
     for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b) {
       for (const Watch& w : watch_buckets_[b]) {
         if (w.start < end && start < w.end) {

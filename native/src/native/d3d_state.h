@@ -146,9 +146,10 @@ class GuestStateTracker {
   // Shaders bound at the last draw (the IM_LOAD address the D3D uses for them).
   const ShaderRef& vs() const { return vs_; }
   const ShaderRef& ps() const { return ps_; }
-  // Appends the registers whose value changed since the last call (since start-up the first
-  // time; the copy it feeds starts zeroed like regs_) and forgets them. The render thread
-  // replays these into its own register file (renderer.cpp).
+  // Appends the register writes that changed a value since the last call, in order, and forgets
+  // them; the first call appends every non-zero register (the copy it feeds starts zeroed like
+  // regs_), and writes are recorded only from then on. The render thread replays these into its
+  // own register file (renderer.cpp).
   void TakeChanges(std::vector<RegWrite>* out);
 
   // Oracle (M1 tap): compares the registers the tap has seen written (`tap_written[r] != 0`)
@@ -163,18 +164,17 @@ class GuestStateTracker {
 
  private:
   void Attach(const uint8_t* base, uint32_t device);
-  // Every write to regs_ goes through Put/Copy, which note the changed registers. raw_ keeps
+  // Every write to regs_ goes through Put/Copy, which record the changed registers. raw_ keeps
   // each register as the guest stores it (big-endian), so Copy compares guest memory with it
   // four registers at a time without swapping.
-  void Mark(uint32_t reg) {
-    changed_[reg >> 6] |= 1ull << (reg & 63);
-    changed_words_[reg >> 12] |= 1ull << ((reg >> 6) & 63);
+  void Record(uint32_t reg, uint32_t value) {
+    if (recording_) changes_.push_back({reg, value});
   }
   void Put(uint32_t reg, uint32_t value) {
     if (regs_[reg] == value) return;
     regs_[reg] = value;
     raw_[reg] = __builtin_bswap32(value);
-    Mark(reg);
+    Record(reg, value);
   }
   void Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count);
   // The block registers whose bit is set in `dirty` (masks +0..+40, host order).
@@ -196,10 +196,9 @@ class GuestStateTracker {
   uint32_t vs_imm_seq_ = 0;
   uint32_t regs_[kGuestRegisterCount] = {};
   uint32_t raw_[kGuestRegisterCount] = {};
-  static constexpr uint32_t kChangedWords = kGuestRegisterCount / 64;
-  static constexpr uint32_t kChangedWordGroups = (kChangedWords + 63) / 64;
-  uint64_t changed_[kChangedWords] = {};             // bit per register
-  uint64_t changed_words_[kChangedWordGroups] = {};  // bit per non-zero changed_ word
+  // Writes since the last TakeChanges (a register written twice appears twice).
+  std::vector<RegWrite> changes_;
+  bool recording_ = false;  // from the first TakeChanges on
 };
 
 GuestStateTracker& GuestState();

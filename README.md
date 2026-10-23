@@ -366,7 +366,14 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   51.2). Of its 16,400 wineserver requests a second, 13,000 are the pad's: winedevice's HID
   threads (9,200), SDL's reads (2,300) and Wine's own XInput reader (1,700), which reads the
   same pad as SDL; winedevice takes 21 % of a core.
-
+- The state tracker hands the render thread its register changes as a list. Each write that
+  changes a register's value is appended as it happens, and `TakeChanges` copies the list in
+  order; before, each write set a bit in a two-level bitmap, and `TakeChanges` walked the bitmap
+  and read every marked register back. The register blocks keep their group count instead of
+  dividing for it at every draw, and the texture cache's capture stamp, which only the game
+  thread writes (once per draw), is a plain store on a cache line of its own instead of a
+  locked add beside members the render thread reads for every texture it binds. td-73 runs
+  both; no run measures them on their own.
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game

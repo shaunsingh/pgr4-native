@@ -121,7 +121,12 @@ class TextureCache {
   // predates the write. kCapturedNow: the draw sees guest memory as it is now. With capture
   // order off, such Gets upload the newer data instead (and still count as stale).
   static constexpr uint64_t kCapturedNow = ~0ull;
-  uint64_t MarkCapture() { return capture_seq_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+  // The guest D3D thread's (the only caller), so a plain store hands out the next stamp.
+  uint64_t MarkCapture() {
+    const uint64_t stamp = capture_seq_.value.load(std::memory_order_relaxed) + 1;
+    capture_seq_.value.store(stamp, std::memory_order_release);
+    return stamp;
+  }
   void SetCaptureOrder(bool on) { capture_order_ = on; }
 
   // The texture for a fetch constant (6 dwords as in the register file), uploaded or copied on
@@ -242,7 +247,11 @@ class TextureCache {
   static constexpr uint32_t kGetMemoBits = 10;
   std::unique_ptr<GetMemo[]> get_memo_{new GetMemo[size_t(1) << kGetMemoBits]};
   std::atomic<uint64_t> change_epoch_{1};
-  std::atomic<uint64_t> capture_seq_{0};  // MarkCapture stamps handed out
+  // MarkCapture stamps handed out, stored once per draw: on a cache line of its own, as the
+  // render thread reads the members around it for every texture it binds.
+  struct alignas(64) {
+    std::atomic<uint64_t> value{0};
+  } capture_seq_;
   bool capture_order_ = true;
   static constexpr uint32_t kStaleLogLimit = 96;  // log lines about stale textures
   uint32_t stale_logged_ = 0;
