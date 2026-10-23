@@ -29,8 +29,9 @@
 #include <mutex>
 #include <thread>
 
-REXCVAR_DEFINE_STRING(pgr4_native_resolve_dump, "", "PGR4 native",
-                      "Directory for resolve oracle dumps; create <dir>\\dump.request to dump the next frame");
+REXCVAR_DEFINE_STRING(
+    pgr4_native_resolve_dump, "", "PGR4 native",
+    "Directory for resolve oracle dumps; create <dir>\\dump.request to dump the next frame");
 REXCVAR_DEFINE_BOOL(pgr4_native_resolve_selftest, false, "PGR4 native",
                     "Check the resolve shader's format packing against known encodings at start");
 REXCVAR_DEFINE_BOOL(pgr4_native_resolve_specialize, true, "PGR4 native",
@@ -48,18 +49,24 @@ constexpr uint32_t kViewsPerResolve = 4;  // t0 color/depth, t1 stencil, u0 texe
 constexpr uint32_t kHeapPerFrame = 128 * kViewsPerResolve;  // descriptors per frame slot
 constexpr uint32_t kHeapSlots = 4;                          // > frames in flight
 constexpr uint32_t kPitchAlign = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-constexpr D3D12_RESOURCE_STATES kImageReadState =
-    D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+constexpr D3D12_RESOURCE_STATES kImageReadState = D3D12_RESOURCE_STATE_COPY_SOURCE |
+                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-#define PGR4_LOG_ONCE(counter, ...)        \
-  do {                                     \
+#define PGR4_LOG_ONCE(counter, ...)                \
+  do {                                             \
     if ((counter)++ < 4) REXLOG_WARN(__VA_ARGS__); \
   } while (0)
 
 // How the shader writes a texel through the image's UAV (kShader's Store).
 enum DestLayout : uint32_t {
-  kR8, kR8G8, kR8G8B8A8, kR10G10B10A2, kR16, kR16G16, kR16G16B16A16,
+  kR8,
+  kR8G8,
+  kR8G8B8A8,
+  kR10G10B10A2,
+  kR16,
+  kR16G16,
+  kR16G16B16A16,
   kR32,          // one to four 32-bit components
   kB5G6R5Unorm,  // no UINT view exists: unorm floats
 };
@@ -79,31 +86,48 @@ const DestStorage* GetDestStorage(uint32_t f) {
   static constexpr DestStorage k8{0, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UINT, kR8};
   static constexpr DestStorage k8_8{1, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UINT, kR8G8};
   // k_5_6_5 and k_6_5_5 share the B5G6R5 host layout (the texture cache's load conversions).
-  static constexpr DestStorage k565{1, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, kB5G6R5Unorm};
+  static constexpr DestStorage k565{1, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM,
+                                    kB5G6R5Unorm};
   static constexpr DestStorage k16f{1, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UINT, kR16};
-  static constexpr DestStorage k8888{2, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UINT, kR8G8B8A8};
-  static constexpr DestStorage k2101010{2, DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UINT,
-                                        kR10G10B10A2};
-  static constexpr DestStorage k16_16f{2, DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UINT, kR16G16};
+  static constexpr DestStorage k8888{2, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UINT,
+                                     kR8G8B8A8};
+  static constexpr DestStorage k2101010{2, DXGI_FORMAT_R10G10B10A2_TYPELESS,
+                                        DXGI_FORMAT_R10G10B10A2_UINT, kR10G10B10A2};
+  static constexpr DestStorage k16_16f{2, DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UINT,
+                                       kR16G16};
   static constexpr DestStorage k32f{2, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, kR32};
-  static constexpr DestStorage k16x4f{3, DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UINT,
-                                      kR16G16B16A16};
-  static constexpr DestStorage k32_32f{3, DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_UINT, kR32};
-  static constexpr DestStorage k32x4f{4, DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32A32_UINT, kR32};
+  static constexpr DestStorage k16x4f{3, DXGI_FORMAT_R16G16B16A16_TYPELESS,
+                                      DXGI_FORMAT_R16G16B16A16_UINT, kR16G16B16A16};
+  static constexpr DestStorage k32_32f{3, DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R32G32_UINT,
+                                       kR32};
+  static constexpr DestStorage k32x4f{4, DXGI_FORMAT_R32G32B32A32_TYPELESS,
+                                      DXGI_FORMAT_R32G32B32A32_UINT, kR32};
   switch (xenos::TextureFormat(f)) {
-    case xenos::TextureFormat::k_8: return &k8;
-    case xenos::TextureFormat::k_8_8: return &k8_8;
+    case xenos::TextureFormat::k_8:
+      return &k8;
+    case xenos::TextureFormat::k_8_8:
+      return &k8_8;
     case xenos::TextureFormat::k_5_6_5:
-    case xenos::TextureFormat::k_6_5_5: return &k565;
-    case xenos::TextureFormat::k_16_FLOAT: return &k16f;
-    case xenos::TextureFormat::k_8_8_8_8: return &k8888;
-    case xenos::TextureFormat::k_2_10_10_10: return &k2101010;
-    case xenos::TextureFormat::k_16_16_FLOAT: return &k16_16f;
-    case xenos::TextureFormat::k_32_FLOAT: return &k32f;
-    case xenos::TextureFormat::k_16_16_16_16_FLOAT: return &k16x4f;
-    case xenos::TextureFormat::k_32_32_FLOAT: return &k32_32f;
-    case xenos::TextureFormat::k_32_32_32_32_FLOAT: return &k32x4f;
-    default: return nullptr;
+    case xenos::TextureFormat::k_6_5_5:
+      return &k565;
+    case xenos::TextureFormat::k_16_FLOAT:
+      return &k16f;
+    case xenos::TextureFormat::k_8_8_8_8:
+      return &k8888;
+    case xenos::TextureFormat::k_2_10_10_10:
+      return &k2101010;
+    case xenos::TextureFormat::k_16_16_FLOAT:
+      return &k16_16f;
+    case xenos::TextureFormat::k_32_FLOAT:
+      return &k32f;
+    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+      return &k16x4f;
+    case xenos::TextureFormat::k_32_32_FLOAT:
+      return &k32_32f;
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      return &k32x4f;
+    default:
+      return nullptr;
   }
 }
 
@@ -120,15 +144,23 @@ uint32_t ColorRtBppLog2(uint32_t f) { return (f == 5 || f == 7 || f == 15) ? 3 :
 // (sub_826CBEE0: the cmplwi chain on the fetch format).
 uint32_t D3DCopyDestFormat(uint32_t f) {
   switch (f) {
-    case 54: return 7;   // k_2_10_10_10_AS_16_16_16_16 -> k_2_10_10_10
-    case 55: return 16;  // k_10_11_11_AS_16_16_16_16 -> k_10_11_11
-    case 56: return 17;  // k_11_11_10_AS_16_16_16_16 -> k_11_11_10
-    case 27: return 30;  // k_16_EXPAND -> k_16_FLOAT
-    case 28: return 31;  // k_16_16_EXPAND -> k_16_16_FLOAT
-    case 29: return 32;  // k_16_16_16_16_EXPAND -> k_16_16_16_16_FLOAT
-    case 22:             // k_24_8
-    case 23: return 6;   // k_24_8_FLOAT -> k_8_8_8_8
-    default: return f;
+    case 54:
+      return 7;  // k_2_10_10_10_AS_16_16_16_16 -> k_2_10_10_10
+    case 55:
+      return 16;  // k_10_11_11_AS_16_16_16_16 -> k_10_11_11
+    case 56:
+      return 17;  // k_11_11_10_AS_16_16_16_16 -> k_11_11_10
+    case 27:
+      return 30;  // k_16_EXPAND -> k_16_FLOAT
+    case 28:
+      return 31;  // k_16_16_EXPAND -> k_16_16_FLOAT
+    case 29:
+      return 32;  // k_16_16_16_16_EXPAND -> k_16_16_16_16_FLOAT
+    case 22:      // k_24_8
+    case 23:
+      return 6;  // k_24_8_FLOAT -> k_8_8_8_8
+    default:
+      return f;
   }
 }
 
@@ -139,8 +171,10 @@ bool IsFloatFormat(uint32_t f) {
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
     case xenos::TextureFormat::k_32_FLOAT:
     case xenos::TextureFormat::k_32_32_FLOAT:
-    case xenos::TextureFormat::k_32_32_32_32_FLOAT: return true;
-    default: return false;
+    case xenos::TextureFormat::k_32_32_32_32_FLOAT:
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -399,8 +433,8 @@ struct PipelineSpec {
   // 6-bit signed.
   uint64_t Key() const {
     return uint64_t(depth) | uint64_t(msaa) << 1 | uint64_t(src_format & 15) << 2 |
-           uint64_t(dest_format & 63) << 6 | uint64_t(dest_layout & 15) << 12 | uint64_t(flags & 0xFFFF) << 16 |
-           uint64_t(uint32_t(exp_bias) & 63) << 32;
+           uint64_t(dest_format & 63) << 6 | uint64_t(dest_layout & 15) << 12 |
+           uint64_t(flags & 0xFFFF) << 16 | uint64_t(uint32_t(exp_bias) & 63) << 32;
   }
 };
 
@@ -416,12 +450,17 @@ void CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParam
   // only the unshifted case is compared.
   const bool origin = p.x0 == p.dest_x && p.y0 == p.dest_y;
   // RB_COPY_DEST_PITCH's height is the level height minus the dest point's y (r18 in the D3D).
-  if ((!origin || dest == p.dest_base) && ((pitch >> 16) & 0x3FFF) == p.dest_height - uint32_t(p.dest_y)) return;
+  if ((!origin || dest == p.dest_base) &&
+      ((pitch >> 16) & 0x3FFF) == p.dest_height - uint32_t(p.dest_y))
+    return;
   static uint32_t logged = 0;
   if (logged++ < 16)
-    REXLOG_WARN("PGR4 native resolve: decode vs D3D shadow: dest {:08X}/{:08X} pitch {:08X} (decoded {}x{}, "
-                "rect {},{}-{},{} point {},{})",
-                dest, p.dest_base, pitch, p.dest_width, p.dest_height, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y);
+    REXLOG_WARN(
+        "PGR4 native resolve: decode vs D3D shadow: dest {:08X}/{:08X} pitch {:08X} (decoded "
+        "{}x{}, "
+        "rect {},{}-{},{} point {},{})",
+        dest, p.dest_base, pitch, p.dest_width, p.dest_height, p.x0, p.y0, p.x1, p.y1, p.dest_x,
+        p.dest_y);
 }
 
 }  // namespace
@@ -465,7 +504,8 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
   for (int i = 0; i < 6; ++i) fetch[i] = Load32(base, tex + 28 + 4 * i);
   TextureKey key;
   if (!TextureKeyFromFetch(fetch, &key)) {
-    PGR4_LOG_ONCE(log_tex, "PGR4 native resolve: invalid destination fetch constant {:08X} {:08X}", fetch[0], fetch[1]);
+    PGR4_LOG_ONCE(log_tex, "PGR4 native resolve: invalid destination fetch constant {:08X} {:08X}",
+                  fetch[0], fetch[1]);
     return false;
   }
   if (key.dimension == xenos::DataDimension::k3D) {
@@ -479,12 +519,17 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
   {
     const uint32_t sign_x = (fetch[0] >> 2) & 3;
     const bool integer = fetch[3] & 1;
-    p.dest_number = IsFloatFormat(p.dest_format) ? 7 : integer ? (sign_x == 1 ? 3 : 2) : (sign_x == 1 ? 1 : 0);
+    p.dest_number = IsFloatFormat(p.dest_format) ? 7
+                    : integer                    ? (sign_x == 1 ? 3 : 2)
+                                                 : (sign_x == 1 ? 1 : 0);
   }
   if (DestBppLog2(p.dest_format) < 0) {
-    PGR4_LOG_ONCE(log_fmt, "PGR4 native resolve: destination format {} (fetch format {}) unsupported, source {}, "
-                  "surface {:08X} {:08X} {:08X}", p.dest_format, fetch_format, p.source, p.regs.surface_info,
-                  p.regs.color_info[0], p.regs.depth_info);
+    PGR4_LOG_ONCE(
+        log_fmt,
+        "PGR4 native resolve: destination format {} (fetch format {}) unsupported, source {}, "
+        "surface {:08X} {:08X} {:08X}",
+        p.dest_format, fetch_format, p.source, p.regs.surface_info, p.regs.color_info[0],
+        p.regs.depth_info);
     return false;
   }
   p.dest_width = std::max(1u, key.width >> level);
@@ -496,15 +541,17 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
   auto d3d_phys = [](uint32_t a) { return (a & 0x1FFFFFFFu) + ((((a >> 20) + 0x200u) & 0x1000u)); };
   const texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
       key.dimension, key.pitch, key.width, key.height, key.depth_or_array_size, key.tiled,
-      rex::graphics::GetBaseFormat(xenos::TextureFormat(fetch_format)), key.packed_mips,
-      true, std::max(level, key.mip_max_level));
+      rex::graphics::GetBaseFormat(xenos::TextureFormat(fetch_format)), key.packed_mips, true,
+      std::max(level, key.mip_max_level));
   const texture_util::TextureGuestLayout::Level* lv;
   if (level == 0) {
     p.dest_base = d3d_phys(fetch[1] & 0xFFFFF000u);
     lv = &layout.base;
   } else {
     if (layout.packed_level != UINT32_MAX && level >= layout.packed_level) {
-      PGR4_LOG_ONCE(log_packed, "PGR4 native resolve: packed mip tail destination (level {}) unsupported", level);
+      PGR4_LOG_ONCE(log_packed,
+                    "PGR4 native resolve: packed mip tail destination (level {}) unsupported",
+                    level);
       return false;
     }
     p.dest_base = d3d_phys(fetch[5] & 0xFFFFF000u) + layout.mip_offsets_bytes[level];
@@ -584,10 +631,12 @@ void HoldFullReadback(bool hold) {
     if (g_full_readback_holds++ == 0) {
       g_readback_before = rex::cvar::GetFlagByName("readback_resolve");
       if (!rex::cvar::SetFlagByName("readback_resolve", "full"))
-        REXLOG_WARN("PGR4 native: could not set readback_resolve=full; guest copies may be a frame old");
+        REXLOG_WARN(
+            "PGR4 native: could not set readback_resolve=full; guest copies may be a frame old");
     }
   } else if (g_full_readback_holds && --g_full_readback_holds == 0) {
-    rex::cvar::SetFlagByName("readback_resolve", g_readback_before.empty() ? "none" : g_readback_before);
+    rex::cvar::SetFlagByName("readback_resolve",
+                             g_readback_before.empty() ? "none" : g_readback_before);
   }
 }
 
@@ -638,20 +687,25 @@ struct Resolver::Pipelines {
   }
 
   ComPtr<ID3D12PipelineState> Compile(const PipelineSpec& s) const {
-    std::vector<D3D_SHADER_MACRO> defines = {
-        {"DEPTH", s.depth ? "1" : "0"}, {"MSAA", s.msaa ? "1" : "0"}, {"SPECIALIZED", s.specialized ? "1" : "0"}};
-    const std::string values[] = {std::to_string(s.src_format) + "u", std::to_string(s.dest_format) + "u",
-                                  std::to_string(s.flags) + "u", std::to_string(s.dest_layout) + "u",
-                                  std::to_string(s.exp_bias)};
+    std::vector<D3D_SHADER_MACRO> defines = {{"DEPTH", s.depth ? "1" : "0"},
+                                             {"MSAA", s.msaa ? "1" : "0"},
+                                             {"SPECIALIZED", s.specialized ? "1" : "0"}};
+    const std::string values[] = {std::to_string(s.src_format) + "u",
+                                  std::to_string(s.dest_format) + "u",
+                                  std::to_string(s.flags) + "u",
+                                  std::to_string(s.dest_layout) + "u", std::to_string(s.exp_bias)};
     if (s.specialized) {
-      const char* names[] = {"SPEC_SRC_FORMAT", "SPEC_DEST_FORMAT", "SPEC_FLAGS", "SPEC_DEST_LAYOUT", "SPEC_EXP_BIAS"};
-      for (size_t i = 0; i < std::size(names); ++i) defines.push_back({names[i], values[i].c_str()});
+      const char* names[] = {"SPEC_SRC_FORMAT", "SPEC_DEST_FORMAT", "SPEC_FLAGS",
+                             "SPEC_DEST_LAYOUT", "SPEC_EXP_BIAS"};
+      for (size_t i = 0; i < std::size(names); ++i)
+        defines.push_back({names[i], values[i].c_str()});
     }
     defines.push_back({nullptr, nullptr});
     ComPtr<ID3DBlob> code, errors;
-    if (FAILED(compile(kShader, sizeof(kShader) - 1, "pgr4_resolve.hlsl", defines.data(), nullptr, "main",
-                       "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
-      REXLOG_ERROR("PGR4 native resolve: shader {:09X}{}: {}", s.Key(), s.specialized ? "" : " (generic)",
+    if (FAILED(compile(kShader, sizeof(kShader) - 1, "pgr4_resolve.hlsl", defines.data(), nullptr,
+                       "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors))) {
+      REXLOG_ERROR("PGR4 native resolve: shader {:09X}{}: {}", s.Key(),
+                   s.specialized ? "" : " (generic)",
                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
       return nullptr;
     }
@@ -659,7 +713,8 @@ struct Resolver::Pipelines {
     pd.pRootSignature = root_signature.Get();
     pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
     ComPtr<ID3D12PipelineState> pso;
-    if (Failed(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)), "resolve CreateComputePipelineState"))
+    if (Failed(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&pso)),
+               "resolve CreateComputePipelineState"))
       return nullptr;
     return pso;
   }
@@ -719,12 +774,16 @@ bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12Co
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
   hd.NumDescriptors = kHeapPerFrame * kHeapSlots;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-  if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "resolve CreateDescriptorHeap")) return false;
+  if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)),
+             "resolve CreateDescriptorHeap"))
+    return false;
   heap_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {DXGI_FORMAT_B5G6R5_UNORM};
-  b5g6r5_store_ = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
-                  (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
-  if (!b5g6r5_store_) REXLOG_WARN("PGR4 native resolve: no typed UAV store for B5G6R5; k_5_6_5 resolves unsupported");
+  b5g6r5_store_ =
+      SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+      (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+  if (!b5g6r5_store_)
+    REXLOG_WARN("PGR4 native resolve: no typed UAV store for B5G6R5; k_5_6_5 resolves unsupported");
   if (!CreatePipelines()) return false;
   const std::string dir = REXCVAR_GET(pgr4_native_resolve_dump);
   if (!dir.empty()) {
@@ -736,8 +795,9 @@ bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12Co
   }
   if (REXCVAR_GET(pgr4_native_resolve_selftest) && queue)
     REXLOG_INFO("PGR4 native resolve selftest: {}", SelfTest(queue) ? "all passed" : "FAILED");
-  pipelines_->specialize = REXCVAR_GET(pgr4_native_resolve_specialize) ? Pipelines::Specialize::kAsync
-                                                                       : Pipelines::Specialize::kOff;
+  pipelines_->specialize = REXCVAR_GET(pgr4_native_resolve_specialize)
+                               ? Pipelines::Specialize::kAsync
+                               : Pipelines::Specialize::kOff;
   return true;
 }
 
@@ -791,7 +851,8 @@ Resolver::Image* Resolver::GetImage(const ResolveParams& p) {
   static uint32_t log_store = 0;
   const DestStorage& storage = *GetDestStorage(p.dest_format);
   if (storage.layout == kB5G6R5Unorm && !b5g6r5_store_) {
-    PGR4_LOG_ONCE(log_store, "PGR4 native resolve: no typed UAV store for B5G6R5 (format {})", p.dest_format);
+    PGR4_LOG_ONCE(log_store, "PGR4 native resolve: no typed UAV store for B5G6R5 (format {})",
+                  p.dest_format);
     return nullptr;
   }
   const bool depth = p.source == 4;
@@ -815,14 +876,16 @@ Resolver::Image* Resolver::GetImage(const ResolveParams& p) {
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                              nullptr, IID_PPV_ARGS(&img->texture)),
+  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                              IID_PPV_ARGS(&img->texture)),
              "resolve destination texture"))
     return nullptr;
   if (depth) {
     d.Format = DXGI_FORMAT_R32_FLOAT;
-    if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                nullptr, IID_PPV_ARGS(&img->depth_r32f)),
+    if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                IID_PPV_ARGS(&img->depth_r32f)),
                "resolve depth_r32f texture"))
       return nullptr;
   }
@@ -832,9 +895,9 @@ Resolver::Image* Resolver::GetImage(const ResolveParams& p) {
   img->view.depth_r32f = img->depth_r32f.Get();
   // Creation is a stall on the guest thread; every one is logged so frame-time spikes can be
   // matched against it.
-  REXLOG_INFO("PGR4 native resolve: image {} at {:08X}: format {} {}x{}{} ({} at this address)", ++image_count_,
-              p.dest_base, p.dest_format, p.dest_width, p.dest_height, depth ? " + depth float" : "",
-              dest.images.size() + 1);
+  REXLOG_INFO("PGR4 native resolve: image {} at {:08X}: format {} {}x{}{} ({} at this address)",
+              ++image_count_, p.dest_base, p.dest_format, p.dest_width, p.dest_height,
+              depth ? " + depth float" : "", dest.images.size() + 1);
   return dest.images.emplace_back(std::move(img)).get();
 }
 
@@ -855,8 +918,8 @@ static uint32_t CopyControlOf(const ResolveParams& p) {
   return p.source | (p.sample_select << 4) | p.clear_flags | (p.copy_command << 20);
 }
 static uint32_t DestInfoOf(const ResolveParams& p) {
-  return p.dest_endian | (p.dest_format << 7) | (p.dest_number << 13) | ((uint32_t(p.exp_bias) & 0x3F) << 16) |
-         (uint32_t(p.dest_swap) << 24);
+  return p.dest_endian | (p.dest_format << 7) | (p.dest_number << 13) |
+         ((uint32_t(p.exp_bias) & 0x3F) << 16) | (uint32_t(p.dest_swap) << 24);
 }
 
 bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) {
@@ -867,19 +930,21 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   RenderTarget* rt = depth ? targets_->GetDepth(p.regs, uint32_t(std::max(p.y1, 0)))
                            : targets_->GetColor(p.regs, p.source, uint32_t(std::max(p.y1, 0)));
   if (!rt) {
-    PGR4_LOG_ONCE(log_rt, "PGR4 native resolve: no host target for source {} (surface {:08X})", p.source,
-            p.regs.surface_info);
+    PGR4_LOG_ONCE(log_rt, "PGR4 native resolve: no host target for source {} (surface {:08X})",
+                  p.source, p.regs.surface_info);
     return false;
   }
-  if (p.copy_command == 0 && !depth && ColorRtBppLog2(rt->guest_format) != uint32_t(storage->bpp_log2)) {
-    PGR4_LOG_ONCE(log_raw, "PGR4 native resolve: raw copy from RT format {} into format {}", rt->guest_format,
-            p.dest_format);
+  if (p.copy_command == 0 && !depth &&
+      ColorRtBppLog2(rt->guest_format) != uint32_t(storage->bpp_log2)) {
+    PGR4_LOG_ONCE(log_raw, "PGR4 native resolve: raw copy from RT format {} into format {}",
+                  rt->guest_format, p.dest_format);
     return false;
   }
   if (!depth) targets_->SyncEdram(list, rt);
   // Clip the rectangle to the source target and the destination level.
   int32_t x0 = std::max(p.x0, 0), y0 = std::max(p.y0, 0);
-  int32_t x1 = std::min<int32_t>(p.x1, int32_t(rt->width)), y1 = std::min<int32_t>(p.y1, int32_t(rt->height));
+  int32_t x1 = std::min<int32_t>(p.x1, int32_t(rt->width)),
+          y1 = std::min<int32_t>(p.y1, int32_t(rt->height));
   int32_t dx = p.dest_x + (x0 - p.x0), dy = p.dest_y + (y0 - p.y0);
   x1 = std::min<int32_t>(x1, x0 + int32_t(p.dest_width) - dx);
   y1 = std::min<int32_t>(y1, y0 + int32_t(p.dest_height) - dy);
@@ -888,15 +953,16 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
 
   Image* img = GetImage(p);
   if (!img) {
-    PGR4_LOG_ONCE(log_img, "PGR4 native resolve: no host image for format {} {}x{}", p.dest_format, p.dest_width,
-            p.dest_height);
+    PGR4_LOG_ONCE(log_img, "PGR4 native resolve: no host image for format {} {}x{}", p.dest_format,
+                  p.dest_width, p.dest_height);
     return false;
   }
 
   // Descriptors: t0 = color / depth plane, t1 = stencil plane, u0 = the image's UINT view,
   // u1 = its float view (B5G6R5) or the depth float image; null where unused.
   if (heap_next_ + kViewsPerResolve > kHeapPerFrame) {
-    PGR4_LOG_ONCE(log_heap, "PGR4 native resolve: more than {} resolves in a frame; descriptors wrap",
+    PGR4_LOG_ONCE(log_heap,
+                  "PGR4 native resolve: more than {} resolves in a frame; descriptors wrap",
                   kHeapPerFrame / kViewsPerResolve);
     heap_next_ = 0;
   }
@@ -904,12 +970,15 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   heap_next_ += kViewsPerResolve;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += size_t(slot) * heap_stride_;
-  auto view = [&](uint32_t i) { return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + size_t(i) * heap_stride_}; };
+  auto view = [&](uint32_t i) {
+    return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + size_t(i) * heap_stride_};
+  };
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
   gpu.ptr += uint64_t(slot) * heap_stride_;
   D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
   sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  sd.ViewDimension = rt->samples > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+  sd.ViewDimension =
+      rt->samples > 1 ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
   if (rt->samples == 1) sd.Texture2D.MipLevels = 1;
   sd.Format = rt->srv_format;
   device_->CreateShaderResourceView(rt->resource.Get(), &sd, view(0));
@@ -929,10 +998,11 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
   ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
   ud.Format = float_texels ? DXGI_FORMAT_R32_UINT : storage->uav;
-  device_->CreateUnorderedAccessView(float_texels ? nullptr : img->texture.Get(), nullptr, &ud, view(2));
+  device_->CreateUnorderedAccessView(float_texels ? nullptr : img->texture.Get(), nullptr, &ud,
+                                     view(2));
   ud.Format = float_texels ? storage->uav : DXGI_FORMAT_R32_FLOAT;
-  device_->CreateUnorderedAccessView(float_texels ? img->texture.Get() : img->depth_r32f.Get(), nullptr, &ud,
-                                     view(3));
+  device_->CreateUnorderedAccessView(float_texels ? img->texture.Get() : img->depth_r32f.Get(),
+                                     nullptr, &ud, view(3));
 
   // Source readable by the compute shader, the image(s) writable: one barrier batch.
   D3D12_RESOURCE_BARRIER bs[3];
@@ -943,9 +1013,11 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
     rt->state = kSourceState;
   }
   if (img->state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
-    bs[nb++] = TransitionBarrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    bs[nb++] =
+        TransitionBarrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (img->depth_r32f)
-      bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), img->state,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   if (nb) list->ResourceBarrier(nb, bs);
   ShaderConstants c = {};
@@ -972,8 +1044,11 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
 
   if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p, GpuTimer::kResolveRelease));
   nb = 0;
-  bs[nb++] = TransitionBarrier(img->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
-  if (img->depth_r32f) bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
+  bs[nb++] =
+      TransitionBarrier(img->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
+  if (img->depth_r32f)
+    bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 kImageReadState);
   list->ResourceBarrier(nb, bs);
   img->state = kImageReadState;
   img->view.width = std::max(img->view.width, uint32_t(dx) + w);
@@ -995,8 +1070,8 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
     cp.stencil = p.clear_stencil;
     cp.rects.push_back({LONG(x0), LONG(y0), LONG(x1), LONG(y1)});
     if (p.edram_x || p.edram_y)
-      cp.edram_rects.push_back({LONG(x0 - p.edram_x), LONG(y0 - p.edram_y), LONG(x1 - p.edram_x),
-                                LONG(y1 - p.edram_y)});
+      cp.edram_rects.push_back(
+          {LONG(x0 - p.edram_x), LONG(y0 - p.edram_y), LONG(x1 - p.edram_x), LONG(y1 - p.edram_y)});
     targets_->Clear(list, p.regs, 0xF, true, uint32_t(std::max(p.y1, 0)), cp);
   }
   return true;
@@ -1005,8 +1080,8 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
 // ---------------------------------------------------------------------------------------------
 // Oracle dumps
 
-void Resolver::DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, Image* img, uint32_t width,
-                          uint32_t height) {
+void Resolver::DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, Image* img,
+                          uint32_t width, uint32_t height) {
   Dump& d = *dump_;
   Dump::Entry e;
   e.p = p;
@@ -1042,7 +1117,8 @@ void Resolver::AfterSwap() {
   }
   d.guest_read = true;
   HoldFullReadback(false);
-  REXLOG_INFO("PGR4 native resolve: read guest memory of {} resolves of frame {}", d.entries.size(), d.frame);
+  REXLOG_INFO("PGR4 native resolve: read guest memory of {} resolves of frame {}", d.entries.size(),
+              d.frame);
 }
 
 void Resolver::DumpBeginFrame(uint64_t completed_fence) {
@@ -1060,7 +1136,8 @@ void Resolver::DumpBeginFrame(uint64_t completed_fence) {
         std::FILE* f = std::fopen((d.dir / (stem + "-native.bin")).string().c_str(), "wb");
         if (f) {
           for (uint32_t y = 0; y < e.height; ++y)
-            std::fwrite(static_cast<const uint8_t*>(data) + size_t(y) * e.row_pitch, 1, size_t(e.width) * e.bpp, f);
+            std::fwrite(static_cast<const uint8_t*>(data) + size_t(y) * e.row_pitch, 1,
+                        size_t(e.width) * e.bpp, f);
           std::fclose(f);
         }
         D3D12_RANGE none = {0, 0};
@@ -1071,22 +1148,25 @@ void Resolver::DumpBeginFrame(uint64_t completed_fence) {
         std::fclose(f);
       }
       if (meta)
-        std::fprintf(meta,
-                     "{\"index\":%zu,\"source\":%u,\"surface_info\":%u,\"source_info\":%u,\"sample_select\":%u,"
-                     "\"copy_command\":%u,\"rect\":[%d,%d,%d,%d],\"dest_point\":[%d,%d],\"dest_base\":%u,"
-                     "\"dest_format\":%u,\"dest_width\":%u,\"dest_height\":%u,\"endian\":%u,\"number\":%u,"
-                     "\"swap\":%d,\"exp_bias\":%d,\"tiled\":%d,\"pitch_blocks\":%u,\"extent_bytes\":%u,"
-                     "\"bpp\":%u,\"native_width\":%u,\"native_height\":%u,\"clear_flags\":%u,"
-                     "\"copy_control\":%u,\"dest_info\":%u}\n",
-                     i, p.source, p.regs.surface_info, p.source == 4 ? p.regs.depth_info : p.regs.color_info[p.source & 3],
-                     p.sample_select, p.copy_command, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y, p.dest_base,
-                     p.dest_format, p.dest_width, p.dest_height, p.dest_endian, p.dest_number, p.dest_swap ? 1 : 0,
-                     p.exp_bias, p.dest_tiled ? 1 : 0, p.dest_pitch_blocks, p.dest_extent_bytes, e.bpp, e.width,
-                     e.height, p.clear_flags, CopyControlOf(p), DestInfoOf(p));
+        std::fprintf(
+            meta,
+            "{\"index\":%zu,\"source\":%u,\"surface_info\":%u,\"source_info\":%u,\"sample_select\":"
+            "%u,"
+            "\"copy_command\":%u,\"rect\":[%d,%d,%d,%d],\"dest_point\":[%d,%d],\"dest_base\":%u,"
+            "\"dest_format\":%u,\"dest_width\":%u,\"dest_height\":%u,\"endian\":%u,\"number\":%u,"
+            "\"swap\":%d,\"exp_bias\":%d,\"tiled\":%d,\"pitch_blocks\":%u,\"extent_bytes\":%u,"
+            "\"bpp\":%u,\"native_width\":%u,\"native_height\":%u,\"clear_flags\":%u,"
+            "\"copy_control\":%u,\"dest_info\":%u}\n",
+            i, p.source, p.regs.surface_info,
+            p.source == 4 ? p.regs.depth_info : p.regs.color_info[p.source & 3], p.sample_select,
+            p.copy_command, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y, p.dest_base, p.dest_format,
+            p.dest_width, p.dest_height, p.dest_endian, p.dest_number, p.dest_swap ? 1 : 0,
+            p.exp_bias, p.dest_tiled ? 1 : 0, p.dest_pitch_blocks, p.dest_extent_bytes, e.bpp,
+            e.width, e.height, p.clear_flags, CopyControlOf(p), DestInfoOf(p));
     }
     if (meta) std::fclose(meta);
-    REXLOG_INFO("PGR4 native resolve: dumped {} resolves (native + guest) of frame {} to {}", d.entries.size(),
-                d.frame, d.dir.string());
+    REXLOG_INFO("PGR4 native resolve: dumped {} resolves (native + guest) of frame {} to {}",
+                d.entries.size(), d.frame, d.dir.string());
     d.entries.clear();
     d.guest_read = false;
   }
@@ -1102,7 +1182,6 @@ void Resolver::DumpBeginFrame(uint64_t completed_fence) {
   }
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Self test
 
@@ -1110,10 +1189,13 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
   ComPtr<ID3D12CommandAllocator> alloc;
   ComPtr<ID3D12GraphicsCommandList> list;
   ComPtr<ID3D12Fence> fence;
-  if (Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "selftest allocator") ||
-      Failed(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)),
+  if (Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)),
+             "selftest allocator") ||
+      Failed(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr,
+                                        IID_PPV_ARGS(&list)),
              "selftest list") ||
-      Failed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "selftest fence"))
+      Failed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)),
+             "selftest fence"))
     return false;
   list->Close();
   struct Case {
@@ -1134,27 +1216,203 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
   // 20e4 and 7e3 as xenos.h; halves exact). 7e3 sources go through the EDRAM's 7e3 first:
   // 1e-6 is below 7e3's smallest step and becomes 0, alpha 0.5 becomes 2/3 (2-bit unorm).
   const Case cases[] = {
-      {"8888 1x -> k_8_8_8_8", false, 0, 0, {64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f}, 0, 0, 6, 1, 0, false, 0, {0xFFBF8040u, 0}, 0},
-      {"8888 1x -> k_8_8_8_8 swap", false, 0, 0, {64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f}, 0, 0, 6, 1, 0, true, 0, {0xFF4080BFu, 0}, 0},
-      {"8888 1x raw", false, 0, 0, {64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f}, 0, 0, 6, 0, 0, false, 0, {0xFFBF8040u, 0}, 0},
-      {"7e3 4x avg4 -> k_16_16_16_16_FLOAT", false, 2, 3, {1.5f, 0.25f, 1e-6f, 0.5f}, 0, 0, 32, 1, 6, false, 0,
-       {0x34003E00u, 0x39550000u}, 0},
-      {"7e3 1x -> k_8_8_8_8 (saturate)", false, 0, 3, {1.5f, 0.25f, 0.0f, 0.5f}, 0, 0, 6, 1, 0, false, 0, {0xAA0040FFu, 0}, 0},
+      {"8888 1x -> k_8_8_8_8",
+       false,
+       0,
+       0,
+       {64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f},
+       0,
+       0,
+       6,
+       1,
+       0,
+       false,
+       0,
+       {0xFFBF8040u, 0},
+       0},
+      {"8888 1x -> k_8_8_8_8 swap",
+       false,
+       0,
+       0,
+       {64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f},
+       0,
+       0,
+       6,
+       1,
+       0,
+       true,
+       0,
+       {0xFF4080BFu, 0},
+       0},
+      {"8888 1x raw",
+       false,
+       0,
+       0,
+       {64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f},
+       0,
+       0,
+       6,
+       0,
+       0,
+       false,
+       0,
+       {0xFFBF8040u, 0},
+       0},
+      {"7e3 4x avg4 -> k_16_16_16_16_FLOAT",
+       false,
+       2,
+       3,
+       {1.5f, 0.25f, 1e-6f, 0.5f},
+       0,
+       0,
+       32,
+       1,
+       6,
+       false,
+       0,
+       {0x34003E00u, 0x39550000u},
+       0},
+      {"7e3 1x -> k_8_8_8_8 (saturate)",
+       false,
+       0,
+       3,
+       {1.5f, 0.25f, 0.0f, 0.5f},
+       0,
+       0,
+       6,
+       1,
+       0,
+       false,
+       0,
+       {0xAA0040FFu, 0},
+       0},
       // Ties round to even: 2.5 denormal steps -> 2, 1 + 1/256 -> 1, 1 + 3/256 -> 1 + 2/128.
-      {"7e3 1x ties -> k_16_16_16_16_FLOAT", false, 0, 3, {2.5f / 512, 1.00390625f, 1.01171875f, 1.0f}, 0, 0, 32, 1, 0,
-       false, 0, {0x3C001C00u, 0x3C003C10u}, 0},
-      {"7e3_AS_16 2x avg2 -> k_2_10_10_10", false, 1, 12, {0.5f, 0.25f, 1.0f, 1.0f}, 0, 0, 7, 1, 4, false, 0,
-       {0xFFF40200u, 0}, 0},
-      {"8888 1x -> k_5_6_5", false, 0, 0, {1.0f, 0.0f, 0.0f, 1.0f}, 0, 0, 4, 1, 0, false, 0, {0xF800u, 0}, 0},
-      {"8888 1x -> k_6_5_5", false, 0, 0, {0.0f, 1.0f, 0.0f, 1.0f}, 0, 0, 5, 1, 0, false, 0, {0xF800u, 0}, 0},
-      {"32F 1x -> k_32_FLOAT", false, 0, 14, {3.0f, 0, 0, 0}, 0, 0, 36, 1, 0, false, 0, {0x40400000u, 0}, 0},
-      {"16F 1x bias -1 -> k_16_16_16_16_FLOAT", false, 0, 7, {2.0f, 1.0f, 0.5f, 4.0f}, 0, 0, 32, 1, 0, false, -1,
-       {0x38003C00u, 0x40003400u}, 0},
-      {"D24FS8 2x raw -> k_8_8_8_8", true, 1, 1, {}, 0.5f, 0x5A, 6, 0, 0, false, 0, {0xE000005Au, 0}, 0.5f},
+      {"7e3 1x ties -> k_16_16_16_16_FLOAT",
+       false,
+       0,
+       3,
+       {2.5f / 512, 1.00390625f, 1.01171875f, 1.0f},
+       0,
+       0,
+       32,
+       1,
+       0,
+       false,
+       0,
+       {0x3C001C00u, 0x3C003C10u},
+       0},
+      {"7e3_AS_16 2x avg2 -> k_2_10_10_10",
+       false,
+       1,
+       12,
+       {0.5f, 0.25f, 1.0f, 1.0f},
+       0,
+       0,
+       7,
+       1,
+       4,
+       false,
+       0,
+       {0xFFF40200u, 0},
+       0},
+      {"8888 1x -> k_5_6_5",
+       false,
+       0,
+       0,
+       {1.0f, 0.0f, 0.0f, 1.0f},
+       0,
+       0,
+       4,
+       1,
+       0,
+       false,
+       0,
+       {0xF800u, 0},
+       0},
+      {"8888 1x -> k_6_5_5",
+       false,
+       0,
+       0,
+       {0.0f, 1.0f, 0.0f, 1.0f},
+       0,
+       0,
+       5,
+       1,
+       0,
+       false,
+       0,
+       {0xF800u, 0},
+       0},
+      {"32F 1x -> k_32_FLOAT",
+       false,
+       0,
+       14,
+       {3.0f, 0, 0, 0},
+       0,
+       0,
+       36,
+       1,
+       0,
+       false,
+       0,
+       {0x40400000u, 0},
+       0},
+      {"16F 1x bias -1 -> k_16_16_16_16_FLOAT",
+       false,
+       0,
+       7,
+       {2.0f, 1.0f, 0.5f, 4.0f},
+       0,
+       0,
+       32,
+       1,
+       0,
+       false,
+       -1,
+       {0x38003C00u, 0x40003400u},
+       0},
+      {"D24FS8 2x raw -> k_8_8_8_8",
+       true,
+       1,
+       1,
+       {},
+       0.5f,
+       0x5A,
+       6,
+       0,
+       0,
+       false,
+       0,
+       {0xE000005Au, 0},
+       0.5f},
       // 0.5 + 7 ulp: ReXGlue truncates host D32 to 20e4 (round to nearest even would give E00001).
-      {"D24FS8 1x truncate -> k_8_8_8_8", true, 0, 1, {}, std::bit_cast<float>(0x3F000007u), 0x5A, 6, 0, 0, false, 0,
-       {0xE000005Au, 0}, 0.5f},
-      {"D24S8 1x raw -> k_8_8_8_8", true, 0, 0, {}, 0.25f, 0x11, 6, 0, 0, false, 0, {0x40000011u, 0},
+      {"D24FS8 1x truncate -> k_8_8_8_8",
+       true,
+       0,
+       1,
+       {},
+       std::bit_cast<float>(0x3F000007u),
+       0x5A,
+       6,
+       0,
+       0,
+       false,
+       0,
+       {0xE000005Au, 0},
+       0.5f},
+      {"D24S8 1x raw -> k_8_8_8_8",
+       true,
+       0,
+       0,
+       {},
+       0.25f,
+       0x11,
+       6,
+       0,
+       0,
+       false,
+       0,
+       {0x40000011u, 0},
        float(0x400000) / 16777215.0f},
   };
   constexpr uint32_t kPitch = 64, kDestW = 64, kDestH = 32;
@@ -1162,7 +1420,8 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
   uint64_t fence_value = 0;
   bool all_ok = true;
   // Every case through the generic pipeline, then through its specialized one.
-  for (const Pipelines::Specialize mode : {Pipelines::Specialize::kOff, Pipelines::Specialize::kSync}) {
+  for (const Pipelines::Specialize mode :
+       {Pipelines::Specialize::kOff, Pipelines::Specialize::kSync}) {
     const char* const mode_name = mode == Pipelines::Specialize::kOff ? "generic" : "specialized";
     pipelines_->specialize = mode;
     uint32_t index = 0;
@@ -1170,13 +1429,19 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       ResolveParams p;
       p.regs.surface_info = kPitch | (c.msaa << 16);
       const uint32_t base = 1024 + index * 32;  // EDRAM bases the game does not use at start
-      if (c.depth) p.regs.depth_info = base | (c.format << 16);
-      else p.regs.color_info[0] = base | (c.format << 16);
+      if (c.depth)
+        p.regs.depth_info = base | (c.format << 16);
+      else
+        p.regs.color_info[0] = base | (c.format << 16);
       p.source = c.depth ? 4 : 0;
       p.sample_select = c.sample_select;
       p.copy_command = c.copy_command;
-      p.x0 = rx0; p.y0 = ry0; p.x1 = rx1; p.y1 = ry1;
-      p.dest_x = px; p.dest_y = py;
+      p.x0 = rx0;
+      p.y0 = ry0;
+      p.x1 = rx1;
+      p.y1 = ry1;
+      p.dest_x = px;
+      p.dest_y = py;
       p.dest_base = 0xFFF00000u + index * 0x10000u;  // not a guest address: never found by textures
       p.dest_format = c.dest_format;
       p.dest_width = kDestW;
@@ -1210,8 +1475,8 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
           src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
           dst.pResource = readback[k].Get();
           dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-          dst.PlacedFootprint.Footprint = {k ? DXGI_FORMAT_R32_FLOAT : img->storage->resource, kDestW, kDestH, 1,
-                                           row_pitch};
+          dst.PlacedFootprint.Footprint = {k ? DXGI_FORMAT_R32_FLOAT : img->storage->resource,
+                                           kDestW, kDestH, 1, row_pitch};
           list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
       }
@@ -1229,7 +1494,8 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
         const uint8_t* data = nullptr;
         readback[0]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&data)));
         const uint8_t* fdata = nullptr;
-        if (readback[1]) readback[1]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&fdata)));
+        if (readback[1])
+          readback[1]->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&fdata)));
         for (uint32_t y = 0; y < h; ++y) {
           for (uint32_t x = 0; x < w; ++x) {
             const uint8_t* t = data + size_t(py + y) * row_pitch + size_t(px + x) * bpp;
@@ -1259,13 +1525,15 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       const bool pass = img && bad == 0;
       all_ok = all_ok && pass;
       if (pass)
-        REXLOG_INFO("PGR4 native resolve selftest: ok   {} {} ({:08X} {:08X})", mode_name, c.name, c.expect[0],
-                    c.expect[1]);
+        REXLOG_INFO("PGR4 native resolve selftest: ok   {} {} ({:08X} {:08X})", mode_name, c.name,
+                    c.expect[0], c.expect[1]);
       else
-        REXLOG_ERROR("PGR4 native resolve selftest: FAIL {} {}: {} of {} texels wrong, first at ({}, {}) = {:08X} "
-                     "{:08X}, expected {:08X} {:08X}, r32f {} (expected {}){}",
-                     mode_name, c.name, bad, w * h, first_x, first_y, first_bad[0], first_bad[1], c.expect[0],
-                     c.expect[1], r32f_seen, c.expect_r32f, img ? "" : ", resolve failed");
+        REXLOG_ERROR(
+            "PGR4 native resolve selftest: FAIL {} {}: {} of {} texels wrong, first at ({}, {}) = "
+            "{:08X} "
+            "{:08X}, expected {:08X} {:08X}, r32f {} (expected {}){}",
+            mode_name, c.name, bad, w * h, first_x, first_y, first_bad[0], first_bad[1],
+            c.expect[0], c.expect[1], r32f_seen, c.expect_r32f, img ? "" : ", resolve failed");
     }
   }
   return all_ok;

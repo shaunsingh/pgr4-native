@@ -160,9 +160,8 @@ ShaderModifications SelectModifications(const DxbcShaderTranslator& translator,
   uint32_t param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
       ps ? vs.writes_interpolators() &
-               ps->GetInterpolatorInputMask(program_cntl,
-                                            Reg<reg::SQ_CONTEXT_MISC>(regs.sq_context_misc),
-                                            param_gen_pos)
+               ps->GetInterpolatorInputMask(
+                   program_cntl, Reg<reg::SQ_CONTEXT_MISC>(regs.sq_context_misc), param_gen_pos)
          : 0;
 
   // Vertex shader (always a plain host vertex shader: PGR4 does not tessellate).
@@ -229,15 +228,16 @@ ComPtr<ID3D12RootSignature> CreateBindlessRootSignature(ID3D12Device* device) {
   p[kBindlessRoot_BoolLoopConstants] = Cbv(CB::kBoolLoopConstants, D3D12_SHADER_VISIBILITY_ALL);
   D3D12_DESCRIPTOR_RANGE shared[2] = {SharedMemoryRanges(0), SharedMemoryRanges(1)};
   p[kBindlessRoot_SharedMemory] = Table(shared, 2, D3D12_SHADER_VISIBILITY_ALL);
-  D3D12_DESCRIPTOR_RANGE samplers =
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 0, 0);
+  D3D12_DESCRIPTOR_RANGE samplers = Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 0, 0);
   p[kBindlessRoot_SamplerHeap] = Table(&samplers, 1, D3D12_SHADER_VISIBILITY_ALL);
   // The three texture dimensions alias the same unbounded range of the view heap; the bindless
   // descriptor indices in b4 index from its start.
   D3D12_DESCRIPTOR_RANGE views[3] = {
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, uint32_t(Space::kBindlessTextures2DArray), 0),
+      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, uint32_t(Space::kBindlessTextures2DArray),
+            0),
       Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, uint32_t(Space::kBindlessTextures3D), 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, uint32_t(Space::kBindlessTexturesCube), 0),
+      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, UINT_MAX, 0, uint32_t(Space::kBindlessTexturesCube),
+            0),
   };
   p[kBindlessRoot_ViewHeap] = Table(views, 3, D3D12_SHADER_VISIBILITY_ALL);
   D3D12_ROOT_SIGNATURE_DESC desc = {kBindlessRoot_Count, p, 0, nullptr,
@@ -261,8 +261,7 @@ ComPtr<ID3D12RootSignature> CreateBindfulRootSignature(ID3D12Device* device, con
   D3D12_DESCRIPTOR_RANGE shared[2] = {SharedMemoryRanges(0), SharedMemoryRanges(1)};
   p[kBindfulRoot_SharedMemory] = Table(shared, 2, D3D12_SHADER_VISIBILITY_ALL);
   uint32_t n = kBindfulRoot_CountBase;
-  uint32_t textures_start =
-      uint32_t(DxbcShaderTranslator::SRVMainRegister::kBindfulTexturesStart);
+  uint32_t textures_start = uint32_t(DxbcShaderTranslator::SRVMainRegister::kBindfulTexturesStart);
   uint32_t main_space = uint32_t(DxbcShaderTranslator::SRVSpace::kMain);
   D3D12_DESCRIPTOR_RANGE ranges[4] = {
       Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, textures_ps, textures_start, main_space, 0),
@@ -270,9 +269,9 @@ ComPtr<ID3D12RootSignature> CreateBindfulRootSignature(ID3D12Device* device, con
       Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, textures_vs, textures_start, main_space, 0),
       Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, samplers_vs, 0, 0, 0),
   };
-  const D3D12_SHADER_VISIBILITY vis[4] = {D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_PIXEL,
-                                          D3D12_SHADER_VISIBILITY_VERTEX,
-                                          D3D12_SHADER_VISIBILITY_VERTEX};
+  const D3D12_SHADER_VISIBILITY vis[4] = {
+      D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_VERTEX,
+      D3D12_SHADER_VISIBILITY_VERTEX};
   for (uint32_t i = 0; i < 4; ++i) {
     if (ranges[i].NumDescriptors) p[n++] = Table(&ranges[i], 1, vis[i]);
   }

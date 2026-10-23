@@ -14,8 +14,8 @@
 namespace pgr4::native {
 namespace {
 
-constexpr uint32_t kMaxViews = 256;   // RTVs and DSVs each; PGR4 uses ~20 surfaces per frame
-constexpr uint32_t kNullRtvs = 3;     // null RTVs for 1, 2 and 4 samples, at the heap's start
+constexpr uint32_t kMaxViews = 256;     // RTVs and DSVs each; PGR4 uses ~20 surfaces per frame
+constexpr uint32_t kNullRtvs = 3;       // null RTVs for 1, 2 and 4 samples, at the heap's start
 constexpr uint32_t kEdramTiles = 2048;  // 10 MiB of 80x16-sample tiles
 constexpr uint32_t kMaxHeight = 2048;
 
@@ -57,7 +57,9 @@ EdramGrid GridOf(const RenderTarget& rt) {
 }
 
 // Tiles [base, end) under a surface's first `rows` rows of pixels.
-uint32_t GridEnd(const EdramGrid& g, uint32_t rows) { return g.base + (rows * g.dy + 15) / 16 * g.pitch; }
+uint32_t GridEnd(const EdramGrid& g, uint32_t rows) {
+  return g.base + (rows * g.dy + 15) / 16 * g.pitch;
+}
 
 // The EDRAM format a color format stores as (the _AS_ formats only change blending).
 uint32_t StorageFormat(uint32_t color_format) {
@@ -73,7 +75,8 @@ struct GridSpan {
 // same pitch at a whole number of rows from g's base, up to three (a row's tail, whole rows, a
 // row's head) for whole tile rows on another pitch. 0 when it covers nothing of g, -1 when its
 // shape does not map (part of a row on another pitch).
-int32_t MapSpan(uint32_t base, uint32_t pitch, const GridSpan& s, const EdramGrid& g, GridSpan* out) {
+int32_t MapSpan(uint32_t base, uint32_t pitch, const GridSpan& s, const EdramGrid& g,
+                GridSpan* out) {
   const int64_t d = int64_t(base) - int64_t(g.base);  // tiles
   const int64_t p = g.pitch;
   if (pitch == g.pitch && d % p == 0) {
@@ -127,8 +130,8 @@ SurfaceRegs SurfaceRegsFromDevice(const uint8_t* base, uint32_t device) {
 
 DXGI_FORMAT RenderTargets::ColorFormat(uint32_t f) {
   switch (f) {
-    case 0:   // k_8_8_8_8
-    case 1:   // k_8_8_8_8_GAMMA (gamma not applied on the host yet)
+    case 0:  // k_8_8_8_8
+    case 1:  // k_8_8_8_8_GAMMA (gamma not applied on the host yet)
       return DXGI_FORMAT_R8G8B8A8_UNORM;
     case 2:   // k_2_10_10_10
     case 10:  // k_2_10_10_10_AS_10_10_10_10
@@ -137,12 +140,18 @@ DXGI_FORMAT RenderTargets::ColorFormat(uint32_t f) {
     case 12:  // k_2_10_10_10_FLOAT_AS_16_16_16_16: same EDRAM data, 16-bit blending
     case 7:   // k_16_16_16_16_FLOAT
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case 4: return DXGI_FORMAT_R16G16_SNORM;        // k_16_16 (-32..32 on Xenos; scaled)
-    case 5: return DXGI_FORMAT_R16G16B16A16_SNORM;  // k_16_16_16_16
-    case 6: return DXGI_FORMAT_R16G16_FLOAT;
-    case 14: return DXGI_FORMAT_R32_FLOAT;
-    case 15: return DXGI_FORMAT_R32G32_FLOAT;
-    default: return DXGI_FORMAT_UNKNOWN;
+    case 4:
+      return DXGI_FORMAT_R16G16_SNORM;  // k_16_16 (-32..32 on Xenos; scaled)
+    case 5:
+      return DXGI_FORMAT_R16G16B16A16_SNORM;  // k_16_16_16_16
+    case 6:
+      return DXGI_FORMAT_R16G16_FLOAT;
+    case 14:
+      return DXGI_FORMAT_R32_FLOAT;
+    case 15:
+      return DXGI_FORMAT_R32G32_FLOAT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
   }
 }
 
@@ -154,11 +163,13 @@ bool RenderTargets::Initialize(ID3D12Device* device) {
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
   hd.NumDescriptors = kMaxViews + kNullRtvs;
-  if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "RT CreateDescriptorHeap(RTV)"))
+  if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)),
+             "RT CreateDescriptorHeap(RTV)"))
     return false;
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
   hd.NumDescriptors = kMaxViews;
-  if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_)), "RT CreateDescriptorHeap(DSV)"))
+  if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_)),
+             "RT CreateDescriptorHeap(DSV)"))
     return false;
   rtv_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
   dsv_stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
@@ -202,7 +213,8 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   d.Format = rt->resource_format;
   d.SampleDesc.Count = rt->samples;
   d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  d.Flags = rt->depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  d.Flags =
+      rt->depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   const D3D12_RESOURCE_STATES initial =
@@ -216,9 +228,9 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
     return false;
   }
   if (log_)
-    std::fprintf(log_, "rt created %s base %u pitch %u x%u format %d %ux%u%s\n", rt->depth ? "depth" : "color",
-                 rt->edram_base, rt->pitch, rt->samples, int(rt->view_format), uint32_t(d.Width), height,
-                 rt->resource ? " (grown)" : "");
+    std::fprintf(log_, "rt created %s base %u pitch %u x%u format %d %ux%u%s\n",
+                 rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
+                 int(rt->view_format), uint32_t(d.Width), height, rt->resource ? " (grown)" : "");
   Retire(std::move(rt->resource));
   rt->resource = std::move(res);
   rt->state = initial;
@@ -234,14 +246,16 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   if (rt->depth) {
     D3D12_DEPTH_STENCIL_VIEW_DESC v = {};
     v.Format = rt->view_format;
-    v.ViewDimension = rt->samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+    v.ViewDimension =
+        rt->samples > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
     rt->view = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
     rt->view.ptr += size_t(rt->view_index) * dsv_stride_;
     device_->CreateDepthStencilView(rt->resource.Get(), &v, rt->view);
   } else {
     D3D12_RENDER_TARGET_VIEW_DESC v = {};
     v.Format = rt->view_format;
-    v.ViewDimension = rt->samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+    v.ViewDimension =
+        rt->samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
     rt->view = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
     rt->view.ptr += size_t(rt->view_index) * rtv_stride_;
     device_->CreateRenderTargetView(rt->resource.Get(), &v, rt->view);
@@ -249,7 +263,8 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   return true;
 }
 
-RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height) {
+RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t info,
+                                 uint32_t height) {
   const uint32_t pitch = surface_info & 0x3FFF;
   const uint32_t samples = SamplesOf(surface_info);
   const uint32_t base = info & 0xFFF;
@@ -281,8 +296,8 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     wide = Is64bpp(guest_format);
   }
   if (pitch == 0) return nullptr;
-  const uint64_t key = (uint64_t(depth) << 63) | (uint64_t(samples >> 1) << 60) | (uint64_t(base) << 44) |
-                       (uint64_t(pitch) << 30) | uint64_t(view);
+  const uint64_t key = (uint64_t(depth) << 63) | (uint64_t(samples >> 1) << 60) |
+                       (uint64_t(base) << 44) | (uint64_t(pitch) << 30) | uint64_t(view);
   GetMemo& memo = get_memo_[(key ^ (key >> 30) ^ (key >> 44) ^ (key >> 60)) & 15];
   if (memo.rt && memo.key == key && std::min(height, kMaxHeight) <= memo.rt->height) {
     memo.rt->guest_format = guest_format;
@@ -316,8 +331,8 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     if (std::min(height, kMaxHeight) > rt->height) {
       // Taller than anything this surface had: a new, taller target. The old content is lost
       // (not seen in PGR4's traces: every surface is created at its EDRAM height or more).
-      REXLOG_WARN("PGR4 native RT: growing {} base {} pitch {} x{} from {} to {} rows", depth ? "depth" : "color",
-                  base, pitch, samples, rt->height, want);
+      REXLOG_WARN("PGR4 native RT: growing {} base {} pitch {} x{} from {} to {} rows",
+                  depth ? "depth" : "color", base, pitch, samples, rt->height, want);
       if (!Create(rt, want)) return nullptr;
     }
   }
@@ -343,8 +358,8 @@ void RenderTargets::Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt
   rt->state = state;
 }
 
-bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t color_mask,
-                         bool depth_used, uint32_t height, BoundTargets* out) {
+bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
+                         uint32_t color_mask, bool depth_used, uint32_t height, BoundTargets* out) {
   *out = BoundTargets{};
   const uint32_t samples = SamplesOf(regs.surface_info);
   out->samples = samples;
@@ -448,14 +463,17 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
   const float ys = LoadFloat(base, device + kDevShadow2100 + 0x11 * 4);
   const float yo = LoadFloat(base, device + kDevShadow2100 + 0x12 * 4);
   float bottom = std::fabs(ys) + yo;
-  uint32_t height = (bottom > 0.0f && bottom <= float(kMaxHeight)) ? uint32_t(std::ceil(bottom)) : 0;
-  for (const D3D12_RECT& r : p.rects) height = std::max(height, uint32_t(std::max<LONG>(r.bottom, 0)));
+  uint32_t height =
+      (bottom > 0.0f && bottom <= float(kMaxHeight)) ? uint32_t(std::ceil(bottom)) : 0;
+  for (const D3D12_RECT& r : p.rects)
+    height = std::max(height, uint32_t(std::max<LONG>(r.bottom, 0)));
   out->height = height;
   return true;
 }
 
-void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t bound_colors,
-                          bool depth_bound, uint32_t height, const ClearParams& p) {
+void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
+                          uint32_t bound_colors, bool depth_bound, uint32_t height,
+                          const ClearParams& p) {
   const UINT nrects = UINT(p.rects.size());
   const D3D12_RECT* rects = nrects ? p.rects.data() : nullptr;
   // What the clear leaves in the EDRAM, in pixels from the surface's base. A whole-surface
@@ -489,7 +507,8 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
     RenderTarget* rt = GetDepth(regs, height);
     if (rt) {
       Transition(list, rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-      list->ClearDepthStencilView(rt->view, df, std::clamp(p.depth, 0.0f, 1.0f), p.stencil, nrects, rects);
+      list->ClearDepthStencilView(rt->view, df, std::clamp(p.depth, 0.0f, 1.0f), p.stencil, nrects,
+                                  rects);
       if (!fills_.empty()) DropFills(*rt, edram_rows(*rt));
     }
   }
@@ -525,7 +544,9 @@ void RenderTargets::DropFills(const RenderTarget& rt, uint32_t rows) {
   const EdramGrid g = GridOf(rt);
   const uint32_t begin = g.base, end = GridEnd(g, rows);
   fills_.erase(std::remove_if(fills_.begin(), fills_.end(),
-                              [&](const EdramFill& f) { return f.first_tile() < end && f.end_tile() > begin; }),
+                              [&](const EdramFill& f) {
+                                return f.first_tile() < end && f.end_tile() > begin;
+                              }),
                fills_.end());
 }
 
@@ -543,8 +564,11 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
     const int32_t n = MapSpan(f.base, f.pitch, {f.x0, f.x1, f.y0, f.y1}, g, spans);
     if (n < 0) {
       if (log_shape++ < 4)
-        REXLOG_INFO("PGR4 native RT: EDRAM fill at tile {} pitch {} ({}x{} dwords x rows) does not map onto base {} "
-                    "pitch {}", f.base, f.pitch, f.x1 - f.x0, f.y1 - f.y0, g.base, g.pitch);
+        REXLOG_INFO(
+            "PGR4 native RT: EDRAM fill at tile {} pitch {} ({}x{} dwords x rows) does not map "
+            "onto base {} "
+            "pitch {}",
+            f.base, f.pitch, f.x1 - f.x0, f.y1 - f.y0, g.base, g.pitch);
       continue;
     }
     // The whole pixels inside each span, clipped to the target.
@@ -560,19 +584,29 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
     if (!nr) continue;
     if (f.format != format) {
       if (log_format++ < 4)
-        REXLOG_INFO("PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at base {}", f.format,
-                    f.base, format, g.base);
+        REXLOG_INFO(
+            "PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at base "
+            "{}",
+            f.format, f.base, format, g.base);
       continue;
     }
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ClearRenderTargetView(rt->view, f.color, nr, rects);
     if (log_)
-      std::fprintf(log_, "edram fill seq %llu at tile %u pitch %u color %g,%g,%g,%g applied to base %u pitch %u x%u "
-                   "rows %ld-%ld (%u rects)\n", (unsigned long long)f.seq, f.base, f.pitch, f.color[0], f.color[1],
-                   f.color[2], f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom, nr);
+      std::fprintf(log_,
+                   "edram fill seq %llu at tile %u pitch %u color %g,%g,%g,%g applied to base %u "
+                   "pitch %u x%u "
+                   "rows %ld-%ld (%u rects)\n",
+                   (unsigned long long)f.seq, f.base, f.pitch, f.color[0], f.color[1], f.color[2],
+                   f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom,
+                   nr);
     if (log_applied++ < 4)
-      REXLOG_INFO("PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} pitch {} x{} rows "
-                  "{}-{}", f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom);
+      REXLOG_INFO(
+          "PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} pitch {} "
+          "x{} rows "
+          "{}-{}",
+          f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top,
+          rects[nr - 1].bottom);
   }
 }
 

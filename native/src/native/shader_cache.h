@@ -18,11 +18,11 @@
 namespace pgr4::native {
 
 struct ShaderCacheStats {
-  uint64_t shaders = 0;            // distinct ucode loaded
-  uint64_t translations = 0;       // distinct (ucode, modification) translated
-  uint64_t failures = 0;           // translations that came out invalid
-  double analyze_us = 0;           // total ucode analysis time
-  double translate_us = 0;         // total translation time
+  uint64_t shaders = 0;       // distinct ucode loaded
+  uint64_t translations = 0;  // distinct (ucode, modification) translated
+  uint64_t failures = 0;      // translations that came out invalid
+  double analyze_us = 0;      // total ucode analysis time
+  double translate_us = 0;    // total translation time
   double max_translate_us = 0;
 };
 

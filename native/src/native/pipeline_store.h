@@ -30,8 +30,8 @@ namespace pgr4::native {
 class PipelineStore {
  public:
   struct Shader {
-    uint32_t type;                 // xenos::ShaderType
-    std::vector<uint32_t> ucode;   // as in guest memory (big-endian)
+    uint32_t type;                // xenos::ShaderType
+    std::vector<uint32_t> ucode;  // as in guest memory (big-endian)
   };
   struct Pipeline {
     uint64_t vs_hash, vs_mod, ps_hash, ps_mod;  // ucode_data_hash and modification; ps_hash 0: none

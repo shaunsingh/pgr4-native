@@ -1,6 +1,7 @@
-// Geometry shader generation: CreateGeometryShader is d3d12::PipelineCache::CreateDxbcGeometryShader
-// from ReXGlue's src/graphics/d3d12/pipeline_cache.cpp, unchanged except for its signature (Xenia,
-// Copyright Ben Vanik, BSD-3; adapted for ReXGlue by Tom Clay).
+// Geometry shader generation: CreateGeometryShader is
+// d3d12::PipelineCache::CreateDxbcGeometryShader from ReXGlue's
+// src/graphics/d3d12/pipeline_cache.cpp, unchanged except for its signature (Xenia, Copyright Ben
+// Vanik, BSD-3; adapted for ReXGlue by Tom Clay).
 #include "geometry_shader.h"
 
 #include <algorithm>
@@ -23,21 +24,28 @@ using PipelineGeometryShader = GeometryShaderType;
 
 GeometryShaderType GeometryShaderForPrimitive(xenos::PrimitiveType type) {
   switch (type) {
-    case xenos::PrimitiveType::kPointList: return GeometryShaderType::kPointList;
-    case xenos::PrimitiveType::kRectangleList: return GeometryShaderType::kRectangleList;
-    case xenos::PrimitiveType::kQuadList: return GeometryShaderType::kQuadList;
-    default: return GeometryShaderType::kNone;
+    case xenos::PrimitiveType::kPointList:
+      return GeometryShaderType::kPointList;
+    case xenos::PrimitiveType::kRectangleList:
+      return GeometryShaderType::kRectangleList;
+    case xenos::PrimitiveType::kQuadList:
+      return GeometryShaderType::kQuadList;
+    default:
+      return GeometryShaderType::kNone;
   }
 }
 
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeForPrimitive(xenos::PrimitiveType type) {
   switch (type) {
-    case xenos::PrimitiveType::kPointList: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    case xenos::PrimitiveType::kPointList:
+      return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
     case xenos::PrimitiveType::kLineList:
     case xenos::PrimitiveType::kLineStrip:
     case xenos::PrimitiveType::kQuadList:  // lines with adjacency
-    case xenos::PrimitiveType::k2DLineStrip: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
-    default: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    case xenos::PrimitiveType::k2DLineStrip:
+      return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    default:
+      return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   }
 }
 
@@ -159,7 +167,7 @@ void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shad
       auto rdef_constants =
           reinterpret_cast<dxbc::RdefVariable*>(shader_out.data() + rdef_constants_position_dwords);
       // float2 xe_point_constant_diameter
-      static_assert(sizeof(DxbcShaderTranslator::SystemConstants ::point_constant_diameter) ==
+      static_assert(sizeof(DxbcShaderTranslator::SystemConstants::point_constant_diameter) ==
                         sizeof(float) * 2,
                     "DxbcShaderTranslator point_constant_diameter system constant size "
                     "differs between the shader translator and geometry shader "
@@ -178,7 +186,7 @@ void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shad
       rdef_constant_point_constant_diameter.start_sampler = UINT32_MAX;
       // float2 xe_point_screen_diameter_to_ndc_radius
       static_assert(
-          sizeof(DxbcShaderTranslator::SystemConstants ::point_screen_diameter_to_ndc_radius) ==
+          sizeof(DxbcShaderTranslator::SystemConstants::point_screen_diameter_to_ndc_radius) ==
               sizeof(float) * 2,
           "DxbcShaderTranslator point_screen_diameter_to_ndc_radius system "
           "constant size differs between the shader translator and geometry "

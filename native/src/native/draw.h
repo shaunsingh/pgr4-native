@@ -66,10 +66,10 @@ struct VertexCopy {
 struct DrawPrep {
   rex::graphics::DxbcShader* vs = nullptr;  // nullptr: no vertex shader (the draw is dropped)
   rex::graphics::DxbcShader* ps = nullptr;
-  bool upload_ok = true;                    // every vertex/index range was copied
-  const VertexCopy* copies = nullptr;       // set by the render side before OnDraw
+  bool upload_ok = true;               // every vertex/index range was copied
+  const VertexCopy* copies = nullptr;  // set by the render side before OnDraw
   uint32_t copy_count = 0;
-  bool copy_segment = false;                // Prepare: the draw's copies start a copy segment
+  bool copy_segment = false;  // Prepare: the draw's copies start a copy segment
   // Triangle fans: the converted host indices in upload memory.
   D3D12_GPU_VIRTUAL_ADDRESS fan_indices = 0;
   uint32_t fan_count = 0;
@@ -83,25 +83,25 @@ struct DrawPrep {
 class DrawRenderer {
  public:
   struct Stats {
-    uint64_t draws = 0;           // issued host draws
-    uint64_t skipped = 0;         // dropped like the plugin does: nothing to draw or write
-    uint64_t unsupported = 0;     // see the header comment; logged once per reason
-    uint64_t failed = 0;          // shader/PSO/RT/upload failures
+    uint64_t draws = 0;        // issued host draws
+    uint64_t skipped = 0;      // dropped like the plugin does: nothing to draw or write
+    uint64_t unsupported = 0;  // see the header comment; logged once per reason
+    uint64_t failed = 0;       // shader/PSO/RT/upload failures
     uint64_t pso_created = 0;
-    uint64_t pso_pending = 0;     // draws skipped while their pipeline compiles (async)
-    uint64_t pso_generic = 0;     // draws on unspecialized shaders while a specialization compiles
-    uint64_t pso_wait_us = 0;     // the frame waiting for the pipelines of its skipped draws
-    uint64_t upload_bytes = 0;    // guest memory copied into shared memory
-    uint64_t uploads = 0;         // copy regions recorded
+    uint64_t pso_pending = 0;   // draws skipped while their pipeline compiles (async)
+    uint64_t pso_generic = 0;   // draws on unspecialized shaders while a specialization compiles
+    uint64_t pso_wait_us = 0;   // the frame waiting for the pipelines of its skipped draws
+    uint64_t upload_bytes = 0;  // guest memory copied into shared memory
+    uint64_t uploads = 0;       // copy regions recorded
     uint64_t textures = 0, textures_missing = 0;  // bindings; missing = null SRV bound
     uint64_t textures_stale = 0;  // bindings for draws queued before a newer guest write
     uint64_t srv_lookups = 0, srv_created = 0, samplers_created = 0;
-    uint64_t views = 0;           // texture views in the bindless heap (at the frame's end)
+    uint64_t views = 0;  // texture views in the bindless heap (at the frame's end)
     uint64_t bind_memo_hits = 0, bind_memo_misses = 0;  // whole-shader texture binding memo
-    uint64_t watch_faults = 0;    // guest writes caught by a page watch (any watcher), per frame
-    uint64_t copy_batches = 0;    // groups of shared-memory copies, each between two barriers
+    uint64_t watch_faults = 0;  // guest writes caught by a page watch (any watcher), per frame
+    uint64_t copy_batches = 0;  // groups of shared-memory copies, each between two barriers
     uint64_t watch_arms = 0, watch_arm_pages = 0;  // vertex/index watches armed (calls, pages)
-    uint64_t hash_pages = 0, hash_copies = 0;  // hot pages hashed, and copied as they changed
+    uint64_t hash_pages = 0, hash_copies = 0;      // hot pages hashed, and copied as they changed
     // --pgr4_native_coherency_check: pages whose guest memory differed from shared memory's
     // copy although the page watch said it was current, and pages rewritten after a draw of
     // the frame read them.

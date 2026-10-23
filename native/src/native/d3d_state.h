@@ -101,14 +101,14 @@ struct DrawState {
 
   HookFn fn{};
   uint32_t device = 0;
-  uint32_t primitive = 0;    // xenos::PrimitiveType (VGT_DRAW_INITIATOR bits 0-5)
-  uint32_t count = 0;        // indices (indexed) or vertices
+  uint32_t primitive = 0;  // xenos::PrimitiveType (VGT_DRAW_INITIATOR bits 0-5)
+  uint32_t count = 0;      // indices (indexed) or vertices
   bool indexed = false;
   // Index buffer (indexed draws): physical address of the first index of this draw.
   uint32_t index_address = 0;
   bool index_32bit = false;
-  uint32_t index_endian = 0;     // xenos::Endian of the indices
-  uint32_t base_vertex = 0;      // = regs[0x2102] VGT_INDX_OFFSET
+  uint32_t index_endian = 0;  // xenos::Endian of the indices
+  uint32_t base_vertex = 0;   // = regs[0x2102] VGT_INDX_OFFSET
   // BeginVertices / DrawVerticesUP: inline vertices in the push buffer (vfetch 95).
   uint32_t inline_vertices = 0;  // physical, 0 if none
 

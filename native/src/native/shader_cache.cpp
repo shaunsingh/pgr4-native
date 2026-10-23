@@ -19,7 +19,8 @@ namespace pgr4::native {
 
 namespace {
 double Us(std::chrono::steady_clock::time_point since) {
-  return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - since).count();
+  return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - since)
+      .count();
 }
 }  // namespace
 

@@ -112,9 +112,10 @@ class UploadPool {
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (created_ > reserved_ && created_ <= reserved_ + 32)
-      REXLOG_INFO("PGR4 native: upload block {} of {} MB created during play in {:.2f} ms (pool "
-                  "of {} MB blocks, {} reserved)",
-                  created_, size >> 20, ms, block_size_ >> 20, reserved_);
+      REXLOG_INFO(
+          "PGR4 native: upload block {} of {} MB created during play in {:.2f} ms (pool "
+          "of {} MB blocks, {} reserved)",
+          created_, size >> 20, ms, block_size_ >> 20, reserved_);
     return b;
   }
   bool NewBlock(uint64_t size, uint64_t fence) {

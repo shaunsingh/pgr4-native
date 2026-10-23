@@ -101,16 +101,17 @@ struct NativeRenderer::Csv {
   // Profile: RDTSC calibration (ticks and ns at start-up) and the window's stage ticks.
   uint64_t tsc0 = 0, ns0 = 0;
   uint64_t stage_ticks[profile::kStageCount] = {}, track_calls = 0;
-  TextureCache::Stats tex_prev;  // texture counters at the previous CSV row
+  TextureCache::Stats tex_prev;                  // texture counters at the previous CSV row
   uint64_t evicted_prev = 0, evict_ns_prev = 0;  // the same for every row (tex_prev: profile)
-  bool luma = false;             // --pgr4_native_luma_probe columns
+  bool luma = false;                             // --pgr4_native_luma_probe columns
   ~Csv() {
     if (file) std::fclose(file);
   }
 };
 
 namespace {
-std::atomic<bool> g_failed{false};  // set once the device or swapchain failed; the native path stops
+// Set once the device or swapchain failed; the native path stops.
+std::atomic<bool> g_failed{false};
 
 // The game window: the process's visible, unowned top-level window (the SDK's), not ours.
 HWND FindGameWindow() {
@@ -239,8 +240,7 @@ struct NativeRenderer::Queue {
 };
 
 NativeRenderer* NativeRenderer::Get() {
-  if (!(REXCVAR_GET(pgr4_native) || REXCVAR_GET(pgr4_native_primary)) || g_failed)
-    return nullptr;
+  if (!(REXCVAR_GET(pgr4_native) || REXCVAR_GET(pgr4_native_primary)) || g_failed) return nullptr;
   // Never destroyed: the process exits with the game, and the guest thread may still be in a
   // hook during static destruction.
   static NativeRenderer* r = [] {
@@ -299,13 +299,15 @@ bool NativeRenderer::Initialize() {
   // Only once native is up: from here the Xenos plugin does no draw, copy or swap work, and its
   // command processor only runs fences, write-backs and interrupts.
   if (primary && !rex::cvar::SetFlagByName("gpu_skip_draws", "true"))
-    REXLOG_ERROR("PGR4 native: could not set gpu_skip_draws (rexglue-native-primary.patch missing?); "
-                 "Xenos keeps drawing");
+    REXLOG_ERROR(
+        "PGR4 native: could not set gpu_skip_draws (rexglue-native-primary.patch missing?); "
+        "Xenos keeps drawing");
   // A handheld has no keyboard for the replay name prompt; the title's default name is what
   // confirming the dialog unchanged returns.
   if (primary && !rex::cvar::SetFlagByName("xam_keyboard_accept_default", "true"))
-    REXLOG_ERROR("PGR4 native: could not set xam_keyboard_accept_default "
-                 "(rexglue-native-primary.patch missing?)");
+    REXLOG_ERROR(
+        "PGR4 native: could not set xam_keyboard_accept_default "
+        "(rexglue-native-primary.patch missing?)");
   csv_ = std::make_unique<Csv>();
   profile::g.on = REXCVAR_GET(pgr4_native_profile);
   csv_->tsc0 = profile::Now();
@@ -314,21 +316,24 @@ bool NativeRenderer::Initialize() {
   if (!path.empty()) {
     csv_->file = std::fopen(path.c_str(), "w");
     if (csv_->file) {
-      std::fprintf(csv_->file,
-                   "frame,draws,clears,resolves,state_fail,draw_us,clear_us,resolve_us,swap_us,"
-                   "us_per_draw,frame_ms,host_draws,skipped,unsupported,failed,pso_created,"
-                   "upload_kb,textures,textures_missing,front_buffer,hook_us,hook_wait_us,"
-                   "reg_writes,swap_untile_us,swap_submit_us,swap_present_us,swap_fence_us,"
-                   "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
-                   "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,coh_stale,coh_late,coh_gpu,coh_regs,"
-                   "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic,"
-                   "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry,submits");
+      std::fprintf(
+          csv_->file,
+          "frame,draws,clears,resolves,state_fail,draw_us,clear_us,resolve_us,swap_us,"
+          "us_per_draw,frame_ms,host_draws,skipped,unsupported,failed,pso_created,"
+          "upload_kb,textures,textures_missing,front_buffer,hook_us,hook_wait_us,"
+          "reg_writes,swap_untile_us,swap_submit_us,swap_present_us,swap_fence_us,"
+          "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
+          "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,"
+          "coh_stale,coh_late,coh_gpu,coh_regs,"
+          "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic,"
+          "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry,submits");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
-        std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
-                                 "tex_uploads,tex_upload_kb,tex_upload_us,tex_untile_us,"
-                                 "tex_resolved_copies,tex_copy_resolved_us,tex_resolved_aliases,srv_lookups,"
-                                 "srv_created,samplers_created,bind_hits,bind_misses");
+        std::fprintf(csv_->file,
+                     ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
+                     "tex_uploads,tex_upload_kb,tex_upload_us,tex_untile_us,"
+                     "tex_resolved_copies,tex_copy_resolved_us,tex_resolved_aliases,srv_lookups,"
+                     "srv_created,samplers_created,bind_hits,bind_misses");
         for (const char* n : profile::kCounterNames) std::fprintf(csv_->file, ",%s", n);
       }
       csv_->luma = REXCVAR_GET(pgr4_native_luma_probe);
@@ -401,8 +406,12 @@ void NativeRenderer::RenderThreadMain() {
           ExecuteDraw(d.state, &d.prep);
           break;
         }
-        case Queue::kClear: ExecuteClear(b->clears[c.index]); break;
-        case Queue::kResolve: ExecuteResolve(b->resolves[c.index]); break;
+        case Queue::kClear:
+          ExecuteClear(b->clears[c.index]);
+          break;
+        case Queue::kResolve:
+          ExecuteResolve(b->resolves[c.index]);
+          break;
         case Queue::kSwap: {
           const Queue::SwapCmd& s = b->swaps[c.index];
           if (!g_failed) {
@@ -691,58 +700,61 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
   }
   if (csv_->file) {
     const DrawRenderer::Stats& ds = draw_->stats();
-    std::fprintf(csv_->file,
-                 "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
-                 "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
-                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu,"
-                 "%04X,%u,%u,%d,%d,%d,%d,%llu",
-                 (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
-                 (unsigned long long)s.clears, (unsigned long long)s.resolves,
-                 (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
-                 s.resolve_ns / 1000.0, s.swap_ns / 1000.0, us_per_draw, frame_ns / 1e6,
-                 (unsigned long long)ds.draws, (unsigned long long)ds.skipped,
-                 (unsigned long long)ds.unsupported, (unsigned long long)ds.failed,
-                 (unsigned long long)ds.pso_created, ds.upload_bytes / 1024.0,
-                 (unsigned long long)ds.textures, (unsigned long long)ds.textures_missing,
-                 present_->front_buffer_found() ? 1 : 0, s.hook_ns / 1000.0, s.hook_wait_ns / 1000.0,
-                 (unsigned long long)s.reg_writes, s.swap_untile_ns / 1000.0,
-                 s.swap_submit_ns / 1000.0, s.swap_present_ns / 1000.0, s.swap_fence_ns / 1000.0,
-                 s.hook_max_ns / 1000.0, (unsigned long long)ds.watch_faults,
-                 gpu_timer_ ? gpu_timer_->last_frame_ms() : 0.0, (unsigned long long)ds.copy_batches,
-                 (unsigned long long)ds.watch_arms, (unsigned long long)ds.watch_arm_pages,
-                 NowNs() / 1e6, (unsigned long long)ds.hash_pages,
-                 (unsigned long long)ds.hash_copies, (unsigned long long)ds.pso_pending,
-                 (unsigned long long)ds.pso_wait_us, (unsigned long long)s.frames_held,
-                 (unsigned long long)ds.textures_stale, (unsigned long long)ds.stale_pages,
-                 (unsigned long long)ds.late_pages, (unsigned long long)ds.gpu_mismatch_pages,
-                 (unsigned long long)ds.reg_mismatches, textures_->resident_bytes() / 1048576.0,
-                 (unsigned long long)textures_->texture_count(),
-                 (unsigned long long)(textures_->stats().evicted - csv_->evicted_prev),
-                 (textures_->stats().evict_ns - csv_->evict_ns_prev) / 1000.0,
-                 (unsigned long long)ds.views, (unsigned long long)ds.pso_generic,
-                 unsigned(s.pad & 0xFFFF), unsigned(uint8_t(s.pad >> 16)), unsigned(uint8_t(s.pad >> 24)),
-                 int(int8_t(s.pad >> 32)), int(int8_t(s.pad >> 40)), int(int8_t(s.pad >> 48)),
-                 int(int8_t(s.pad >> 56)), (unsigned long long)s.submits);
+    std::fprintf(
+        csv_->file,
+        "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
+        "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
+        "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu,"
+        "%04X,%u,%u,%d,%d,%d,%d,%llu",
+        (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
+        (unsigned long long)s.clears, (unsigned long long)s.resolves,
+        (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
+        s.resolve_ns / 1000.0, s.swap_ns / 1000.0, us_per_draw, frame_ns / 1e6,
+        (unsigned long long)ds.draws, (unsigned long long)ds.skipped,
+        (unsigned long long)ds.unsupported, (unsigned long long)ds.failed,
+        (unsigned long long)ds.pso_created, ds.upload_bytes / 1024.0,
+        (unsigned long long)ds.textures, (unsigned long long)ds.textures_missing,
+        present_->front_buffer_found() ? 1 : 0, s.hook_ns / 1000.0, s.hook_wait_ns / 1000.0,
+        (unsigned long long)s.reg_writes, s.swap_untile_ns / 1000.0, s.swap_submit_ns / 1000.0,
+        s.swap_present_ns / 1000.0, s.swap_fence_ns / 1000.0, s.hook_max_ns / 1000.0,
+        (unsigned long long)ds.watch_faults, gpu_timer_ ? gpu_timer_->last_frame_ms() : 0.0,
+        (unsigned long long)ds.copy_batches, (unsigned long long)ds.watch_arms,
+        (unsigned long long)ds.watch_arm_pages, NowNs() / 1e6, (unsigned long long)ds.hash_pages,
+        (unsigned long long)ds.hash_copies, (unsigned long long)ds.pso_pending,
+        (unsigned long long)ds.pso_wait_us, (unsigned long long)s.frames_held,
+        (unsigned long long)ds.textures_stale, (unsigned long long)ds.stale_pages,
+        (unsigned long long)ds.late_pages, (unsigned long long)ds.gpu_mismatch_pages,
+        (unsigned long long)ds.reg_mismatches, textures_->resident_bytes() / 1048576.0,
+        (unsigned long long)textures_->texture_count(),
+        (unsigned long long)(textures_->stats().evicted - csv_->evicted_prev),
+        (textures_->stats().evict_ns - csv_->evict_ns_prev) / 1000.0, (unsigned long long)ds.views,
+        (unsigned long long)ds.pso_generic, unsigned(s.pad & 0xFFFF),
+        unsigned(uint8_t(s.pad >> 16)), unsigned(uint8_t(s.pad >> 24)), int(int8_t(s.pad >> 32)),
+        int(int8_t(s.pad >> 40)), int(int8_t(s.pad >> 48)), int(int8_t(s.pad >> 56)),
+        (unsigned long long)s.submits);
     csv_->evicted_prev = textures_->stats().evicted;
     csv_->evict_ns_prev = textures_->stats().evict_ns;
     if (profile::g.on) {
-      for (uint64_t t : profile::g.ticks) std::fprintf(csv_->file, ",%.1f", double(t) / ticks_per_us);
+      for (uint64_t t : profile::g.ticks)
+        std::fprintf(csv_->file, ",%.1f", double(t) / ticks_per_us);
       std::fprintf(csv_->file, ",%llu", (unsigned long long)profile::g.track_calls);
       const TextureCache::Stats& t = textures_->stats();
       TextureCache::Stats& p = csv_->tex_prev;
-      std::fprintf(csv_->file, ",%llu,%llu,%.1f,%llu,%.1f,%.1f,%.1f,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%llu",
-                   (unsigned long long)(t.memo_misses - p.memo_misses),
-                   (unsigned long long)(t.created - p.created), (t.create_ns - p.create_ns) / 1000.0,
-                   (unsigned long long)(t.uploads - p.uploads),
-                   (t.upload_bytes - p.upload_bytes) / 1024.0, (t.upload_ns - p.upload_ns) / 1000.0,
-                   (t.untile_ns - p.untile_ns) / 1000.0,
-                   (unsigned long long)(t.resolved_copies - p.resolved_copies),
-                   (t.copy_resolved_ns - p.copy_resolved_ns) / 1000.0,
-                   (unsigned long long)(t.resolved_aliases - p.resolved_aliases), (unsigned long long)ds.srv_lookups, (unsigned long long)ds.srv_created,
-                   (unsigned long long)ds.samplers_created, (unsigned long long)ds.bind_memo_hits,
-                   (unsigned long long)ds.bind_memo_misses);
+      std::fprintf(
+          csv_->file, ",%llu,%llu,%.1f,%llu,%.1f,%.1f,%.1f,%llu,%.1f,%llu,%llu,%llu,%llu,%llu,%llu",
+          (unsigned long long)(t.memo_misses - p.memo_misses),
+          (unsigned long long)(t.created - p.created), (t.create_ns - p.create_ns) / 1000.0,
+          (unsigned long long)(t.uploads - p.uploads), (t.upload_bytes - p.upload_bytes) / 1024.0,
+          (t.upload_ns - p.upload_ns) / 1000.0, (t.untile_ns - p.untile_ns) / 1000.0,
+          (unsigned long long)(t.resolved_copies - p.resolved_copies),
+          (t.copy_resolved_ns - p.copy_resolved_ns) / 1000.0,
+          (unsigned long long)(t.resolved_aliases - p.resolved_aliases),
+          (unsigned long long)ds.srv_lookups, (unsigned long long)ds.srv_created,
+          (unsigned long long)ds.samplers_created, (unsigned long long)ds.bind_memo_hits,
+          (unsigned long long)ds.bind_memo_misses);
       p = t;
-      for (uint64_t c : profile::g.counters) std::fprintf(csv_->file, ",%llu", (unsigned long long)c);
+      for (uint64_t c : profile::g.counters)
+        std::fprintf(csv_->file, ",%llu", (unsigned long long)c);
     }
     if (csv_->luma) {
       const LumaProbe& l = present_->luma_probe();
@@ -772,12 +784,13 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
   const int32_t every = REXCVAR_GET(pgr4_d3d_stats_frames);
   if (every > 0 && w.frames >= uint64_t(every)) {
     const double n = double(w.frames);
-    REXLOG_INFO("PGR4 native: frames {} | per frame: draws {:.1f}, draw CPU {:.1f} us "
-                "({:.4f} us/draw), swap {:.1f} us, frame {:.2f} ms, game thread {:.1f} us "
-                "(waiting {:.1f} us)",
-                frame_index_, w.draws / n, w.draw_ns / 1000.0 / n,
-                w.draws ? w.draw_ns / 1000.0 / double(w.draws) : 0.0, w.swap_ns / 1000.0 / n,
-                w.frame_ns / 1e6 / n, w.hook_ns / 1000.0 / n, w.hook_wait_ns / 1000.0 / n);
+    REXLOG_INFO(
+        "PGR4 native: frames {} | per frame: draws {:.1f}, draw CPU {:.1f} us "
+        "({:.4f} us/draw), swap {:.1f} us, frame {:.2f} ms, game thread {:.1f} us "
+        "(waiting {:.1f} us)",
+        frame_index_, w.draws / n, w.draw_ns / 1000.0 / n,
+        w.draws ? w.draw_ns / 1000.0 / double(w.draws) : 0.0, w.swap_ns / 1000.0 / n,
+        w.frame_ns / 1e6 / n, w.hook_ns / 1000.0 / n, w.hook_wait_ns / 1000.0 / n);
     if (profile::g.on && w.draws) {
       // ns per draw for each stage (the hook-side ones are per draw too, for comparison).
       std::string line;

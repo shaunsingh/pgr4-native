@@ -28,12 +28,12 @@ namespace pgr4::native {
 // read the same guest memory the same way, so they share one host texture; the swizzle,
 // signedness, filtering and clamping stay per binding.
 struct TextureKey {
-  uint32_t base_page = 0;   // physical base address >> 12 (0: no base level)
-  uint32_t mip_page = 0;    // physical mip address >> 12 (0: no mips)
-  uint32_t width = 0;       // texels
+  uint32_t base_page = 0;  // physical base address >> 12 (0: no base level)
+  uint32_t mip_page = 0;   // physical mip address >> 12 (0: no mips)
+  uint32_t width = 0;      // texels
   uint32_t height = 0;
   uint32_t depth_or_array_size = 0;  // 3D depth, or array layers (6 for cube)
-  uint32_t pitch = 0;       // base row pitch in texels / 32 (fetch dword 0)
+  uint32_t pitch = 0;                // base row pitch in texels / 32 (fetch dword 0)
   uint32_t mip_max_level = 0;
   rex::graphics::xenos::TextureFormat format{};  // base format (GetBaseFormat applied)
   rex::graphics::xenos::Endian endianness{};
@@ -60,19 +60,19 @@ bool TextureKeyFromFetch(const uint32_t fetch[6], TextureKey* key);
 // Per-block conversion from the endian-swapped guest block to the host block.
 enum class TextureConversion : uint8_t {
   kCopy,
-  kR5G6B5ToB5G6R5,             // k_5_6_5: swap the 5-bit R and B fields
+  kR5G6B5ToB5G6R5,                 // k_5_6_5: swap the 5-bit R and B fields
   kR5G5B6ToB5G6R5WithRBGASwizzle,  // k_6_5_5: host swizzle R,B,G,G restores the order
-  kDepthUnorm24ToFloat32,      // k_24_8: R32_FLOAT = unorm24(d >> 8)
-  kDepthFloat24ToFloat32,      // k_24_8_FLOAT: R32_FLOAT = float20e4(d >> 8)
+  kDepthUnorm24ToFloat32,          // k_24_8: R32_FLOAT = unorm24(d >> 8)
+  kDepthFloat24ToFloat32,          // k_24_8_FLOAT: R32_FLOAT = float20e4(d >> 8)
 };
 
 struct HostFormat {
-  DXGI_FORMAT resource;       // resource format (TYPELESS when both views exist)
-  DXGI_FORMAT unorm;          // SRV for unsigned (and float) components
-  DXGI_FORMAT snorm;          // SRV for signed components, DXGI_FORMAT_UNKNOWN if none
+  DXGI_FORMAT resource;  // resource format (TYPELESS when both views exist)
+  DXGI_FORMAT unorm;     // SRV for unsigned (and float) components
+  DXGI_FORMAT snorm;     // SRV for signed components, DXGI_FORMAT_UNKNOWN if none
   TextureConversion conversion;
-  bool block_compressed;      // BCn: 4x4 blocks are copied as is
-  uint32_t host_swizzle;      // XE_GPU_TEXTURE_SWIZZLE_* of the host channels
+  bool block_compressed;  // BCn: 4x4 blocks are copied as is
+  uint32_t host_swizzle;  // XE_GPU_TEXTURE_SWIZZLE_* of the host channels
 };
 
 // nullptr for formats PGR4 does not use yet (or that need a decompressing load).
@@ -90,7 +90,7 @@ uint32_t GuestToHostComponentMapping(uint32_t guest_swizzle, uint32_t host_swizz
 // One host subresource (D3D12 subresource index = level + slice * mip_levels).
 struct HostSubresource {
   uint32_t level = 0, slice = 0;
-  uint32_t width = 0, height = 0, depth = 0;  // texels, max(size >> level, 1)
+  uint32_t width = 0, height = 0, depth = 0;   // texels, max(size >> level, 1)
   uint32_t block_columns = 0, block_rows = 0;  // host blocks (4x4 for BCn, else texels)
   uint32_t row_bytes = 0;                      // block_columns * host bytes per block
   uint32_t row_pitch = 0;                      // >= row_bytes

@@ -54,15 +54,15 @@ struct TextureCache::Texture {
   std::atomic<bool> dirty{true};
   // The last MarkCapture stamp when a write set `dirty` (stored before it, under watch_mutex_).
   std::atomic<uint64_t> write_mark{0};
-  bool failed = false;  // unsupported or creation failed; logged once, never retried
-  uint64_t stale_gets = 0;  // for the log
+  bool failed = false;                 // unsupported or creation failed; logged once, never retried
+  uint64_t stale_gets = 0;             // for the log
   std::vector<uint64_t> resolved_seq;  // per subresource; 0 = holds guest-memory data
   // A resolve may have changed an image at one of its subresource addresses (OnResolved), or
   // the texture was uploaded: the next Get runs CopyResolved.
   bool resolve_pending = true;
   // The resolved image bound in place of `resource` (CopyResolved), or null.
   ID3D12Resource* alias = nullptr;
-  uint32_t uploads = 0;                // Upload calls so far (the slow-upload log)
+  uint32_t uploads = 0;  // Upload calls so far (the slow-upload log)
   uint32_t slot = 0;
   uint64_t placed = kCommitted, bytes = 0;  // CreateTextureResource's placement and size
   uint64_t used_fence = 0, used_ms = 0;     // the last frame that bound it (MarkUsed)
@@ -78,33 +78,52 @@ constexpr D3D12_RESOURCE_STATES kShaderRead =
 // Typeless family for CopyTextureRegion compatibility.
 DXGI_FORMAT Family(DXGI_FORMAT f) {
   switch (f) {
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_R8G8B8A8_SNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    case DXGI_FORMAT_R8G8B8A8_UINT: case DXGI_FORMAT_R8G8B8A8_SINT:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R8G8B8A8_SINT:
       return DXGI_FORMAT_R8G8B8A8_TYPELESS;
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
     case DXGI_FORMAT_R10G10B10A2_UINT:
       return DXGI_FORMAT_R10G10B10A2_TYPELESS;
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    case DXGI_FORMAT_R16G16B16A16_UNORM: case DXGI_FORMAT_R16G16B16A16_SNORM:
-    case DXGI_FORMAT_R16G16B16A16_UINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SINT:
       return DXGI_FORMAT_R16G16B16A16_TYPELESS;
-    case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT: case DXGI_FORMAT_R32_UINT:
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_UINT:
     case DXGI_FORMAT_R32_SINT:
       return DXGI_FORMAT_R32_TYPELESS;
-    case DXGI_FORMAT_R16G16_TYPELESS: case DXGI_FORMAT_R16G16_FLOAT:
-    case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM:
       return DXGI_FORMAT_R16G16_TYPELESS;
-    case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16_UNORM:
     case DXGI_FORMAT_R16_SNORM:
       return DXGI_FORMAT_R16_TYPELESS;
-    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_TYPELESS:
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8_SNORM:
       return DXGI_FORMAT_R8_TYPELESS;
-    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R8G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_SNORM:
       return DXGI_FORMAT_R8G8_TYPELESS;
-    case DXGI_FORMAT_R32G32_TYPELESS: case DXGI_FORMAT_R32G32_FLOAT:
+    case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G32_FLOAT:
       return DXGI_FORMAT_R32G32_TYPELESS;
-    case DXGI_FORMAT_R32G32B32A32_TYPELESS: case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
       return DXGI_FORMAT_R32G32B32A32_TYPELESS;
     default:
       return f;
@@ -154,7 +173,8 @@ TextureCache::TextureCache(ID3D12Device* device, const uint8_t* physical_membase
 TextureCache::TextureCache(ID3D12Device* device, rex::memory::Memory* memory)
     : TextureCache(device, memory->physical_membase()) {
   memory_ = memory;
-  invalidation_handle_ = memory_->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
+  invalidation_handle_ =
+      memory_->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
   auto limit = [](int32_t mb) { return mb > 0 ? uint64_t(mb) << 20 : ~0ull; };
   budget_.soft_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_soft_mb));
   budget_.hard_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_hard_mb));
@@ -177,7 +197,8 @@ TextureCache::~TextureCache() {
   jobs_cv_.notify_all();
   for (std::thread& w : workers_) w.join();  // after the queued jobs ran
 #ifndef PGR4_TEXTURES_OFFLINE
-  if (invalidation_handle_) memory_->UnregisterPhysicalMemoryInvalidationCallback(invalidation_handle_);
+  if (invalidation_handle_)
+    memory_->UnregisterPhysicalMemoryInvalidationCallback(invalidation_handle_);
 #endif
 }
 
@@ -216,20 +237,21 @@ uint64_t TextureCache::RunUntile(const UntileJob& job, std::vector<uint8_t>* scr
   static std::atomic<uint32_t> slow_logged{0};
   if (ns > 500000 && slow_logged.fetch_add(1, std::memory_order_relaxed) < 40) {
     const TextureKey& key = job.key;
-    REXLOG_INFO("PGR4 native textures: slow upload #{} of {:08X} {}x{}x{} {} dim{} tiled{} endian{} "
-                "mips{} packed{} conv{}: host {} B, guest base {} B mips {} B, untile {} us",
-                job.upload_number, key.base_page << 12, key.width, key.height,
-                key.depth_or_array_size, rex::graphics::FormatInfo::Get(key.format)->name,
-                uint32_t(key.dimension), uint32_t(key.tiled), uint32_t(key.endianness),
-                key.mip_levels(), uint32_t(key.packed_mips), uint32_t(job.conversion), job.size,
-                job.base_bytes, job.mips_bytes, ns / 1000);
+    REXLOG_INFO(
+        "PGR4 native textures: slow upload #{} of {:08X} {}x{}x{} {} dim{} tiled{} endian{} "
+        "mips{} packed{} conv{}: host {} B, guest base {} B mips {} B, untile {} us",
+        job.upload_number, key.base_page << 12, key.width, key.height, key.depth_or_array_size,
+        rex::graphics::FormatInfo::Get(key.format)->name, uint32_t(key.dimension),
+        uint32_t(key.tiled), uint32_t(key.endianness), key.mip_levels(), uint32_t(key.packed_mips),
+        uint32_t(job.conversion), job.size, job.base_bytes, job.mips_bytes, ns / 1000);
   }
   return ns;
 }
 
 void TextureCache::ArmWatch(uint32_t physical, uint32_t length) {
 #ifndef PGR4_TEXTURES_OFFLINE
-  if (memory_ && length) memory_->EnablePhysicalMemoryAccessCallbacks(physical, length, true, false);
+  if (memory_ && length)
+    memory_->EnablePhysicalMemoryAccessCallbacks(physical, length, true, false);
 #endif
 }
 
@@ -358,23 +380,24 @@ TextureCache::Texture* TextureCache::NewTexture(const TextureKey& key) {
 TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFormat& host) {
   Texture& t = *NewTexture(key);
   t.host = &host;
-  t.layout = texture_util::GetGuestTextureLayout(key.dimension, key.pitch, key.width, key.height,
-                                                 key.depth_or_array_size, key.tiled, key.format,
-                                                 key.packed_mips, key.base_page != 0,
-                                                 key.mip_max_level);
+  t.layout = texture_util::GetGuestTextureLayout(
+      key.dimension, key.pitch, key.width, key.height, key.depth_or_array_size, key.tiled,
+      key.format, key.packed_mips, key.base_page != 0, key.mip_max_level);
   GetGuestExtents(key, &t.base_bytes, &t.mips_bytes);
   t.resolved_seq.assign(size_t(key.mip_levels()) * key.array_size(), 0);
 
   const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
   bool unaligned = (key.width % info->block_width) || (key.height % info->block_height);
   if (host.block_compressed && unaligned && !unaligned_bc_supported_) {
-    REXLOG_WARN("PGR4 native textures: {}x{} {} needs decompression (no unaligned BC support); "
-                "not supported", key.width, key.height, info->name);
+    REXLOG_WARN(
+        "PGR4 native textures: {}x{} {} needs decompression (no unaligned BC support); "
+        "not supported",
+        key.width, key.height, info->name);
     t.failed = true;
   } else {
     D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = key.is_3d() ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
-                                 : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Dimension =
+        key.is_3d() ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = key.width;
     desc.Height = key.height;
     desc.DepthOrArraySize = uint16_t(key.depth_or_array_size);
@@ -384,16 +407,17 @@ TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFor
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     HRESULT hr = CreateTextureResource(desc, &t.resource, &t.placed, &t.bytes);
     if (FAILED(hr)) {
-      REXLOG_ERROR("PGR4 native textures: texture resource {}x{}x{} {} failed: {:08X}",
-                   key.width, key.height, key.depth_or_array_size, info->name, uint32_t(hr));
+      REXLOG_ERROR("PGR4 native textures: texture resource {}x{}x{} {} failed: {:08X}", key.width,
+                   key.height, key.depth_or_array_size, info->name, uint32_t(hr));
       t.failed = true;
     } else {
       resident_bytes_ += t.bytes;
       t.state = D3D12_RESOURCE_STATE_COPY_DEST;
       WatchRange(t, key.base_page << 12, t.base_bytes);
       WatchRange(t, key.mip_page << 12, t.mips_bytes);
-      ForEachResolveAddress(key, t.layout,
-                            [&](size_t, uint32_t address) { resolve_targets_[address].push_back(&t); });
+      ForEachResolveAddress(key, t.layout, [&](size_t, uint32_t address) {
+        resolve_targets_[address].push_back(&t);
+      });
     }
   }
   return &t;
@@ -451,10 +475,11 @@ void TextureCache::EvictOverBudget(uint64_t completed_fence) {
   }
   if (evict_batch_.empty()) return;
   if (!stats_.evicted)
-    REXLOG_INFO("PGR4 native textures: {} MB in {} textures, over the budget (soft {} MB for {} s "
-                "unused, hard {} MB): evicting",
-                resident_bytes_ >> 20, textures_.size(), budget_.soft_bytes >> 20,
-                budget_.soft_lifetime_ms / 1000, budget_.hard_bytes >> 20);
+    REXLOG_INFO(
+        "PGR4 native textures: {} MB in {} textures, over the budget (soft {} MB for {} s "
+        "unused, hard {} MB): evicting",
+        resident_bytes_ >> 20, textures_.size(), budget_.soft_bytes >> 20,
+        budget_.soft_lifetime_ms / 1000, budget_.hard_bytes >> 20);
   if (evict_callback_) evict_callback_(evict_resources_);
   std::sort(evict_batch_.begin(), evict_batch_.end());
   for (size_t i = 0; i < (size_t(1) << kGetMemoBits); ++i) {
@@ -529,9 +554,8 @@ bool TextureCache::AddHeap() {
   return true;
 }
 
-HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc,
-                                            ComPtr<ID3D12Resource>* out, uint64_t* placed,
-                                            uint64_t* bytes) {
+HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc, ComPtr<ID3D12Resource>* out,
+                                            uint64_t* placed, uint64_t* bytes) {
   // 4 KB placement when the driver allows it for this texture, else 64 KB.
   desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
   D3D12_RESOURCE_ALLOCATION_INFO info = device_->GetResourceAllocationInfo(0, 1, &desc);
@@ -543,12 +567,13 @@ HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc,
   *bytes = info.SizeInBytes == UINT64_MAX ? 0 : info.SizeInBytes;
   if (info.SizeInBytes != UINT64_MAX && info.SizeInBytes <= kTextureHeapSize) {
     uint64_t offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
-    if (offset == kCommitted && AddHeap()) offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
+    if (offset == kCommitted && AddHeap())
+      offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
     if (offset != kCommitted) {
-      if (SUCCEEDED(device_->CreatePlacedResource(
-              heaps_[offset / kTextureHeapSize].Get(), offset % kTextureHeapSize, &desc,
-              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-              IID_PPV_ARGS(out->ReleaseAndGetAddressOf())))) {
+      if (SUCCEEDED(device_->CreatePlacedResource(heaps_[offset / kTextureHeapSize].Get(),
+                                                  offset % kTextureHeapSize, &desc,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(out->ReleaseAndGetAddressOf())))) {
         *placed = offset;
         return S_OK;
       }
@@ -572,9 +597,9 @@ void TextureCache::StartSpareHeap() {
     hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
     ComPtr<ID3D12Heap> heap;
     if (FAILED(device->CreateHeap(&hd, IID_PPV_ARGS(&heap)))) return ComPtr<ID3D12Heap>();
-    REXLOG_INFO("PGR4 native textures: texture heap {} created in {:.1f} ms (background)", n,
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                    .count());
+    REXLOG_INFO(
+        "PGR4 native textures: texture heap {} created in {:.1f} ms (background)", n,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return heap;
   });
 }
@@ -642,8 +667,10 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   }
 
   Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
-  const uint32_t bw = t.host->block_compressed ? rex::graphics::FormatInfo::Get(key.format)->block_width : 1;
-  const uint32_t bh = t.host->block_compressed ? rex::graphics::FormatInfo::Get(key.format)->block_height : 1;
+  const uint32_t bw =
+      t.host->block_compressed ? rex::graphics::FormatInfo::Get(key.format)->block_width : 1;
+  const uint32_t bh =
+      t.host->block_compressed ? rex::graphics::FormatInfo::Get(key.format)->block_height : 1;
   for (const HostSubresource& s : footprints_) {
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = t.resource.Get();
@@ -707,7 +734,8 @@ bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
   // textures.
   if (t.resolved_seq.size() == 1 && !key.is_3d()) {
     const ResolvedImage* image = nullptr;
-    ForEachResolveAddress(key, t.layout, [&](size_t, uint32_t address) { image = resolved_lookup_(address); });
+    ForEachResolveAddress(key, t.layout,
+                          [&](size_t, uint32_t address) { image = resolved_lookup_(address); });
     ID3D12Resource* source = image ? ResolvedSource(t, *image) : nullptr;
     if (source) {
       const D3D12_RESOURCE_DESC sd = source->GetDesc();
@@ -816,11 +844,12 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   if (stale && stale_logged_ < kStaleLogLimit &&
       (++t->stale_gets == 1 || (t->stale_gets >= 256 && !(t->stale_gets & (t->stale_gets - 1))))) {
     ++stale_logged_;
-    REXLOG_INFO("PGR4 native textures: {:08X} {}x{}x{} {} mips {} rewritten after a draw that "
-                "reads it was queued: {} times (upload {}, get {})",
-                key.base_page << 12, key.width, key.height, key.depth_or_array_size,
-                rex::graphics::FormatInfo::Get(key.format)->name, key.mip_levels(), t->stale_gets,
-                t->uploads, stats_.gets);
+    REXLOG_INFO(
+        "PGR4 native textures: {:08X} {}x{}x{} {} mips {} rewritten after a draw that "
+        "reads it was queued: {} times (upload {}, get {})",
+        key.base_page << 12, key.width, key.height, key.depth_or_array_size,
+        rex::graphics::FormatInfo::Get(key.format)->name, key.mip_levels(), t->stale_gets,
+        t->uploads, stats_.gets);
   }
   if (was_dirty && !(stale && capture_order_)) {
     const uint64_t u0 = NowNs();
@@ -846,13 +875,13 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   }();
   if (trace_address && (key.base_page << 12) == trace_address) {
     const ResolvedImage* image = resolved_lookup_ ? resolved_lookup_(trace_address) : nullptr;
-    REXLOG_INFO("PGR4 native texture trace {:08X} {}x{} fmt{}: get #{} dirty_upload={} image_seq={} "
-                "level0_seq {} -> {} image_fmt={} image_size={}x{}",
-                trace_address, key.width, key.height, uint32_t(key.format), stats_.gets, was_dirty,
-                image ? image->seq : 0, seq_before,
-                t->resolved_seq.empty() ? 0 : t->resolved_seq[0],
-                image && image->texture ? uint32_t(image->texture->GetDesc().Format) : 0,
-                image ? image->width : 0, image ? image->height : 0);
+    REXLOG_INFO(
+        "PGR4 native texture trace {:08X} {}x{} fmt{}: get #{} dirty_upload={} image_seq={} "
+        "level0_seq {} -> {} image_fmt={} image_size={}x{}",
+        trace_address, key.width, key.height, uint32_t(key.format), stats_.gets, was_dirty,
+        image ? image->seq : 0, seq_before, t->resolved_seq.empty() ? 0 : t->resolved_seq[0],
+        image && image->texture ? uint32_t(image->texture->GetDesc().Format) : 0,
+        image ? image->width : 0, image ? image->height : 0);
   }
 #endif
   // An alias is in the Resolver's read state, which includes kShaderRead.

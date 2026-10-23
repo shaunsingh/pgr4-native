@@ -69,14 +69,14 @@ constexpr uint32_t kMaxTiles = 15;
 struct RenderTarget {
   uint64_t key = 0;
   bool depth = false;
-  uint32_t edram_base = 0;   // tiles
-  uint32_t pitch = 0;        // pixels (RB_SURFACE_INFO surface_pitch)
-  uint32_t samples = 1;      // 1, 2 or 4
+  uint32_t edram_base = 0;  // tiles
+  uint32_t pitch = 0;       // pixels (RB_SURFACE_INFO surface_pitch)
+  uint32_t samples = 1;     // 1, 2 or 4
   uint32_t width = 0, height = 0;
   uint32_t guest_format = 0;  // last xenos::ColorRenderTargetFormat / DepthRenderTargetFormat
   DXGI_FORMAT resource_format = DXGI_FORMAT_UNKNOWN;
-  DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;     // RTV or DSV
-  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;      // color, or the depth plane
+  DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;         // RTV or DSV
+  DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;          // color, or the depth plane
   DXGI_FORMAT stencil_srv_format = DXGI_FORMAT_UNKNOWN;  // depth only: the stencil plane
   ComPtr<ID3D12Resource> resource;
   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -99,8 +99,8 @@ struct BoundTargets {
 
 // Decoded Clear / ClearF arguments.
 struct ClearParams {
-  uint32_t flags = 0;          // D3DCLEAR_TARGET0..3 = 1..8, ZBUFFER = 0x10, STENCIL = 0x20
-  float color[4] = {};         // RGBA
+  uint32_t flags = 0;   // D3DCLEAR_TARGET0..3 = 1..8, ZBUFFER = 0x10, STENCIL = 0x20
+  float color[4] = {};  // RGBA
   float depth = 1.0f;
   uint8_t stencil = 0;
   std::vector<D3D12_RECT> rects;  // surface pixels; empty: whole surface
@@ -131,14 +131,15 @@ class RenderTargets {
   // non-zero); depth_used: depth or stencil test/write enabled. height: rows the draw can
   // touch (bottom of its scissor/viewport, clamped to 2048). Records the barriers to
   // RENDER_TARGET / DEPTH_WRITE into `list`; the caller sets the RTVs/DSV from `out`.
-  bool Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t color_mask, bool depth_used, uint32_t height, BoundTargets* out);
+  bool Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t color_mask,
+            bool depth_used, uint32_t height, BoundTargets* out);
 
   // Guest Clear / ClearF (HookFn kClear / kClearF), after the guest call returned: the surfaces
   // bound in the device's register shadow and the clear values (reads guest memory only);
   // false: nothing to clear. Clear then clears their host targets.
   static bool DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out);
-  void Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
-             uint32_t bound_colors, bool depth_bound, uint32_t height, const ClearParams& p);
+  void Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t bound_colors,
+             bool depth_bound, uint32_t height, const ClearParams& p);
 
   // The host target of guest color RT `index` (0..3) or of the depth surface, created if
   // missing (resolve sources). nullptr for an invalid format.

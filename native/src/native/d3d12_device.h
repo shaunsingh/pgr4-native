@@ -160,8 +160,8 @@ inline D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* resource,
 // A buffer of `size` bytes.
 constexpr D3D12_RESOURCE_DESC BufferDesc(uint64_t size,
                                          D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
-  return {D3D12_RESOURCE_DIMENSION_BUFFER, 0, size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
-          D3D12_TEXTURE_LAYOUT_ROW_MAJOR, flags};
+  return {D3D12_RESOURCE_DIMENSION_BUFFER, 0,    size, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+          D3D12_TEXTURE_LAYOUT_ROW_MAJOR,  flags};
 }
 
 // A committed buffer of `size` bytes on a heap of `type`, created in `state`. Logs `what` and

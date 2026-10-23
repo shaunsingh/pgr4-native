@@ -29,10 +29,11 @@
 #include <thread>
 #include <vector>
 
-REXCVAR_DEFINE_STRING(pgr4_native_capture_dir, "", "PGR4 native",
-                      "Folder for front buffer captures (native + Xenos PNGs, PSNR), marks and draw "
-                      "logs; when set, <dir>\\capture.request and the mark key (F12) take a "
-                      "capture and <dir>\\draw-debug.txt is read. Empty: nothing is polled");
+REXCVAR_DEFINE_STRING(
+    pgr4_native_capture_dir, "", "PGR4 native",
+    "Folder for front buffer captures (native + Xenos PNGs, PSNR), marks and draw "
+    "logs; when set, <dir>\\capture.request and the mark key (F12) take a "
+    "capture and <dir>\\draw-debug.txt is read. Empty: nothing is polled");
 REXCVAR_DEFINE_INT32(pgr4_native_capture_frame, -1, "PGR4 native",
                      "Capture the front buffer of this native frame index (-1 = off)");
 REXCVAR_DEFINE_INT32(pgr4_native_capture_hold_ms, 500, "PGR4 native",
@@ -115,8 +116,8 @@ float4 ps(float4 pos : SV_Position, float2 texel : TEXCOORD0) : SV_Target {
 const rex::graphics::CommandProcessor* GuestCommandProcessor() {
   rex::Runtime* runtime = rex::Runtime::instance();
   // The Xenos plugin's graphics system is the only IGraphicsSystem this title runs with.
-  auto* graphics = runtime ? static_cast<rex::graphics::GraphicsSystem*>(runtime->graphics_system())
-                           : nullptr;
+  auto* graphics =
+      runtime ? static_cast<rex::graphics::GraphicsSystem*>(runtime->graphics_system()) : nullptr;
   return graphics ? graphics->command_processor() : nullptr;
 }
 
@@ -216,13 +217,13 @@ void ToRgb(const uint8_t* src, uint32_t pitch, uint32_t width, uint32_t height, 
       std::memcpy(&t, row + x * 4, 4);
       uint8_t ch[4];
       if (rgb10a2) {
-        for (uint32_t c = 0; c < 3; ++c) ch[c] = uint8_t((((t >> (10 * c)) & 1023) * 255 + 511) / 1023);
+        for (uint32_t c = 0; c < 3; ++c)
+          ch[c] = uint8_t((((t >> (10 * c)) & 1023) * 255 + 511) / 1023);
         ch[3] = uint8_t((t >> 30) * 85);
       } else {
         std::memcpy(ch, &t, 4);
       }
-      for (uint32_t c = 0; c < 3; ++c)
-        out[x * 3 + c] = m[c] < 4 ? ch[m[c]] : (m[c] == 5 ? 255 : 0);
+      for (uint32_t c = 0; c < 3; ++c) out[x * 3 + c] = m[c] < 4 ? ch[m[c]] : (m[c] == 5 ? 255 : 0);
     }
   }
 }
@@ -295,9 +296,9 @@ struct Presenter::Impl {
   };
   static_assert(sizeof(RecordHeader) == 32);
   // On the glitch catcher's thread: the frames it is handed, in a ring, and the whole-image jumps
-  // of native/tools/flicker.py --jumps found as they arrive (a frame whose mean block difference from
-  // the one before is at least 6x the median of the last kSteps and 15, followed within kMaxLen
-  // frames by one that is back near the frame before).
+  // of native/tools/flicker.py --jumps found as they arrive (a frame whose mean block difference
+  // from the one before is at least 6x the median of the last kSteps and 15, followed within
+  // kMaxLen frames by one that is back near the frame before).
   struct Catcher {
     // kRing: 5 s at 90 Hz, since a mark comes a few seconds after what it marks.
     static constexpr uint32_t kRing = 450, kBlock = 10, kMaxLen = 4, kPad = 8, kSteps = 512;
@@ -343,7 +344,7 @@ struct Presenter::Impl {
     std::thread writer;
     std::mutex mutex;
     std::condition_variable cv;
-    std::deque<std::vector<uint8_t>> queue;  // a RecordHeader, then RGBA rows (width * 4 bytes)
+    std::deque<std::vector<uint8_t>> queue;   // a RecordHeader, then RGBA rows (width * 4 bytes)
     std::vector<std::vector<uint8_t>> spare;  // consumed buffers, reused
     bool stopping = false;
     uint64_t written = 0, dropped = 0;
@@ -370,7 +371,8 @@ struct Presenter::Impl {
   }
   // In the blit's state (root signature, pipeline, source and ramp bound): records this frame
   // for the glitch catcher (after GlitchCatch::Collect of the slot).
-  void Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih, uint32_t ramp_mode);
+  void Record(ID3D12GraphicsCommandList* list, uint32_t slot, float iw, float ih,
+              uint32_t ramp_mode);
   // Reads the slot's previous rows into probe_result, then records this frame's copies.
   void Probe(ID3D12GraphicsCommandList* list, uint32_t slot, const ResolvedImage& image,
              uint32_t mapping, bool rgb10a2);
@@ -446,10 +448,9 @@ bool Presenter::Impl::Initialize() {
   {
     void* p = nullptr;
     const D3D12_RANGE none = {0, 0};
-    if (!CreateBuffer(device, D3D12_HEAP_TYPE_UPLOAD,
-                      uint64_t(kRampSlotBytes) * D3D12Device::kFramesInFlight,
-                      D3D12_RESOURCE_STATE_GENERIC_READ, "present gamma ramp buffer",
-                      &ramp_buffer) ||
+    if (!CreateBuffer(
+            device, D3D12_HEAP_TYPE_UPLOAD, uint64_t(kRampSlotBytes) * D3D12Device::kFramesInFlight,
+            D3D12_RESOURCE_STATE_GENERIC_READ, "present gamma ramp buffer", &ramp_buffer) ||
         Failed(ramp_buffer->Map(0, &none, &p), "present gamma ramp map"))
       return false;
     ramp_mapped = static_cast<uint8_t*>(p);
@@ -468,7 +469,8 @@ bool Presenter::Impl::Initialize() {
 bool Presenter::Impl::GlitchCatch::Start(ID3D12Device* device, uint32_t w, uint32_t h) {
   width = w;
   height = h;
-  pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+  pitch =
+      (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
   slot_bytes = (uint64_t(pitch) * h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
                ~uint64_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
   D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
@@ -492,12 +494,14 @@ bool Presenter::Impl::GlitchCatch::Start(ID3D12Device* device, uint32_t w, uint3
       Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap)), "glitch catch heap"))
     return false;
   mapped = static_cast<const uint8_t*>(p);
-  device->CreateRenderTargetView(target.Get(), nullptr, rtv_heap->GetCPUDescriptorHandleForHeapStart());
+  device->CreateRenderTargetView(target.Get(), nullptr,
+                                 rtv_heap->GetCPUDescriptorHandleForHeapStart());
   writer = std::thread([this] { Write(); });
   SetThreadDescription(writer.native_handle(), L"PGR4 native glitch catch");
-  REXLOG_INFO("PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
-              "{}glitch-<frame>.rec",
-              Catcher::kRing, w, h, catcher.prefix);
+  REXLOG_INFO(
+      "PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
+      "{}glitch-<frame>.rec",
+      Catcher::kRing, w, h, catcher.prefix);
   return true;
 }
 
@@ -708,16 +712,17 @@ bool Presenter::Impl::WriteRamp(RampMode mode, uint32_t slot) {
     if (ramp_changes_logged < 8) {
       ++ramp_changes_logged;
       if (mode == kRampPwl)
-        REXLOG_INFO("PGR4 native present: PWL gamma ramp at frame {}: 0.25/0.5/0.75 -> R {:.3f} "
-                    "{:.3f} {:.3f}, G {:.3f} {:.3f} {:.3f}, B {:.3f} {:.3f} {:.3f}",
-                    r.frame_index(), PwlOut(ramp, 0, 256), PwlOut(ramp, 0, 512),
-                    PwlOut(ramp, 0, 767), PwlOut(ramp, 1, 256), PwlOut(ramp, 1, 512),
-                    PwlOut(ramp, 1, 767), PwlOut(ramp, 2, 256), PwlOut(ramp, 2, 512),
-                    PwlOut(ramp, 2, 767));
+        REXLOG_INFO(
+            "PGR4 native present: PWL gamma ramp at frame {}: 0.25/0.5/0.75 -> R {:.3f} "
+            "{:.3f} {:.3f}, G {:.3f} {:.3f} {:.3f}, B {:.3f} {:.3f} {:.3f}",
+            r.frame_index(), PwlOut(ramp, 0, 256), PwlOut(ramp, 0, 512), PwlOut(ramp, 0, 767),
+            PwlOut(ramp, 1, 256), PwlOut(ramp, 1, 512), PwlOut(ramp, 1, 767), PwlOut(ramp, 2, 256),
+            PwlOut(ramp, 2, 512), PwlOut(ramp, 2, 767));
       else
-        REXLOG_INFO("PGR4 native present: gamma table at frame {}: 64/128/192 -> R {} {} {} (of 1023)",
-                    r.frame_index(), (ramp[64] >> 20) & 1023, (ramp[128] >> 20) & 1023,
-                    (ramp[192] >> 20) & 1023);
+        REXLOG_INFO(
+            "PGR4 native present: gamma table at frame {}: 64/128/192 -> R {} {} {} (of 1023)",
+            r.frame_index(), (ramp[64] >> 20) & 1023, (ramp[128] >> 20) & 1023,
+            (ramp[192] >> 20) & 1023);
     }
   }
   return true;
@@ -796,8 +801,8 @@ void Presenter::Impl::FinishCapture() {
   HoldFullReadback(false);
 
   std::vector<uint8_t> native_rgb, xenos_rgb;
-  const bool read = ReadbackRgb(c.readback.Get(), c.footprint.Footprint.RowPitch, c.width,
-                                c.height, c.mapping, c.rgb10a2, &native_rgb);
+  const bool read = ReadbackRgb(c.readback.Get(), c.footprint.Footprint.RowPitch, c.width, c.height,
+                                c.mapping, c.rgb10a2, &native_rgb);
   c.readback.Reset();
   if (!read) return;
   {
@@ -836,8 +841,9 @@ void Presenter::Impl::FinishCapture() {
   bool ok = WritePng(dir / (stem + "-native.png"), native_rgb, c.width, c.height) &&
             WritePng(dir / (stem + "-xenos.png"), xenos_rgb, c.width, c.height);
   const double psnr = Psnr(native_rgb, xenos_rgb);
-  REXLOG_INFO("PGR4 native capture: frame {} {}x{} front buffer {:08X}: PSNR {:.2f} dB ({}\\{}-*.png{})",
-              c.frame, c.width, c.height, c.base, psnr, dir.string(), stem, ok ? "" : ", write failed");
+  REXLOG_INFO(
+      "PGR4 native capture: frame {} {}x{} front buffer {:08X}: PSNR {:.2f} dB ({}\\{}-*.png{})",
+      c.frame, c.width, c.height, c.base, psnr, dir.string(), stem, ok ? "" : ", write failed");
   if (std::FILE* f = _wfopen((dir / "captures.csv").c_str(), L"a")) {
     std::fprintf(f, "%llu,%u,%u,%08X,%.3f\n", (unsigned long long)c.frame, c.width, c.height,
                  c.base, psnr);
@@ -893,12 +899,14 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
   }
   if (!image && !m.log_missing) {
     m.log_missing = true;
-    REXLOG_WARN("PGR4 native present: no resolved image for the front buffer {:08X} (texture {:08X})",
-                fetch[1] & 0xFFFFF000u, tex);
+    REXLOG_WARN(
+        "PGR4 native present: no resolved image for the front buffer {:08X} (texture {:08X})",
+        fetch[1] & 0xFFFFF000u, tex);
   }
 
   uint32_t mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  if (last_found_) mapping = GuestToHostComponentMapping((fetch[3] >> 1) & 0xFFF, host->host_swizzle);
+  if (last_found_)
+    mapping = GuestToHostComponentMapping((fetch[3] >> 1) & 0xFFF, host->host_swizzle);
   if (m.glitch.on) m.glitch.Collect(d.frame_slot());
   // A held frame (DrawRenderer::FrameIncomplete) never reaches the screen: it is neither blitted
   // nor recorded, so the glitch catcher and the luma probe see what was shown.
@@ -929,8 +937,10 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
       list->SetGraphicsRootDescriptorTable(0, gpu);
       // The image (1280x720 in PGR4's mode) scaled to fit the window, centred, aspect kept.
       const D3D12_RESOURCE_DESC desc = image->texture->GetDesc();
-      const float iw = float(std::min<uint64_t>(image->width ? image->width : desc.Width, desc.Width));
-      const float ih = float(std::min<uint32_t>(image->height ? image->height : desc.Height, desc.Height));
+      const float iw =
+          float(std::min<uint64_t>(image->width ? image->width : desc.Width, desc.Width));
+      const float ih =
+          float(std::min<uint32_t>(image->height ? image->height : desc.Height, desc.Height));
       const float ww = float(d.width()), wh = float(d.height());
       const float s = std::min(ww / iw, wh / ih);
       const float vw = std::round(iw * s), vh = std::round(ih * s);
@@ -939,13 +949,14 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
       struct {
         float image_size[2];
         uint32_t ramp_mode, point_sampled;
-      } constants = {{iw, ih}, m.WriteRamp(wanted, ramp_slot) ? wanted : kRampNone,
-                     vw == iw && vh == ih};
+      } constants = {
+          {iw, ih}, m.WriteRamp(wanted, ramp_slot) ? wanted : kRampNone, vw == iw && vh == ih};
       list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
       list->SetGraphicsRootConstantBufferView(
           2, m.ramp_buffer->GetGPUVirtualAddress() + uint64_t(ramp_slot) * kRampSlotBytes);
       list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-      D3D12_VIEWPORT vp = {std::floor((ww - vw) * 0.5f), std::floor((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
+      D3D12_VIEWPORT vp = {
+          std::floor((ww - vw) * 0.5f), std::floor((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
       D3D12_RECT sc = {0, 0, LONG(d.width()), LONG(d.height())};
       list->RSSetViewports(1, &vp);
       list->RSSetScissorRects(1, &sc);
@@ -1011,7 +1022,7 @@ void Presenter::OnSwap(const SwapCall& swap, bool shown) {
 }
 
 void Presenter::Impl::Probe(ID3D12GraphicsCommandList* list, uint32_t slot,
-                             const ResolvedImage& image, uint32_t mapping, bool rgb10a2) {
+                            const ResolvedImage& image, uint32_t mapping, bool rgb10a2) {
   // A row of the widest texture each, so the buffer never grows while a slot is in flight.
   constexpr uint32_t kRowBytes = 8192 * 4;
   if (!probe_buffer) {
@@ -1044,8 +1055,8 @@ void Presenter::Impl::Probe(ID3D12GraphicsCommandList* list, uint32_t slot,
   const uint32_t w = std::min<uint32_t>(
       {image.width ? image.width : uint32_t(desc.Width), uint32_t(desc.Width), 8192u});
   const uint32_t h = std::min<uint32_t>(image.height ? image.height : desc.Height, desc.Height);
-  const uint32_t pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
-                         ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+  const uint32_t pitch =
+      (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
   for (uint32_t i = 0; i < kProbeRows; ++i) {
     static constexpr uint32_t kRowPercent[kProbeRows] = {10, 40, 80};
     const uint32_t y = h * kRowPercent[i] / 100;
@@ -1069,8 +1080,10 @@ bool Presenter::capture_holds_guest() const { return REXCVAR_GET(pgr4_native_cap
 void Presenter::AfterEndFrame() {
   Impl& m = *impl_;
   if (!m.capture.pending) return;
-  if (m.capture.xenos) m.FinishCapture();
-  else if (renderer_.device().completed_fence() >= m.capture.fence) m.WriteCapture();
+  if (m.capture.xenos)
+    m.FinishCapture();
+  else if (renderer_.device().completed_fence() >= m.capture.fence)
+    m.WriteCapture();
 }
 
 }  // namespace pgr4::native

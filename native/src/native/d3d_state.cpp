@@ -37,7 +37,12 @@ struct Block {
   uint8_t mask, top, per, groups;  // groups = count / per, kept here: CopyDirty runs per draw
   constexpr Block(uint32_t offset, uint32_t reg, uint32_t count, uint8_t mask, uint8_t top,
                   uint8_t per)
-      : offset(offset), reg(reg), count(count), mask(mask), top(top), per(per),
+      : offset(offset),
+        reg(reg),
+        count(count),
+        mask(mask),
+        top(top),
+        per(per),
         groups(uint8_t(count / per)) {}
 };
 constexpr Block kRegisterBlocks[] = {
@@ -91,8 +96,8 @@ void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, ui
   };
   uint32_t i = 0;
   for (; i + 16 <= count; i += 16) {
-    const __m128i e = _mm_and_si128(_mm_and_si128(eq4(i), eq4(i + 4)),
-                                    _mm_and_si128(eq4(i + 8), eq4(i + 12)));
+    const __m128i e =
+        _mm_and_si128(_mm_and_si128(eq4(i), eq4(i + 4)), _mm_and_si128(eq4(i + 8), eq4(i + 12)));
     if (_mm_movemask_epi8(e) == 0xFFFF) continue;
     for (uint32_t k = 0; k < 16; ++k) put_raw(i + k);
   }
@@ -135,8 +140,9 @@ void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn
       if (!seen[reg] && reported < 64) {
         seen[reg] = true;
         ++reported;
-        REXLOG_INFO("PGR4 native state verify: register {:04X} shadow {:08X} tracked {:08X} after {:08X}",
-                    reg, __builtin_bswap32(v), regs_[reg], fn_addr);
+        REXLOG_INFO(
+            "PGR4 native state verify: register {:04X} shadow {:08X} tracked {:08X} after {:08X}",
+            reg, __builtin_bswap32(v), regs_[reg], fn_addr);
       }
     }
   }
@@ -186,9 +192,17 @@ CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device) {
 
 bool IsStateFlushingFn(uint32_t addr) {
   switch (addr) {
-    case kFnBeginVertices: case kFnDrawVerticesUP: case kFnDrawVertices: case kFnDrawIndexed:
-    case kFnDrawIndx2Inline: case kFnDrawIndx2Split: case kFnClearF: case kFnClear:
-    case kFnResolve: case kFnSwap: case kFn10A8:
+    case kFnBeginVertices:
+    case kFnDrawVerticesUP:
+    case kFnDrawVertices:
+    case kFnDrawIndexed:
+    case kFnDrawIndx2Inline:
+    case kFnDrawIndx2Split:
+    case kFnClearF:
+    case kFnClear:
+    case kFnResolve:
+    case kFnSwap:
+    case kFn10A8:
       return true;
     default:
       return false;
@@ -203,7 +217,8 @@ GuestStateTracker& GuestState() {
 void GuestStateTracker::Attach(const uint8_t* base, uint32_t device) {
   // A new device (the game creates a second one at the title screen): start from its shadow.
   static uint32_t attaches = 0;
-  if (++attaches <= 8) REXLOG_INFO("PGR4 native state: tracking device {:08X} (was {:08X})", device, device_);
+  if (++attaches <= 8)
+    REXLOG_INFO("PGR4 native state: tracking device {:08X} (was {:08X})", device, device_);
   device_ = device;
   Copy(0x4000, base, device + dev::kVsConstants, 1024);
   Copy(0x4400, base, device + dev::kPsConstants, 1024);
@@ -267,7 +282,8 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   // from there. Untiled form (offset 0); with predicated tiling the D3D writes one clamped
   // copy per tile instead.
   {
-    const uint32_t tl = Load32(base, device + dev::kScissorTL), br = Load32(base, device + dev::kScissorBR);
+    const uint32_t tl = Load32(base, device + dev::kScissorTL),
+                   br = Load32(base, device + dev::kScissorBR);
     auto field = [](uint32_t v) { return uint32_t(int32_t(v << 17) >> 17); };
     Put(0x2080, 0);
     Put(0x2081, ((field(tl >> 16) << 16) & 0x3FFF0000u) | (field(tl) & 0x3FFFu));
@@ -295,7 +311,8 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
         // Variant 1 is used without a pixel shader when the object has one (flag 0x20).
         uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
         uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
-        vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)), Load32(base, sub + 876) >> 2};
+        vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)),
+               Load32(base, sub + 876) >> 2};
         vs_.binding = XXH3_64bits(HostPtr(base, vs + 416 * variant + 40), 24);
       }
       if (rebind & (kVsRebind | kPsRebind)) LoadLiterals(base, vs + 872, Load32(base, vs + 32));
@@ -304,7 +321,8 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     }
     if (ps) {
       uint32_t sub = ps + Load32(base, ps + 64);
-      ps_ = {ps, GpuAddress(Load32(base, ps + 24) + Load32(base, sub + 40)), Load32(base, sub + 44) >> 2};
+      ps_ = {ps, GpuAddress(Load32(base, ps + 24) + Load32(base, sub + 40)),
+             Load32(base, sub + 44) >> 2};
       if (rebind & kPsRebind) LoadLiterals(base, ps + 40, Load32(base, ps + 24));
     } else {
       ps_ = {};
@@ -358,8 +376,9 @@ void GuestStateTracker::AfterImmediateVs(const uint8_t* base, const uint32_t r[8
   if (Load32(base, start - 12) != (0xC0002B00u | (((dwords + 1) & 0x3FFFu) << 16)) ||
       Load32(base, start - 8) != 0 || Load32(base, start - 4) != dwords) {
     static uint32_t misses = 0;
-    if (++misses <= 4) REXLOG_WARN("PGR4 native state: no IM_LOAD_IMMEDIATE before push cursor {:08X} (vs {:08X})",
-                                   start, vs);
+    if (++misses <= 4)
+      REXLOG_WARN("PGR4 native state: no IM_LOAD_IMMEDIATE before push cursor {:08X} (vs {:08X})",
+                  start, vs);
     return;
   }
   vs_imm_pending_.resize(dwords);
@@ -394,7 +413,7 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, cons
       s->base_vertex = a.r[2];
       s->count = a.r[3];
       break;
-    case HookFn::kBeginVertices:  // (dev, prim, vertex count, stride)
+    case HookFn::kBeginVertices:   // (dev, prim, vertex count, stride)
     case HookFn::kDrawVerticesUP:  // (dev, prim, vertex count, data, stride)
       s->primitive = a.r[1] & 0x3F;
       s->count = a.r[2];

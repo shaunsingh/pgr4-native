@@ -25,10 +25,9 @@ bool TextureKey::operator==(const TextureKey& o) const {
 }
 
 size_t TextureKey::Hash() const {
-  uint64_t a = uint64_t(base_page) | uint64_t(mip_page) << 20 |
-               uint64_t(uint32_t(format)) << 40 | uint64_t(uint32_t(endianness)) << 46 |
-               uint64_t(uint32_t(dimension)) << 48 | uint64_t(tiled) << 50 |
-               uint64_t(packed_mips) << 51 | uint64_t(mip_max_level) << 52;
+  uint64_t a = uint64_t(base_page) | uint64_t(mip_page) << 20 | uint64_t(uint32_t(format)) << 40 |
+               uint64_t(uint32_t(endianness)) << 46 | uint64_t(uint32_t(dimension)) << 48 |
+               uint64_t(tiled) << 50 | uint64_t(packed_mips) << 51 | uint64_t(mip_max_level) << 52;
   uint64_t b = uint64_t(width) | uint64_t(height) << 24 | uint64_t(depth_or_array_size) << 48 |
                uint64_t(pitch) << 54;
   uint64_t h = a * 0x9E3779B97F4A7C15ull;
@@ -92,8 +91,8 @@ const HostFormat kFormats[] = {
     {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_SNORM,
      C::kCopy, false, kRGBA},
     // k_2_10_10_10
-    {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN,
-     C::kCopy, false, kRGBA},
+    {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy,
+     false, kRGBA},
     // k_8_8
     {DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_SNORM, C::kCopy, false,
      kRGGG},
@@ -104,11 +103,11 @@ const HostFormat kFormats[] = {
     // k_DXT4_5
     {DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA},
     // k_24_8 (R32_FLOAT: shaders get no stencil, as in ReXGlue)
-    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT,
-     C::kDepthUnorm24ToFloat32, false, kRRRR},
+    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kDepthUnorm24ToFloat32,
+     false, kRRRR},
     // k_24_8_FLOAT
-    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT,
-     C::kDepthFloat24ToFloat32, false, kRRRR},
+    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kDepthFloat24ToFloat32,
+     false, kRRRR},
     // k_16
     {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_SNORM, C::kCopy, false,
      kRRRR},
@@ -124,16 +123,16 @@ const HostFormat kFormats[] = {
     {DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT, C::kCopy, false,
      kRGGG},
     // k_16_16_16_16_FLOAT (also k_16_16_16_16_EXPAND)
-    {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-     DXGI_FORMAT_R16G16B16A16_FLOAT, C::kCopy, false, kRGBA},
+    {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+     C::kCopy, false, kRGBA},
     // k_32_FLOAT
     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kCopy, false, kRRRR},
     // k_32_32_FLOAT
     {DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, C::kCopy, false,
      kRGGG},
     // k_32_32_32_32_FLOAT
-    {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-     DXGI_FORMAT_R32G32B32A32_FLOAT, C::kCopy, false, kRGBA},
+    {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+     C::kCopy, false, kRGBA},
     // k_DXN
     {DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGGG},
 };
@@ -225,28 +224,50 @@ void SwapCopy(uint8_t* dst, const uint8_t* src, size_t size, xenos::Endian endia
 
 const HostFormat* GetHostFormat(TextureFormat f) {
   switch (f) {
-    case TextureFormat::k_8: return &kFormats[0];
-    case TextureFormat::k_5_6_5: return &kFormats[1];
-    case TextureFormat::k_6_5_5: return &kFormats[2];
-    case TextureFormat::k_8_8_8_8: return &kFormats[3];
-    case TextureFormat::k_2_10_10_10: return &kFormats[4];
-    case TextureFormat::k_8_8: return &kFormats[5];
-    case TextureFormat::k_DXT1: return &kFormats[6];
-    case TextureFormat::k_DXT2_3: return &kFormats[7];
-    case TextureFormat::k_DXT4_5: return &kFormats[8];
-    case TextureFormat::k_24_8: return &kFormats[9];
-    case TextureFormat::k_24_8_FLOAT: return &kFormats[10];
-    case TextureFormat::k_16: return &kFormats[11];
-    case TextureFormat::k_16_16: return &kFormats[12];
-    case TextureFormat::k_16_16_16_16: return &kFormats[13];
-    case TextureFormat::k_16_FLOAT: return &kFormats[14];
-    case TextureFormat::k_16_16_FLOAT: return &kFormats[15];
-    case TextureFormat::k_16_16_16_16_FLOAT: return &kFormats[16];
-    case TextureFormat::k_32_FLOAT: return &kFormats[17];
-    case TextureFormat::k_32_32_FLOAT: return &kFormats[18];
-    case TextureFormat::k_32_32_32_32_FLOAT: return &kFormats[19];
-    case TextureFormat::k_DXN: return &kFormats[20];
-    default: return nullptr;
+    case TextureFormat::k_8:
+      return &kFormats[0];
+    case TextureFormat::k_5_6_5:
+      return &kFormats[1];
+    case TextureFormat::k_6_5_5:
+      return &kFormats[2];
+    case TextureFormat::k_8_8_8_8:
+      return &kFormats[3];
+    case TextureFormat::k_2_10_10_10:
+      return &kFormats[4];
+    case TextureFormat::k_8_8:
+      return &kFormats[5];
+    case TextureFormat::k_DXT1:
+      return &kFormats[6];
+    case TextureFormat::k_DXT2_3:
+      return &kFormats[7];
+    case TextureFormat::k_DXT4_5:
+      return &kFormats[8];
+    case TextureFormat::k_24_8:
+      return &kFormats[9];
+    case TextureFormat::k_24_8_FLOAT:
+      return &kFormats[10];
+    case TextureFormat::k_16:
+      return &kFormats[11];
+    case TextureFormat::k_16_16:
+      return &kFormats[12];
+    case TextureFormat::k_16_16_16_16:
+      return &kFormats[13];
+    case TextureFormat::k_16_FLOAT:
+      return &kFormats[14];
+    case TextureFormat::k_16_16_FLOAT:
+      return &kFormats[15];
+    case TextureFormat::k_16_16_16_16_FLOAT:
+      return &kFormats[16];
+    case TextureFormat::k_32_FLOAT:
+      return &kFormats[17];
+    case TextureFormat::k_32_32_FLOAT:
+      return &kFormats[18];
+    case TextureFormat::k_32_32_32_32_FLOAT:
+      return &kFormats[19];
+    case TextureFormat::k_DXN:
+      return &kFormats[20];
+    default:
+      return nullptr;
   }
 }
 
@@ -264,10 +285,12 @@ uint32_t GuestToHostComponentMapping(uint32_t guest_swizzle, uint32_t host_swizz
   for (uint32_t i = 0; i < 4; ++i) {
     uint32_t c = (guest_swizzle >> (3 * i)) & 0b111;
     // 4/5 are the constants 0/1 (D3D12 FORCE_VALUE_0/1 have the same values); 6/7 become 4/5.
-    uint32_t h = c >= xenos::XE_GPU_TEXTURE_SWIZZLE_0 ? (c & 0b101) : (host_swizzle >> (3 * c)) & 0b111;
+    uint32_t h =
+        c >= xenos::XE_GPU_TEXTURE_SWIZZLE_0 ? (c & 0b101) : (host_swizzle >> (3 * c)) & 0b111;
     mapping |= h << (3 * i);
   }
-  return mapping | (1u << 12);  // D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES
+  // D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES
+  return mapping | (1u << 12);
 }
 
 void GetGuestExtents(const TextureKey& key, uint32_t* base_bytes, uint32_t* mips_bytes) {
@@ -339,7 +362,8 @@ bool UntileTexture(const TextureKey& key, const GuestTextureMemory& memory,
   const bool convert = host->conversion != TextureConversion::kCopy;
   size_t row_scratch = 0;
   if (convert)
-    for (const HostSubresource& s : subresources) row_scratch = std::max<size_t>(row_scratch, s.row_bytes);
+    for (const HostSubresource& s : subresources)
+      row_scratch = std::max<size_t>(row_scratch, s.row_bytes);
   scratch->resize(base_size + mips_size + row_scratch);
   uint8_t* base = scratch->data();
   uint8_t* mips = base + base_size;
@@ -366,8 +390,8 @@ bool UntileTexture(const TextureKey& key, const GuestTextureMemory& memory,
     level_offset += uint64_t(level_layout.array_slice_stride_bytes) * s.slice;
     uint32_t ox = 0, oy = 0, oz = 0;
     if (s.level >= layout.packed_level) {
-      texture_util::GetPackedMipOffset(key.width, key.height, key.depth(), key.format, s.level,
-                                       ox, oy, oz);
+      texture_util::GetPackedMipOffset(key.width, key.height, key.depth(), key.format, s.level, ox,
+                                       oy, oz);
     }
     const uint32_t row_pitch = level_layout.row_pitch_bytes;
     const uint32_t pitch_blocks = row_pitch / bpb;  // tiled: pitch in blocks

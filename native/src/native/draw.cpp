@@ -140,17 +140,16 @@ constexpr uint32_t NullView(D3D12_SRV_DIMENSION dim) {
          : dim == D3D12_SRV_DIMENSION_TEXTURE3D ? kNull3D
                                                 : kNull2DArray;
 }
-constexpr D3D12_RESOURCE_STATES kSharedReadState =
-    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-    D3D12_RESOURCE_STATE_INDEX_BUFFER;
+constexpr D3D12_RESOURCE_STATES kSharedReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                                   D3D12_RESOURCE_STATE_INDEX_BUFFER;
 
 using enum rex::graphics::Register;  // XE_GPU_REG_* (clang-cl, C++20)
 
 // reg::RB_COLOR_INFO / RB_BLENDCONTROL::rt_register_indices live in the plugin DLL (not exported).
-constexpr rex::graphics::Register kColorInfoRegs[4] = {XE_GPU_REG_RB_COLOR_INFO,
-                                                       XE_GPU_REG_RB_COLOR1_INFO,
-                                                       XE_GPU_REG_RB_COLOR2_INFO,
-                                                       XE_GPU_REG_RB_COLOR3_INFO};
+constexpr rex::graphics::Register kColorInfoRegs[4] = {
+    XE_GPU_REG_RB_COLOR_INFO, XE_GPU_REG_RB_COLOR1_INFO, XE_GPU_REG_RB_COLOR2_INFO,
+    XE_GPU_REG_RB_COLOR3_INFO};
 constexpr rex::graphics::Register kBlendControlRegs[4] = {
     XE_GPU_REG_RB_BLENDCONTROL0, XE_GPU_REG_RB_BLENDCONTROL1, XE_GPU_REG_RB_BLENDCONTROL2,
     XE_GPU_REG_RB_BLENDCONTROL3};
@@ -216,10 +215,9 @@ uint32_t GetNormalizedColorMask(const RegisterFile& regs, uint32_t ps_writes_col
   uint32_t rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
   for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
     if (!(ps_writes_color_targets & (1u << i))) continue;
-    uint32_t format_mask =
-        (1u << xenos::GetColorRenderTargetFormatComponentCount(
-             regs.Get<reg::RB_COLOR_INFO>(kColorInfoRegs[i]).color_format)) -
-        1;
+    uint32_t format_mask = (1u << xenos::GetColorRenderTargetFormatComponentCount(
+                                regs.Get<reg::RB_COLOR_INFO>(kColorInfoRegs[i]).color_format)) -
+                           1;
     uint32_t rt_mask = (rb_color_mask >> (4 * i)) & format_mask;
     if (!rt_mask) continue;
     rt_mask |= 0b1111 & ~format_mask;
@@ -233,8 +231,7 @@ uint32_t GetNormalizedColorMask(const RegisterFile& regs, uint32_t ps_writes_col
 // settings), and full_float24_in_0_to_1 = false: the host depth buffers here are not shared
 // with EDRAM ownership transfers, so depth stays in 0...1 (the Clear values RenderTargets uses,
 // and the shader-written depth: the system flags never carry kSysFlag_DepthFloat24).
-void HostViewportInfo(const RegisterFile& regs, bool pixel_shader_writes_depth,
-                         ViewportInfo& out) {
+void HostViewportInfo(const RegisterFile& regs, bool pixel_shader_writes_depth, ViewportInfo& out) {
   auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -393,35 +390,54 @@ struct PipelineKey {
 constexpr uint32_t kPipelineKeyVersion = 3;
 
 enum class BlendFactor : uint8_t {
-  kZero, kOne, kSrcColor, kInvSrcColor, kSrcAlpha, kInvSrcAlpha, kDestColor, kInvDestColor,
-  kDestAlpha, kInvDestAlpha, kBlendFactor, kInvBlendFactor, kSrcAlphaSat,
+  kZero,
+  kOne,
+  kSrcColor,
+  kInvSrcColor,
+  kSrcAlpha,
+  kInvSrcAlpha,
+  kDestColor,
+  kInvDestColor,
+  kDestAlpha,
+  kInvDestAlpha,
+  kBlendFactor,
+  kInvBlendFactor,
+  kSrcAlphaSat,
 };
 constexpr BlendFactor kBlendFactorMap[32] = {
-    BlendFactor::kZero,        BlendFactor::kOne,          BlendFactor::kZero,
-    BlendFactor::kZero,        BlendFactor::kSrcColor,     BlendFactor::kInvSrcColor,
-    BlendFactor::kSrcAlpha,    BlendFactor::kInvSrcAlpha,  BlendFactor::kDestColor,
-    BlendFactor::kInvDestColor, BlendFactor::kDestAlpha,   BlendFactor::kInvDestAlpha,
-    BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor, BlendFactor::kBlendFactor,
-    BlendFactor::kInvBlendFactor, BlendFactor::kSrcAlphaSat,
+    BlendFactor::kZero,        BlendFactor::kOne,
+    BlendFactor::kZero,        BlendFactor::kZero,
+    BlendFactor::kSrcColor,    BlendFactor::kInvSrcColor,
+    BlendFactor::kSrcAlpha,    BlendFactor::kInvSrcAlpha,
+    BlendFactor::kDestColor,   BlendFactor::kInvDestColor,
+    BlendFactor::kDestAlpha,   BlendFactor::kInvDestAlpha,
+    BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor,
+    BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor,
+    BlendFactor::kSrcAlphaSat,
 };
 constexpr BlendFactor kBlendFactorAlphaMap[32] = {
-    BlendFactor::kZero,       BlendFactor::kOne,          BlendFactor::kZero,
-    BlendFactor::kZero,       BlendFactor::kSrcAlpha,     BlendFactor::kInvSrcAlpha,
-    BlendFactor::kSrcAlpha,   BlendFactor::kInvSrcAlpha,  BlendFactor::kDestAlpha,
-    BlendFactor::kInvDestAlpha, BlendFactor::kDestAlpha,  BlendFactor::kInvDestAlpha,
-    BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor, BlendFactor::kBlendFactor,
-    BlendFactor::kInvBlendFactor, BlendFactor::kSrcAlphaSat,
+    BlendFactor::kZero,        BlendFactor::kOne,
+    BlendFactor::kZero,        BlendFactor::kZero,
+    BlendFactor::kSrcAlpha,    BlendFactor::kInvSrcAlpha,
+    BlendFactor::kSrcAlpha,    BlendFactor::kInvSrcAlpha,
+    BlendFactor::kDestAlpha,   BlendFactor::kInvDestAlpha,
+    BlendFactor::kDestAlpha,   BlendFactor::kInvDestAlpha,
+    BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor,
+    BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor,
+    BlendFactor::kSrcAlphaSat,
 };
 constexpr D3D12_BLEND kD3DBlend[] = {
-    D3D12_BLEND_ZERO,         D3D12_BLEND_ONE,           D3D12_BLEND_SRC_COLOR,
-    D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_SRC_ALPHA,    D3D12_BLEND_INV_SRC_ALPHA,
-    D3D12_BLEND_DEST_COLOR,   D3D12_BLEND_INV_DEST_COLOR, D3D12_BLEND_DEST_ALPHA,
-    D3D12_BLEND_INV_DEST_ALPHA, D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR,
+    D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,
+    D3D12_BLEND_SRC_COLOR,     D3D12_BLEND_INV_SRC_COLOR,
+    D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA,
+    D3D12_BLEND_DEST_COLOR,    D3D12_BLEND_INV_DEST_COLOR,
+    D3D12_BLEND_DEST_ALPHA,    D3D12_BLEND_INV_DEST_ALPHA,
+    D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR,
     D3D12_BLEND_SRC_ALPHA_SAT,
 };
 constexpr D3D12_BLEND_OP kD3DBlendOp[8] = {
-    D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX,
-    D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
+    D3D12_BLEND_OP_ADD,          D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX,
+    D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD,      D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
 
 // ---- samplers ----
 
@@ -463,8 +479,8 @@ SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBind
                  ? uint8_t(fetch.border_color)
                  : uint8_t(xenos::BorderColor::k_ABGR_Black);
   uint32_t mip_min_level, mip_max_level;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
-                                                 nullptr, &mip_min_level, &mip_max_level);
+  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                 &mip_min_level, &mip_max_level);
   k.mip_min_level = uint8_t(mip_min_level);
   auto mag = binding.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter
                                                                         : binding.mag_filter;
@@ -493,18 +509,18 @@ D3D12_SAMPLER_DESC SamplerDesc(const SamplerKey& k) {
     d.Filter = D3D12_FILTER_ANISOTROPIC;
     d.MaxAnisotropy = 1u << (uint32_t(k.aniso) - 1);
   } else {
-    d.Filter = D3D12_ENCODE_BASIC_FILTER(
-        k.min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
-        k.mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
-        k.mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
-        D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+    d.Filter =
+        D3D12_ENCODE_BASIC_FILTER(k.min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                  k.mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                  k.mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+                                  D3D12_FILTER_REDUCTION_TYPE_STANDARD);
     d.MaxAnisotropy = 1;
   }
   static const D3D12_TEXTURE_ADDRESS_MODE kAddress[] = {
-      D3D12_TEXTURE_ADDRESS_MODE_WRAP,        D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
-      D3D12_TEXTURE_ADDRESS_MODE_CLAMP,       D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
-      D3D12_TEXTURE_ADDRESS_MODE_CLAMP,       D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
-      D3D12_TEXTURE_ADDRESS_MODE_BORDER,      D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+      D3D12_TEXTURE_ADDRESS_MODE_WRAP,   D3D12_TEXTURE_ADDRESS_MODE_MIRROR,
+      D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+      D3D12_TEXTURE_ADDRESS_MODE_CLAMP,  D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+      D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
   };
   d.AddressU = kAddress[k.clamp_x & 7];
   d.AddressV = kAddress[k.clamp_y & 7];
@@ -547,11 +563,10 @@ inline bool Equal(const void* a, const void* b, uint32_t size) {
   };
   uint32_t i = 0;
   for (; i + 64 <= size; i += 64) {
-    const __m128i d = _mm_or_si128(
-        _mm_or_si128(_mm_xor_si128(load(x + i), load(y + i)),
-                     _mm_xor_si128(load(x + i + 16), load(y + i + 16))),
-        _mm_or_si128(_mm_xor_si128(load(x + i + 32), load(y + i + 32)),
-                     _mm_xor_si128(load(x + i + 48), load(y + i + 48))));
+    const __m128i d = _mm_or_si128(_mm_or_si128(_mm_xor_si128(load(x + i), load(y + i)),
+                                                _mm_xor_si128(load(x + i + 16), load(y + i + 16))),
+                                   _mm_or_si128(_mm_xor_si128(load(x + i + 32), load(y + i + 32)),
+                                                _mm_xor_si128(load(x + i + 48), load(y + i + 48))));
     if (!zero(d)) return false;
   }
   for (; i + 16 <= size; i += 16)
@@ -611,8 +626,7 @@ void PackFloats(CachedCbv& cb, const DxbcShader* shader, const uint32_t* regs, u
       _mm_store_si128(out++, v);
     }
   }
-  if (resized || _mm_movemask_epi8(_mm_cmpeq_epi8(diff, _mm_setzero_si128())) != 0xFFFF)
-    cb.gpu = 0;
+  if (resized || _mm_movemask_epi8(_mm_cmpeq_epi8(diff, _mm_setzero_si128())) != 0xFFFF) cb.gpu = 0;
 }
 
 }  // namespace
@@ -779,7 +793,7 @@ struct DrawRenderer::Impl {
     uint64_t epoch = 0;
     uint64_t used = 0;  // bind_clock at the last fill or set lookup (the set's replacement order)
     uint64_t touched = 0;  // the frame fence its textures were last marked used with
-    uint32_t bound = 0;  // textures bound, in order: their cache entries and signs[] writes
+    uint32_t bound = 0;    // textures bound, in order: their cache entries and signs[] writes
     uint32_t textures = 0;
     // The shader's fetch constants in ShaderSlots::mask order (count x 6 dwords), then its
     // descriptor table (n), then one signs[] write per bound texture (slot | value << 8).
@@ -817,7 +831,7 @@ struct DrawRenderer::Impl {
   struct PipelineJob {
     Pipeline* target;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;  // bytecode and root signature outlive the job
-    bool logged = false;  // a draw needed it new: its compile time is logged
+    bool logged = false;                      // a draw needed it new: its compile time is logged
   };
   std::vector<std::thread> pso_threads;
   std::mutex pso_mutex;
@@ -830,7 +844,7 @@ struct DrawRenderer::Impl {
   bool pso_stopping = false;
   static constexpr std::chrono::milliseconds kPipelineWaitBudget{500};
   bool pipeline_wait = false;
-  bool generic_pipelines = false;  // --pgr4_native_generic_pipelines (with worker threads)
+  bool generic_pipelines = false;        // --pgr4_native_generic_pipelines (with worker threads)
   std::vector<Pipeline*> frame_pending;  // pipelines of the frame's skipped draws, once each
   PipelineStore store;
   // What made the pipelines created while running new (logged, kNewPipelineLog lines): a
@@ -904,8 +918,7 @@ struct DrawRenderer::Impl {
   // Draw path counters, logged every 300 frames with --pgr4_native_profile.
   struct Diag {
     uint64_t frames = 0, draws = 0, shader_loads = 0, mods_hits = 0, translation_hits = 0,
-             pso_hits = 0, ranges = 0, range_runs = 0, range_pages = 0, unwatched = 0,
-             flushes = 0;
+             pso_hits = 0, ranges = 0, range_runs = 0, range_pages = 0, unwatched = 0, flushes = 0;
     uint64_t cbv_uploads[16] = {}, cbv_bytes[16] = {};  // by root parameter
     // Textures bound, by the fetch constant state the shaders read at run time: swizzled signs
     // all unsigned, gamma RGB + unsigned A, all gamma, all signed, other; then exponent bias
@@ -958,13 +971,14 @@ struct DrawRenderer::Impl {
   std::vector<Snap> snaps;
   uint64_t snap_fence = 0;
   uint32_t snap_pending = 0;  // bit i: listed hash i (bit 31: draw skip_from) still to snapshot
-  void SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets, uint32_t draw_index);
+  void SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets,
+                       uint32_t draw_index);
   void Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem);
   void WriteSnapshots(uint64_t completed_fence);
   // DRAW_LOG_ONCE: the message was logged.
   bool log_memexport = false, log_tess = false, log_reset = false, log_prim = false,
-       log_vfetch = false, log_pso = false, log_rt = false, log_upload = false,
-       log_shader = false, log_heap = false;
+       log_vfetch = false, log_pso = false, log_rt = false, log_upload = false, log_shader = false,
+       log_heap = false;
 
   Impl(NativeRenderer& renderer, DrawRenderer::Stats& s) : r(renderer), stats(s) {}
   ~Impl() {
@@ -1118,12 +1132,13 @@ struct DrawRenderer::Impl {
   // then costs less. Frames are counted by watch_frame on the thread that calls RequestRange.
   static constexpr uint32_t kHotRewriteFrames = 16;
   static constexpr uint16_t kHotMaxHashes = 64;
-  std::unique_ptr<std::atomic<uint64_t>[]> hot;          // one bit per page
-  std::unique_ptr<std::atomic<uint32_t>[]> armed_frame;  // watch_frame of the last arm
+  std::unique_ptr<std::atomic<uint64_t>[]> hot;            // one bit per page
+  std::unique_ptr<std::atomic<uint32_t>[]> armed_frame;    // watch_frame of the last arm
   std::unique_ptr<std::atomic<uint8_t>[]> quick_rewrites;  // quick rewrites in a row (to 2)
-  std::unique_ptr<uint64_t[]> hot_hash;     // XXH3 | 1 of the content last copied, 0: none
-  std::unique_ptr<uint16_t[]> hot_hashes;   // hashes since the content last changed
-  std::unique_ptr<std::atomic<uint32_t>[]> write_frame;  // watch_frame + 1 of the last write, 0: none
+  std::unique_ptr<uint64_t[]> hot_hash;    // XXH3 | 1 of the content last copied, 0: none
+  std::unique_ptr<uint16_t[]> hot_hashes;  // hashes since the content last changed
+  // watch_frame + 1 of the last write, 0: none.
+  std::unique_ptr<std::atomic<uint32_t>[]> write_frame;
   std::atomic<uint32_t> watch_frame{0};
   // Hot pages hashed and copied (content changed) since the last EndFrame.
   std::atomic<uint64_t> hash_pages{0}, hash_copies{0};
@@ -1170,7 +1185,7 @@ struct DrawRenderer::Impl {
     std::vector<Range> ranges;  // watched ranges read since the last Swap
     // Every byte range the current copy segment's draws read (SegmentReads is conservative).
     std::vector<std::pair<uint32_t, uint32_t>> segment_reads;
-    uint8_t slot = 0xFF;  // vertex fetch constant being requested, 0xFF: indices
+    uint8_t slot = 0xFF;           // vertex fetch constant being requested, 0xFF: indices
     uint64_t stale = 0, late = 0;  // pages, since the last Swap
     uint32_t logged = 0, late_logged = 0;
     std::vector<std::pair<uint32_t, uint32_t>> frame_copies;  // (start, size) since the Swap
@@ -1180,12 +1195,13 @@ struct DrawRenderer::Impl {
   void CheckSegmentCopy(uint32_t from, uint32_t size);
   void CheckLateWrites();
   std::shared_ptr<CoherencyJob> MakeCoherencyJob();
-  static constexpr uint32_t kRegisterBlocks[6] = {0, 0x4000, 0x4400, 0x4800, 0x4900,
-                                                  kGuestRegisterCount};
+  static constexpr uint32_t kRegisterBlocks[6] = {0,      0x4000, 0x4400,
+                                                  0x4800, 0x4900, kGuestRegisterCount};
   static void HashRegisterBlocks(const uint32_t* regs, uint64_t out[5]) {
     for (uint32_t i = 0; i < 5; ++i)
       out[i] = XXH3_64bits(regs + kRegisterBlocks[i],
-                           (kRegisterBlocks[i + 1] - kRegisterBlocks[i]) * 4) | 1;
+                           (kRegisterBlocks[i + 1] - kRegisterBlocks[i]) * 4) |
+               1;
   }
   uint32_t coherency_reg_logged = 0;
   bool LogCoherency() { return coherency->logged < 200 && ++coherency->logged; }
@@ -1203,7 +1219,7 @@ struct DrawRenderer::Impl {
 struct CoherencyJob {
   uint32_t frame = 0;
   std::vector<std::pair<uint32_t, uint32_t>> runs;  // (start, size), sorted and disjoint
-  std::vector<uint8_t> expected;                     // the runs' bytes back to back
+  std::vector<uint8_t> expected;                    // the runs' bytes back to back
   uint64_t fence = 0;
   ComPtr<ID3D12Resource> readback;
 };
@@ -1221,7 +1237,8 @@ bool DrawRenderer::Impl::Initialize() {
   if (const std::string dir = REXCVAR_GET(pgr4_native_capture_dir); !dir.empty())
     debug_path = (std::filesystem::path(dir) / "draw-debug.txt").string();
   constant_upload.SetDevice(device);
-  // Race start keeps 3 vertex and 10 constant blocks in flight; creating one there costs up to 16 ms.
+  // Race start keeps 3 vertex and 10 constant blocks in flight; creating one there takes up to
+  // 16 ms.
   vertex_upload.Reserve(4);
   constant_upload.Reserve(12);
   root_signature = CreateBindlessRootSignature(device);
@@ -1320,8 +1337,9 @@ bool DrawRenderer::Impl::Initialize() {
   device->CreateShaderResourceView(nullptr, &nd, view_at(kViewTableStart + kNullCube));
   r.textures().SetEvictCallback(
       [this](const std::vector<ID3D12Resource*>& resources) { ReleaseViews(resources); });
-  REXLOG_INFO("PGR4 native draw: up (shared memory 512 MB {}, bindless heaps {} views / {} samplers)",
-              shared_tiled ? "reserved" : "committed", kViewHeapSize, kSamplerHeapSize);
+  REXLOG_INFO(
+      "PGR4 native draw: up (shared memory 512 MB {}, bindless heaps {} views / {} samplers)",
+      shared_tiled ? "reserved" : "committed", kViewHeapSize, kSamplerHeapSize);
   D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16 = {};
   dynamic_depth_bias = REXCVAR_GET(pgr4_native_dynamic_depth_bias) &&
                        SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16,
@@ -1330,8 +1348,8 @@ bool DrawRenderer::Impl::Initialize() {
   REXLOG_INFO("PGR4 native draw: dynamic depth bias {}", dynamic_depth_bias ? "on" : "off");
   if (REXCVAR_GET(pgr4_native_pipeline_cache)) {
     // The runtime's cache root (userdata\cache unless --cache_root): co_run keeps it.
-    rex::Runtime* runtime = rex::system::kernel_state() ? rex::system::kernel_state()->emulator()
-                                                       : nullptr;
+    rex::Runtime* runtime =
+        rex::system::kernel_state() ? rex::system::kernel_state()->emulator() : nullptr;
     std::filesystem::path dir = runtime ? runtime->cache_root() : std::filesystem::path();
     if (dir.empty()) {
       REXLOG_WARN("PGR4 native pipelines: no cache root, no pipeline cache");
@@ -1348,8 +1366,7 @@ bool DrawRenderer::Impl::Initialize() {
     if (threads <= 0) threads = int(std::thread::hardware_concurrency() / 4);
     threads = std::clamp(threads, 1, 4);
     // While a frame waits for its pipelines, the game threads wait as well.
-    const int total =
-        std::max(threads, std::min(int(std::thread::hardware_concurrency()) - 2, 8));
+    const int total = std::max(threads, std::min(int(std::thread::hardware_concurrency()) - 2, 8));
     for (int i = 0; i < total; ++i) {
       pso_threads.emplace_back([this, i, threads] { PipelineWorker(i == 0, i >= threads); });
       wchar_t name[32];
@@ -1364,9 +1381,7 @@ bool DrawRenderer::Impl::Initialize() {
 void DrawRenderer::Impl::PipelineWorker(bool saves, bool on_wait) {
   std::call_once(library_open, [this] { library.Open(device, library_path); });
   std::unique_lock<std::mutex> lock(pso_mutex);
-  auto has_work = [this] {
-    return pso_stopping || !pso_jobs.empty() || !prewarm_jobs.empty();
-  };
+  auto has_work = [this] { return pso_stopping || !pso_jobs.empty() || !prewarm_jobs.empty(); };
   for (;;) {
     if (on_wait) {
       pso_wait_cv.wait(lock, [this] { return pso_stopping || (pso_waiting && !pso_jobs.empty()); });
@@ -1425,8 +1440,8 @@ void DrawRenderer::Impl::ResetListState() {
   bound_dsv.ptr = 0;
   bound_rt_count = UINT32_MAX;
   bound_ibv = {};
-  for (CachedCbv* cb : {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop, &cb_fetch,
-                        &cb_desc_vs, &cb_desc_ps})
+  for (CachedCbv* cb :
+       {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop, &cb_fetch, &cb_desc_vs, &cb_desc_ps})
     cb->bound = 0;
 }
 
@@ -1442,8 +1457,8 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
                                       std::vector<PendingCopy>& out) {
   if (!length) return true;
   if (start >= kSharedMemorySize || kSharedMemorySize - start < length) {
-    DRAW_LOG_ONCE(log_upload, "PGR4 native draw: range {:08X}+{:X} outside physical memory",
-                  start, length);
+    DRAW_LOG_ONCE(log_upload, "PGR4 native draw: range {:08X}+{:X} outside physical memory", start,
+                  length);
     return false;
   }
   const bool exact = !watch || upload_every_draw.load(std::memory_order_relaxed);
@@ -1532,7 +1547,8 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     while (run_end <= last) {
       const uint64_t b = 1ull << (run_end & 63);
       if ((valid[run_end >> 6].load(std::memory_order_relaxed) |
-           hot[run_end >> 6].load(std::memory_order_relaxed)) & b)
+           hot[run_end >> 6].load(std::memory_order_relaxed)) &
+          b)
         break;
       ++run_end;
     }
@@ -1597,12 +1613,13 @@ void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
         first = std::min(first, i);
       }
     if (LogCoherency())
-      REXLOG_WARN("PGR4 native coherency: frame {} stale page {:05X} (request {:08X}+{:X}, slot "
-                  "{}): {} of {} bytes differ from {:08X}, {} armed at frame {}, last write fault "
-                  "frame {}",
-                  stamp - 1, p, start, length, c.slot, differ, hi - lo, first,
-                  is_hot ? "hot" : "valid", armed_frame[p].load(std::memory_order_relaxed),
-                  int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
+      REXLOG_WARN(
+          "PGR4 native coherency: frame {} stale page {:05X} (request {:08X}+{:X}, slot "
+          "{}): {} of {} bytes differ from {:08X}, {} armed at frame {}, last write fault "
+          "frame {}",
+          stamp - 1, p, start, length, c.slot, differ, hi - lo, first, is_hot ? "hot" : "valid",
+          armed_frame[p].load(std::memory_order_relaxed),
+          int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
   }
 }
 
@@ -1613,9 +1630,10 @@ void DrawRenderer::Impl::CheckSegmentCopy(uint32_t from, uint32_t size) {
     if (!(b < end && from < e)) continue;
     if (segment_conflict) return;
     if (LogCoherency())
-      REXLOG_WARN("PGR4 native coherency: frame {} copy {:08X}+{:X} overwrites {:08X}-{:08X}, read "
-                  "earlier in its copy segment, without a new segment",
-                  watch_frame.load(std::memory_order_relaxed), from, size, b, e);
+      REXLOG_WARN(
+          "PGR4 native coherency: frame {} copy {:08X}+{:X} overwrites {:08X}-{:08X}, read "
+          "earlier in its copy segment, without a new segment",
+          watch_frame.load(std::memory_order_relaxed), from, size, b, e);
     return;
   }
 }
@@ -1668,7 +1686,8 @@ void DrawRenderer::Impl::CheckCoherencyJobs(uint64_t completed_fence) {
       for (const auto& [start, size] : job->runs) {
         for (uint32_t off = 0; off < size;) {
           const uint32_t addr = start + off;
-          const uint32_t n = std::min(size - off, ((addr >> kPageShift) + 1) * (1u << kPageShift) - addr);
+          const uint32_t n =
+              std::min(size - off, ((addr >> kPageShift) + 1) * (1u << kPageShift) - addr);
           if (std::memcmp(got + off, want + off, n)) {
             ++stats.gpu_mismatch_pages;
             uint32_t differ = 0, first = UINT32_MAX;
@@ -1679,10 +1698,11 @@ void DrawRenderer::Impl::CheckCoherencyJobs(uint64_t completed_fence) {
               }
             if (coherency_gpu_logged < 200) {
               ++coherency_gpu_logged;
-              REXLOG_WARN("PGR4 native coherency: frame {} shared memory page {:05X} (copied run "
-                          "{:08X}+{:X}) differs from its copies after the frame: {} of {} bytes "
-                          "from {:08X}",
-                          job->frame, addr >> kPageShift, start, size, differ, n, first);
+              REXLOG_WARN(
+                  "PGR4 native coherency: frame {} shared memory page {:05X} (copied run "
+                  "{:08X}+{:X}) differs from its copies after the frame: {} of {} bytes "
+                  "from {:08X}",
+                  job->frame, addr >> kPageShift, start, size, differ, n, first);
             }
           }
           off += n;
@@ -1718,10 +1738,11 @@ void DrawRenderer::Impl::CheckLateWrites() {
         // Valid and watched, yet guest memory differs: a write the watch missed.
         ++stale;
         if (LogCoherency())
-          REXLOG_WARN("PGR4 native coherency: frame {} stale page {:05X} at the Swap (range "
-                      "{:08X}+{:X}, slot {}), armed at frame {}",
-                      stamp - 1, p, r.start, r.length, r.slot,
-                      armed_frame[p].load(std::memory_order_relaxed));
+          REXLOG_WARN(
+              "PGR4 native coherency: frame {} stale page {:05X} at the Swap (range "
+              "{:08X}+{:X}, slot {}), armed at frame {}",
+              stamp - 1, p, r.start, r.length, r.slot,
+              armed_frame[p].load(std::memory_order_relaxed));
         continue;
       }
       ++late;
@@ -1740,9 +1761,10 @@ void DrawRenderer::Impl::CheckLateWrites() {
     std::string slots;
     for (uint32_t s = 0; s < 256; ++s)
       if (slot_pages[s]) slots += fmt::format(" {}:{}", s == 0xFF ? -1 : int(s), slot_pages[s]);
-    REXLOG_INFO("PGR4 native coherency: frame {} {} pages of {} ranges rewritten after a draw read "
-                "them (first {:08X}+{:X}); pages per slot{}",
-                stamp - 1, late, late_ranges, first_late->start, first_late->length, slots);
+    REXLOG_INFO(
+        "PGR4 native coherency: frame {} {} pages of {} ranges rewritten after a draw read "
+        "them (first {:08X}+{:X}); pages per slot{}",
+        stamp - 1, late, late_ranges, first_late->start, first_late->length, slots);
   }
   c.ranges.clear();
 }
@@ -1904,8 +1926,7 @@ uint32_t DrawRenderer::Impl::SamplerDescriptor(const SamplerKey& k) {
   return index;
 }
 
-DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash,
-                                                              const PipelineKey& key,
+DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash, const PipelineKey& key,
                                                               const DxbcShader::Translation& vs,
                                                               const DxbcShader::Translation* ps,
                                                               uint32_t variant, bool background) {
@@ -1918,14 +1939,15 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash,
       ++new_pipelines_logged;
       const auto st = pipeline_states.find(StateDigest(key));
       const auto pr = pipeline_pairs.find(PairDigest(key));
-      REXLOG_INFO("PGR4 native pipelines: new at frame {}: vs {:016X}{} ps {:016X}{}{}, state {} "
-                  "({} pipelines), shader pair {} ({} pipelines)",
-                  r.frame_index(), vs.shader().ucode_data_hash(), variant & 1 ? " (bools)" : "",
-                  ps ? ps->shader().ucode_data_hash() : 0, variant & 2 ? " (bools)" : "",
-                  variant & 4 ? " (signs)" : "", st == pipeline_states.end() ? "new" : "known",
-                  st == pipeline_states.end() ? 0 : st->second,
-                  pr == pipeline_pairs.end() ? "new" : "known",
-                  pr == pipeline_pairs.end() ? 0 : pr->second);
+      REXLOG_INFO(
+          "PGR4 native pipelines: new at frame {}: vs {:016X}{} ps {:016X}{}{}, state {} "
+          "({} pipelines), shader pair {} ({} pipelines)",
+          r.frame_index(), vs.shader().ucode_data_hash(), variant & 1 ? " (bools)" : "",
+          ps ? ps->shader().ucode_data_hash() : 0, variant & 2 ? " (bools)" : "",
+          variant & 4 ? " (signs)" : "", st == pipeline_states.end() ? "new" : "known",
+          st == pipeline_states.end() ? 0 : st->second,
+          pr == pipeline_pairs.end() ? "new" : "known",
+          pr == pipeline_pairs.end() ? 0 : pr->second);
     }
     p = CreatePipeline(hash, key, vs, ps, background);
     ++stats.pso_created;
@@ -1972,16 +1994,18 @@ void DrawRenderer::Impl::WaitForPipelines() {
       });
       pso_waiting = false;
     }
-    stats.pso_wait_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                      std::chrono::steady_clock::now() - t0)
-                                      .count());
+    stats.pso_wait_us += uint64_t(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
   }
   frame_pending.clear();
 }
 
-DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
-    uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
-    const DxbcShader::Translation* ps, bool prewarm) {
+DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
+                                                                 const PipelineKey& key,
+                                                                 const DxbcShader::Translation& vs,
+                                                                 const DxbcShader::Translation* ps,
+                                                                 bool prewarm) {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC d;
   std::memset(&d, 0, sizeof(d));  // padding too: PipelineLibrary hashes the bytes
   d.pRootSignature = root_signature.Get();
@@ -2105,9 +2129,10 @@ void DrawRenderer::Impl::Prewarm() {
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   ++prewarm_frames;
   if (prewarm_next == list.size())
-    REXLOG_INFO("PGR4 native pipelines: prewarm queued {} pipelines ({} failed) in {:.1f} ms "
-                "over {} frames",
-                list.size() - prewarm_failed, prewarm_failed, prewarm_ms, prewarm_frames);
+    REXLOG_INFO(
+        "PGR4 native pipelines: prewarm queued {} pipelines ({} failed) in {:.1f} ms "
+        "over {} frames",
+        list.size() - prewarm_failed, prewarm_failed, prewarm_ms, prewarm_frames);
 }
 
 void DrawRenderer::Impl::WriteFanIndices(const DrawState& s, uint32_t count, bool wide,
@@ -2260,13 +2285,14 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       ++stats.reg_mismatches;
       if (coherency_reg_logged < 100) {
         ++coherency_reg_logged;
-        REXLOG_WARN("PGR4 native coherency: frame {} draw {} registers differ from Prepare's in "
-                    "blocks{}{}{}{}{}",
-                    r.frame_index(), frame_draws, now[0] != prep->regs_hash[0] ? " state" : "",
-                    now[1] != prep->regs_hash[1] ? " vs-float" : "",
-                    now[2] != prep->regs_hash[2] ? " ps-float" : "",
-                    now[3] != prep->regs_hash[3] ? " fetch" : "",
-                    now[4] != prep->regs_hash[4] ? " bool-loop" : "");
+        REXLOG_WARN(
+            "PGR4 native coherency: frame {} draw {} registers differ from Prepare's in "
+            "blocks{}{}{}{}{}",
+            r.frame_index(), frame_draws, now[0] != prep->regs_hash[0] ? " state" : "",
+            now[1] != prep->regs_hash[1] ? " vs-float" : "",
+            now[2] != prep->regs_hash[2] ? " ps-float" : "",
+            now[3] != prep->regs_hash[3] ? " fetch" : "",
+            now[4] != prep->regs_hash[4] ? " bool-loop" : "");
       }
     }
   }
@@ -2294,10 +2320,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     ++stats.skipped;
     return;
   }
-  DxbcShader* vs =
-      prep ? prep->vs : LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
-  DxbcShader* ps =
-      prep ? prep->ps : LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
+  DxbcShader* vs = prep ? prep->vs : LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
+  DxbcShader* ps = prep ? prep->ps : LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
   if (!vs) {
     ++stats.failed;
     return;
@@ -2327,8 +2351,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   sdr.rb_surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
   sdr.rb_colorcontrol = regs[XE_GPU_REG_RB_COLORCONTROL];
   sdr.rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
-  for (uint32_t i = 0; i < 4; ++i)
-    sdr.rb_color_info[i] = regs[kColorInfoRegs[i]];
+  for (uint32_t i = 0; i < 4; ++i) sdr.rb_color_info[i] = regs[kColorInfoRegs[i]];
   if (mods_memo.vs == vs && mods_memo.ps == ps &&
       std::memcmp(&mods_memo.sdr, &sdr, sizeof(sdr)) == 0) {
     ++diag.mods_hits;
@@ -2339,7 +2362,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     mods_memo.mods = SelectModifications(shaders.translator(), *vs, ps, sdr);
     mods_memo.ps_textures = 0;
     if (mods_memo.mods.pixel_shader_used)
-      for (const auto& tb : ps->texture_bindings()) mods_memo.ps_textures |= 1u << tb.fetch_constant;
+      for (const auto& tb : ps->texture_bindings())
+        mods_memo.ps_textures |= 1u << tb.fetch_constant;
   }
   ShaderModifications mods = mods_memo.mods;
   const uint64_t generic_pixel_mod = mods.pixel;
@@ -2356,9 +2380,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     ++stats.unsupported;
     return;
   }
-  const bool tess =
-      xenos::IsMajorModeExplicit(initiator.major_mode, initiator.prim_type) &&
-      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select == xenos::VGTOutputPath::kTessellationEnable;
+  const bool tess = xenos::IsMajorModeExplicit(initiator.major_mode, initiator.prim_type) &&
+                    regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+                        xenos::VGTOutputPath::kTessellationEnable;
   if (tess) {
     DRAW_LOG_ONCE(log_tess, "PGR4 native draw: tessellation unsupported");
     ++stats.unsupported;
@@ -2372,9 +2396,15 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // through a geometry shader, triangle fans through converted indices).
   D3D_PRIMITIVE_TOPOLOGY topology;
   switch (prim) {
-    case xenos::PrimitiveType::kPointList: topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST; break;
-    case xenos::PrimitiveType::kLineList: topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST; break;
-    case xenos::PrimitiveType::kLineStrip: topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+    case xenos::PrimitiveType::kPointList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+      break;
+    case xenos::PrimitiveType::kLineList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+      break;
+    case xenos::PrimitiveType::kLineStrip:
+      topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+      break;
     case xenos::PrimitiveType::kTriangleList:
     case xenos::PrimitiveType::kRectangleList:
       topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
@@ -2382,7 +2412,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     case xenos::PrimitiveType::kTriangleStrip:
       topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
       break;
-    case xenos::PrimitiveType::kQuadList: topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ; break;
+    case xenos::PrimitiveType::kQuadList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+      break;
     case xenos::PrimitiveType::kTriangleFan:
       // As a triangle list with host indices (v1, v2, v0), (v2, v3, v0)... like the plugin's
       // primitive processor; guest indices are copied raw (the VS still swaps them).
@@ -2406,12 +2438,13 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     index_endian = xenos::Endian(s.index_endian);
     if (!s.index_32bit && index_endian != xenos::Endian::kNone &&
         index_endian != xenos::Endian::k8in16)
-      index_endian = index_endian == xenos::Endian::k8in32 ? xenos::Endian::k8in16
-                                                           : xenos::Endian::kNone;
+      index_endian =
+          index_endian == xenos::Endian::k8in32 ? xenos::Endian::k8in16 : xenos::Endian::kNone;
     if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
-        (prim == xenos::PrimitiveType::kLineStrip || prim == xenos::PrimitiveType::kTriangleStrip)) {
-      uint32_t reset = xenos::GpuSwap(regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx,
-                                      index_endian);
+        (prim == xenos::PrimitiveType::kLineStrip ||
+         prim == xenos::PrimitiveType::kTriangleStrip)) {
+      uint32_t reset =
+          xenos::GpuSwap(regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx, index_endian);
       if (!s.index_32bit) {
         if (reset <= 0xFFFF) {
           if (reset != 0xFFFF) {
@@ -2452,8 +2485,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   const uint32_t height = std::clamp(scissor.offset[1] + scissor.extent[1], 1u, 2048u);
   profile::Mark(profile::kSetup);
   BoundTargets targets;
-  if (!r.render_targets().Bind(list, SurfaceRegsFromRegisters(s.regs), rt_mask, depth_used,
-                               height, &targets)) {
+  if (!r.render_targets().Bind(list, SurfaceRegsFromRegisters(s.regs), rt_mask, depth_used, height,
+                               &targets)) {
     DRAW_LOG_ONCE(log_rt, "PGR4 native draw: RenderTargets::Bind failed (surface {:08X})",
                   regs[XE_GPU_REG_RB_SURFACE_INFO]);
     ++stats.failed;
@@ -2505,9 +2538,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       key.front_ccw = sc.face == 0;
       cull_front = sc.cull_front != 0;
       cull_back = sc.cull_back != 0;
-      if (cull_front) key.cull = uint8_t(D3D12_CULL_MODE_FRONT);
-      else if (cull_back) key.cull = uint8_t(D3D12_CULL_MODE_BACK);
-      if (!cull_front && sc.polymode_front_ptype != xenos::PolygonType::kTriangles) key.wireframe = 1;
+      if (cull_front)
+        key.cull = uint8_t(D3D12_CULL_MODE_FRONT);
+      else if (cull_back)
+        key.cull = uint8_t(D3D12_CULL_MODE_BACK);
+      if (!cull_front && sc.polymode_front_ptype != xenos::PolygonType::kTriangles)
+        key.wireframe = 1;
       if (!cull_back && sc.polymode_back_ptype != xenos::PolygonType::kTriangles) key.wireframe = 1;
       if (sc.poly_mode != xenos::PolygonModeEnable::kDualMode) key.wireframe = 0;
     }
@@ -2528,9 +2564,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       if (depth_control.stencil_enable) {
         key.stencil_enable = 1;
         const bool bf = polygonal && depth_control.backface_enable;
-        auto ref = regs.Get<reg::RB_STENCILREFMASK>(bf && cull_front
-                                                        ? XE_GPU_REG_RB_STENCILREFMASK_BF
-                                                        : XE_GPU_REG_RB_STENCILREFMASK);
+        auto ref = regs.Get<reg::RB_STENCILREFMASK>(
+            bf && cull_front ? XE_GPU_REG_RB_STENCILREFMASK_BF : XE_GPU_REG_RB_STENCILREFMASK);
         key.stencil_read_mask = uint8_t(ref.stencilmask);
         key.stencil_write_mask = uint8_t(ref.stencilwritemask);
         key.front[0] = uint8_t(D3D12_STENCIL_OP_KEEP + uint32_t(depth_control.stencilfail));
@@ -2604,8 +2639,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     uint32_t listed = 0;
     for (uint32_t i = 0; i < debug_hash_count; ++i)
       if (debug_hashes[i] == vs_hash || (ps && debug_hashes[i] == ps_hash)) listed |= 1u << i;
-    if (debug_mask & 256) snap_now = listed & snap_pending;
-    else debug_skip |= bool(listed) != bool(debug_mask & 128);
+    if (debug_mask & 256)
+      snap_now = listed & snap_pending;
+    else
+      debug_skip |= bool(listed) != bool(debug_mask & 128);
   } else if ((snap_pending >> 31) && draw_index == debug_skip_from) {
     snap_now = 1u << 31;
   }
@@ -2614,33 +2651,32 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     return;
   }
   if (draw_log) {
-    std::fprintf(draw_log,
-                 "%u fn=%08X prim=%u n=%u idx=%u vs=%016llX:%llX ps=%016llX:%llX rt=%u:%d,%d dsv=%d "
-                 "z=%u/%u/%u st=%u cull=%u blend=%u:%u/%u/%u,%u/%u/%u mask=%X bc=%08X cc=%08X "
-                 "f=%.2f,%.2f,%.2f,%.2f samples=%u vp=%u,%u,%u,%u z=%.3f-%.3f sc=%u,%u,%u,%u "
-                 "tex=%zu ci=%08X si=%08X di=%08X su=%08X dc=%08X po=%g/%g,%g/%g bias=%d/%g\n",
-                 draw_index, uint32_t(s.fn), s.primitive, count, uint32_t(s.indexed),
-                 (unsigned long long)vs->ucode_data_hash(), (unsigned long long)mods.vertex,
-                 ps ? (unsigned long long)ps->ucode_data_hash() : 0ull,
-                 (unsigned long long)mods.pixel, key.num_rts, int(key.rtv[0]), int(key.rtv[1]),
-                 int(key.dsv), key.depth_enable, key.depth_write, key.depth_func,
-                 key.stencil_enable, key.cull, key.rt[0].blend, key.rt[0].src, key.rt[0].dst,
-                 key.rt[0].op, key.rt[0].src_a, key.rt[0].dst_a, key.rt[0].op_a, key.rt[0].mask,
-                 regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_COLORCONTROL],
-                 regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-                 regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
-                 key.samples, vp.xy_offset[0], vp.xy_offset[1], vp.xy_extent[0], vp.xy_extent[1],
-                 vp.z_min, vp.z_max, scissor.offset[0], scissor.offset[1], scissor.extent[0],
-                 scissor.extent[1],
-                 ps ? ps->GetTextureBindingsAfterTranslation().size() : size_t(0),
-                 regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
-                 regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
-                 regs[XE_GPU_REG_RB_DEPTHCONTROL],
-                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
-                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
-                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
-                 regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
-                 key.slope_scaled_depth_bias);
+    std::fprintf(
+        draw_log,
+        "%u fn=%08X prim=%u n=%u idx=%u vs=%016llX:%llX ps=%016llX:%llX rt=%u:%d,%d dsv=%d "
+        "z=%u/%u/%u st=%u cull=%u blend=%u:%u/%u/%u,%u/%u/%u mask=%X bc=%08X cc=%08X "
+        "f=%.2f,%.2f,%.2f,%.2f samples=%u vp=%u,%u,%u,%u z=%.3f-%.3f sc=%u,%u,%u,%u "
+        "tex=%zu ci=%08X si=%08X di=%08X su=%08X dc=%08X po=%g/%g,%g/%g bias=%d/%g\n",
+        draw_index, uint32_t(s.fn), s.primitive, count, uint32_t(s.indexed),
+        (unsigned long long)vs->ucode_data_hash(), (unsigned long long)mods.vertex,
+        ps ? (unsigned long long)ps->ucode_data_hash() : 0ull, (unsigned long long)mods.pixel,
+        key.num_rts, int(key.rtv[0]), int(key.rtv[1]), int(key.dsv), key.depth_enable,
+        key.depth_write, key.depth_func, key.stencil_enable, key.cull, key.rt[0].blend,
+        key.rt[0].src, key.rt[0].dst, key.rt[0].op, key.rt[0].src_a, key.rt[0].dst_a,
+        key.rt[0].op_a, key.rt[0].mask, regs[XE_GPU_REG_RB_BLENDCONTROL0],
+        regs[XE_GPU_REG_RB_COLORCONTROL], regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
+        regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN), regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
+        regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA), key.samples, vp.xy_offset[0], vp.xy_offset[1],
+        vp.xy_extent[0], vp.xy_extent[1], vp.z_min, vp.z_max, scissor.offset[0], scissor.offset[1],
+        scissor.extent[0], scissor.extent[1],
+        ps ? ps->GetTextureBindingsAfterTranslation().size() : size_t(0),
+        regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
+        regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+        regs[XE_GPU_REG_RB_DEPTHCONTROL], regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
+        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
+        key.slope_scaled_depth_bias);
     // Where the draw's data comes from and the float constants each shader reads (hashed).
     std::fprintf(draw_log, "  ia=%08X", s.indexed ? s.index_address : 0u);
     const Shader::ConstantRegisterMap& vmap = vs->constant_register_map();
@@ -2753,8 +2789,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   profile::Mark(profile::kPipeline);
 
   // Textures and samplers (bindless descriptor indices, b4).
-  const uint32_t used_textures =
-      vs->GetUsedTextureMaskAfterTranslation() | (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0);
+  const uint32_t used_textures = vs->GetUsedTextureMaskAfterTranslation() |
+                                 (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0);
   DxbcShaderTranslator::SystemConstants sys;
   std::memset(&sys, 0, sizeof(sys));
   uint32_t desc_vs[64], desc_ps[64];
@@ -2843,7 +2879,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           const uint32_t* stored = bm->data + ss.count * 6;
           std::memcpy(indices, stored, n * sizeof(uint32_t));
           stored += n;
-          for (uint32_t i = 0; i < bm->bound; ++i) signs[stored[i] & 0xFF] = uint8_t(stored[i] >> 8);
+          for (uint32_t i = 0; i < bm->bound; ++i)
+            signs[stored[i] & 0xFF] = uint8_t(stored[i] >> 8);
           stats.textures += bm->textures;
           ++stats.bind_memo_hits;
           profile::Count(profile::kBindHit);
@@ -2877,10 +2914,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         profile::Scope srv_scope(profile::kTexSrv);
         stale += b.stale;
         const uint32_t mapping = b.srv.Shader4ComponentMapping;
-        const uint64_t sh = (uint64_t(reinterpret_cast<uintptr_t>(b.resource)) ^
-                             (uint64_t(mapping) << 32) ^ (uint64_t(tb.is_signed) << 3) ^
-                             (uint64_t(tb.dimension) << 4)) *
-                            0x9E3779B97F4A7C15ull;
+        const uint64_t sh =
+            (uint64_t(reinterpret_cast<uintptr_t>(b.resource)) ^ (uint64_t(mapping) << 32) ^
+             (uint64_t(tb.is_signed) << 3) ^ (uint64_t(tb.dimension) << 4)) *
+            0x9E3779B97F4A7C15ull;
         SrvMemo& m = srv_memo[sh >> (64 - kSrvMemoBits)];
         if (m.resource == b.resource && m.mapping == mapping &&
             m.is_signed == uint8_t(tb.is_signed) && m.dimension == uint8_t(tb.dimension)) {
@@ -3063,9 +3100,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   profile::Mark(profile::kVertices);
 
   // Fixed-function state.
-  D3D12_VIEWPORT viewport = {float(vp.xy_offset[0]), float(vp.xy_offset[1]),
-                             float(vp.xy_extent[0]),  float(vp.xy_extent[1]),
-                             vp.z_min,                vp.z_max};
+  D3D12_VIEWPORT viewport = {float(vp.xy_offset[0]),
+                             float(vp.xy_offset[1]),
+                             float(vp.xy_extent[0]),
+                             float(vp.xy_extent[1]),
+                             vp.z_min,
+                             vp.z_max};
   D3D12_RECT scissor_rect = {LONG(scissor.offset[0]), LONG(scissor.offset[1]),
                              LONG(scissor.offset[0] + scissor.extent[0]),
                              LONG(scissor.offset[1] + scissor.extent[1])};
@@ -3082,17 +3122,16 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     list->SetGraphicsRootDescriptorTable(kBindlessRoot_ViewHeap, table);
     list_dirty = false;
   }
-  bool ok = UploadCbv(cb_system, &sys, sizeof(sys), kBindlessRoot_SystemConstants, list) &&
-            CommitCbv(cb_float_vs, cb_float_vs.last, kBindlessRoot_FloatConstantsVertex, list) &&
-            CommitCbv(cb_float_ps, cb_float_ps.last, kBindlessRoot_FloatConstantsPixel, list) &&
-            UploadCbv(cb_bool_loop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
-                      (8 + 32) * 4, kBindlessRoot_BoolLoopConstants, list) &&
-            UploadCbv(cb_fetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4,
-                      kBindlessRoot_FetchConstants, list) &&
-            UploadCbv(cb_desc_vs, desc_vs, n_desc_vs * 4, kBindlessRoot_DescriptorIndicesVertex,
-                      list) &&
-            UploadCbv(cb_desc_ps, desc_ps, n_desc_ps * 4, kBindlessRoot_DescriptorIndicesPixel,
-                      list);
+  bool ok =
+      UploadCbv(cb_system, &sys, sizeof(sys), kBindlessRoot_SystemConstants, list) &&
+      CommitCbv(cb_float_vs, cb_float_vs.last, kBindlessRoot_FloatConstantsVertex, list) &&
+      CommitCbv(cb_float_ps, cb_float_ps.last, kBindlessRoot_FloatConstantsPixel, list) &&
+      UploadCbv(cb_bool_loop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], (8 + 32) * 4,
+                kBindlessRoot_BoolLoopConstants, list) &&
+      UploadCbv(cb_fetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4,
+                kBindlessRoot_FetchConstants, list) &&
+      UploadCbv(cb_desc_vs, desc_vs, n_desc_vs * 4, kBindlessRoot_DescriptorIndicesVertex, list) &&
+      UploadCbv(cb_desc_ps, desc_ps, n_desc_ps * 4, kBindlessRoot_DescriptorIndicesPixel, list);
   if (!ok) {
     ++stats.failed;
     return;
@@ -3117,10 +3156,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     list->RSSetScissorRects(1, &scissor_rect);
     bound_scissor = scissor_rect;
   }
-  float blend[4] = {regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
-                    regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
-                    regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
-                    regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
+  float blend[4] = {
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
   if (std::memcmp(bound_blend, blend, sizeof(blend))) {
     list->OMSetBlendFactor(blend);
     std::memcpy(bound_blend, blend, sizeof(blend));
@@ -3217,19 +3255,22 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   profile::Mark(profile::kRecord);
 }
 
-void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets,
-                                         uint32_t draw_index) {
+void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list,
+                                         const BoundTargets& targets, uint32_t draw_index) {
   const std::string stem =
       (std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) / "snap-f").string() +
       std::to_string(r.frame_index()) + "-d" + std::to_string(draw_index);
-  for (uint32_t i = 0; i < targets.color_count; ++i) Snapshot(list, targets.color[i], stem + "-c" + std::to_string(i));
+  for (uint32_t i = 0; i < targets.color_count; ++i)
+    Snapshot(list, targets.color[i], stem + "-c" + std::to_string(i));
   Snapshot(list, targets.depth, stem + "-depth");
   snap_fence = r.frame_fence();
-  REXLOG_INFO("PGR4 native draw: snapshot of draw {} ({} targets) to {}-*", draw_index, snaps.size(), stem);
+  REXLOG_INFO("PGR4 native draw: snapshot of draw {} ({} targets) to {}-*", draw_index,
+              snaps.size(), stem);
   ResetListState();  // the barriers moved the targets out of their bound states
 }
 
-void DrawRenderer::Impl::Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem) {
+void DrawRenderer::Impl::Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt,
+                                  const std::string& stem) {
   if (!rt || rt->samples != 1) return;
   const D3D12_RESOURCE_DESC desc = rt->resource->GetDesc();
   Snap s;
@@ -3269,8 +3310,8 @@ void DrawRenderer::Impl::WriteSnapshots(uint64_t completed_fence) {
     const D3D12_RANGE none = {0, 0};
     s.readback->Unmap(0, &none);
     if (std::FILE* f = std::fopen((s.stem + ".txt").c_str(), "w")) {
-      std::fprintf(f, "%u %u %llu %u\n", s.layout.Footprint.Width, s.rows, (unsigned long long)s.row_bytes,
-                   uint32_t(s.layout.Footprint.Format));
+      std::fprintf(f, "%u %u %llu %u\n", s.layout.Footprint.Width, s.rows,
+                   (unsigned long long)s.row_bytes, uint32_t(s.layout.Footprint.Format));
       std::fclose(f);
     }
   }
@@ -3344,7 +3385,8 @@ void DrawRenderer::BeforeSubmit() {
 
 void DrawRenderer::InvalidateListState(const char* why) {
   impl_->ResetListState();
-  if (impl_->draw_log) std::fprintf(impl_->draw_log, "%s (after draw %u)\n", why, impl_->frame_draws);
+  if (impl_->draw_log)
+    std::fprintf(impl_->draw_log, "%s (after draw %u)\n", why, impl_->frame_draws);
 }
 
 std::pair<uint64_t, uint64_t> DrawRenderer::ShaderHashes(const DrawPrep& prep) {
@@ -3359,20 +3401,26 @@ std::string DrawRenderer::ShaderDisassembly(uint64_t hash) const {
 void DrawRenderer::LogClear(const ClearCall& c) {
   std::FILE* f = impl_->draw_log;
   if (!f) return;
-  std::fprintf(f, "clear (after draw %u) flags=%X colors=%X depth_bound=%d z=%g stencil=%u height=%u si=%08X "
-               "ci0=%08X di=%08X rects", impl_->frame_draws, c.p.flags, c.bound_colors, int(c.depth_bound),
-               c.p.depth, uint32_t(c.p.stencil), c.height, c.regs.surface_info, c.regs.color_info[0],
-               c.regs.depth_info);
-  for (const D3D12_RECT& r : c.p.rects) std::fprintf(f, " %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom);
+  std::fprintf(
+      f,
+      "clear (after draw %u) flags=%X colors=%X depth_bound=%d z=%g stencil=%u height=%u si=%08X "
+      "ci0=%08X di=%08X rects",
+      impl_->frame_draws, c.p.flags, c.bound_colors, int(c.depth_bound), c.p.depth,
+      uint32_t(c.p.stencil), c.height, c.regs.surface_info, c.regs.color_info[0],
+      c.regs.depth_info);
+  for (const D3D12_RECT& r : c.p.rects)
+    std::fprintf(f, " %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom);
   std::fprintf(f, " edram");
-  for (const D3D12_RECT& r : c.p.edram_rects) std::fprintf(f, " %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom);
+  for (const D3D12_RECT& r : c.p.edram_rects)
+    std::fprintf(f, " %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom);
   std::fprintf(f, "\n");
 }
 
 void DrawRenderer::LogResolve(const ResolveParams& p) {
   std::FILE* f = impl_->draw_log;
   if (!f) return;
-  std::fprintf(f, "resolve params (after draw %u) src=%u si=%08X ci0=%08X di=%08X rect=%d,%d-%d,%d "
+  std::fprintf(f,
+               "resolve params (after draw %u) src=%u si=%08X ci0=%08X di=%08X rect=%d,%d-%d,%d "
                "dest=%08X fmt=%u %ux%u at %d,%d clear=%X z=%g stencil=%u edram=%d,%d\n",
                impl_->frame_draws, p.source, p.regs.surface_info, p.regs.color_info[0],
                p.regs.depth_info, p.x0, p.y0, p.x1, p.y1, p.dest_base, p.dest_format, p.dest_width,
@@ -3387,7 +3435,8 @@ bool DrawRenderer::FrameIncomplete() const {
 
 void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->WaitForPipelines();  // after the frame's submission: the GPU runs it meanwhile
-  stats_.views = impl_->views_allocated - (kViewTableStart + kFirstTexture) - impl_->free_views.size();
+  stats_.views =
+      impl_->views_allocated - (kViewTableStart + kFirstTexture) - impl_->free_views.size();
   stats_.watch_faults = impl_->watch_faults.exchange(0, std::memory_order_relaxed);
   stats_.watch_arms = impl_->watch_arms.exchange(0, std::memory_order_relaxed);
   stats_.watch_arm_pages = impl_->watch_arm_pages.exchange(0, std::memory_order_relaxed);
@@ -3429,9 +3478,10 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     }
     REXLOG_INFO("PGR4 native draw diag: cbv uploads per draw / bytes per upload:{}", cbv);
     const uint64_t* fc = d.fetch_classes;
-    REXLOG_INFO("PGR4 native draw diag: textures per draw by signs: unsigned {:.3f}, gamma rgb "
-                "{:.3f}, gamma {:.3f}, signed {:.3f}, other {:.3f}; exp bias {:.3f}, lod bias {:.3f}",
-                per(fc[0]), per(fc[1]), per(fc[2]), per(fc[3]), per(fc[4]), per(fc[5]), per(fc[6]));
+    REXLOG_INFO(
+        "PGR4 native draw diag: textures per draw by signs: unsigned {:.3f}, gamma rgb "
+        "{:.3f}, gamma {:.3f}, signed {:.3f}, other {:.3f}; exp bias {:.3f}, lod bias {:.3f}",
+        per(fc[0]), per(fc[1]), per(fc[2]), per(fc[3]), per(fc[4]), per(fc[5]), per(fc[6]));
     d = Impl::Diag{};
   }
   if (!impl_->debug_path.empty() && ++impl_->debug_poll >= 15) {
@@ -3441,7 +3491,8 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     if (std::FILE* f = std::fopen(impl_->debug_path.c_str(), "r")) {
       if (std::fscanf(f, "%u %u %u %u", &mask, &max_draws, &skip_from, &skip_to) < 1) mask = 0;
       unsigned long long h;
-      while (hash_count < hashes.size() && std::fscanf(f, "%llx", &h) == 1) hashes[hash_count++] = h;
+      while (hash_count < hashes.size() && std::fscanf(f, "%llx", &h) == 1)
+        hashes[hash_count++] = h;
       std::fclose(f);
     }
     if (mask != impl_->debug_mask || max_draws != impl_->debug_max_draws ||

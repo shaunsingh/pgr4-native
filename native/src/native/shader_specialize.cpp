@@ -36,7 +36,8 @@ constexpr uint32_t kJumpPredicated = 1u << 14;
 constexpr uint32_t kJumpConditionBits = 0x7FCu;  // bool address and condition
 
 void SetExec(ControlFlowInstruction& cf, bool end) {
-  cf.dword_1 = (cf.dword_1 & kExecKeepDword1) | (uint32_t(end ? Op::kExecEnd : Op::kExec) << kOpcodeShift);
+  cf.dword_1 =
+      (cf.dword_1 & kExecKeepDword1) | (uint32_t(end ? Op::kExecEnd : Op::kExec) << kOpcodeShift);
 }
 
 // An exec of no instructions at the same address: the control flow bound stays.
@@ -183,35 +184,35 @@ DxbcShader* BoolSpecializer::Get(DxbcShader* shader, const uint32_t* bools) {
 
 DxbcShader* BoolSpecializer::Create(DxbcShader& shader, const uint32_t* bools) {
   std::vector<uint32_t> ucode = shader.ucode_data();
-  if (!SpecializeBoolControlFlow(ucode.data(), shader.cf_pair_index_bound(), bools))
-    return &shader;
+  if (!SpecializeBoolControlFlow(ucode.data(), shader.cf_pair_index_bound(), bools)) return &shader;
   // ShaderCache::Load takes guest (big-endian) ucode, which its hash is of.
   for (uint32_t& d : ucode) d = _byteswap_ulong(d);
   DxbcShader* s = cache_.Load(shader.type(), ucode.data(), uint32_t(ucode.size()));
   // The draw's pipeline, color mask and host vertex shader type follow from what a shader
   // writes. An export only on a path the bools exclude would change them, so such a shader
   // stays generic.
-  const bool same_outputs =
-      s->writes_color_targets() == shader.writes_color_targets() &&
-      s->writes_depth() == shader.writes_depth() &&
-      s->writes_interpolators() == shader.writes_interpolators() &&
-      s->writes_point_size_edge_flag_kill_vertex() ==
-          shader.writes_point_size_edge_flag_kill_vertex() &&
-      s->memexport_eM_written() == shader.memexport_eM_written();
+  const bool same_outputs = s->writes_color_targets() == shader.writes_color_targets() &&
+                            s->writes_depth() == shader.writes_depth() &&
+                            s->writes_interpolators() == shader.writes_interpolators() &&
+                            s->writes_point_size_edge_flag_kill_vertex() ==
+                                shader.writes_point_size_edge_flag_kill_vertex() &&
+                            s->memexport_eM_written() == shader.memexport_eM_written();
   if (!same_outputs) {
     ++kept_generic_;
-    REXLOG_INFO("PGR4 native: shader {:016X} stays generic for bools {:08X}{:08X}{:08X}{:08X} "
-                "{:08X}{:08X}{:08X}{:08X} (outputs differ)",
-                shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4],
-                bools[5], bools[6], bools[7]);
+    REXLOG_INFO(
+        "PGR4 native: shader {:016X} stays generic for bools {:08X}{:08X}{:08X}{:08X} "
+        "{:08X}{:08X}{:08X}{:08X} (outputs differ)",
+        shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4], bools[5],
+        bools[6], bools[7]);
     return &shader;
   }
   ++created_;
   if (created_ <= kLogged)
-    REXLOG_INFO("PGR4 native: shader {:016X} for bools {:08X}{:08X}{:08X}{:08X} "
-                "{:08X}{:08X}{:08X}{:08X} is {:016X}",
-                shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4],
-                bools[5], bools[6], bools[7], s->ucode_data_hash());
+    REXLOG_INFO(
+        "PGR4 native: shader {:016X} for bools {:08X}{:08X}{:08X}{:08X} "
+        "{:08X}{:08X}{:08X}{:08X} is {:016X}",
+        shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4], bools[5],
+        bools[6], bools[7], s->ucode_data_hash());
   return s;
 }
 

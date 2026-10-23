@@ -50,9 +50,9 @@ class GpuTimer;
 // What the texture cache needs to use a resolve result (TextureMod contract).
 // The resources live as long as the Resolver.
 struct ResolvedImage {
-  uint32_t guest_base = 0;  // physical address of the destination level/slice
+  uint32_t guest_base = 0;                       // physical address of the destination level/slice
   rex::graphics::xenos::TextureFormat format{};  // destination format (RB_COPY_DEST_INFO)
-  uint32_t width = 0, height = 0;  // texels written from (0, 0), dest point included
+  uint32_t width = 0, height = 0;                // texels written from (0, 0), dest point included
   ID3D12Resource* texture = nullptr;  // state: COPY_SOURCE | ALL_SHADER_RESOURCE; typeless
   // Depth resolves only: R32_FLOAT = float20e4(d >> 8) (or unorm24 for D24S8), what the
   // texture cache's k_24_8(_FLOAT) conversion gives when the game samples the k_8_8_8_8
@@ -63,19 +63,19 @@ struct ResolvedImage {
 
 // One decoded Resolve call.
 struct ResolveParams {
-  SurfaceRegs regs;            // the source surfaces (register shadow at the call)
-  uint32_t source = 0;         // 0-3 color render target, 4 depth
-  uint32_t sample_select = 0;  // xenos::CopySampleSelect
-  uint32_t copy_command = 1;   // xenos::CopyCommand: 0 raw, 1 convert
-  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // source rectangle, surface pixels, exclusive end
-  int32_t dest_x = 0, dest_y = 0;          // destination point
-  uint32_t dest_base = 0;      // physical address of the destination level/slice
-  uint32_t dest_format = 0;    // xenos::TextureFormat (copy destination format)
+  SurfaceRegs regs;                          // the source surfaces (register shadow at the call)
+  uint32_t source = 0;                       // 0-3 color render target, 4 depth
+  uint32_t sample_select = 0;                // xenos::CopySampleSelect
+  uint32_t copy_command = 1;                 // xenos::CopyCommand: 0 raw, 1 convert
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;    // source rectangle, surface pixels, exclusive end
+  int32_t dest_x = 0, dest_y = 0;            // destination point
+  uint32_t dest_base = 0;                    // physical address of the destination level/slice
+  uint32_t dest_format = 0;                  // xenos::TextureFormat (copy destination format)
   uint32_t dest_width = 0, dest_height = 0;  // destination level size, texels
-  uint32_t dest_endian = 0;    // xenos::Endian (dumps only; the host image is unswapped)
-  uint32_t dest_number = 0;    // xenos::SurfaceNumberFormat: 0 unorm, 1 snorm, 2 uint, 3 sint, 7 float
-  bool dest_swap = false;      // swap red and blue
-  int32_t exp_bias = 0;        // color *= 2^exp_bias (convert only)
+  uint32_t dest_endian = 0;  // xenos::Endian (dumps only; the host image is unswapped)
+  uint32_t dest_number = 0;  // xenos::SurfaceNumberFormat: 0/1 unorm/snorm, 2/3 uint/sint, 7 float
+  bool dest_swap = false;    // swap red and blue
+  int32_t exp_bias = 0;      // color *= 2^exp_bias (convert only)
   // Guest layout of the destination (dumps only).
   bool dest_tiled = false;
   uint32_t dest_pitch_blocks = 0;  // row pitch in texels (tiled: 32-aligned)
@@ -126,7 +126,9 @@ class Resolver {
   // Called with a guest physical address whenever its Find result may change (an image is
   // resolved into, created, replaced or erased), so a cache can recheck only the textures
   // that sample that address.
-  void SetChangedCallback(std::function<void(uint32_t guest_phys_base)> f) { changed_ = std::move(f); }
+  void SetChangedCallback(std::function<void(uint32_t guest_phys_base)> f) {
+    changed_ = std::move(f);
+  }
   // With GPU timing: Resolve marks its phases (GpuTimer::ResolvePhase).
   void set_gpu_timer(GpuTimer* timer) { timer_ = timer; }
 
@@ -157,7 +159,7 @@ class Resolver {
   RenderTargets* targets_ = nullptr;
   struct Pipelines;
   std::unique_ptr<Pipelines> pipelines_;
-  ComPtr<ID3D12DescriptorHeap> heap_;   // shader visible: per-frame rings of view tables
+  ComPtr<ID3D12DescriptorHeap> heap_;  // shader visible: per-frame rings of view tables
   uint32_t heap_stride_ = 0;
   uint32_t heap_next_ = 0;
   bool b5g6r5_store_ = false;  // typed UAV store of B5G6R5_UNORM (k_5_6_5 / k_6_5_5 images)

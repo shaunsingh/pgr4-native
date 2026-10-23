@@ -64,11 +64,22 @@ class KeyReader {
 Kind KindOf(uint64_t key) { return Kind(key & kKindMask); }
 
 const char* ColorFormatName(uint32_t f) {
-  static constexpr const char* kNames[16] = {
-      "k_8_8_8_8",     "k_8_8_8_8_GAMMA",     "k_2_10_10_10", "k_2_10_10_10_FLOAT",
-      "k_16_16",       "k_16_16_16_16",       "k_16_16_FLOAT", "k_16_16_16_16_FLOAT",
-      "fmt8",          "fmt9",                "k_2_10_10_10_AS_10_10_10_10", "fmt11",
-      "k_2_10_10_10_FLOAT_AS_16_16_16_16", "fmt13", "k_32_FLOAT", "k_32_32_FLOAT"};
+  static constexpr const char* kNames[16] = {"k_8_8_8_8",
+                                             "k_8_8_8_8_GAMMA",
+                                             "k_2_10_10_10",
+                                             "k_2_10_10_10_FLOAT",
+                                             "k_16_16",
+                                             "k_16_16_16_16",
+                                             "k_16_16_FLOAT",
+                                             "k_16_16_16_16_FLOAT",
+                                             "fmt8",
+                                             "fmt9",
+                                             "k_2_10_10_10_AS_10_10_10_10",
+                                             "fmt11",
+                                             "k_2_10_10_10_FLOAT_AS_16_16_16_16",
+                                             "fmt13",
+                                             "k_32_FLOAT",
+                                             "k_32_32_FLOAT"};
   return kNames[f & 15];
 }
 const char* DepthFormatName(uint32_t f) { return f ? "D24FS8" : "D24S8"; }
@@ -175,8 +186,10 @@ void GpuTimer::Switch(ID3D12GraphicsCommandList* list, uint64_t key) {
   if (f.spans.size() >= kMaxSpans) {
     if (!overflow_logged_) {
       overflow_logged_ = true;
-      REXLOG_WARN("PGR4 native: GPU timing: more than {} passes in a frame; the rest are charged "
-                  "to the last one", kMaxSpans);
+      REXLOG_WARN(
+          "PGR4 native: GPU timing: more than {} passes in a frame; the rest are charged "
+          "to the last one",
+          kMaxSpans);
     }
     return;
   }
@@ -309,8 +322,9 @@ uint64_t GpuTimer::KeyClear(const ClearCall& c) {
 uint64_t GpuTimer::KeyResolve(const ResolveParams& p, ResolvePhase phase) {
   const reg::RB_SURFACE_INFO surface{.value = p.regs.surface_info};
   const uint32_t source_format =
-      p.source == 4 ? uint32_t(reg::RB_DEPTH_INFO{.value = p.regs.depth_info}.depth_format)
-                    : uint32_t(reg::RB_COLOR_INFO{.value = p.regs.color_info[p.source & 3]}.color_format);
+      p.source == 4
+          ? uint32_t(reg::RB_DEPTH_INFO{.value = p.regs.depth_info}.depth_format)
+          : uint32_t(reg::RB_COLOR_INFO{.value = p.regs.color_info[p.source & 3]}.color_format);
   return KeyWriter(kResolve)
       .Put(p.source, 3)
       .Put(uint32_t(surface.msaa_samples), 2)
@@ -329,8 +343,8 @@ uint64_t GpuTimer::KeySubmit() { return KeyWriter(kSubmit).key(); }
 
 uint64_t GpuTimer::KeyDrawShaders(const uint32_t* regs, uint64_t vs_hash, uint64_t ps_hash) {
   const reg::RB_SURFACE_INFO surface{.value = regs[XE_GPU_REG_RB_SURFACE_INFO]};
-  const auto [it, added] = pair_ids_.try_emplace(vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull),
-                                                 uint32_t(pairs_.size()));
+  const auto [it, added] =
+      pair_ids_.try_emplace(vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull), uint32_t(pairs_.size()));
   if (added) pairs_.emplace_back(vs_hash, ps_hash);
   return KeyWriter(kShaders)
       .Put(surface.surface_pitch, 14)
@@ -351,14 +365,15 @@ void GpuTimer::Log() {
     kind_ms[KindOf(key) == kShaders ? kDraw : KindOf(key)] += ms(g.ticks);
     top.emplace_back(key, &g);
   }
-  REXLOG_INFO("PGR4 native GPU: frames {} | GPU {:.2f} ms/frame (max {:.2f}), idle between "
-              "frames {:.2f} ms, spans/frame {:.0f} | {} {:.2f}, {} {:.2f}, {} {:.2f}, {} {:.2f}, "
-              "{} {:.2f}, {} {:.2f} ms",
-              frames_collected_, ms(frame_ticks_), double(frame_ticks_max_) * ms_per_tick,
-              ms(idle_ticks_), double(spans_collected_) / n, kKindNames[kDraw], kind_ms[kDraw],
-              kKindNames[kClear], kind_ms[kClear], kKindNames[kResolve], kind_ms[kResolve],
-              kKindNames[kPresent], kind_ms[kPresent], kKindNames[kSubmit], kind_ms[kSubmit],
-              kKindNames[kStart], kind_ms[kStart]);
+  REXLOG_INFO(
+      "PGR4 native GPU: frames {} | GPU {:.2f} ms/frame (max {:.2f}), idle between "
+      "frames {:.2f} ms, spans/frame {:.0f} | {} {:.2f}, {} {:.2f}, {} {:.2f}, {} {:.2f}, "
+      "{} {:.2f}, {} {:.2f} ms",
+      frames_collected_, ms(frame_ticks_), double(frame_ticks_max_) * ms_per_tick, ms(idle_ticks_),
+      double(spans_collected_) / n, kKindNames[kDraw], kind_ms[kDraw], kKindNames[kClear],
+      kind_ms[kClear], kKindNames[kResolve], kind_ms[kResolve], kKindNames[kPresent],
+      kind_ms[kPresent], kKindNames[kSubmit], kind_ms[kSubmit], kKindNames[kStart],
+      kind_ms[kStart]);
   // The costliest groups, in frame order.
   constexpr size_t kTop = 24;
   const size_t shown = std::min(kTop, top.size());
@@ -372,10 +387,11 @@ void GpuTimer::Log() {
   const double frame_ms = ms(frame_ticks_);
   for (const auto& [key, g] : top) {
     const uint32_t occurrence = uint32_t(key >> kOccurrenceShift) & kOccurrenceMax;
-    REXLOG_INFO("PGR4 native GPU: {:6.3f} ms {:5.1f} %  span {:4.0f}  #{:<2} x{:.2f}  {:5.0f} cmds  {}",
-                ms(g->ticks), frame_ms > 0 ? 100.0 * ms(g->ticks) / frame_ms : 0.0,
-                double(g->position) / double(g->spans), occurrence, double(g->spans) / n,
-                double(g->commands) / n, Describe(key & ~(uint64_t(kOccurrenceMax) << kOccurrenceShift)));
+    REXLOG_INFO(
+        "PGR4 native GPU: {:6.3f} ms {:5.1f} %  span {:4.0f}  #{:<2} x{:.2f}  {:5.0f} cmds  {}",
+        ms(g->ticks), frame_ms > 0 ? 100.0 * ms(g->ticks) / frame_ms : 0.0,
+        double(g->position) / double(g->spans), occurrence, double(g->spans) / n,
+        double(g->commands) / n, Describe(key & ~(uint64_t(kOccurrenceMax) << kOccurrenceShift)));
     if (KindOf(key) != kShaders) continue;
     const uint32_t id = uint32_t(key >> (kFieldShift + 16)) & 0xFFFFFF;
     if (id >= pairs_.size()) continue;

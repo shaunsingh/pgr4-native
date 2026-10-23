@@ -45,7 +45,7 @@ struct LumaProbe {
 
 // What OnSwap needs from the guest Swap call (read at the call).
 struct SwapCall {
-  uint32_t texture = 0;  // r4: the front buffer D3DBaseTexture (0 = none)
+  uint32_t texture = 0;    // r4: the front buffer D3DBaseTexture (0 = none)
   uint32_t fetch[6] = {};  // its fetch constant (+28), as stored (virtual address)
   // -1: OnSwap checks for a capture request itself; 0/1: the caller did (CaptureRequested).
   int8_t capture_request = -1;

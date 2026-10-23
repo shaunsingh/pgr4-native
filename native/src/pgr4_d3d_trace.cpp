@@ -76,8 +76,25 @@ namespace {
 using namespace rex::graphics;
 
 enum Cat : uint8_t {
-  kDraw, kResolve, kSwap, kPush, kSync, kConst, kShader, kTexture, kStream, kSurface,
-  kState, kGet, kClear, kTiling, kQuery, kDevice, kResource, kOther, kCatCount
+  kDraw,
+  kResolve,
+  kSwap,
+  kPush,
+  kSync,
+  kConst,
+  kShader,
+  kTexture,
+  kStream,
+  kSurface,
+  kState,
+  kGet,
+  kClear,
+  kTiling,
+  kQuery,
+  kDevice,
+  kResource,
+  kOther,
+  kCatCount
 };
 
 enum FnId : uint32_t {
@@ -107,10 +124,16 @@ constexpr FnId kDrawCounterFns[] = {kFn_826CFA60, kFn_826CFF58, kFn_826D0340, kF
 enum Skip : uint32_t { kSkipDraw = 1, kSkipClear = 2, kSkipResolve = 4 };
 uint32_t SkipClassOf(FnId id) {
   switch (id) {
-    case kFn_826D0340: case kFn_826CFF58: case kFn_826CFF10: return kSkipDraw;
-    case kFn_826D1A08: return kSkipClear;
-    case kFn_826CBEE0: return kSkipResolve;
-    default: return 0;
+    case kFn_826D0340:
+    case kFn_826CFF58:
+    case kFn_826CFF10:
+      return kSkipDraw;
+    case kFn_826D1A08:
+      return kSkipClear;
+    case kFn_826CBEE0:
+      return kSkipResolve;
+    default:
+      return 0;
   }
 }
 
@@ -141,50 +164,94 @@ const char* RegName(uint32_t r) {
 
 const char* OpName(uint32_t op) {
   switch (op) {
-    case 0x10: return "NOP";
-    case 0x21: return "REG_RMW";
-    case 0x22: return "DRAW_INDX";
-    case 0x23: return "VIZ_QUERY";
-    case 0x26: return "WAIT_FOR_IDLE";
-    case 0x27: return "IM_LOAD";
-    case 0x2B: return "IM_LOAD_IMMEDIATE";
-    case 0x2D: return "SET_CONSTANT";
-    case 0x2F: return "LOAD_ALU_CONSTANT";
-    case 0x34: return "DRAW_INDX_BIN";
-    case 0x35: return "DRAW_INDX_2_BIN";
-    case 0x36: return "DRAW_INDX_2";
-    case 0x37: return "INDIRECT_BUFFER_PFD";
-    case 0x3B: return "INVALIDATE_STATE";
-    case 0x3C: return "WAIT_REG_MEM";
-    case 0x3D: return "MEM_WRITE";
-    case 0x3E: return "REG_TO_MEM";
-    case 0x3F: return "INDIRECT_BUFFER";
-    case 0x44: return "COND_EXEC";
-    case 0x45: return "COND_WRITE";
-    case 0x46: return "EVENT_WRITE";
-    case 0x48: return "ME_INIT";
-    case 0x4A: return "SET_SHADER_BASES";
-    case 0x4B: return "SET_BIN_BASE_OFFSET";
-    case 0x50: return "SET_BIN_MASK";
-    case 0x51: return "SET_BIN_SELECT";
-    case 0x52: return "WAIT_REG_EQ";
-    case 0x53: return "WAIT_REG_GTE";
-    case 0x54: return "INTERRUPT";
-    case 0x55: return "SET_CONSTANT2";
-    case 0x56: return "SET_SHADER_CONSTANTS";
-    case 0x58: return "EVENT_WRITE_SHD";
-    case 0x59: return "EVENT_WRITE_CFL";
-    case 0x5A: return "EVENT_WRITE_EXT";
-    case 0x5B: return "EVENT_WRITE_ZPD";
-    case 0x5C: return "WAIT_UNTIL_READ";
-    case 0x5D: return "WAIT_IB_PFD_COMPLETE";
-    case 0x5E: return "CONTEXT_UPDATE";
-    case 0x60: return "SET_BIN_MASK_LO";
-    case 0x61: return "SET_BIN_MASK_HI";
-    case 0x62: return "SET_BIN_SELECT_LO";
-    case 0x63: return "SET_BIN_SELECT_HI";
-    case 0x64: return "XE_SWAP";
-    default: return nullptr;
+    case 0x10:
+      return "NOP";
+    case 0x21:
+      return "REG_RMW";
+    case 0x22:
+      return "DRAW_INDX";
+    case 0x23:
+      return "VIZ_QUERY";
+    case 0x26:
+      return "WAIT_FOR_IDLE";
+    case 0x27:
+      return "IM_LOAD";
+    case 0x2B:
+      return "IM_LOAD_IMMEDIATE";
+    case 0x2D:
+      return "SET_CONSTANT";
+    case 0x2F:
+      return "LOAD_ALU_CONSTANT";
+    case 0x34:
+      return "DRAW_INDX_BIN";
+    case 0x35:
+      return "DRAW_INDX_2_BIN";
+    case 0x36:
+      return "DRAW_INDX_2";
+    case 0x37:
+      return "INDIRECT_BUFFER_PFD";
+    case 0x3B:
+      return "INVALIDATE_STATE";
+    case 0x3C:
+      return "WAIT_REG_MEM";
+    case 0x3D:
+      return "MEM_WRITE";
+    case 0x3E:
+      return "REG_TO_MEM";
+    case 0x3F:
+      return "INDIRECT_BUFFER";
+    case 0x44:
+      return "COND_EXEC";
+    case 0x45:
+      return "COND_WRITE";
+    case 0x46:
+      return "EVENT_WRITE";
+    case 0x48:
+      return "ME_INIT";
+    case 0x4A:
+      return "SET_SHADER_BASES";
+    case 0x4B:
+      return "SET_BIN_BASE_OFFSET";
+    case 0x50:
+      return "SET_BIN_MASK";
+    case 0x51:
+      return "SET_BIN_SELECT";
+    case 0x52:
+      return "WAIT_REG_EQ";
+    case 0x53:
+      return "WAIT_REG_GTE";
+    case 0x54:
+      return "INTERRUPT";
+    case 0x55:
+      return "SET_CONSTANT2";
+    case 0x56:
+      return "SET_SHADER_CONSTANTS";
+    case 0x58:
+      return "EVENT_WRITE_SHD";
+    case 0x59:
+      return "EVENT_WRITE_CFL";
+    case 0x5A:
+      return "EVENT_WRITE_EXT";
+    case 0x5B:
+      return "EVENT_WRITE_ZPD";
+    case 0x5C:
+      return "WAIT_UNTIL_READ";
+    case 0x5D:
+      return "WAIT_IB_PFD_COMPLETE";
+    case 0x5E:
+      return "CONTEXT_UPDATE";
+    case 0x60:
+      return "SET_BIN_MASK_LO";
+    case 0x61:
+      return "SET_BIN_MASK_HI";
+    case 0x62:
+      return "SET_BIN_SELECT_LO";
+    case 0x63:
+      return "SET_BIN_SELECT_HI";
+    case 0x64:
+      return "XE_SWAP";
+    default:
+      return nullptr;
   }
 }
 
@@ -192,9 +259,9 @@ const char* OpName(uint32_t op) {
 struct ShaderInfo {
   uint32_t type = 0, addr = 0, dwords = 0;
   uint64_t hash = 0;
-  uint32_t tfetch_mask = 0;   // bit i: tf[i]
-  uint64_t vfetch_lo = 0;     // bit i: vf[i], i < 64
-  uint32_t vfetch_hi = 0;     // bit i: vf[64 + i]
+  uint32_t tfetch_mask = 0;  // bit i: tf[i]
+  uint64_t vfetch_lo = 0;    // bit i: vf[i], i < 64
+  uint32_t vfetch_hi = 0;    // bit i: vf[64 + i]
   uint32_t uses = 0;
 };
 
@@ -217,7 +284,10 @@ void ScanUcode(const uint32_t* host_le, uint32_t dwords, ShaderInfo& info) {
         std::memcpy(&fi, host_le + at, sizeof(fi));
         if (fi.opcode() == ucode::FetchOpcode::kVertexFetch) {
           uint32_t vf = fi.vertex_fetch().fetch_constant_index();
-          if (vf < 64) info.vfetch_lo |= 1ull << vf; else if (vf < 96) info.vfetch_hi |= 1u << (vf - 64);
+          if (vf < 64)
+            info.vfetch_lo |= 1ull << vf;
+          else if (vf < 96)
+            info.vfetch_hi |= 1u << (vf - 64);
         } else {
           info.tfetch_mask |= 1u << (fi.texture_fetch().fetch_constant_index() & 31);
         }
@@ -229,7 +299,7 @@ void ScanUcode(const uint32_t* host_le, uint32_t dwords, ShaderInfo& info) {
 }
 
 struct FrameCounters {
-  uint64_t calls = 0, draw_calls = 0;          // hooked calls; DrawCounter's five builders
+  uint64_t calls = 0, draw_calls = 0;  // hooked calls; DrawCounter's five builders
   uint64_t tap_draws = 0, tap_aux = 0, tap_resolves = 0;  // predicated / other draw packets
   uint64_t dwords = 0, segments = 0, resyncs = 0, torn = 0, unknown_ops = 0, ibs = 0, zero_pad = 0;
   uint64_t checked = 0, differ = 0;  // --pgr4_d3d_tap_check: draws compared, draws that differ
@@ -268,7 +338,7 @@ struct Tap {
   uint32_t check_logged = 0;
   std::vector<uint64_t> state_regs = std::vector<uint64_t>(kRegCount);
   std::map<uint32_t, uint64_t> op_counts;
-  std::map<uint64_t, ShaderInfo> shaders;                 // key: type<<63 | addr<<20 ^ dwords
+  std::map<uint64_t, ShaderInfo> shaders;                      // key: type<<63 | addr<<20 ^ dwords
   std::map<std::pair<uint32_t, uint32_t>, uint64_t> textures;  // (dword1, dword2) -> draws
   uint64_t fn_calls[kFnCount] = {};
 };
@@ -395,16 +465,22 @@ void CompareState(Tap& t, FnId id) {
     Append(s, " %04X tap=%08X state=%08X", r, t.regs[r], v[r]);
     ++shown;
   }
-  if (vs_bad) Append(s, " vs tap=%08X:%u%s state=%08X:%u%s", t.vs_addr, t.vs_dwords, t.vs_addr ? "" : ":imm",
-                     gvs.ucode, gvs.dwords, gvs.immediate ? ":imm" : "");
-  if (ps_bad) Append(s, " ps tap=%08X:%u state=%08X:%u", t.ps_addr, t.ps_dwords, gs.ps().ucode, gs.ps().dwords);
-  if (detail) Out(t, "# state_diff %s\n", s.c_str());
-  else t.check_first = std::move(s);
+  if (vs_bad)
+    Append(s, " vs tap=%08X:%u%s state=%08X:%u%s", t.vs_addr, t.vs_dwords, t.vs_addr ? "" : ":imm",
+           gvs.ucode, gvs.dwords, gvs.immediate ? ":imm" : "");
+  if (ps_bad)
+    Append(s, " ps tap=%08X:%u state=%08X:%u", t.ps_addr, t.ps_dwords, gs.ps().ucode,
+           gs.ps().dwords);
+  if (detail)
+    Out(t, "# state_diff %s\n", s.c_str());
+  else
+    t.check_first = std::move(s);
 }
 
 void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
   // DRAW_INDX: viz, initiator, [index base, index size]; DRAW_INDX_2: initiator, indices.
-  uint32_t initiator = op == 0x22 ? (t.pkt.size() > 1 ? t.pkt[1] : 0) : (t.pkt.empty() ? 0 : t.pkt[0]);
+  uint32_t initiator =
+      op == 0x22 ? (t.pkt.size() > 1 ? t.pkt[1] : 0) : (t.pkt.empty() ? 0 : t.pkt[0]);
   bool resolve = (t.regs[0x2208] & 7) == uint32_t(xenos::EdramMode::kCopy);
   if (resolve) {
     ++t.frame.tap_resolves;
@@ -424,7 +500,10 @@ void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
   Out(t, "D %llu c=%llu fn=%s op=%s pred=%d %s prim=%u src=%s idx32=%u count=%u",
       (unsigned long long)t.draw_seq++, (unsigned long long)CurrentSeq(),
       fn < kFnCount ? kFns[fn].name : "-", OpName(op), predicated ? 1 : 0,
-      resolve ? "RESOLVE" : "draw", prim, src == 0 ? "dma" : src == 2 ? "auto" : "imm",
+      resolve ? "RESOLVE" : "draw", prim,
+      src == 0   ? "dma"
+      : src == 2 ? "auto"
+                 : "imm",
       (initiator >> 11) & 1, count);
   if (op == 0x22 && src == 0 && t.pkt.size() >= 4)
     Out(t, " ib=%08X:%u", t.pkt[2], t.pkt[3] & 0xFFFFFF);
@@ -439,8 +518,9 @@ void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
   Out(t, " vs=%08X:%u:%016llX ps=%08X:%u:%016llX", t.vs_addr, t.vs_dwords,
       (unsigned long long)(vs ? vs->hash : t.vs_imm_hash), t.ps_addr, t.ps_dwords,
       (unsigned long long)(ps ? ps->hash : t.ps_imm_hash));
-  Out(t, " mode=%08X surf=%08X c0=%08X c1=%08X c2=%08X c3=%08X d=%08X mask=%08X depth=%08X"
-         " blend0=%08X sc=%08X,%08X vgt_offs=%u",
+  Out(t,
+      " mode=%08X surf=%08X c0=%08X c1=%08X c2=%08X c3=%08X d=%08X mask=%08X depth=%08X"
+      " blend0=%08X sc=%08X,%08X vgt_offs=%u",
       t.regs[0x2208], t.regs[0x2000], t.regs[0x2001], t.regs[0x2003], t.regs[0x2004],
       t.regs[0x2005], t.regs[0x2002], t.regs[0x2104], t.regs[0x2200], t.regs[0x2201],
       t.regs[0x2081], t.regs[0x2082], t.regs[0x2102]);
@@ -488,7 +568,8 @@ void HandlePacket(Tap& t, uint8_t* base) {
   if (!OpName(op)) ++t.frame.unknown_ops;
   auto range = [&](uint32_t reg, size_t first) {
     const uint8_t how = pred ? pgr4::native::GuestStateTracker::kTapWrittenPredicated : 1;
-    for (size_t i = first; i < t.pkt.size(); ++i) WriteReg(t, reg + uint32_t(i - first), t.pkt[i], how);
+    for (size_t i = first; i < t.pkt.size(); ++i)
+      WriteReg(t, reg + uint32_t(i - first), t.pkt[i], how);
     if (Tracing(t)) {
       size_t n = t.pkt.size() - first;
       if (reg >= 0x4000 && reg < 0x4800)
@@ -515,7 +596,8 @@ void HandlePacket(Tap& t, uint8_t* base) {
       break;
     case 0x2F: {  // LOAD_ALU_CONSTANT
       if (t.pkt.size() < 3) break;
-      uint32_t addr = t.pkt[0] & 0x3FFFFFFF, index = t.pkt[1] & 0x7FF, kind = (t.pkt[1] >> 16) & 0xFF;
+      uint32_t addr = t.pkt[0] & 0x3FFFFFFF, index = t.pkt[1] & 0x7FF,
+               kind = (t.pkt[1] >> 16) & 0xFF;
       uint32_t n = t.pkt[2] & 0xFFF;
       static constexpr uint32_t kBase[5] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
       if (kind >= 5) break;
@@ -537,20 +619,34 @@ void HandlePacket(Tap& t, uint8_t* base) {
         t.ps_addr = t.pkt[0] & ~3u;
         t.ps_dwords = t.pkt[1] & 0xFFFF;
       }
-      if (Tracing(t)) Out(t, "S %s %08X %u\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[0] & ~3u, t.pkt[1] & 0xFFFF);
+      if (Tracing(t))
+        Out(t, "S %s %08X %u\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[0] & ~3u, t.pkt[1] & 0xFFFF);
       break;
     case 0x2B: {  // IM_LOAD_IMMEDIATE
       if (t.pkt.size() < 2) break;
       uint64_t h = Fnv(t.pkt.data() + 2, t.pkt.size() - 2);
-      if ((t.pkt[0] & 3) == 0) { t.vs_addr = 0; t.vs_dwords = t.pkt[1] & 0xFFFF; t.vs_imm_hash = h; }
-      else { t.ps_addr = 0; t.ps_dwords = t.pkt[1] & 0xFFFF; t.ps_imm_hash = h; }
-      if (Tracing(t)) Out(t, "S %s imm %u %016llX\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[1] & 0xFFFF, (unsigned long long)h);
+      if ((t.pkt[0] & 3) == 0) {
+        t.vs_addr = 0;
+        t.vs_dwords = t.pkt[1] & 0xFFFF;
+        t.vs_imm_hash = h;
+      } else {
+        t.ps_addr = 0;
+        t.ps_dwords = t.pkt[1] & 0xFFFF;
+        t.ps_imm_hash = h;
+      }
+      if (Tracing(t))
+        Out(t, "S %s imm %u %016llX\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[1] & 0xFFFF,
+            (unsigned long long)h);
       break;
     }
-    case 0x22: case 0x36: case 0x34: case 0x35:
+    case 0x22:
+    case 0x36:
+    case 0x34:
+    case 0x35:
       OnDraw(t, base, op, pred);
       break;
-    case 0x3F: case 0x37:
+    case 0x3F:
+    case 0x37:
       ++t.frame.ibs;
       if (Tracing(t) && t.pkt.size() >= 2) Out(t, "I %08X %u\n", t.pkt[0], t.pkt[1] & 0xFFFFF);
       break;
@@ -578,9 +674,15 @@ void Feed(Tap& t, uint8_t* base, uint32_t dw) {
     t.header = dw;
     t.pkt.clear();
     switch (dw >> 30) {
-      case 0: case 3: t.need = ((dw >> 16) & 0x3FFF) + 1; break;
-      case 1: t.need = 2; break;
-      default: return;  // type 2: NOP
+      case 0:
+      case 3:
+        t.need = ((dw >> 16) & 0x3FFF) + 1;
+        break;
+      case 1:
+        t.need = 2;
+        break;
+      default:
+        return;  // type 2: NOP
     }
     t.in_packet = true;
     return;
@@ -607,13 +709,15 @@ void Sync(Tap& t, uint8_t* base, bool segment_switch_expected, bool jump = false
     if (t.in_packet) {
       ++t.frame.torn;
       if (Tracing(t))
-        Out(t, "# torn packet header=%08X still needs %u dwords at window %08X\n", t.header, t.need, t.cursor + 4);
+        Out(t, "# torn packet header=%08X still needs %u dwords at window %08X\n", t.header, t.need,
+            t.cursor + 4);
       t.in_packet = false;
     }
     if (Tracing(t)) {  // raw dwords, for checking the decoder against the stream
       uint32_t n = (cur - t.cursor) / 4;
       Out(t, "X %08X n=%u", t.cursor + 4, n);
-      for (uint32_t i = 0; i < n && i < 24; ++i) Out(t, " %08X", Load32(base, t.cursor + 4 + i * 4));
+      for (uint32_t i = 0; i < n && i < 24; ++i)
+        Out(t, " %08X", Load32(base, t.cursor + 4 + i * 4));
       Out(t, "%s\n", n > 24 ? " ..." : "");
     }
     for (uint32_t a = t.cursor + 4; a <= cur; a += 4) Feed(t, base, Load32(base, a));
@@ -621,39 +725,48 @@ void Sync(Tap& t, uint8_t* base, bool segment_switch_expected, bool jump = false
   } else {
     // The pointer moved to another segment (MakeSpace, RestorePush). Packets end at segment
     // boundaries, so a partial packet here means the decoder lost data.
-    if (segment_switch_expected) ++t.frame.segments; else ++t.frame.resyncs;
+    if (segment_switch_expected)
+      ++t.frame.segments;
+    else
+      ++t.frame.resyncs;
     if (t.in_packet) ++t.frame.resyncs;
     t.in_packet = false;
-    if (Tracing(t)) Out(t, "# segment %08X -> %08X%s\n", t.cursor, cur, segment_switch_expected ? "" : " (unexpected)");
+    if (Tracing(t))
+      Out(t, "# segment %08X -> %08X%s\n", t.cursor, cur,
+          segment_switch_expected ? "" : " (unexpected)");
   }
   t.cursor = cur;
 }
 
 void FlushTrace(Tap& t) {
-  Out(t, "# summary frame=%llu calls=%llu draw_calls=%llu tap_draws=%llu tap_aux=%llu tap_resolves=%llu"
-         " dwords=%llu segments=%llu resyncs=%llu torn=%llu unknown_ops=%llu ibs=%llu zero_pad=%llu"
-         " state_checked_draws=%llu state_mismatch_draws=%llu state_shader_mismatch=%llu state_unchecked=%llu"
-         " state_per_tile=%llu\n",
+  Out(t,
+      "# summary frame=%llu calls=%llu draw_calls=%llu tap_draws=%llu tap_aux=%llu"
+      " tap_resolves=%llu dwords=%llu segments=%llu resyncs=%llu torn=%llu unknown_ops=%llu"
+      " ibs=%llu zero_pad=%llu state_checked_draws=%llu state_mismatch_draws=%llu"
+      " state_shader_mismatch=%llu state_unchecked=%llu state_per_tile=%llu\n",
       (unsigned long long)t.trace_frame, (unsigned long long)t.frame.calls,
       (unsigned long long)t.frame.draw_calls, (unsigned long long)t.frame.tap_draws,
       (unsigned long long)t.frame.tap_aux, (unsigned long long)t.frame.tap_resolves,
       (unsigned long long)t.frame.dwords, (unsigned long long)t.frame.segments,
       (unsigned long long)t.frame.resyncs, (unsigned long long)t.frame.torn,
-      (unsigned long long)t.frame.unknown_ops, (unsigned long long)t.frame.ibs, (unsigned long long)t.frame.zero_pad,
-      (unsigned long long)t.state_draws, (unsigned long long)t.state_bad_draws,
-      (unsigned long long)t.state_shader_bad, (unsigned long long)t.state_unchecked,
-      (unsigned long long)t.state_per_tile);
+      (unsigned long long)t.frame.unknown_ops, (unsigned long long)t.frame.ibs,
+      (unsigned long long)t.frame.zero_pad, (unsigned long long)t.state_draws,
+      (unsigned long long)t.state_bad_draws, (unsigned long long)t.state_shader_bad,
+      (unsigned long long)t.state_unchecked, (unsigned long long)t.state_per_tile);
   for (uint32_t r = 0; r < kRegCount; ++r)
     if (t.state_regs[r])
       Out(t, "# state_mismatch %04X %s draws=%llu\n", r, RegName(r) ? RegName(r) : "?",
           (unsigned long long)t.state_regs[r]);
   for (uint32_t i = 0; i < kFnCount; ++i)
-    if (t.fn_calls[i]) Out(t, "# calls %08X %s %llu\n", kFns[i].addr, kFns[i].name, (unsigned long long)t.fn_calls[i]);
+    if (t.fn_calls[i])
+      Out(t, "# calls %08X %s %llu\n", kFns[i].addr, kFns[i].name,
+          (unsigned long long)t.fn_calls[i]);
   for (auto& [op, n] : t.op_counts)
     Out(t, "# packets %s %llu\n", OpName(op) ? OpName(op) : "?", (unsigned long long)n);
   for (auto& [k, s] : t.shaders)
-    Out(t, "# shader %s %08X dwords=%u hash=%016llX tfetch=%08X vfetch=%08X%016llX\n", s.type ? "ps" : "vs",
-        s.addr, s.dwords, (unsigned long long)s.hash, s.tfetch_mask, s.vfetch_hi, (unsigned long long)s.vfetch_lo);
+    Out(t, "# shader %s %08X dwords=%u hash=%016llX tfetch=%08X vfetch=%08X%016llX\n",
+        s.type ? "ps" : "vs", s.addr, s.dwords, (unsigned long long)s.hash, s.tfetch_mask,
+        s.vfetch_hi, (unsigned long long)s.vfetch_lo);
   for (auto& [k, n] : t.textures)
     Out(t, "# texture %08X fmt%u %ux%u draws=%llu\n", k.first & 0xFFFFF000u, k.first & 0x3F,
         (k.second & 0x1FFF) + 1, ((k.second >> 13) & 0x1FFF) + 1, (unsigned long long)n);
@@ -661,7 +774,8 @@ void FlushTrace(Tap& t) {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   char name[256];
-  std::snprintf(name, sizeof(name), "pgr4-d3d-%s-f%llu.txt", t.trace_tag.c_str(), (unsigned long long)t.trace_frame);
+  std::snprintf(name, sizeof(name), "pgr4-d3d-%s-f%llu.txt", t.trace_tag.c_str(),
+                (unsigned long long)t.trace_frame);
   std::ofstream(dir / name, std::ios::binary).write(t.out.data(), std::streamsize(t.out.size()));
   REXLOG_INFO("PGR4 D3D trace: wrote {} ({} bytes, {} draws, {} resolves)", (dir / name).string(),
               t.out.size(), t.frame.tap_draws, t.frame.tap_resolves);
@@ -732,14 +846,18 @@ void PollControl(Tap& t, uint8_t* base) {
 
 struct Window {
   uint64_t frames = 0, calls = 0, draw_calls = 0, tap_draws = 0, tap_aux = 0, tap_resolves = 0;
-  uint64_t dwords = 0, segments = 0, resyncs = 0, torn = 0, unknown_ops = 0, min_draws = ~0ull, max_draws = 0;
+  uint64_t dwords = 0, segments = 0, resyncs = 0, torn = 0, unknown_ops = 0, min_draws = ~0ull,
+           max_draws = 0;
 } g_window;
 
 std::FILE* FrameCsv() {
   static std::FILE* f = [] {
     std::string p = REXCVAR_GET(pgr4_d3d_frame_csv);
     std::FILE* f = p.empty() ? nullptr : std::fopen(p.c_str(), "w");
-    if (f) std::fprintf(f, "frame,calls,draw_calls,tap_draws,tap_aux,tap_resolves,dwords,segments,resyncs,torn,unknown_ops\n");
+    if (f)
+      std::fprintf(f,
+                   "frame,calls,draw_calls,tap_draws,tap_aux,tap_resolves,dwords,segments,resyncs,"
+                   "torn,unknown_ops\n");
     return f;
   }();
   return f;
@@ -748,36 +866,47 @@ std::FILE* FrameCsv() {
 void EndFrame(Tap& t, uint8_t* base) {
   auto& c = t.frame;
   if (std::FILE* f = FrameCsv()) {
-    std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", (unsigned long long)t.frame_index,
-                 (unsigned long long)c.calls, (unsigned long long)c.draw_calls, (unsigned long long)c.tap_draws,
-                 (unsigned long long)c.tap_aux, (unsigned long long)c.tap_resolves, (unsigned long long)c.dwords,
-                 (unsigned long long)c.segments, (unsigned long long)c.resyncs, (unsigned long long)c.torn,
+    std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                 (unsigned long long)t.frame_index, (unsigned long long)c.calls,
+                 (unsigned long long)c.draw_calls, (unsigned long long)c.tap_draws,
+                 (unsigned long long)c.tap_aux, (unsigned long long)c.tap_resolves,
+                 (unsigned long long)c.dwords, (unsigned long long)c.segments,
+                 (unsigned long long)c.resyncs, (unsigned long long)c.torn,
                  (unsigned long long)c.unknown_ops);
     if ((t.frame_index & 31) == 0) std::fflush(f);
   }
   auto& w = g_window;
   ++w.frames;
-  w.calls += c.calls; w.draw_calls += c.draw_calls; w.tap_draws += c.tap_draws; w.tap_aux += c.tap_aux;
-  w.tap_resolves += c.tap_resolves; w.dwords += c.dwords; w.segments += c.segments; w.resyncs += c.resyncs;
-  w.torn += c.torn; w.unknown_ops += c.unknown_ops;
+  w.calls += c.calls;
+  w.draw_calls += c.draw_calls;
+  w.tap_draws += c.tap_draws;
+  w.tap_aux += c.tap_aux;
+  w.tap_resolves += c.tap_resolves;
+  w.dwords += c.dwords;
+  w.segments += c.segments;
+  w.resyncs += c.resyncs;
+  w.torn += c.torn;
+  w.unknown_ops += c.unknown_ops;
   w.min_draws = std::min(w.min_draws, c.tap_draws);
   w.max_draws = std::max(w.max_draws, c.tap_draws);
   int32_t every = REXCVAR_GET(pgr4_d3d_stats_frames);
   if (every > 0 && w.frames >= uint64_t(every)) {
     double n = double(w.frames);
-    REXLOG_INFO("PGR4 D3D: frames {} | per frame: calls {:.0f}, draw calls {:.1f}, tap draws {:.1f} "
-                "(min {} max {}), tap aux {:.1f}, tap resolves {:.1f}, dwords {:.0f}, segments {:.1f}, "
-                "resyncs {}, torn {}, unknown ops {} | tap {} skip {}",
-                t.frame_index, w.calls / n, w.draw_calls / n, w.tap_draws / n, w.min_draws, w.max_draws,
-                w.tap_aux / n, w.tap_resolves / n, w.dwords / n, w.segments / n, w.resyncs, w.torn,
-                w.unknown_ops, t.enabled ? "on" : "off", g_skip.load());
+    REXLOG_INFO(
+        "PGR4 D3D: frames {} | per frame: calls {:.0f}, draw calls {:.1f}, tap draws {:.1f} "
+        "(min {} max {}), tap aux {:.1f}, tap resolves {:.1f}, dwords {:.0f}, segments {:.1f}, "
+        "resyncs {}, torn {}, unknown ops {} | tap {} skip {}",
+        t.frame_index, w.calls / n, w.draw_calls / n, w.tap_draws / n, w.min_draws, w.max_draws,
+        w.tap_aux / n, w.tap_resolves / n, w.dwords / n, w.segments / n, w.resyncs, w.torn,
+        w.unknown_ops, t.enabled ? "on" : "off", g_skip.load());
     w = Window{};
   }
   if (t.check && c.differ && t.check_logged < 2000) {
     ++t.check_logged;
     const pgr4::native::NativeRenderer* r = pgr4::native::NativeRenderer::Get();
-    REXLOG_INFO("PGR4 D3D check: frame {} (native {}): {} of {} draws differ from the stream; first {}",
-                t.frame_index, r ? r->frame_index() : 0, c.differ, c.checked, t.check_first);
+    REXLOG_INFO(
+        "PGR4 D3D check: frame {} (native {}): {} of {} draws differ from the stream; first {}",
+        t.frame_index, r ? r->frame_index() : 0, c.differ, c.checked, t.check_first);
   }
   t.check_first.clear();
   if (t.tracing) {
@@ -803,11 +932,13 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   const bool forward = !(skip & g_skip.load(std::memory_order_relaxed));
   // The game creates the device more than once (once more at the title screen); the device a
   // Swap or draw call runs on is the current one.
-  if (r3 && r3 != t.device && t.device && (id == kFn_826CB148 || id == kFn_826D0340 || id == kFn_826CFF58)) {
+  if (r3 && r3 != t.device && t.device &&
+      (id == kFn_826CB148 || id == kFn_826D0340 || id == kFn_826CFF58)) {
     std::lock_guard lock(t.mutex);
     static uint32_t switches = 0;
     if (++switches <= 8)
-      REXLOG_INFO("PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it", kFns[id].name, r3, t.device);
+      REXLOG_INFO("PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it", kFns[id].name,
+                  r3, t.device);
     t.device = r3;
     t.cursor = Load32(base, t.device + kDevPush);
     t.in_packet = false;
@@ -824,14 +955,21 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
       g_hook_all.store(t.enabled || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
       g_skip.store(ParseSkip(REXCVAR_GET(pgr4_d3d_skip)));
       REXLOG_INFO("PGR4 D3D: device {:08X}, push {:08X}, tap {}{}, {} hooked functions", t.device,
-                  t.cursor, t.enabled ? "on" : "off", t.check ? " (state check)" : "", uint32_t(kFnCount));
+                  t.cursor, t.enabled ? "on" : "off", t.check ? " (state check)" : "",
+                  uint32_t(kFnCount));
       return;
     }
-    if (forward) original(ctx, base); else ctx.r3.u64 = 0;
+    if (forward)
+      original(ctx, base);
+    else
+      ctx.r3.u64 = 0;
     return;
   }
   if (!t.enabled) {  // hooks count and forward only; Swap still polls the control file
-    if (forward) original(ctx, base); else ctx.r3.u64 = 0;
+    if (forward)
+      original(ctx, base);
+    else
+      ctx.r3.u64 = 0;
     if (id == kFn_826CB148) {
       std::lock_guard lock(t.mutex);
       EndFrame(t, base);
@@ -843,7 +981,8 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   Sync(t, base, false);
   uint64_t seq = ++t.call_seq;
   ++t.frame.calls;
-  for (FnId d : kDrawCounterFns) if (d == id) ++t.frame.draw_calls;
+  for (FnId d : kDrawCounterFns)
+    if (d == id) ++t.frame.draw_calls;
   if (Tracing(t)) {
     ++t.fn_calls[id];
     Out(t, "C %llu %u %s r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s\n", (unsigned long long)seq,
@@ -854,22 +993,32 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   ++t_depth;
   lock.unlock();
 
-  if (forward) original(ctx, base); else ctx.r3.u64 = 0;
+  if (forward)
+    original(ctx, base);
+  else
+    ctx.r3.u64 = 0;
 
   lock.lock();
   // These move the push pointer by assignment: MakeSpace and RestorePush stay in the written
   // stream; the segment functions leave a hole (reserved dwords, an unwritten new segment).
-  const bool jump = id == kFn_826CE738 || id == kFn_826CE4E0 || id == kFn_826CD868 || id == kFn_826CD380;
+  const bool jump =
+      id == kFn_826CE738 || id == kFn_826CE4E0 || id == kFn_826CD868 || id == kFn_826CD380;
   Sync(t, base, jump || id == kFn_826CE8C0 || id == kFn_826CFF00 || id == kFn_826CFF10, jump);
   --t_depth;
   if (Tracing(t)) Out(t, "R %llu r3=%08X\n", (unsigned long long)seq, ctx.r3.u32);
   if (t_depth == 0 && (Tracing(t) || t.check)) {
     if (t.state_pending) {  // BeginVertices' packets are in the stream once RestorePush ran
       t.state_pending = false;
-      if (id == kFn_826CFF00) CompareState(t, kFn_826CFA60); else ++t.state_unchecked;
+      if (id == kFn_826CFF00)
+        CompareState(t, kFn_826CFA60);
+      else
+        ++t.state_unchecked;
     }
     if (kFns[id].cat == kDraw) {
-      if (id == kFn_826CFA60) t.state_pending = true; else CompareState(t, id);
+      if (id == kFn_826CFA60)
+        t.state_pending = true;
+      else
+        CompareState(t, id);
     }
   }
   if (id == kFn_826CB148) EndFrame(t, base);  // Swap
@@ -886,11 +1035,16 @@ enum NativeClass : uint8_t { kNatNone, kNatDraw, kNatClear, kNatResolve, kNatSwa
 
 constexpr NativeClass NativeClassOf(Cat c) {
   switch (c) {
-    case kDraw: return kNatDraw;
-    case kClear: return kNatClear;
-    case kResolve: return kNatResolve;
-    case kSwap: return kNatSwap;
-    default: return kNatNone;
+    case kDraw:
+      return kNatDraw;
+    case kClear:
+      return kNatClear;
+    case kResolve:
+      return kNatResolve;
+    case kSwap:
+      return kNatSwap;
+    default:
+      return kNatNone;
   }
 }
 
@@ -907,8 +1061,13 @@ thread_local pgr4::native::TilingCall t_tiling_call = pgr4::native::TilingCall::
 constexpr bool IsPassThrough(FnId id) {
   if (NativeClassOf(kFns[id].cat) != kNatNone) return false;
   switch (kFns[id].addr) {
-    case 0x826D6610u: case 0x826D1C38u: case 0x826D20D0u: case 0x826CD270u: return false;
-    default: return true;
+    case 0x826D6610u:
+    case 0x826D1C38u:
+    case 0x826D20D0u:
+    case 0x826CD270u:
+      return false;
+    default:
+      return true;
   }
 }
 
@@ -982,8 +1141,10 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   const NativeClass cls = NativeClassOf(kFns[id].cat);
   if (cls == kNatNone) {
     const nat::TilingCall outer = t_tiling_call;
-    if (id == kFn_826D1C38) t_tiling_call = nat::TilingCall::kBegin;
-    else if (id == kFn_826D20D0) t_tiling_call = nat::TilingCall::kEnd;
+    if (id == kFn_826D1C38)
+      t_tiling_call = nat::TilingCall::kBegin;
+    else if (id == kFn_826D20D0)
+      t_tiling_call = nat::TilingCall::kEnd;
     OnCall(id, ctx, base, run);
     t_tiling_call = outer;
     return;
@@ -991,10 +1152,19 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   nat::HookArgs a;
   a.fn = nat::HookFn(kFns[id].addr);
   a.device = ctx.r3.u32;
-  a.r[0] = ctx.r3.u32; a.r[1] = ctx.r4.u32; a.r[2] = ctx.r5.u32; a.r[3] = ctx.r6.u32;
-  a.r[4] = ctx.r7.u32; a.r[5] = ctx.r8.u32; a.r[6] = ctx.r9.u32; a.r[7] = ctx.r10.u32;
+  a.r[0] = ctx.r3.u32;
+  a.r[1] = ctx.r4.u32;
+  a.r[2] = ctx.r5.u32;
+  a.r[3] = ctx.r6.u32;
+  a.r[4] = ctx.r7.u32;
+  a.r[5] = ctx.r8.u32;
+  a.r[6] = ctx.r9.u32;
+  a.r[7] = ctx.r10.u32;
   a.sp = ctx.r1.u32;
-  a.f[0] = ctx.f1.f64; a.f[1] = ctx.f2.f64; a.f[2] = ctx.f3.f64; a.f[3] = ctx.f4.f64;
+  a.f[0] = ctx.f1.f64;
+  a.f[1] = ctx.f2.f64;
+  a.f[2] = ctx.f3.f64;
+  a.f[3] = ctx.f4.f64;
   a.tiling = t_tiling_call;
   ++t_native_depth;
   OnCall(id, ctx, base, run);
@@ -1009,10 +1179,17 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
         r->OnDraw(base, a);
       }
       break;
-    case kNatClear: r->OnClear(base, a); break;
-    case kNatResolve: r->OnResolve(base, a); break;
-    case kNatSwap: r->OnSwap(base, a); break;
-    default: break;
+    case kNatClear:
+      r->OnClear(base, a);
+      break;
+    case kNatResolve:
+      r->OnResolve(base, a);
+      break;
+    case kNatSwap:
+      r->OnSwap(base, a);
+      break;
+    default:
+      break;
   }
 }
 
@@ -1021,12 +1198,13 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
 // Cumulative counters for the SDK's --gpu_stream_stats (instrument patch): names
 // starting with "draw" are summed into its api_total, as in DrawCounter's hooks.
 extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint64_t** values,
-                                                                      const char* const** names) {
-  static const char* const kNames[] = {"draw_826CFA60", "draw_826CFF58", "draw_826D0340", "draw_826D0798",
-                                       "draw_826DC888", "aux_826CBEE0",  "tap_draws",     "tap_aux",
-                                       "tap_resolves"};
+                                                                     const char* const** names) {
+  static const char* const kNames[] = {"draw_826CFA60", "draw_826CFF58", "draw_826D0340",
+                                       "draw_826D0798", "draw_826DC888", "aux_826CBEE0",
+                                       "tap_draws",     "tap_aux",       "tap_resolves"};
   static uint64_t snapshot[9];
-  for (int i = 0; i < 5; ++i) snapshot[i] = g_calls[kDrawCounterFns[i]].load(std::memory_order_relaxed);
+  for (int i = 0; i < 5; ++i)
+    snapshot[i] = g_calls[kDrawCounterFns[i]].load(std::memory_order_relaxed);
   snapshot[5] = g_calls[kFn_826CBEE0].load(std::memory_order_relaxed);
   for (int i = 0; i < 3; ++i) snapshot[6 + i] = g_tap_counts[i].load(std::memory_order_relaxed);
   *values = snapshot;
@@ -1034,14 +1212,14 @@ extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint6
   return 9;
 }
 
-#define D3D_FN(a, n, c)                                                  \
-  REX_EXTERN(__imp__sub_##a);                                            \
-  REX_HOOK_RAW(sub_##a) {                                                \
-    if constexpr (HasFastPath(kFn_##a)) {                                \
-      if (!g_hook_all.load(std::memory_order_relaxed)) [[likely]]        \
-        return __imp__sub_##a(ctx, base);                                \
-    }                                                                    \
-    OnHook(kFn_##a, ctx, base, __imp__sub_##a);                          \
+#define D3D_FN(a, n, c)                                           \
+  REX_EXTERN(__imp__sub_##a);                                     \
+  REX_HOOK_RAW(sub_##a) {                                         \
+    if constexpr (HasFastPath(kFn_##a)) {                         \
+      if (!g_hook_all.load(std::memory_order_relaxed)) [[likely]] \
+        return __imp__sub_##a(ctx, base);                         \
+    }                                                             \
+    OnHook(kFn_##a, ctx, base, __imp__sub_##a);                   \
   }
 #include "d3d_surface.inc"
 #undef D3D_FN

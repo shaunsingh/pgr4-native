@@ -57,7 +57,7 @@ struct TextureHandle {
 
 // What a draw binds for one texture fetch constant.
 struct TextureBinding {
-  ID3D12Resource* resource = nullptr;      // in PIXEL|NON_PIXEL_SHADER_RESOURCE state
+  ID3D12Resource* resource = nullptr;  // in PIXEL|NON_PIXEL_SHADER_RESOURCE state
   // SRV for unsigned components (Format, ViewDimension TEXTURE2DARRAY for 1D/2D/stacked,
   // TEXTURE3D, TEXTURECUBE; Shader4ComponentMapping = the fetch swizzle on the host format).
   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -65,7 +65,7 @@ struct TextureBinding {
   DXGI_FORMAT srv_signed_format = DXGI_FORMAT_UNKNOWN;
   uint8_t swizzled_signs = 0;  // texture_util::SwizzleSigns (4 x 2-bit xenos::TextureSign)
   TextureKey key;
-  TextureHandle entry;  // the cache's texture, for TextureCache::Unchanged and Touch
+  TextureHandle entry;   // the cache's texture, for TextureCache::Unchanged and Touch
   bool aliased = false;  // `resource` is a resolved image bound in place of the texture's own
   // The game wrote the texture's memory after it queued the draw. With capture order on, bound
   // with the data from before that write, which is still to be uploaded for later draws (not
@@ -115,11 +115,11 @@ class TextureCache {
 
   // Capture order. With the render thread, Get runs up to a frame after the game captured the
   // draw, and in primary mode the game may rewrite texture memory (update a dynamic texture or
-  // stream another one into it) as soon as it has queued the draws that read it. The guest thread stamps each draw with
-  // MarkCapture; the first write that stales an uploaded texture records the last stamp handed
-  // out, and a Get for a draw stamped at or before it binds the texture's current data, which
-  // predates the write. kCapturedNow: the draw sees guest memory as it is now. With capture
-  // order off, such Gets upload the newer data instead (and still count as stale).
+  // stream another one into it) as soon as it has queued the draws that read it. The guest thread
+  // stamps each draw with MarkCapture; the first write that stales an uploaded texture records the
+  // last stamp handed out, and a Get for a draw stamped at or before it binds the texture's current
+  // data, which predates the write. kCapturedNow: the draw sees guest memory as it is now. With
+  // capture order off, such Gets upload the newer data instead (and still count as stale).
   static constexpr uint64_t kCapturedNow = ~0ull;
   // The guest D3D thread's (the only caller), so a plain store hands out the next stamp.
   uint64_t MarkCapture() {
@@ -267,7 +267,7 @@ class TextureCache {
   Budget budget_;
   EvictCallback evict_callback_;
   static constexpr size_t kMaxEvictionsPerFrame = 128;
-  std::vector<Texture*> evict_batch_;            // scratch
+  std::vector<Texture*> evict_batch_;             // scratch
   std::vector<ID3D12Resource*> evict_resources_;  // scratch
   // The watched ranges of every texture, listed in each 64 KB bucket of guest physical memory
   // they touch (Destroy removes a texture's).

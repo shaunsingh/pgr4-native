@@ -35,8 +35,8 @@ struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12GraphicsCommandList;
 
-REXCVAR_DECLARE(bool, pgr4_native);             // master switch, off by default
-REXCVAR_DECLARE(std::string, pgr4_native_csv);  // per-frame CSV of the native path ("" = off)
+REXCVAR_DECLARE(bool, pgr4_native);                // master switch, off by default
+REXCVAR_DECLARE(std::string, pgr4_native_csv);     // per-frame CSV of the native path ("" = off)
 REXCVAR_DECLARE(bool, pgr4_native_render_thread);  // record on a render thread (see above)
 
 namespace pgr4::native {
@@ -178,7 +178,7 @@ class NativeRenderer {
   void QueueSwap(const uint8_t* base, const HookArgs& args);
   void RenderThreadMain();
 
-  std::unique_ptr<Queue> queue_;   // render thread mode only
+  std::unique_ptr<Queue> queue_;  // render thread mode only
 
   std::unique_ptr<D3D12Device> device_;
   std::unique_ptr<RenderTargets> rt_;
