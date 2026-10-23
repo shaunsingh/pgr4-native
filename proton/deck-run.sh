@@ -13,7 +13,7 @@
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
 #               [--output NAME] [--captures "5 10 15"] [--record "FROM FRAMES"] [--catch]
-#               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES]
+#               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -32,6 +32,8 @@
 # --perf N samples the game's user-space CPU time with perf for N seconds from the race mark and
 # prints its hottest functions per thread (native/tools/perf_symbols.py, with the .map files of
 # the runtime); sampling costs some speed, so such a run's frame rate is not a measurement.
+# --pmu (with --perf) counts the front end over the same seconds, per thread: instructions per
+# cycle, fetch stalls, instruction cache fills and iTLB misses (pmu_summary.py).
 # --record "FROM FRAMES" records FRAMES frames (0: to the end) from native frame index FROM, as
 # shown at half size, into ~/pgr4-proton/rec-<tag>.rec (--pgr4_native_record); then
 # native/tools/flicker.py finds the frames that flash and writes them out as PNG strips.
@@ -58,7 +60,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-captures="5 10 15"; record=""; catch=0; keys=""; race_draws=3000; draw_log=0
+captures="5 10 15"; record=""; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -83,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --keys) keys=$(readlink -f "$2"); shift 2 ;;
     --race-draws) race_draws=$2; shift 2 ;;
     --draw-log) draw_log=$2; shift 2 ;;
+    --pmu) pmu=1; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -197,6 +200,7 @@ game_pid() {
 kwin_script=pgr4-place-output
 cleanup() {
   [[ -n ${perfrec:-} ]] && kill -INT "$perfrec" 2>/dev/null || true
+  [[ -n ${pmustat:-} ]] && kill -INT "$pmustat" 2>/dev/null || true
   stop_game
   [[ -n $output ]] && qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$kwin_script" >/dev/null 2>&1 || true
   [[ -n ${shooter:-} ]] && kill "$shooter" 2>/dev/null || true
@@ -333,6 +337,12 @@ if (( perf_secs > 0 )); then
   perf record -q -e cycles:u -F 999 -p "$pid" -o "$base-perf.data" -- sleep "$perf_secs" \
     > "$base-perf.out" 2>&1 &
   perfrec=$!
+  if (( pmu )); then
+    perf stat --per-thread -x, -o "$base-pmu.csv" -p "$pid" -e cycles:u,instructions:u \
+      -e ic_fetch_stall.ic_stall_any:u,ic_cache_fill_l2:u,ic_cache_fill_sys:u \
+      -e bp_l1_tlb_miss_l2_tlb_miss:u -- sleep "$perf_secs" > /dev/null 2>&1 &
+    pmustat=$!
+  fi
 fi
 if [[ $mode == oracle ]]; then
   # The game takes one capture per request file at its next Swap and deletes the file.
@@ -360,6 +370,10 @@ if [[ -n ${perfrec:-} ]]; then
   else
     echo "perf: no .map files in $runtime (native/build.sh --stage install copies them)"
   fi
+fi
+if [[ -n ${pmustat:-} ]]; then
+  wait "$pmustat" 2>/dev/null || true; pmustat=""
+  python3 "$here/pmu_summary.py" "$base-pmu.csv" || true
 fi
 fps=$(python3 "$repo/native/tools/perf_fps.py" "$base.log" "$race_hms" 40 2>&1 || true)
 head -n 1 <<< "$fps"

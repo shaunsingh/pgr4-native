@@ -288,6 +288,19 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   td-47's profile. The frame rate did not move (race 69.1 fps against 68.8): the APU is at its
   15 W limit in every sample, the CPU takes 9.1 W of it and the GPU runs at 600-685 MHz, 86 %
   busy. The frame waits on the GPU, and the CPU's savings are power the GPU can clock up with.
+- The XMA decoder's worker no longer wakes after every kick. A kick (the game setting a
+  context's kick bit) decodes the kicked contexts at once on the game's audio thread (MTR's
+  change), and `Work` takes the context's enable, so the worker woken behind it walked all 320
+  contexts, about 18 KB apart and a cache miss each, and found nothing: 71 % of its 8.6 % of a
+  core sat on the load of the enable flag (td-47). The kick no longer sets the worker's event
+  (`rexglue-runtime-perf.patch`); pause and shutdown still do. td-48: the thread is idle, the
+  game's threads take 260 % of a core (277 %), the audio thread 47 % (52 %); race 70.6 fps
+  (69.1), 1 % low 41.9 (36.3), p99 20.8 ms (23.6), GFX clock 716 MHz (685).
+- `deck-run.sh --pmu` (with `--perf`) counts the front end per thread over the perf window
+  (`proton/pmu_summary.py`). td-48: the game thread retires 1.16 instructions per cycle and
+  refills its instruction cache 26 times per 1000 instructions (22 from L2, 3.8 from memory);
+  the render thread 63 times (58 from L2). The recompiled code does not fit the caches, so its
+  layout is worth more than any one function.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -535,7 +548,11 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 | `compare_resolves.py` | Resolve outputs against the Xenos plugin's |
 | `flicker.py` | Flashing blocks or whole-image jumps in a frame recording, as PNG sheets |
 | `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
-It also has a texture untiling harness and an offline shader translation test.
+
+It also has a texture untiling harness and an offline shader translation test. `proton/` has the
+Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads) and
+`pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls and instruction cache
+refills per thread).
 
 ## What's next
 

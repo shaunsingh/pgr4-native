@@ -1633,3 +1633,16 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
      $<$<CONFIG:DEBUG>:-g>
      $<$<CONFIG:DEBUG>:-O0>
      $<$<CONFIG:RELEASE>:-O3>
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -323,7 +323,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+         }
+       }
+     }
+-    work_event_->Set();
++    // Work() takes the enable, so every kicked context is done here. Waking the worker made it
++    // sweep all 320 contexts after each kick, a cache miss per context, and find nothing.
+   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
+     // Context lock command.
+     // This requests a lock by flagging the context.
