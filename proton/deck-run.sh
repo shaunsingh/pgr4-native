@@ -23,7 +23,8 @@
 # gamescope then maps no game window either. --view headless shows nothing and so also leaves out
 # the desktop compositor's work on that window.
 # --session desktop opens the game's own window on the desktop and types through uinput. --shots N saves a gamescope screenshot every N seconds (0: one, 10 s
-# after the race mark) into ~/pgr4-proton/shots-<tag>/, to check that the route kept in step.
+# after the race mark) into ~/pgr4-proton/shots-<tag>/, to check that the route kept in step; a
+# route line "<at> mark shot <name>" saves <name>.png there when the player reaches it.
 # --refresh HZ sets the guest's vblank rate (video_mode_refresh_rate) and gamescope's refresh to
 # HZ: 90 matches the Deck OLED's panel. With vsync on the game presents once per guest vblank.
 # --output NAME (KDE Plasma, --view window) has a KWin script move gamescope's window to that
@@ -275,11 +276,15 @@ EOF
   source "$envfile"
   player_args+=(--wm gamescope --input xtest)
   rm -rf "$shotdir"; mkdir -p "$shotdir"
-  shoot() { gamescopectl screenshot "$shotdir/$1.png" >/dev/null 2>&1 || true; }
+  # gamescopectl can block for good (td-85: the periodic shots stopped after 24 s).
+  shoot() { timeout 10 gamescopectl screenshot "$shotdir/$1.png" >/dev/null 2>&1 || true; }
   if (( shots > 0 )); then
     ( n=0; while sleep "$shots"; do n=$((n + shots)); shoot "t$(printf %04d $n)"; done ) &
     shooter=$!
   fi
+  # A route line "<at> mark shot <name>" saves <name>.png when the player reaches it.
+  ( tail --pid=$$ -n0 -F "$ilog" 2>/dev/null | while read -r _ kind word name _; do
+      [[ $kind == mark && $word == shot ]] && shoot "$name"; done ) &
 else
   (cd "$runtime" && exec setsid "${cmd[@]}" > "$base-stdout.log" 2>&1) &
   shoot() { :; }

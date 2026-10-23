@@ -7,7 +7,7 @@ Windows tools (co_run's mark wait, ab_compare.py, perf_fps.py) read its log unch
   +<ms>   <key> [hold_ms]   same, <ms> after the previous event's start time
   <at_ms> mark <label>      write "mark <label>" to the log
 Time zero is when the game's window first exists. Keys: return, space, escape, backspace, tab,
-up/down/left/right, a letter or digit, chords like shift+e.
+up/down/left/right, f1-f12, a letter or digit, chords like shift+e.
 
 Keys go through a uinput keyboard, which needs write access to /dev/uinput (SteamOS grants it to
 the desktop user; elsewhere run sudo setfacl -m u:$USER:rw /dev/uinput), or with --input xtest
@@ -40,6 +40,8 @@ KEYS = {"escape": 1, "backspace": 14, "tab": 15, "return": 28, "enter": 28, "spa
         "shift": 42, "ctrl": 29, "alt": 56, "up": 103, "left": 105, "right": 106, "down": 108}
 for i, ch in enumerate("1234567890"):
     KEYS[ch] = 2 + i
+for i in range(1, 13):
+    KEYS[f"f{i}"] = 58 + i if i <= 10 else 76 + i  # F11 and F12 are 87 and 88
 for row, start in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
     for i, ch in enumerate(row):
         KEYS[ch] = start + i
@@ -81,6 +83,8 @@ class XTestKeyboard:
         for name, code in KEYS.items():
             if len(name) == 1:
                 self.syms[code] = name
+            elif name[0] == "f" and name[1:].isdigit():
+                self.syms[code] = name.upper()
 
     def send(self, code: int, down: bool) -> None:
         subprocess.run(["xdotool", "keydown" if down else "keyup", self.syms[code]], timeout=10)
