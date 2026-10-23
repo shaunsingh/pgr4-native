@@ -352,6 +352,20 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   the game thread waiting for the render thread 0.06 ms against 1.07, 12 submissions per frame.
   The game thread is now the limit (92 % of a core), and the GPU still waits 1.0-1.6 ms per
   frame for the next list.
+- The pad is read on a thread of its own. ReXGlue's SDL driver had every XInput call of the game
+  ask the UI thread to pump SDL's events, and an event watch copied every joystick and gamepad
+  event (each axis of each HID report) into a queue that the game's next call replayed under the
+  driver's lock. Now an SDL timer reads each pad's buttons and axes every 4 ms and keeps the
+  result, the game's calls copy it under the lock, SDL no longer queues the per-report events,
+  and the event filter keeps only connects and disconnects; rumble goes out from the timer
+  thread, outside the lock (`rexglue-runtime-perf.patch`). A first version filtered out the
+  joystick events from which SDL's gamepad layer builds its own state, so a connected pad read
+  as idle; the timer now asks the pad for its state instead of relying on events. td-70 against
+  td-65: the UI thread took 1.4 % of a core (9.0), the game thread that polls the pad 14.4 %
+  (19.9), the timer 5.3 %. td-73 (wineserver trace): race 80.8 fps, 1 % low 49.7 (td-65: 80.0,
+  51.2). Of its 16,400 wineserver requests a second, 13,000 are the pad's: winedevice's HID
+  threads (9,200), SDL's reads (2,300) and Wine's own XInput reader (1,700), which reads the
+  same pad as SDL; winedevice takes 21 % of a core.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
