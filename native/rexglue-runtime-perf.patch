@@ -1711,3 +1711,370 @@ diff --git a/thirdparty/FFmpeg/libavcodec/wmaprodec.c b/thirdparty/FFmpeg/libavc
      .capabilities   = AV_CODEC_CAP_DR1,
      .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
      .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 0a43f07..15aeed5 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -246,6 +246,13 @@ class XObject {
+   bool allocated_guest_object_ = false;
+ };
+ 
++// --kernel_wait_stats (diagnostic): the time guest threads spend blocked in kernel waits, by
++// the guest code that called the wait. Each thread logs its own every 5 s. WaitStatsBegin
++// returns 0 while the cvar is off, and WaitStatsEnd then does nothing.
++enum class WaitOp : uint32_t { kSingle, kAny, kAll, kSignalAndWait, kDelay };
++uint64_t WaitStatsBegin();
++void WaitStatsEnd(uint64_t begin, WaitOp op, XObject::Type type = XObject::Type::Undefined);
++
+ template <typename T>
+ class object_ref {
+  public:
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index d358f39..ceaf0e5 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,9 +9,14 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <chrono>
++#include <iterator>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
+@@ -25,10 +30,102 @@
+ #include <rex/system/xnotifylistener.h>
+ #include <rex/system/xsemaphore.h>
+ #include <rex/system/xsymboliclink.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/xthread.h>
+ 
++REXCVAR_DEFINE_BOOL(kernel_wait_stats, false, "Kernel",
++                    "Diagnostic: log every 5 s, per guest thread, how long its kernel waits "
++                    "blocked and which guest code called them");
++
+ namespace rex::system {
+ 
++namespace {
++
++struct WaitSite {
++  uint32_t lr, lr2;
++  uint32_t kind;  // WaitOp << 8 | XObject::Type
++  uint32_t count;
++  uint64_t ns;
++};
++
++struct WaitWindow {
++  std::vector<WaitSite> sites;
++  uint64_t start_ns = 0;
++};
++
++thread_local WaitWindow t_wait_window;
++
++constexpr uint64_t kWaitWindowNs = 5'000'000'000ull;
++
++uint64_t WaitClockNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++void LogWaitWindow(WaitWindow& w, uint64_t now) {
++  static constexpr const char* kOps[] = {"wait", "wait-any", "wait-all", "signal-wait", "delay"};
++  static constexpr const char* kTypes[] = {"",        "enumerator", "event",   "file",
++                                           "io",      "module",     "mutant",  "notify",
++                                           "semaphore", "session",  "socket",  "link",
++                                           "thread",  "timer"};
++  std::sort(w.sites.begin(), w.sites.end(),
++            [](const WaitSite& a, const WaitSite& b) { return a.ns > b.ns; });
++  uint64_t blocked = 0, waits = 0;
++  for (const WaitSite& s : w.sites) {
++    blocked += s.ns;
++    waits += s.count;
++  }
++  std::string top;
++  for (size_t i = 0; i < w.sites.size() && i < 8; ++i) {
++    const WaitSite& s = w.sites[i];
++    const uint32_t op = s.kind >> 8, type = s.kind & 0xFF;
++    fmt::format_to(std::back_inserter(top), " | {:.1f} ms {}x {} {} at {:08X} < {:08X}",
++                   double(s.ns) / 1e6, s.count, op < std::size(kOps) ? kOps[op] : "?",
++                   type < std::size(kTypes) ? kTypes[type] : "?", s.lr, s.lr2);
++  }
++  REXLOG_INFO("Guest waits: XThread{:04X} blocked {:.1f} ms of {:.1f} s in {} waits{}",
++              rex::thread::current_thread_system_id(), double(blocked) / 1e6,
++              double(now - w.start_ns) / 1e9, waits, top);
++  w.sites.clear();
++  w.start_ns = now;
++}
++
++}  // namespace
++
++uint64_t WaitStatsBegin() { return REXCVAR_GET(kernel_wait_stats) ? WaitClockNs() : 0; }
++
++void WaitStatsEnd(uint64_t begin, WaitOp op, XObject::Type type) {
++  if (!begin || !XThread::IsInThread()) return;
++  const uint64_t now = WaitClockNs();
++  XThread* thread = XThread::GetCurrentThread();
++  if (!thread->thread_state()) return;
++  const PPCContext& ctx = *thread->thread_state()->context();
++  const uint32_t lr = uint32_t(ctx.lr);
++  // The caller's caller: 0(r1) links to the frame above, and 8 bytes below that the Xbox 360
++  // compiler's prologue saved the return address into it.
++  uint32_t lr2 = 0;
++  const uint32_t sp = ctx.r1.u32;
++  if (sp) {
++    memory::Memory* mem = thread->memory();
++    const uint32_t up = memory::load_and_swap<uint32_t>(mem->TranslateVirtual(sp));
++    if (up > sp && up - sp < 0x10000) {
++      lr2 = memory::load_and_swap<uint32_t>(mem->TranslateVirtual(up - 8));
++      if ((lr2 >> 28) != 8) lr2 = 0;
++    }
++  }
++  WaitWindow& w = t_wait_window;
++  if (!w.start_ns) w.start_ns = begin;
++  const uint32_t kind = uint32_t(op) << 8 | uint32_t(type);
++  auto it = std::find_if(w.sites.begin(), w.sites.end(), [&](const WaitSite& s) {
++    return s.lr == lr && s.lr2 == lr2 && s.kind == kind;
++  });
++  if (it == w.sites.end()) it = w.sites.insert(w.sites.end(), WaitSite{lr, lr2, kind, 0, 0});
++  ++it->count;
++  it->ns += now - begin;
++  if (now - w.start_ns >= kWaitWindowNs) LogWaitWindow(w, now);
++}
++
+ XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
+   handles_.reserve(10);
+ }
+@@ -213,7 +310,9 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+                                 : std::chrono::milliseconds::max();
+ 
+   XThread::CheckTitleTermination();
++  const uint64_t stats = WaitStatsBegin();
+   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
++  WaitStatsEnd(stats, WaitOp::kSingle, type_);
+   XThread::CheckTitleTermination();
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+@@ -239,9 +338,11 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+ 
++  const uint64_t stats = WaitStatsBegin();
+   auto result =
+       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
+                                  alertable ? true : false, timeout_ms);
++  WaitStatsEnd(stats, WaitOp::kSignalAndWait, wait_object->type());
+   switch (result) {
+     case rex::thread::WaitResult::kSuccess:
+       wait_object->WaitCallback();
+@@ -274,8 +375,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+ 
+   XThread::CheckTitleTermination();
+   if (wait_type) {
++    const uint64_t stats = WaitStatsBegin();
+     auto result =
+         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    WaitStatsEnd(stats, WaitOp::kAny, count ? objects[0]->type() : Type::Undefined);
+     XThread::CheckTitleTermination();
+     switch (result.first) {
+       case rex::thread::WaitResult::kSuccess:
+@@ -295,8 +398,10 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         return X_STATUS_UNSUCCESSFUL;
+     }
+   } else {
++    const uint64_t stats = WaitStatsBegin();
+     auto result =
+         rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
++    WaitStatsEnd(stats, WaitOp::kAll, count ? objects[0]->type() : Type::Undefined);
+     XThread::CheckTitleTermination();
+     switch (result) {
+       case rex::thread::WaitResult::kSuccess:
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..2a073ff 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -932,11 +932,22 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
+   uint32_t unused_host_suspend_count = 0;
+ 
+ #if REX_PLATFORM_WIN32
+-  uint8_t previous_suspend_count =
+-      reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_sub(1);
++  // Resuming a thread that is not suspended changes nothing, as on the console: the count does
++  // not wrap (a later suspend would be lost), and the host is not asked (some titles resume
++  // their running workers every frame, and each ResumeThread is a kernel call, a wineserver
++  // round trip under Wine).
++  auto& suspend_count = *reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count);
++  uint8_t previous_suspend_count = suspend_count.load(std::memory_order_relaxed);
++  while (previous_suspend_count &&
++         !suspend_count.compare_exchange_weak(previous_suspend_count,
++                                              uint8_t(previous_suspend_count - 1))) {
++  }
+   if (out_suspend_count) {
+     *out_suspend_count = previous_suspend_count;
+   }
++  if (!previous_suspend_count) {
++    return X_STATUS_SUCCESS;
++  }
+   return thread_->Resume(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   bool should_resume_host = false;
+@@ -1013,8 +1024,10 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+   }
+   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
+   CheckTitleTermination();
++  const uint64_t stats = WaitStatsBegin();
+   if (alertable) {
+     auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
++    WaitStatsEnd(stats, WaitOp::kDelay);
+     CheckTitleTermination();
+     switch (result) {
+       default:
+@@ -1033,6 +1046,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
+     } else {
+       rex::thread::Sleep(std::chrono::milliseconds(timeout_ms));
+     }
++    WaitStatsEnd(stats, WaitOp::kDelay);
+     CheckTitleTermination();
+   }
+ 
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 896dfec..36567d7 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -364,7 +364,8 @@ std::unique_ptr<Timer> Timer::CreateSynchronizationTimer() {
+ 
+ class Win32Thread : public Win32Handle<Thread> {
+  public:
+-  explicit Win32Thread(HANDLE handle) : Win32Handle(handle) {}
++  explicit Win32Thread(HANDLE handle)
++      : Win32Handle(handle), priority_(GetThreadPriority(handle)) {}
+   ~Win32Thread() = default;
+ 
+   void set_name(std::string name) override {
+@@ -372,10 +373,16 @@ class Win32Thread : public Win32Handle<Thread> {
+     Thread::set_name(name);
+   }
+ 
+-  int32_t priority() override { return GetThreadPriority(handle_); }
++  // The priority last set through this object, not GetThreadPriority: some titles query their
++  // priority every frame, and each query is a kernel call (a wineserver round trip under Wine).
++  int32_t priority() override { return priority_.load(std::memory_order_relaxed); }
+   uint32_t system_id() const override { return GetThreadId(handle_); }
+ 
+-  void set_priority(int32_t new_priority) override { SetThreadPriority(handle_, new_priority); }
++  void set_priority(int32_t new_priority) override {
++    if (SetThreadPriority(handle_, new_priority)) {
++      priority_.store(new_priority, std::memory_order_relaxed);
++    }
++  }
+ 
+   uint64_t affinity_mask() override {
+     DWORD_PTR prev = SetThreadAffinityMask(handle_, 1);
+@@ -435,6 +442,8 @@ class Win32Thread : public Win32Handle<Thread> {
+ 
+  private:
+   void AssertCallingThread() { assert_true(GetCurrentThreadId() == GetThreadId(handle_)); }
++
++  std::atomic<int32_t> priority_;
+ };
+ 
+ thread_local std::unique_ptr<Win32Thread> current_thread_ = nullptr;
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..b15045b 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -227,22 +227,22 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
+   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
+ 
+-  QueueControllerUpdate();
+-
+-  auto guard = DrainAndLock();
+-
+-  auto controller = FindController(id);
+-  if (!controller) {
+-    return X_ERROR_DEVICE_NOT_CONNECTED;
++  {
++    auto guard = DrainAndLock();
++    auto controller = FindController(id);
++    if (!controller) {
++      return X_ERROR_DEVICE_NOT_CONNECTED;
++    }
++    // A rumble report is device I/O (a HID feature report and several wineserver round trips
++    // under Wine), and racing titles change the motor speeds every frame: the UI thread sends
++    // the latest speeds with its next pump instead of the guest thread waiting on it here.
++    controller->vibration_low = vibration->left_motor_speed;
++    controller->vibration_high = vibration->right_motor_speed;
++    controller->vibration_pending = true;
+   }
+-
+-  // XInput vibration holds until the guest changes it, but SDL rumble expires,
+-  // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
+-  // SDL's maximum instead; each call cancels the previous effect anyway.
+-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
+-                           vibration->right_motor_speed, kRumbleDurationMs)
+-             ? X_ERROR_SUCCESS
+-             : X_ERROR_FUNCTION_FAILED;
++  QueueControllerUpdate();
++  // As on the console, setting the motors of a connected pad succeeds.
++  return X_ERROR_SUCCESS;
+ }
+ 
+ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+@@ -675,11 +675,27 @@ void SDLInputDriver::QueueControllerUpdate() {
+   if (!is_queued) {
+     attached_window_->app_context().CallInUIThread([this]() {
+       SDL_PumpEvents();
++      SendPendingVibration();
+       sdl_pumpevents_queued_ = false;
+     });
+   }
+ }
+ 
++void SDLInputDriver::SendPendingVibration() {
++  std::lock_guard<std::mutex> guard(controllers_mutex_);
++  for (auto& controller : controllers_) {
++    if (!controller.vibration_pending) {
++      continue;
++    }
++    controller.vibration_pending = false;
++    // XInput vibration holds until the guest changes it, but SDL rumble expires, and a zero
++    // duration expires on the next SDL_UpdateJoysticks. Arm it for SDL's maximum instead; SDL
++    // sends nothing to the device when the speeds did not change.
++    SDL_RumbleGamepad(controller.sdl, controller.vibration_low, controller.vibration_high,
++                      kRumbleDurationMs);
++  }
++}
++
+ // Check if the analog inputs exceed their thresholds to become a button press
+ // and build the bitfield.
+ inline uint64_t SDLInputDriver::AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const {
+diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
+index cf0e3d1..e993300 100644
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -67,6 +67,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+     DeviceId id;
+     // Per pad rather than per guest user, so it survives reassignment.
+     KeystrokeState keystroke;
++    // The guest's latest motor speeds, for SendPendingVibration.
++    uint16_t vibration_low;
++    uint16_t vibration_high;
++    bool vibration_pending;
+   };
+ 
+   // WindowListener
+@@ -89,6 +93,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+   bool TestSDLVersion() const;
+   void UpdateXCapabilities(ControllerState& state);
+   void QueueControllerUpdate();
++  void SendPendingVibration();
+ 
+   rex::ui::Window* attached_window_ = nullptr;
+   bool sdl_events_initialized_;

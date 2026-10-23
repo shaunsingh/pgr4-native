@@ -326,6 +326,22 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   show a change this small: td-54 ran the race at 74.9 fps (td-51: 78.7) at a lower GPU clock
   (774 MHz against 870, 2.5 W against 2.7), with one burst of 11 slow frames after the car left
   the scripted line, and its audio thread took 44.5 % of a core (44.2).
+- Wineserver requests per thread. Under Proton, many calls that Windows handles in its kernel
+  are requests to wineserver, a separate process: two context switches and a CPU wakeup each,
+  paid for out of the APU's power budget. `deck-run.sh --server-trace` runs wineserver with its
+  request trace and `proton/server_requests.py` counts each thread's requests per second over
+  the race window. td-60: 17,700 requests a second. The game thread made 1,100 of them: 380
+  `ResumeThread` calls on worker threads that were not suspended, 77 `GetThreadPriority`
+  queries, and a rumble report (an event, a HID ioctl and a close) every frame. Without the
+  frame-rate cap (`--uncapped`, td-55/56) the race ran no faster, with the GPU 93 % busy: the
+  frame waits on the GPU, and the GPU's clock waits on the power the CPU leaves it.
+- The game thread no longer makes those calls (`rexglue-runtime-perf.patch`). Resuming a guest
+  thread that is not suspended does nothing, as on the console; the count had also wrapped
+  below zero, which lost the thread's next suspend. A thread's priority is read from the value
+  last set. The guest's motor speeds are stored and sent by the UI thread with its next pump,
+  and SDL sends nothing when they did not change. td-61: the game thread made 167 requests a
+  second (1,103), and the race ran at 78.0 fps (77.1). `--kernel_wait_stats` logs, per guest
+  thread every 5 s, how long its kernel waits blocked and which guest code called them.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -577,7 +593,8 @@ With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
 It also has a texture untiling harness and an offline shader translation test. `proton/` has the
 Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads) and
 `pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls and instruction cache
-refills per thread).
+refills per thread) and `server_requests.py` (`deck-run.sh --server-trace`: wineserver requests per
+thread and second, by request).
 
 ## What's next
 

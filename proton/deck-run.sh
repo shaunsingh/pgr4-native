@@ -13,7 +13,7 @@
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
 #               [--output NAME] [--captures "5 10 15"] [--record "FROM FRAMES"] [--catch]
-#               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu]
+#               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu] [--server-trace]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -44,6 +44,9 @@
 # --draw-log FRAMES writes the native renderer's log of every draw, clear and resolve of the
 # FRAMES frames from the race mark on into ~/pgr4-proton/captures-<tag>/draws-f<frame>.txt
 # (about 1.5 MB per race frame), for a structural diff of a glitch frame with its neighbours.
+# --server-trace starts the wineserver with its request trace (-d1) and prints which threads call
+# it how often over the 40 s after the race mark (server_requests.py); the trace slows the server,
+# so such a run's frame rate is not a measurement.
 #
 # <tree> names $PGR4_BUILDS/native-<tree>/run/runtime (PGR4_BUILDS defaults to
 # ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is, so the released
@@ -60,7 +63,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-captures="5 10 15"; record=""; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0
+captures="5 10 15"; record=""; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -86,6 +89,7 @@ while [[ $# -gt 0 ]]; do
     --race-draws) race_draws=$2; shift 2 ;;
     --draw-log) draw_log=$2; shift 2 ;;
     --pmu) pmu=1; shift ;;
+    --server-trace) server_trace=1; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -206,6 +210,7 @@ cleanup() {
   [[ -n ${shooter:-} ]] && kill "$shooter" 2>/dev/null || true
   [[ -n ${player:-} ]] && kill "$player" 2>/dev/null || true
   [[ -n ${sampler:-} ]] && kill "$sampler" 2>/dev/null || true
+  [[ -n ${tracer:-} ]] && rm -f "$base-server.fifo"
   echo "stopped $(date +%T)"
   echo "log: $base.log"
   echo "input: $ilog"
@@ -222,6 +227,15 @@ nap() { sleep "$1" & wait $!; }
 player_args=(--script "$keys" --log "$ilog" --timeout 300 --width "$width" --height "$height"
   --stretch "$stretch")
 shotdir=$top/shots-$tag
+if (( server_trace )); then
+  # Started before the game, the server is the one its processes connect to; it exits with them
+  # (stop_game kills it), which ends the recorder's input.
+  rm -f "$base-server.fifo"; mkfifo "$base-server.fifo"
+  python3 "$here/server_requests.py" record "$base-server.json" < "$base-server.fifo" &
+  tracer=$!
+  WINEPREFIX=$top/prefix/pfx WINEESYNC=1 WINEFSYNC=1 WINENTSYNC=1 \
+    "$proton/files/bin/wineserver" -f -p30 -d1 > /dev/null 2> "$base-server.fifo" &
+fi
 if [[ $session == gamescope ]]; then
   # gamescope starts its own Xwayland; the game's side writes that display's names for the
   # route player and the screenshots.
@@ -329,6 +343,7 @@ if [[ $mode != none ]]; then
   (( draw_log > 0 )) && echo 16 > "$capdir/draw-debug.txt"
 fi
 race_iso=$(date +%Y-%m-%dT%H:%M:%S.%6N%:z)
+race_epoch=$(date -d "$race_iso" +%s)
 race_hms=${race_iso:11:8}
 if (( perf_secs > 0 )); then
   pid=$(game_pid)
@@ -381,6 +396,10 @@ ref_draws=$repo/run/route-stpetersburg.draws
 [[ -s $base-frames.csv ]] && { python3 "$repo/native/tools/frame_times.py" "$base-frames.csv" "$base.log" "$race_hms" 40 \
   ${ref_draws:+--ref "$ref_draws"} || true; }
 python3 "$here/deck_sampler.py" summary "$base-sampler.csv" "$race_hms" 40 || true
+if [[ -n ${tracer:-} ]]; then
+  kill -USR1 "$tracer" 2>/dev/null || true; nap 2
+  python3 "$here/server_requests.py" summary "$base-server.json" "$race_epoch" 40 || true
+fi
 # For ab_compare.py: side,log,mark rows are built from these lines.
 echo "RESULT $tag $base.log $race_iso $alive"
 exit
