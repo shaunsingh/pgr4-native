@@ -12,7 +12,8 @@
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
-#               [--display-refresh HZ] [--limit FPS] [--output NAME] [--captures "5 10 15"] [--catch]
+#               [--display-refresh HZ] [--limit FPS] [--limit-at "SECS FPS"] [--output NAME]
+#               [--captures "5 10 15"] [--catch]
 #               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu] [--server-trace]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
@@ -33,7 +34,8 @@
 # gamescope's frame limit (a divisor of its refresh) the way Steam's frame limiter does in Game
 # Mode, through its app refresh cycle override (gamescopectl debug_set_fps_limit):
 # on the OLED a 60 fps limit switches the panel to 60 Hz (--display-refresh 60), a 30 fps one
-# keeps 90 Hz and shows every third refresh (--limit 30).
+# keeps 90 Hz and shows every third refresh (--limit 30). --limit-at "SECS FPS" changes the
+# limit SECS seconds after the game started, as from Steam's menu during play; FPS 0 lifts it.
 # --output NAME (KDE Plasma, --view window) has a KWin script move gamescope's window to that
 # output and make it fullscreen (kscreen-doctor -o lists the outputs; eDP-1 is the Deck's panel),
 # so with an external monitor attached the game still shows on the panel at the panel's refresh.
@@ -70,7 +72,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
-display_refresh=""; limit=0
+display_refresh=""; limit=0; limit_at=""
 captures="5 10 15"; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -91,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --refresh) refresh=$2; shift 2 ;;
     --display-refresh) display_refresh=$2; shift 2 ;;
     --limit) limit=$2; shift 2 ;;
+    --limit-at) limit_at=$2; shift 2 ;;
     --output) output=$2; shift 2 ;;
     --captures) captures=$2; shift 2 ;;
     --catch) catch=1; shift ;;
@@ -290,6 +293,13 @@ EOF
   if (( limit > 0 )); then
     timeout 10 gamescopectl debug_set_fps_limit "$limit" >/dev/null 2>&1 ||
       echo "gamescopectl debug_set_fps_limit $limit failed" >&2
+  fi
+  if [[ -n $limit_at ]]; then
+    read -r limit_secs limit_fps <<< "$limit_at"
+    ( sleep "$limit_secs"
+      timeout 10 gamescopectl debug_set_fps_limit "$limit_fps" >/dev/null 2>&1 ||
+        echo "gamescopectl debug_set_fps_limit $limit_fps failed" >&2
+      echo "frame limit $limit_fps at $(date +%T)" ) &
   fi
   player_args+=(--wm gamescope --input xtest)
   rm -rf "$shotdir"; mkdir -p "$shotdir"
