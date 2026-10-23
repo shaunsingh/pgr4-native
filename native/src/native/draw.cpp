@@ -874,8 +874,12 @@ struct DrawRenderer::Impl {
   // sequence and the vertex shader variant's binding): a hit skips ShaderCache::Load's XXH3
   // over the whole ucode. An entry also keeps the first and last dwords of the ucode it was
   // made from, so a different shader loaded at the same address with the same size misses.
+  // A race binds a few hundred shaders a frame.
   struct ShaderMemo {
-    static constexpr uint32_t kEntries = 64, kSample = 16;
+    static constexpr uint32_t kBits = 8, kEntries = 1u << kBits, kSample = 16;
+    static uint32_t Slot(const ShaderRef& ref) {
+      return ((ref.ucode ^ (ref.dwords << 16)) * 0x9E3779B1u) >> (32 - kBits);  // Fibonacci
+    }
     uint32_t ucode = 0, dwords = 0, immediate_seq = 0;
     uint64_t binding = 0;
     uint32_t sample[kSample] = {};
@@ -912,8 +916,9 @@ struct DrawRenderer::Impl {
 
   // Draw path counters, logged every 300 frames with --pgr4_native_profile.
   struct Diag {
-    uint64_t frames = 0, draws = 0, shader_loads = 0, mods_hits = 0, translation_hits = 0,
-             pso_hits = 0, ranges = 0, range_runs = 0, range_pages = 0, unwatched = 0, flushes = 0;
+    uint64_t frames = 0, draws = 0, shader_loads = 0, shader_loads_immediate = 0, mods_hits = 0,
+             translation_hits = 0, pso_hits = 0, ranges = 0, range_runs = 0, range_pages = 0,
+             unwatched = 0, flushes = 0;
     uint64_t cbv_uploads[16] = {}, cbv_bytes[16] = {};  // by root parameter
     // Textures bound, by the fetch constant state the shaders read at run time: swizzled signs
     // all unsigned, gamma RGB + unsigned A, all gamma, all signed, other; then exponent bias
@@ -2177,7 +2182,7 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
     sample[i] = ucode[std::min(i, ref.dwords - 1)];
     sample[ShaderMemo::kSample / 2 + i] = ucode[ref.dwords - 1 - std::min(i, ref.dwords - 1)];
   }
-  ShaderMemo& memo = table[((ref.ucode >> 4) ^ ref.dwords) & (ShaderMemo::kEntries - 1)];
+  ShaderMemo& memo = table[ShaderMemo::Slot(ref)];
   last = &memo;
   if (memo.shader && memo.ucode == ref.ucode && memo.dwords == ref.dwords &&
       memo.immediate_seq == ref.immediate_seq &&
@@ -2193,6 +2198,7 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
   memo.binding = ref.binding;
   std::memcpy(memo.sample, sample, sizeof(sample));
   ++diag.shader_loads;
+  if (ref.immediate) ++diag.shader_loads_immediate;
   memo.shader = shaders.Load(type, ucode, ref.dwords);
   return memo.shader;
 }
@@ -3465,12 +3471,13 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     const double n = double(std::max<uint64_t>(d.draws, 1));
     auto per = [&](uint64_t v) { return double(v) / n; };
     REXLOG_INFO(
-        "PGR4 native draw diag: {} draws/frame; per draw: shader loads {:.3f}, mods hits {:.3f}, "
+        "PGR4 native draw diag: {} draws/frame; per draw: shader loads {:.3f} ({:.3f} immediate), "
+        "mods hits {:.3f}, "
         "translation hits {:.3f}, pso hits {:.3f}, ranges {:.3f} (pages {:.1f}, copied runs "
         "{:.3f}), unwatched copies {:.3f}, copy flushes {:.3f}",
-        d.draws / d.frames, per(d.shader_loads), per(d.mods_hits), per(d.translation_hits),
-        per(d.pso_hits), per(d.ranges), per(d.range_pages), per(d.range_runs), per(d.unwatched),
-        per(d.flushes));
+        d.draws / d.frames, per(d.shader_loads), per(d.shader_loads_immediate), per(d.mods_hits),
+        per(d.translation_hits), per(d.pso_hits), per(d.ranges), per(d.range_pages),
+        per(d.range_runs), per(d.unwatched), per(d.flushes));
     std::string cbv;
     for (uint32_t i = 0; i < 16; ++i) {
       if (!d.cbv_uploads[i]) continue;

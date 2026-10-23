@@ -12,6 +12,7 @@
 
 #include <emmintrin.h>
 
+#include <bit>
 #include <cstring>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
@@ -62,12 +63,6 @@ constexpr uint64_t kShaderLoadBlocks = (0xFFFFull << 42) | (0x1Full << 12) | 0xF
 // Vertex fetch constant 31 (mask +24 bit 0): BeginVertices' inline vertex buffer.
 constexpr uint64_t kFetch31 = 1ull;
 
-constexpr uint32_t kFnBeginVertices = 0x826CFA60, kFnDrawVerticesUP = 0x826CFF10,
-                   kFnDrawVertices = 0x826CFF58, kFnDrawIndexed = 0x826D0340,
-                   kFnDrawIndx2Inline = 0x826D0798, kFnDrawIndx2Split = 0x826DC888,
-                   kFnClearF = 0x826D18E0, kFnClear = 0x826D1A08, kFnResolve = 0x826CBEE0,
-                   kFnSwap = 0x826CB148, kFn10A8 = 0x826D6610;
-
 // Shader-rebind dirty bits in the mask at +16 (sub_826DEDC8): 19 vertex shader, 20 pixel shader.
 constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 
@@ -75,32 +70,39 @@ constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 
 void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count) {
   const uint8_t* p = HostPtr(base, src);
-  auto put_raw = [&](uint32_t i) {
-    uint32_t v;
-    std::memcpy(&v, p + i * 4, 4);
-    if (v == raw_[reg + i]) return;
-    raw_[reg + i] = v;
-    regs_[reg + i] = __builtin_bswap32(v);
-    Record(reg + i, regs_[reg + i]);
+  // Takes the registers first + k for each bit k of `differ`.
+  auto update = [&](uint32_t first, uint32_t differ) {
+    for (; differ; differ &= differ - 1) {
+      const uint32_t i = first + uint32_t(std::countr_zero(differ));
+      uint32_t v;
+      std::memcpy(&v, p + i * 4, 4);
+      raw_[reg + i] = v;
+      regs_[reg + i] = __builtin_bswap32(v);
+      Record(reg + i, regs_[reg + i]);
+    }
   };
-  // Most of what the flushing calls copy is unchanged: compare 16 registers per branch.
   auto eq4 = [&](uint32_t i) {
     const __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i * 4));
     const __m128i m = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw_ + reg + i));
     return _mm_cmpeq_epi32(g, m);
   };
+  auto equal_lanes = [](__m128i eq) { return uint32_t(_mm_movemask_ps(_mm_castsi128_ps(eq))); };
+  // Most of what the flushing calls copy is unchanged: 16 registers per branch.
   uint32_t i = 0;
   for (; i + 16 <= count; i += 16) {
-    const __m128i e =
-        _mm_and_si128(_mm_and_si128(eq4(i), eq4(i + 4)), _mm_and_si128(eq4(i + 8), eq4(i + 12)));
-    if (_mm_movemask_epi8(e) == 0xFFFF) continue;
-    for (uint32_t k = 0; k < 16; ++k) put_raw(i + k);
+    const __m128i e0 = eq4(i), e1 = eq4(i + 4), e2 = eq4(i + 8), e3 = eq4(i + 12);
+    if (_mm_movemask_epi8(_mm_and_si128(_mm_and_si128(e0, e1), _mm_and_si128(e2, e3))) == 0xFFFF)
+      continue;
+    update(i, ~(equal_lanes(e0) | equal_lanes(e1) << 4 | equal_lanes(e2) << 8 |
+                equal_lanes(e3) << 12) &
+                  0xFFFFu);
   }
-  for (; i + 4 <= count; i += 4) {
-    if (_mm_movemask_epi8(eq4(i)) == 0xFFFF) continue;
-    for (uint32_t k = 0; k < 4; ++k) put_raw(i + k);
+  for (; i + 4 <= count; i += 4) update(i, ~equal_lanes(eq4(i)) & 0xFu);
+  for (; i < count; ++i) {
+    uint32_t v;
+    std::memcpy(&v, p + i * 4, 4);
+    update(i, v != raw_[reg + i]);
   }
-  for (; i < count; ++i) put_raw(i);
 }
 
 void GuestStateTracker::CopyDirty(const uint8_t* base, uint32_t device, const uint64_t dirty[6]) {
@@ -146,16 +148,13 @@ void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn
                 differing);
 }
 
-void GuestStateTracker::TakeChanges(std::vector<RegWrite>* out) {
-  if (!recording_) {
-    recording_ = true;
-    changes_.reserve(4096);
+void GuestStateTracker::RecordInto(std::vector<RegWrite>* sink) {
+  if (sink && !synced_) {
+    synced_ = true;
     for (uint32_t reg = 0; reg < kGuestRegisterCount; ++reg)
-      if (regs_[reg]) out->emplace_back(reg, regs_[reg]);
-    return;
+      if (regs_[reg]) sink->emplace_back(reg, regs_[reg]);
   }
-  out->insert(out->end(), changes_.begin(), changes_.end());
-  changes_.clear();
+  sink_ = sink;
 }
 
 // sub_826DEBD8: a shader object's literal constants, LOAD_ALU_CONSTANT'd from guest memory into
@@ -185,6 +184,12 @@ CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device) {
   return e;
 }
 
+void PrefetchIndexBuffer(const uint8_t* base, uint32_t device) {
+  const uint8_t* ib = HostPtr(base, Load32(base, device + dev::kIndexBuffer));
+  __builtin_prefetch(ib);       // format dword (+0)
+  __builtin_prefetch(ib + 24);  // address (+24), on the next line when the object straddles one
+}
+
 void MarkAllDirty(uint8_t* base, uint32_t device) {
   uint64_t add[6] = {~0ull, ~0ull, kShaderLoadBits, 0, 0, 0};  // masks +0, +8: all constants
   for (const Block& b : kRegisterBlocks)
@@ -192,25 +197,6 @@ void MarkAllDirty(uint8_t* base, uint32_t device) {
   for (uint32_t i = 0; i < 6; ++i) {
     const uint32_t a = device + dev::kDirtyMasks + i * 8;
     Store64(base, a, Load64(base, a) | add[i]);
-  }
-}
-
-bool IsStateFlushingFn(uint32_t addr) {
-  switch (addr) {
-    case kFnBeginVertices:
-    case kFnDrawVerticesUP:
-    case kFnDrawVertices:
-    case kFnDrawIndexed:
-    case kFnDrawIndx2Inline:
-    case kFnDrawIndx2Split:
-    case kFnClearF:
-    case kFnClear:
-    case kFnResolve:
-    case kFnSwap:
-    case kFn10A8:
-      return true;
-    default:
-      return false;
   }
 }
 
@@ -225,6 +211,7 @@ void GuestStateTracker::Attach(const uint8_t* base, uint32_t device) {
   if (++attaches <= 8)
     REXLOG_INFO("PGR4 native state: tracking device {:08X} (was {:08X})", device, device_);
   device_ = device;
+  verify_ = REXCVAR_GET(pgr4_native_track_verify);
   Copy(0x4000, base, device + dev::kVsConstants, 1024);
   Copy(0x4400, base, device + dev::kPsConstants, 1024);
   for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
@@ -239,7 +226,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   if (device != device_) Attach(base, device);
   // DrawVerticesUP is BeginVertices + a copy + RestorePush; the nested BeginVertices call
   // already reported its flush and its inline vertex buffer.
-  if (fn_addr == kFnDrawVerticesUP) return;
+  if (fn_addr == guest_fn::kDrawVerticesUP) return;
   // An immediate VS load belongs to the draw it was made in; one made by Clear/Resolve's own
   // draws (DrawIndx2Inline) never reaches a game draw (the D3D re-dirties the VS after them).
   const bool vs_imm_new = vs_imm_pending_valid_;
@@ -265,17 +252,18 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   // overwrite in the stream, so the next draw restores it). A game draw changes only what was
   // dirty at its entry and what its shader load wrote; Clear, Resolve, Swap and the D3D's own
   // draws may write the shadow themselves, so after them every block is compared.
-  const bool game_draw =
-      fn_addr == kFnDrawIndexed || fn_addr == kFnDrawVertices || fn_addr == kFnBeginVertices;
+  const bool game_draw = fn_addr == guest_fn::kDrawIndexed || fn_addr == guest_fn::kDrawVertices ||
+                         fn_addr == guest_fn::kBeginVertices;
   const bool stride_changed =
-      fn_addr == kFnBeginVertices && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords;
+      fn_addr == guest_fn::kBeginVertices && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords;
   if (game_draw) {
     uint64_t dirty[6];
     std::memcpy(dirty, e.dirty, sizeof(dirty));
     if ((dirty[2] & kShaderLoadBits) || stride_changed) dirty[2] |= kShaderLoadBlocks;
     if (inline_fetch_) dirty[3] |= kFetch31;
     CopyDirty(base, device, dirty);
-    if (REXCVAR_GET(pgr4_native_track_verify)) Verify(base, device, fn_addr);
+    if (verify_) [[unlikely]]
+      Verify(base, device, fn_addr);
   } else {
     for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
   }
@@ -295,56 +283,59 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     Put(0x2082, ((field(br >> 16) << 16) & 0x3FFF0000u) | (field(br) & 0x3FFFu));
   }
 
-  const bool draw = fn_addr == kFnBeginVertices || fn_addr == kFnDrawVertices ||
-                    fn_addr == kFnDrawIndexed || fn_addr == kFn10A8;
+  const bool draw = fn_addr == guest_fn::kBeginVertices || fn_addr == guest_fn::kDrawVertices ||
+                    fn_addr == guest_fn::kDrawIndexed || fn_addr == guest_fn::k10A8;
   if (draw) {
     // Bound shaders and the literal constants sub_826DEDC8 loads when they are rebound (after
-    // the constant flush, so they win over the shadow).
-    uint32_t vs = Load32(base, device + dev::kVertexShader);
-    uint32_t ps = Load32(base, device + dev::kPixelShader);
+    // the constant flush, so they win over the shadow). That load, under the mask +16 bits
+    // 17..20, is the only place the D3D changes which ucode the GPU runs and patches a variant
+    // for a declaration, so the shader objects are read only then or when the object differs
+    // (after an attach, which binds none).
+    const uint32_t vs = Load32(base, device + dev::kVertexShader);
+    const uint32_t ps = Load32(base, device + dev::kPixelShader);
     uint64_t rebind = e.dirty[2];
     if (stride_changed && vs) rebind |= kVsRebind;  // BeginVertices sets it itself
-    if (vs) {
-      if (vs_imm_new) {
-        // sub_826DEA78 ran inside this draw: the GPU now holds the patched copy.
-        vs_imm_.swap(vs_imm_pending_);
-        vs_ = vs_imm_pending_ref_;
-        vs_.immediate = vs_imm_.data();
-      } else if (!vs_.immediate || (rebind & kVsRebind)) {
-        // IM_LOAD of the object's variant, or nothing loaded (same shader as before). After an
-        // immediate load the D3D reloads the VS only under the VS rebind bit (sub_826DEDC8).
-        // Variant 1 is used without a pixel shader when the object has one (flag 0x20).
-        uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
-        uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
-        vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)),
-               Load32(base, sub + 876) >> 2};
-        vs_.binding = XXH3_64bits(HostPtr(base, vs + 416 * variant + 40), 24);
-      }
-      if (rebind & (kVsRebind | kPsRebind)) LoadLiterals(base, vs + 872, Load32(base, vs + 32));
-    } else {
+    const bool shader_load = (rebind & kShaderLoadBits) != 0;
+    if (!vs) {
       vs_ = {};
+    } else if (vs_imm_new) {
+      // sub_826DEA78 ran inside this draw: the GPU now holds the patched copy.
+      vs_imm_.swap(vs_imm_pending_);
+      vs_ = vs_imm_pending_ref_;
+      vs_.immediate = vs_imm_.data();
+    } else if (vs_.immediate ? (rebind & kVsRebind) != 0 : shader_load || vs != vs_.object) {
+      // IM_LOAD of the object's variant. After an immediate load the D3D reloads the VS only
+      // under the VS rebind bit. Variant 1 is used without a pixel shader when the object has
+      // one (flag 0x20).
+      const uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
+      const uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
+      vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)),
+             Load32(base, sub + 876) >> 2};
+      vs_.binding = XXH3_64bits(HostPtr(base, vs + 416 * variant + 40), 24);
     }
-    if (ps) {
-      uint32_t sub = ps + Load32(base, ps + 64);
+    if (vs && (rebind & (kVsRebind | kPsRebind)))
+      LoadLiterals(base, vs + 872, Load32(base, vs + 32));
+    if (!ps) {
+      ps_ = {};
+    } else if (shader_load || ps != ps_.object) {
+      const uint32_t sub = ps + Load32(base, ps + 64);
       ps_ = {ps, GpuAddress(Load32(base, ps + 24) + Load32(base, sub + 40)),
              Load32(base, sub + 44) >> 2};
-      if (rebind & kPsRebind) LoadLiterals(base, ps + 40, Load32(base, ps + 24));
-    } else {
-      ps_ = {};
     }
+    if (ps && (rebind & kPsRebind)) LoadLiterals(base, ps + 40, Load32(base, ps + 24));
   }
 
   // Registers the draw functions write straight into the stream (not into the shadow).
   switch (fn_addr) {
-    case kFnDrawIndexed:   // VGT_INDX_OFFSET = BaseVertexIndex
-    case kFnDrawVertices:  // VGT_INDX_OFFSET = StartVertex
+    case guest_fn::kDrawIndexed:   // VGT_INDX_OFFSET = BaseVertexIndex
+    case guest_fn::kDrawVertices:  // VGT_INDX_OFFSET = StartVertex
       Put(0x2102, r[2]);
       inline_vertices_ = 0;
       break;
-    case kFnDrawIndx2Split:  // Swap's internal draw
+    case guest_fn::kDrawIndx2Split:  // Swap's internal draw
       Put(0x2102, 0);
       break;
-    case kFnBeginVertices: {
+    case guest_fn::kBeginVertices: {
       Put(0x2102, 0);
       uint32_t p = uint32_t(ret);
       if (!p) break;  // no space: nothing was written

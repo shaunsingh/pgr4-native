@@ -1,15 +1,15 @@
 // pgr4-native PGR4 native renderer: per-stage CPU time of the draw path (--pgr4_native_profile).
 //
-// Stage boundaries are timestamped with RDTSC (a few ns each, unlike QueryPerformanceCounter);
-// NativeRenderer converts ticks to µs at the TSC rate measured since start-up and appends one
-// column per stage to the native CSV. Off by default: then each Mark is one predictable branch.
+// Stage boundaries are timestamped in Ticks (clock.h); NativeRenderer converts them to µs and
+// appends one column per stage to the native CSV. Off by default: then each Mark is one predictable
+// branch.
 //
 // Threading: one State per thread. With the render thread (renderer.h) the guest thread's
 // stages (read_state, cap_*, track, imm_vs) are handed to the render thread at each Swap and
 // added to its State before the CSV row is written.
 #pragma once
 
-#include <intrin.h>
+#include "clock.h"
 
 #include <cstdint>
 
@@ -87,7 +87,7 @@ inline thread_local State g;
 
 inline void Count(Counter c) { ++g.counters[c]; }
 
-inline uint64_t Now() { return __rdtsc(); }
+inline uint64_t Now() { return Ticks(); }
 
 // Starts a run of stages.
 inline void Begin() {

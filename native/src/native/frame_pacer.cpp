@@ -1,7 +1,7 @@
 // pgr4-native PGR4 native renderer: frame pacing on the display's clock (frame_pacer.h).
 #include "frame_pacer.h"
 
-#include "renderer.h"
+#include "clock.h"
 
 #include <rex/logging.h>
 

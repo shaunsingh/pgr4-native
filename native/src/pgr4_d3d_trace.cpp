@@ -26,6 +26,7 @@
 //
 // Built only into the pgr4-native native checkout (native/build.sh, native/build.ps1).
 
+#include "native/clock.h"
 #include "native/d3d_state.h"
 #include "native/guest_d3d.h"
 #include "native/guest_memory.h"
@@ -116,21 +117,37 @@ constexpr FnInfo kFns[kFnCount] = {
 #undef D3D_FN
 };
 
+// Entry points the dispatch handles by name (d3d_surface.inc names every hooked one).
+constexpr FnId kFnSwap = kFn_826CB148, kFnResolve = kFn_826CBEE0, kFnCreateDevice = kFn_826CD270,
+               kFnRestoreSegment13392 = kFn_826CD380, kFnRestoreSegment = kFn_826CD868,
+               kFnStartSegment = kFn_826CE4E0, kFnSwitchSegment = kFn_826CE738,
+               kFnMakeSpace = kFn_826CE8C0, kFnBeginVertices = kFn_826CFA60,
+               kFnRestorePush = kFn_826CFF00, kFnDrawVerticesUP = kFn_826CFF10,
+               kFnDrawVertices = kFn_826CFF58, kFnDrawIndexed = kFn_826D0340,
+               kFnClear = kFn_826D1A08, kFnBeginTiling = kFn_826D1C38, kFnEndTiling = kFn_826D20D0;
+
 // The five builders DrawCounter counted as API draws (the development notes).
-constexpr FnId kDrawCounterFns[] = {kFn_826CFA60, kFn_826CFF58, kFn_826D0340, kFn_826D0798,
+constexpr FnId kDrawCounterFns[] = {kFnBeginVertices, kFnDrawVertices, kFnDrawIndexed, kFn_826D0798,
                                     kFn_826DC888};
+constexpr bool IsDrawCounterFn(FnId id) {
+  for (FnId d : kDrawCounterFns)
+    if (d == id) return true;
+  return false;
+}
+// The calls rex_drawcount_api_counters reports: the draw builders and Resolve.
+constexpr bool IsCountedFn(FnId id) { return IsDrawCounterFn(id) || id == kFnResolve; }
 
 // Skippable entry points: void, and nothing in the caller depends on their result.
 enum Skip : uint32_t { kSkipDraw = 1, kSkipClear = 2, kSkipResolve = 4 };
-uint32_t SkipClassOf(FnId id) {
+constexpr uint32_t SkipClassOf(FnId id) {
   switch (id) {
-    case kFn_826D0340:
-    case kFn_826CFF58:
-    case kFn_826CFF10:
+    case kFnDrawIndexed:
+    case kFnDrawVertices:
+    case kFnDrawVerticesUP:
       return kSkipDraw;
-    case kFn_826D1A08:
+    case kFnClear:
       return kSkipClear;
-    case kFn_826CBEE0:
+    case kFnResolve:
       return kSkipResolve;
     default:
       return 0;
@@ -154,8 +171,11 @@ void NoteFrameBegin() {
   g_frame_begin_ns = now;
 }
 
-constexpr uint32_t kRegCount = 0x5000;
+constexpr uint32_t kRegCount = pgr4::native::kGuestRegisterCount;
 constexpr uint32_t kDevPush = 48;  // last written dword; the limit is at device+56
+// First register of each constant kind in SET_CONSTANT and LOAD_ALU_CONSTANT: ALU (float),
+// fetch, bool, loop, register.
+constexpr uint32_t kConstantBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
 
 using pgr4::native::Load32;  // the D3D's push buffer can live in the 0xE0000000 view
 
@@ -361,7 +381,7 @@ struct Tap {
 };
 
 Tap g_tap;
-std::atomic<uint64_t> g_calls[kFnCount];
+std::atomic<uint64_t> g_calls[kFnCount];  // IsCountedFn's, for rex_drawcount_api_counters
 std::atomic<uint32_t> g_skip{0};
 // Pass-through hooks (IsPassThrough) take OnHook's path only while the tap decodes the stream or
 // the profiler times the guest D3D; otherwise they jump straight to the original.
@@ -603,8 +623,7 @@ void HandlePacket(Tap& t, uint8_t* base) {
     case 0x2D: {  // SET_CONSTANT
       if (t.pkt.empty()) break;
       uint32_t index = t.pkt[0] & 0x7FF, kind = (t.pkt[0] >> 16) & 0xFF;
-      static constexpr uint32_t kBase[5] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
-      if (kind < 5) range(kBase[kind] + index, 1);
+      if (kind < std::size(kConstantBase)) range(kConstantBase[kind] + index, 1);
       break;
     }
     case 0x55:  // SET_CONSTANT2
@@ -616,15 +635,14 @@ void HandlePacket(Tap& t, uint8_t* base) {
       uint32_t addr = t.pkt[0] & 0x3FFFFFFF, index = t.pkt[1] & 0x7FF,
                kind = (t.pkt[1] >> 16) & 0xFF;
       uint32_t n = t.pkt[2] & 0xFFF;
-      static constexpr uint32_t kBase[5] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
-      if (kind >= 5) break;
+      if (kind >= std::size(kConstantBase)) break;
       const uint8_t* p = rex::system::kernel_memory()->TranslatePhysical<const uint8_t*>(addr);
       for (uint32_t i = 0; i < n; ++i) {
         uint32_t v;
         std::memcpy(&v, p + i * 4, 4);
-        WriteReg(t, kBase[kind] + index + i, __builtin_bswap32(v));
+        WriteReg(t, kConstantBase[kind] + index + i, __builtin_bswap32(v));
       }
-      if (Tracing(t)) Out(t, "L %04X n=%u from=%08X\n", kBase[kind] + index, n, addr);
+      if (Tracing(t)) Out(t, "L %04X n=%u from=%08X\n", kConstantBase[kind] + index, n, addr);
       break;
     }
     case 0x27:  // IM_LOAD
@@ -827,7 +845,7 @@ void BeginTrace(Tap& t) {
 }
 
 void PollControl(Tap& t, uint8_t* base) {
-  std::string path = REXCVAR_GET(pgr4_d3d_control);
+  const std::string& path = REXCVAR_GET(pgr4_d3d_control);
   if (path.empty()) return;
   std::error_code ec;
   if (!std::filesystem::exists(path, ec)) return;
@@ -940,30 +958,42 @@ void EndFrame(Tap& t, uint8_t* base) {
   }
 }
 
-template <typename F>
-inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
-  g_calls[id].fetch_add(1, std::memory_order_relaxed);
+// The tap's side of one hooked call: counts it, follows the device it runs on and, with the
+// tap on, decodes the push buffer around it. `run` runs the guest function (OnHook's wrapper).
+template <FnId kId, typename Run>
+inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
+  // One guest thread drives the device: a plain increment keeps the counts exact, without the
+  // locked add.
+  if constexpr (IsCountedFn(kId))
+    g_calls[kId].store(g_calls[kId].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
   Tap& t = g_tap;
   const uint32_t r3 = ctx.r3.u32;
-  const uint32_t skip = SkipClassOf(id);
-  const bool forward = !(skip & g_skip.load(std::memory_order_relaxed));
+  constexpr uint32_t kSkip = SkipClassOf(kId);
+  const bool forward = kSkip == 0 || !(kSkip & g_skip.load(std::memory_order_relaxed));
+  auto call = [&] {
+    if (forward)
+      run(ctx, base);
+    else
+      ctx.r3.u64 = 0;
+  };
   // The game creates the device more than once (once more at the title screen); the device a
   // Swap or draw call runs on is the current one.
-  if (r3 && r3 != t.device && t.device &&
-      (id == kFn_826CB148 || id == kFn_826D0340 || id == kFn_826CFF58)) {
-    std::lock_guard lock(t.mutex);
-    static uint32_t switches = 0;
-    if (++switches <= 8)
-      REXLOG_INFO("PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it", kFns[id].name,
-                  r3, t.device);
-    t.device = r3;
-    t.cursor = Load32(base, t.device + kDevPush);
-    t.in_packet = false;
+  if constexpr (kId == kFnSwap || kId == kFnDrawIndexed || kId == kFnDrawVertices) {
+    if (r3 && r3 != t.device && t.device) [[unlikely]] {
+      std::lock_guard lock(t.mutex);
+      static uint32_t switches = 0;
+      if (++switches <= 8)
+        REXLOG_INFO("PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it", kFns[kId].name,
+                    r3, t.device);
+      t.device = r3;
+      t.cursor = Load32(base, t.device + kDevPush);
+      t.in_packet = false;
+    }
   }
   if (!(t.device && r3 == t.device)) {
-    if (id == kFn_826CD270) {  // CreateDevice(..., ppDevice in r8)
-      uint32_t out = ctx.r8.u32;
-      original(ctx, base);
+    if constexpr (kId == kFnCreateDevice) {  // CreateDevice(..., ppDevice in r8)
+      const uint32_t out = ctx.r8.u32;
+      run(ctx, base);
       std::lock_guard lock(t.mutex);
       t.device = Load32(base, out);
       t.cursor = t.device ? Load32(base, t.device + kDevPush) : 0;
@@ -976,69 +1006,61 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
                   uint32_t(kFnCount));
       return;
     }
-    if (forward)
-      original(ctx, base);
-    else
-      ctx.r3.u64 = 0;
+    call();
     return;
   }
-  if (!t.enabled) {  // hooks count and forward only; Swap still polls the control file
-    if (forward)
-      original(ctx, base);
-    else
-      ctx.r3.u64 = 0;
-    if (id == kFn_826CB148) {
+  if (!t.enabled) {  // the hooks only forward; Swap still polls the control file
+    call();
+    if constexpr (kId == kFnSwap) {
       std::lock_guard lock(t.mutex);
-      EndFrame(t, base);
+      ++t.frame_index;
+      PollControl(t, base);
     }
     return;
   }
 
   std::unique_lock lock(t.mutex);
   Sync(t, base, false);
-  uint64_t seq = ++t.call_seq;
+  const uint64_t seq = ++t.call_seq;
   ++t.frame.calls;
-  for (FnId d : kDrawCounterFns)
-    if (d == id) ++t.frame.draw_calls;
+  if constexpr (IsDrawCounterFn(kId)) ++t.frame.draw_calls;
   if (Tracing(t)) {
-    ++t.fn_calls[id];
+    ++t.fn_calls[kId];
     Out(t, "C %llu %u %s r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s\n", (unsigned long long)seq,
-        t_depth, kFns[id].name, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
+        t_depth, kFns[kId].name, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
         forward ? "" : " SKIPPED");
   }
-  if (t_depth < 64) t_stack[t_depth] = {id, seq};
+  if (t_depth < 64) t_stack[t_depth] = {kId, seq};
   ++t_depth;
   lock.unlock();
 
-  if (forward)
-    original(ctx, base);
-  else
-    ctx.r3.u64 = 0;
+  call();
 
   lock.lock();
   // These move the push pointer by assignment: MakeSpace and RestorePush stay in the written
   // stream; the segment functions leave a hole (reserved dwords, an unwritten new segment).
-  const bool jump =
-      id == kFn_826CE738 || id == kFn_826CE4E0 || id == kFn_826CD868 || id == kFn_826CD380;
-  Sync(t, base, jump || id == kFn_826CE8C0 || id == kFn_826CFF00 || id == kFn_826CFF10, jump);
+  constexpr bool kJump = kId == kFnSwitchSegment || kId == kFnStartSegment ||
+                         kId == kFnRestoreSegment || kId == kFnRestoreSegment13392;
+  Sync(t, base, kJump || kId == kFnMakeSpace || kId == kFnRestorePush || kId == kFnDrawVerticesUP,
+       kJump);
   --t_depth;
   if (Tracing(t)) Out(t, "R %llu r3=%08X\n", (unsigned long long)seq, ctx.r3.u32);
   if (t_depth == 0 && (Tracing(t) || t.check)) {
     if (t.state_pending) {  // BeginVertices' packets are in the stream once RestorePush ran
       t.state_pending = false;
-      if (id == kFn_826CFF00)
-        CompareState(t, kFn_826CFA60);
+      if constexpr (kId == kFnRestorePush)
+        CompareState(t, kFnBeginVertices);
       else
         ++t.state_unchecked;
     }
-    if (kFns[id].cat == kDraw) {
-      if (id == kFn_826CFA60)
+    if constexpr (kFns[kId].cat == kDraw) {
+      if constexpr (kId == kFnBeginVertices)
         t.state_pending = true;
       else
-        CompareState(t, id);
+        CompareState(t, kId);
     }
   }
-  if (id == kFn_826CB148) EndFrame(t, base);  // Swap
+  if constexpr (kId == kFnSwap) EndFrame(t, base);
 }
 
 // Native renderer dispatch (--pgr4_native). Only the outermost draw/clear/resolve/Swap call
@@ -1048,7 +1070,7 @@ inline void OnCall(FnId id, PPCContext& ctx, uint8_t* base, F original) {
 // clears through a nested ClearF, which must reach OnClear). A top-level BeginVertices only
 // reserves space: the game writes the vertices after it returns, so its OnDraw is held until
 // the entry of RestorePush (EndVertices) or of the next hooked call that is not a pass-through.
-enum NativeClass : uint8_t { kNatNone, kNatDraw, kNatClear, kNatResolve, kNatSwap, kNatCount };
+enum NativeClass : uint8_t { kNatNone, kNatDraw, kNatClear, kNatResolve, kNatSwap };
 
 constexpr NativeClass NativeClassOf(Cat c) {
   switch (c) {
@@ -1072,106 +1094,55 @@ thread_local uint32_t t_original_depth = 0;  // hooked originals running on this
 thread_local pgr4::native::TilingCall t_tiling_call = pgr4::native::TilingCall::kNone;
 
 // Hooked functions that neither the renderer nor the state tracker needs to see: no draw,
-// clear, resolve or Swap, no state flush (d3d_state.h IsStateFlushingFn: these plus
-// fn_826D6610), not the tiling bracket and not CreateDevice. Without the tap they run
-// straight through, and without the profiler too they skip OnHook (HasFastPath).
+// clear, resolve or Swap, no state flush (d3d_state.h IsStateFlushingFn), not the tiling
+// bracket and not CreateDevice. Without the tap they run straight through, and without the
+// profiler too they skip OnHook (HasFastPath).
 constexpr bool IsPassThrough(FnId id) {
-  if (NativeClassOf(kFns[id].cat) != kNatNone) return false;
-  switch (kFns[id].addr) {
-    case 0x826D6610u:
-    case 0x826D1C38u:
-    case 0x826D20D0u:
-    case 0x826CD270u:
-      return false;
-    default:
-      return true;
-  }
+  return NativeClassOf(kFns[id].cat) == kNatNone &&
+         !pgr4::native::IsStateFlushingFn(kFns[id].addr) && id != kFnBeginTiling &&
+         id != kFnEndTiling && id != kFnCreateDevice;
 }
 
 // The pass-through hooks with a fast path. RestorePush (EndVertices) keeps OnHook's: the draw a
 // top-level BeginVertices holds is queued at its entry, once the game has written the vertices.
-constexpr bool HasFastPath(FnId id) { return IsPassThrough(id) && kFns[id].addr != 0x826CFF00u; }
+constexpr bool HasFastPath(FnId id) { return IsPassThrough(id) && id != kFnRestorePush; }
+
+using GuestFn = void (*)(PPCContext&, uint8_t*);
 
 // Runs a hooked guest D3D function. The outermost one is timed as profile::kGuestD3d (nested
 // hooked calls and their tracking are inside that time).
-template <typename F>
-inline void RunOriginal(F original, PPCContext& c, uint8_t* b) {
+template <GuestFn kFn>
+inline void RunOriginal(PPCContext& c, uint8_t* b) {
   namespace nat = pgr4::native;
   if (t_original_depth++ == 0 && nat::profile::g.on) {
     nat::profile::Scope scope(nat::profile::kGuestD3d);
-    original(c, b);
+    kFn(c, b);
   } else {
-    original(c, b);
+    kFn(c, b);
   }
   --t_original_depth;
 }
 
-// The state tracker (native/d3d_state) needs the dirty masks at the entry of every flushing
-// call, at every depth, and the call's exit before anything reads the state (the tap's per-draw
-// compare inside OnCall, OnDraw here). So the original is wrapped; OnCall's skip path does not
-// run it and nothing is tracked then.
-template <typename F>
-inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
-  namespace nat = pgr4::native;
-  nat::NativeRenderer* r = nat::NativeRenderer::Live();
-  if (IsPassThrough(id) && !g_tap.enabled) {
-    // A held BeginVertices draw is queued where the fast path would queue it too.
-    if (!HasFastPath(id) && t_pending_vertices && r) {
-      t_pending_vertices = false;
-      r->OnDraw(base, t_pending_args);
-    }
-    RunOriginal(original, ctx, base);
-    return;
-  }
-  const bool track = r || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap);
-  // --pgr4_native_replace_draws: native/guest_d3d.h replaces DrawIndexedVertices' body.
-  auto body = [id, original](PPCContext& c, uint8_t* b) {
-    if (id == kFn_826D0340 && nat::guest_d3d::DrawIndexed(c, b)) return;
-    original(c, b);
-  };
-  auto run = [id, track, body](PPCContext& c, uint8_t* b) {
-    const uint32_t fn = kFns[id].addr;
-    if (!track || !c.r3.u32 || !nat::IsStateFlushingFn(fn)) {
-      RunOriginal(body, c, b);
-      return;
-    }
-    const uint32_t rr[8] = {c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32,
-                            c.r7.u32, c.r8.u32, c.r9.u32, c.r10.u32};
-    nat::CallEntry e;
-    {
-      nat::profile::Scope scope(nat::profile::kTrack);
-      e = nat::ReadDirtyMasks(b, rr[0]);
-    }
-    RunOriginal(body, c, b);
-    nat::profile::Scope scope(nat::profile::kTrack);
-    ++nat::profile::g.track_calls;
-    nat::GuestState().AfterCall(b, fn, e, rr, c.r3.u64);
-  };
-  if (!r) {
-    OnCall(id, ctx, base, run);
-    if (id == kFn_826CB148) {
-      if (nat::NativeRenderer* suspended = nat::NativeRenderer::Get()) suspended->OnSwapSuspended();
-      NoteFrameBegin();
-    }
-    return;
-  }
-  if (t_pending_vertices && !HasFastPath(id)) {
+// The guest function, or its replacement (--pgr4_native_replace_draws, native/guest_d3d.h).
+template <FnId kId, GuestFn kOriginal>
+void Body(PPCContext& c, uint8_t* b) {
+  if constexpr (kId == kFnDrawIndexed)
+    if (pgr4::native::guest_d3d::DrawIndexed(c, b)) return;
+  kOriginal(c, b);
+}
+
+// Queues the draw a top-level BeginVertices holds: the game has written its vertices by now.
+inline void QueuePendingVertices(pgr4::native::NativeRenderer* r, const uint8_t* base) {
+  if (t_pending_vertices && r) {
     t_pending_vertices = false;
     r->OnDraw(base, t_pending_args);
   }
-  const NativeClass cls = NativeClassOf(kFns[id].cat);
-  if (cls == kNatNone) {
-    const nat::TilingCall outer = t_tiling_call;
-    if (id == kFn_826D1C38)
-      t_tiling_call = nat::TilingCall::kBegin;
-    else if (id == kFn_826D20D0)
-      t_tiling_call = nat::TilingCall::kEnd;
-    OnCall(id, ctx, base, run);
-    t_tiling_call = outer;
-    return;
-  }
-  nat::HookArgs a;
-  a.fn = nat::HookFn(kFns[id].addr);
+}
+
+// A hooked call's arguments at its entry, before the guest function clobbers them.
+inline pgr4::native::HookArgs EntryArgs(uint32_t fn, const PPCContext& ctx) {
+  pgr4::native::HookArgs a;
+  a.fn = pgr4::native::HookFn(fn);
   a.device = ctx.r3.u32;
   a.r[0] = ctx.r3.u32;
   a.r[1] = ctx.r4.u32;
@@ -1186,35 +1157,96 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   a.f[1] = ctx.f2.f64;
   a.f[2] = ctx.f3.f64;
   a.f[3] = ctx.f4.f64;
+  a.ret = 0;
   a.tiling = t_tiling_call;
-  ++t_native_depth;
-  OnCall(id, ctx, base, run);
-  if (--t_native_depth) return;
-  a.ret = ctx.r3.u64;
-  switch (cls) {
-    case kNatDraw:
-      if (id == kFn_826CFA60) {  // BeginVertices
+  return a;
+}
+
+// The state tracker (native/d3d_state) needs the dirty masks at the entry of every flushing
+// call, at every depth, and the call's exit before anything reads the state (the tap's per-draw
+// compare inside OnCall, OnDraw here). So the original is wrapped; OnCall's skip path does not
+// run it and nothing is tracked then. Everything that depends on the function is resolved at
+// compile time: each hook holds only its own path.
+template <FnId kId, GuestFn kOriginal>
+inline void OnHook(PPCContext& ctx, uint8_t* base) {
+  namespace nat = pgr4::native;
+  constexpr uint32_t kAddr = kFns[kId].addr;
+  constexpr NativeClass kClass = NativeClassOf(kFns[kId].cat);
+  if constexpr (IsPassThrough(kId)) {
+    if (!g_tap.enabled) {
+      if constexpr (!HasFastPath(kId))
+        if (t_pending_vertices) QueuePendingVertices(nat::NativeRenderer::Live(), base);
+      RunOriginal<kOriginal>(ctx, base);
+      return;
+    }
+  }
+  nat::NativeRenderer* const r = nat::NativeRenderer::Live();
+  const bool track = r || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap);
+  auto run = [&](PPCContext& c, uint8_t* b) {
+    if constexpr (nat::IsStateFlushingFn(kAddr)) {
+      if (track && c.r3.u32) {
+        const uint32_t rr[8] = {c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32,
+                                c.r7.u32, c.r8.u32, c.r9.u32, c.r10.u32};
+        nat::CallEntry e;
+        {
+          nat::profile::Scope scope(nat::profile::kTrack);
+          e = nat::ReadDirtyMasks(b, rr[0]);
+          if constexpr (kId == kFnDrawIndexed) nat::PrefetchIndexBuffer(b, rr[0]);
+        }
+        RunOriginal<Body<kId, kOriginal>>(c, b);
+        nat::profile::Scope scope(nat::profile::kTrack);
+        ++nat::profile::g.track_calls;
+        nat::GuestState().AfterCall(b, kAddr, e, rr, c.r3.u64);
+        return;
+      }
+    }
+    RunOriginal<Body<kId, kOriginal>>(c, b);
+  };
+  if (!r) {
+    OnCall<kId>(ctx, base, run);
+    if constexpr (kId == kFnSwap) {
+      if (nat::NativeRenderer* suspended = nat::NativeRenderer::Get()) suspended->OnSwapSuspended();
+      NoteFrameBegin();
+    }
+    return;
+  }
+  if constexpr (!HasFastPath(kId)) QueuePendingVertices(r, base);
+  if constexpr (kClass == kNatNone) {
+    if constexpr (kId == kFnBeginTiling || kId == kFnEndTiling) {
+      const nat::TilingCall outer = t_tiling_call;
+      t_tiling_call = kId == kFnBeginTiling ? nat::TilingCall::kBegin : nat::TilingCall::kEnd;
+      OnCall<kId>(ctx, base, run);
+      t_tiling_call = outer;
+    } else {
+      OnCall<kId>(ctx, base, run);
+    }
+  } else {
+    // Only the outermost call reaches the renderer, with its arguments at entry.
+    const bool outer = t_native_depth++ == 0;
+    nat::HookArgs a;
+    if (outer) a = EntryArgs(kAddr, ctx);
+    OnCall<kId>(ctx, base, run);
+    --t_native_depth;
+    if (!outer) return;
+    a.ret = ctx.r3.u64;
+    if constexpr (kClass == kNatDraw) {
+      if constexpr (kId == kFnBeginVertices) {
         t_pending_args = a;
         t_pending_vertices = true;
       } else {
         r->OnDraw(base, a);
       }
-      break;
-    case kNatClear:
+    } else if constexpr (kClass == kNatClear) {
       r->OnClear(base, a);
-      break;
-    case kNatResolve:
+    } else if constexpr (kClass == kNatResolve) {
       r->OnResolve(base, a);
-      break;
-    case kNatSwap:
+    } else {
+      static_assert(kClass == kNatSwap);
       r->OnSwap(base, a);
       NoteFrameBegin();
-      break;
-    default:
-      break;
+    }
   }
 }
-
 }  // namespace
 
 // Cumulative counters for the SDK's --gpu_stream_stats (instrument patch): names
@@ -1227,7 +1259,7 @@ extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint6
   static uint64_t snapshot[9];
   for (int i = 0; i < 5; ++i)
     snapshot[i] = g_calls[kDrawCounterFns[i]].load(std::memory_order_relaxed);
-  snapshot[5] = g_calls[kFn_826CBEE0].load(std::memory_order_relaxed);
+  snapshot[5] = g_calls[kFnResolve].load(std::memory_order_relaxed);
   for (int i = 0; i < 3; ++i) snapshot[6 + i] = g_tap_counts[i].load(std::memory_order_relaxed);
   *values = snapshot;
   *names = kNames;
@@ -1272,7 +1304,7 @@ extern "C" float Pgr4MotionBlurStep(float step, uint8_t*) {
       if (!g_hook_all.load(std::memory_order_relaxed)) [[likely]] \
         return __imp__sub_##a(ctx, base);                         \
     }                                                             \
-    OnHook(kFn_##a, ctx, base, __imp__sub_##a);                   \
+    OnHook<kFn_##a, __imp__sub_##a>(ctx, base);                   \
   }
 #include "d3d_surface.inc"
 #undef D3D_FN

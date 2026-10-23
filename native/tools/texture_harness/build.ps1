@@ -3,7 +3,7 @@
 #   pwsh -NoProfile -File build.ps1 [-Sdk C:\recomp\builds\pgr4\native-TextureMod\MTR-PGR4\thirdparty\rexglue-sdk]
 #           [-Out C:\recomp\builds\pgr4\native-TextureMod\texture_harness]
 #
-# Compiles the harness, ..\..\src\native\texture_layout.cpp, textures.cpp (with
+# Compiles the harness, ..\..\src\native\clock.cpp, texture_layout.cpp, textures.cpp (with
 # PGR4_TEXTURES_OFFLINE: no ReXGlue runtime, no write tracking) and the SDK's BSD texture helpers
 # (src/graphics/pipeline/texture/util.cpp, info_formats.cpp) with clang-cl; headers from the
 # SDK source tree (include\) and its installed copy (fmt, header-only here). Links d3d12.lib.
@@ -25,6 +25,7 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 $native = Join-Path $PSScriptRoot '..\..\src\native'
 $srcs = @(
     (Join-Path $PSScriptRoot 'texture_harness.cpp'),
+    (Join-Path $native 'clock.cpp'),
     (Join-Path $native 'texture_layout.cpp'),
     (Join-Path $native 'textures.cpp'),
     (Join-Path $Sdk 'src\graphics\pipeline\texture\util.cpp'),

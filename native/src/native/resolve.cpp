@@ -5,6 +5,7 @@
 // red/blue swap of RB_COPY_DEST_INFO and the sample selections of RB_COPY_CONTROL.
 #include "resolve.h"
 
+#include "clock.h"
 #include "gpu_timer.h"
 #include "guest_memory.h"
 #include "renderer.h"

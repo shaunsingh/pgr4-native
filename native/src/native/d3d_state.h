@@ -57,6 +57,10 @@ struct CallEntry {
 };
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device);
 
+// At the entry of DrawIndexedVertices: starts fetching the bound index buffer object, which
+// ReadDrawState reads after the call (and the replaced draw, guest_d3d.h, does not read at all).
+void PrefetchIndexBuffer(const uint8_t* base, uint32_t device);
+
 // Sets the dirty bits of every state block the draws flush (float constants, register blocks,
 // fetch and bool/loop constants, clip planes) and the shader rebind bits, so the next draw
 // writes the whole shadow and both shaders into the stream.
@@ -66,8 +70,32 @@ void MarkAllDirty(uint8_t* base, uint32_t device);
 // the draws, DrawIndx2Inline/Split, Clear/ClearF, Resolve, Swap and fn_826D6610. The dispatch
 // calls ReadDirtyMasks before and GuestState().AfterCall after each of them, at every
 // nesting depth, whenever --pgr4_native or the trace tap is on.
-bool IsStateFlushingFn(uint32_t addr);
+namespace guest_fn {
+constexpr uint32_t kBeginVertices = 0x826CFA60, kDrawVerticesUP = 0x826CFF10,
+                   kDrawVertices = 0x826CFF58, kDrawIndexed = 0x826D0340,
+                   kDrawIndx2Inline = 0x826D0798, kDrawIndx2Split = 0x826DC888,
+                   kClearF = 0x826D18E0, kClear = 0x826D1A08, kResolve = 0x826CBEE0,
+                   kSwap = 0x826CB148, k10A8 = 0x826D6610;
+}  // namespace guest_fn
 
+constexpr bool IsStateFlushingFn(uint32_t addr) {
+  switch (addr) {
+    case guest_fn::kBeginVertices:
+    case guest_fn::kDrawVerticesUP:
+    case guest_fn::kDrawVertices:
+    case guest_fn::kDrawIndexed:
+    case guest_fn::kDrawIndx2Inline:
+    case guest_fn::kDrawIndx2Split:
+    case guest_fn::kClearF:
+    case guest_fn::kClear:
+    case guest_fn::kResolve:
+    case guest_fn::kSwap:
+    case guest_fn::k10A8:
+      return true;
+    default:
+      return false;
+  }
+}
 // Registers the D3D writes into the stream outside any draw state (Resolve's
 // RB_COPY_DEST_BASE, the queries' RB_SAMPLE_COUNT_ADDR); CompareWithTap skips them.
 bool IsTapOnlyRegister(uint32_t reg);
@@ -140,11 +168,10 @@ class GuestStateTracker {
   // Shaders bound at the last draw (the IM_LOAD address the D3D uses for them).
   const ShaderRef& vs() const { return vs_; }
   const ShaderRef& ps() const { return ps_; }
-  // Appends the register writes that changed a value since the last call, in order, and forgets
-  // them; the first call appends every non-zero register (the copy it feeds starts zeroed like
-  // regs_), and writes are recorded only from then on. The render thread replays these into its
-  // own register file (renderer.cpp).
-  void TakeChanges(std::vector<RegWrite>* out);
+  // From now on appends every register write that changes a value to `*sink`, in order (null:
+  // none). The first sink also gets every non-zero register, as the copy it feeds starts zeroed
+  // like regs_. The render thread replays these into its own register file (renderer.cpp).
+  void RecordInto(std::vector<RegWrite>* sink);
   // Forgets the device after calls the tracker did not see: the next flushing call attaches
   // again and copies the whole shadow (recording what changed).
   void Resync() {
@@ -168,7 +195,7 @@ class GuestStateTracker {
   // each register as the guest stores it (big-endian), so Copy compares guest memory with it
   // four registers at a time without swapping.
   void Record(uint32_t reg, uint32_t value) {
-    if (recording_) changes_.emplace_back(reg, value);
+    if (sink_) sink_->emplace_back(reg, value);
   }
   void Put(uint32_t reg, uint32_t value) {
     if (regs_[reg] == value) return;
@@ -194,11 +221,11 @@ class GuestStateTracker {
   ShaderRef vs_imm_pending_ref_;
   bool vs_imm_pending_valid_ = false;
   uint32_t vs_imm_seq_ = 0;
+  bool verify_ = false;  // --pgr4_native_track_verify, read at Attach
   uint32_t regs_[kGuestRegisterCount] = {};
   uint32_t raw_[kGuestRegisterCount] = {};
-  // Writes since the last TakeChanges (a register written twice appears twice).
-  std::vector<RegWrite> changes_;
-  bool recording_ = false;  // from the first TakeChanges on
+  std::vector<RegWrite>* sink_ = nullptr;  // RecordInto
+  bool synced_ = false;                    // a sink got the whole register file
 };
 
 GuestStateTracker& GuestState();

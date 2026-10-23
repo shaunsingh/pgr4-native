@@ -2,6 +2,7 @@
 // See present.h.
 #include "present.h"
 
+#include "clock.h"
 #include "d3d12_device.h"
 #include "guest_memory.h"
 #include "resolve.h"

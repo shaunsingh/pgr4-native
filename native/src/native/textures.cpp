@@ -1,8 +1,8 @@
 // pgr4-native PGR4 native renderer: texture cache (see textures.h).
 #include "textures.h"
 
+#include "clock.h"
 #include "profile.h"
-#include "renderer.h"  // NowNs
 
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>

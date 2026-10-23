@@ -15,9 +15,10 @@
 //
 // With --pgr4_native_render_thread (default on; false keeps everything on the guest thread as
 // above) the On* calls only capture, on the guest thread, what each call reads from guest
-// memory: the register changes since the last draw (the tracker's TakeChanges), the
-// DrawState, DrawRenderer::Prepare's shader lookup and vertex/index copies,
-// and the decoded Clear/Resolve/Swap arguments. They queue it in batches to the render thread
+// memory: the register changes since the last draw (which the tracker records straight into the
+// batch, GuestStateTracker::RecordInto), the DrawState, DrawRenderer::Prepare's shader lookup and
+// vertex/index copies, and the decoded Clear/Resolve/Swap arguments. They queue it in batches to
+// the render thread
 // ("PGR4 native render"), which replays it into the modules with its own copy of the register
 // file. From then on the command list, the D3D12 objects and every module's state belong to
 // that thread (DrawRenderer's vertex upload pool and shader lookup stay on the guest thread).
@@ -241,8 +242,5 @@ class NativeRenderer {
   struct Csv;
   std::unique_ptr<Csv> csv_;
 };
-
-// Monotonic CPU time in nanoseconds (RDTSC calibrated against QueryPerformanceCounter).
-uint64_t NowNs();
 
 }  // namespace pgr4::native

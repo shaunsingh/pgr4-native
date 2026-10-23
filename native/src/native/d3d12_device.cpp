@@ -2,8 +2,8 @@
 // window.
 #include "d3d12_device.h"
 
+#include "clock.h"
 #include "gpu_timer.h"
-#include "renderer.h"  // NowNs
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
