@@ -6,7 +6,7 @@
 # only read, never modified.
 #
 #   native/build.sh [--stage prep,sdk,game,install] [--root DIR] [--dest DIR] [--game DIR]
-#                   [--jobs N] [--march x86-64-v3] [--mtune znver2] [--force]
+#                   [--jobs N] [--march x86-64-v3] [--mtune znver2] [--pgo gen|off|FILE] [--force]
 #
 # Stages, in order (default: all):
 #   prep     rsync $root/MTR-PGR4 (source and patched SDK source; no build dirs, no generated
@@ -33,6 +33,16 @@
 # older CPUs build.ps1 targets. A tree configured with other flags is reconfigured (and so
 # rebuilt in full).
 #
+# --pgo FILE builds the game (not the SDK) optimized with the profile FILE, copied to $dest/pgo
+# under its hash (a new profile is new flags); without --pgo, $dest/pgo/default.profdata is used
+# when it exists, and --pgo off builds without one. --pgo gen builds the game instrumented: a
+# run of it writes run/runtime/pgr4_recompiled.profraw (src/native/pgo_counters.cpp), and
+# `llvm-profdata merge -o $dest/pgo/default.profdata <profraw>` makes it the default. The profile
+# runtime the instrumented build links, clang_rt.profile.lib, is compiled here from the
+# compiler-rt source of the clang-cl in use: the Linux LLVM packages have no Windows one. A
+# profile goes stale only where the code changes; clang warns per file and compiles the changed
+# functions without it. Like --march, a change of profile rebuilds the game in full.
+#
 # Needs clang-cl, lld-link and the llvm-* tools, cmake, ninja, python3, git and PowerShell
 # (MTR's tools/apply_game_patches.ps1 runs as `powershell`). When clang-cl is not on PATH the
 # script re-runs itself in the distrobox container named by $PGR4_DISTROBOX (default pgr4dev).
@@ -49,6 +59,7 @@ jobs=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))
 march=x86-64-v3
 mtune=znver2
 force=0
+pgo=auto
 xwin=${XWIN_DIR:-$HOME/recomp/xwin}
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -59,21 +70,31 @@ while [[ $# -gt 0 ]]; do
     --jobs) jobs=$2; shift 2 ;;
     --march) march=$2; shift 2 ;;
     --mtune) mtune=$2; shift 2 ;;
+    --pgo) pgo=$2; shift 2 ;;
     --force) force=1; shift ;;
     -h|--help) sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p}' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
 
+case $pgo in
+  auto|off|gen) ;;
+  *) [[ -f $pgo ]] || { echo "--pgo: no profile $pgo" >&2; exit 2; }; pgo=$(realpath "$pgo") ;;
+esac
+
 if ! command -v clang-cl >/dev/null; then
   box=${PGR4_DISTROBOX:-pgr4dev}
   command -v distrobox >/dev/null || { echo "clang-cl not on PATH and no distrobox" >&2; exit 1; }
   exec distrobox enter "$box" -- "$here/build.sh" --stage "$stages" --root "$root" \
     ${dest:+--dest "$dest"} --game "$game" --jobs "$jobs" --march "$march" --mtune "$mtune" \
-    $([[ $force == 1 ]] && echo --force)
+    --pgo "$pgo" $([[ $force == 1 ]] && echo --force)
 fi
 
 [[ -n $dest ]] || dest=$root/native-deck
+if [[ $pgo == auto ]]; then
+  pgo=off
+  [[ -f $dest/pgo/default.profdata ]] && pgo=$dest/pgo/default.profdata
+fi
 src=$root/MTR-PGR4
 tree=$dest/MTR-PGR4
 sdk_src=$tree/thirdparty/rexglue-sdk
@@ -111,22 +132,23 @@ step() {
   echo "=== $name done in $((SECONDS - t0)) s"
 }
 need() { local f; for f in "$@"; do [[ -e $f ]] || { echo "missing $f" >&2; exit 1; }; done; }
-# Configures build tree $1 with the cmake arguments after it. CMake takes CFLAGS/CXXFLAGS only
-# when it creates a cache, so a tree configured with other compile flags starts over. A tree
-# configured with other arguments is reconfigured, and an unchanged one is left alone: the SDK's
-# configure step stamps include/rex/version.h with the time, and a new header rebuilds all that
-# includes it, the generated code too. `cmake --build` still reconfigures after a CMakeLists.txt
-# change.
+# Configures build tree $1 with compile flags $2, linker flags $3 and the cmake arguments after
+# them. CMake takes CFLAGS/CXXFLAGS/LDFLAGS only when it creates a cache, so a tree configured
+# with other flags starts over (and Ninja, seeing new command lines, rebuilds every object). A
+# tree configured with other arguments is reconfigured, and an unchanged one is left alone: the
+# SDK's configure step stamps include/rex/version.h with the time, and a new header rebuilds all
+# that includes it, the generated code too. `cmake --build` still reconfigures after a
+# CMakeLists.txt change.
 configure() {
-  local dir=$1; shift
+  local dir=$1 flags=$2 ldflags=$3; shift 3
   local flags_stamp=$dir/pgr4-compile-flags args_stamp=$dir/pgr4-configure-args args="$*"
-  if [[ -f $dir/CMakeCache.txt && $(cat "$flags_stamp" 2>/dev/null) != "$clang_cl_flags" ]]; then
+  if [[ -f $dir/CMakeCache.txt && $(cat "$flags_stamp" 2>/dev/null) != "$flags$ldflags" ]]; then
     echo "compile flags changed: configuring $dir from scratch"
     rm -rf "$dir/CMakeCache.txt" "$dir/CMakeFiles"
   fi
   [[ -f $dir/CMakeCache.txt && $(cat "$args_stamp" 2>/dev/null) == "$args" ]] && return 0
-  CFLAGS=$clang_cl_flags CXXFLAGS=$clang_cl_flags cmake -B "$dir" "$@"
-  printf '%s' "$clang_cl_flags" > "$flags_stamp"
+  CFLAGS=$flags CXXFLAGS=$flags LDFLAGS=$ldflags cmake -B "$dir" "$@"
+  printf '%s' "$flags$ldflags" > "$flags_stamp"
   printf '%s' "$args" > "$args_stamp"
 }
 
@@ -220,6 +242,31 @@ if new != text:
 PY
 }
 
+# clang_rt.profile.lib for --pgo gen: the compiler-rt profile runtime of this clang-cl, the
+# sources compiler-rt's CMakeLists.txt lists for Windows, built with the game's dynamic CRT (/MD,
+# no default libraries named); compiler-rt's own build would bring the static CRT along.
+# Sets profile_rt_dir.
+profile_rt() {
+  local ver src obj f d inc=()
+  ver=$(clang-cl --version | sed -n '1s/.*clang version \([0-9][0-9.]*\).*/\1/p')
+  profile_rt_dir=$dest/profile-rt/$ver
+  [[ -f $profile_rt_dir/clang_rt.profile.lib ]] && return 0
+  src=$dest/profile-rt/llvm-$ver
+  if [[ ! -d $src/compiler-rt/lib/profile ]]; then
+    git clone -q --depth 1 --filter=blob:none --sparse --branch "llvmorg-$ver" \
+      https://github.com/llvm/llvm-project.git "$src"
+    git -C "$src" sparse-checkout set --no-cone /compiler-rt/lib/profile/ /compiler-rt/include/profile/
+  fi
+  obj=$profile_rt_dir/obj
+  mkdir -p "$obj"
+  for d in crt/include sdk/include/ucrt sdk/include/um sdk/include/shared; do inc+=("/imsvc$xwin/$d"); done
+  for f in "$src"/compiler-rt/lib/profile/*.c "$src/compiler-rt/lib/profile/InstrProfilingRuntime.cpp"; do
+    clang-cl --target=x86_64-pc-windows-msvc /nologo /c /O2 /MD /Zl /GS- /W0 -DCOMPILER_RT_HAS_ATOMICS=1 \
+      "/I$src/compiler-rt/lib" "/I$src/compiler-rt/include" "${inc[@]}" "$f" "/Fo$obj/$(basename "${f%.*}").obj"
+  done
+  llvm-lib /nologo "/out:$profile_rt_dir/clang_rt.profile.lib" "$obj"/*.obj
+}
+
 # Windows sources spell SDK header and library names in any case; the splat needs those spellings.
 case_links() { python3 "$repo_root/build/xwin-case-links.py" "$xwin" "$tree" "$here/src"; }
 
@@ -235,8 +282,8 @@ sdk_stage() {
   fi
   "$host_rexglue" --version
   # /MAP: rexruntime.map and rexgpu-xenos.map, function addresses for Linux perf samples.
-  configure "$sdk_build" -S "$sdk_src" -G Ninja "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DXWIN_DIR=$xwin" \
-    -DCMAKE_BUILD_TYPE=Release "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/INCREMENTAL:NO /MAP" \
+  configure "$sdk_build" "$clang_cl_flags" "" -S "$sdk_src" -G Ninja \
+    "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DXWIN_DIR=$xwin" -DCMAKE_BUILD_TYPE=Release "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/INCREMENTAL:NO /MAP" \
     "-DCMAKE_INSTALL_PREFIX=$sdk"
   cmake --build "$sdk_build" --target install -j "$jobs"
 }
@@ -318,9 +365,22 @@ if new != text:
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
 PY
   case_links
-  configure "$tree/out/pgr4" -S "$tree" -G Ninja "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DXWIN_DIR=$xwin" \
-    -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$sdk" "-DMTR_GAME_MANIFEST=$manifest" \
-    "-DPGR4_HOST_REXGLUE=$host_rexglue"
+  local flags=$clang_cl_flags ldflags="" sum
+  case $pgo in
+    off) ;;
+    gen)
+      profile_rt
+      flags+=" /clang:-fprofile-generate"
+      ldflags="/libpath:$profile_rt_dir" ;;
+    *)
+      sum=$(sha1sum < "$pgo" | cut -c1-12)
+      mkdir -p "$dest/pgo"
+      cmp -s "$pgo" "$dest/pgo/$sum.profdata" || cp "$pgo" "$dest/pgo/$sum.profdata"
+      flags+=" /clang:-fprofile-use=$dest/pgo/$sum.profdata" ;;
+  esac
+  configure "$tree/out/pgr4" "$flags" "$ldflags" -S "$tree" -G Ninja \
+    "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DXWIN_DIR=$xwin" -DCMAKE_BUILD_TYPE=Release \
+    "-DCMAKE_PREFIX_PATH=$sdk" "-DMTR_GAME_MANIFEST=$manifest" "-DPGR4_HOST_REXGLUE=$host_rexglue"
   cmake --build "$tree/out/pgr4" -j "$jobs"
   ls -l "$tree/out/pgr4/pgr4_recompiled.exe"
 }

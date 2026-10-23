@@ -56,14 +56,14 @@ runs at 1280x800 in a gamescope window on the Deck's panel at 90 Hz with MTR-PGR
 patch, so it presents at most once per 90 Hz vblank. `proton/deck-run.sh` drives the scripted
 race and reports frame times, GPU load and the APU's power split (`proton/deck_sampler.py`).
 
-St Petersburg race, 40 s after the start (2026-10-22):
+St Petersburg race, 9-45 s after the start (2026-10-23, td-51):
 
 | | |
 |---|---|
-| Average | 72-75 fps |
-| 1 % low | 40-42 fps |
-| GPU | 82-92 % busy at 630-830 MHz (of 1600) |
-| APU power | 15 W cap reached in 99 % of samples: CPU 9.2 W, GPU 2.2 W, SoC 1.2 W |
+| Average | 78.7 fps |
+| 1 % low | 49.2 fps |
+| GPU | 90 % busy at 705-870 MHz (of 1600) |
+| APU power | 15 W cap reached in every sample: CPU 8.8 W, GPU 2.7 W, SoC 1.3 W |
 
 The APU's 15 W limit is shared, and the CPU takes most of it, so the GPU runs at about half its
 top clock. CPU time saved on any thread becomes GPU clock; GPU work saved shortens the frame
@@ -301,6 +301,18 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   refills its instruction cache 26 times per 1000 instructions (22 from L2, 3.8 from memory);
   the render thread 63 times (58 from L2). The recompiled code does not fit the caches, so its
   layout is worth more than any one function.
+- The game is built with profile-guided optimization. 90 % of the executable's samples fall in
+  677 functions spread over 35 MB of its 38 MB, and of their 2.9 MB only 480 KB of cache lines
+  run. With a profile, clang puts each function's hot blocks together, its cold ones after
+  them, and inlines by call counts. `native/build.sh --pgo gen` builds the game instrumented and
+  `--pgo FILE` with a profile; a build without `--pgo` uses `<dest>/pgo/default.profdata` when
+  it exists. The Linux LLVM packages have no Windows profile runtime, so `build.sh` compiles
+  compiler-rt's for the clang-cl in use, and as the run scripts kill the game, the instrumented
+  build writes its counters every 5 s (`src/native/pgo_counters.cpp`). The profile is one
+  scripted race run (td-49, 63 fps while counting). td-50 against td-48: race 75.7 fps (70.6),
+  1 % low 44.7 (41.9), p99 19.7 ms (20.8), GFX clock 772 MHz (716); the game thread refills its
+  instruction cache from L2 16.5 times per 1000 instructions (22.1) at 1.21 instructions per
+  cycle (1.16), the render thread 50 times (58).
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
