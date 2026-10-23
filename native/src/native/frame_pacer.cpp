@@ -158,6 +158,7 @@ void FramePacer::ControlLocked(const Present& p, uint64_t shown_ns) {
   if (std::abs(interval - interval_ns_) * 4 > interval_ns_) {
     interval_ns_ = interval;
     headroom_count_ = 0;
+    probe_period_ns_ = kProbePeriodNs;
   }
   const int64_t missed = std::max<int64_t>(0, (shown_interval + interval / 2) / interval - 1);
   // A stall (a loading screen) says nothing of the pipeline's time: the headroom starts over.
@@ -167,13 +168,23 @@ void FramePacer::ControlLocked(const Present& p, uint64_t shown_ns) {
   }
   const int64_t headroom = std::max<int64_t>(
       0, int64_t(shown_ns) - missed * interval - int64_t(p.ready_ns) + int64_t(lag));
-  headroom_ns_ = headroom_count_++ == 0
-                     ? headroom
-                     : std::min(headroom, headroom_ns_ + shown_interval * kHeadroomReleaseNsPerS /
-                                                             1'000'000'000);
+  const uint64_t second = shown_ns / 1'000'000'000;
+  if (headroom_count_++ == 0) {
+    headroom_by_s_.fill(std::numeric_limits<int64_t>::max());
+  } else {
+    for (uint64_t s = headroom_s_ + 1; s <= std::min(second, headroom_s_ + kHeadroomWindowS); ++s)
+      headroom_by_s_[s % kHeadroomWindowS] = std::numeric_limits<int64_t>::max();
+  }
+  headroom_s_ = second;
+  int64_t& least = headroom_by_s_[second % kHeadroomWindowS];
+  least = std::min(least, headroom);
+  headroom_ns_ = *std::min_element(headroom_by_s_.begin(), headroom_by_s_.end());
   int64_t target = std::max<int64_t>(0, headroom_ns_ - margin_ns_);
   if (headroom_count_ < kHeadroomFrames) target = std::min(target, delay_ns_);
-  if (delay_ns_ > 0 && shown_ns - probe_at_ns_ > kProbePeriodNs) {
+  const bool sooner = shown_interval * 8 < interval * 7;
+  if (delay_ns_ > 0 && p.frame >= probe_end_frame_ &&
+      (sooner || shown_ns - probe_at_ns_ > probe_period_ns_)) {
+    if (!sooner) probe_period_ns_ = std::min(probe_period_ns_ * 2, kProbePeriodMaxNs);
     probe_at_ns_ = shown_ns;
     probe_delay_ns_ = std::max<int64_t>(0, delay_ns_ - interval / 2);
     probe_end_frame_ = p.frame + kProbeHoldFrames +
@@ -190,6 +201,7 @@ void FramePacer::ResetControlLocked() {
   interval_count_ = headroom_count_ = 0;
   interval_ns_ = 0;
   probe_at_ns_ = probe_end_frame_ = 0;
+  probe_period_ns_ = kProbePeriodNs;
 }
 
 void FramePacer::Stop() {

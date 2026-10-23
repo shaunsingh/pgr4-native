@@ -25,18 +25,22 @@
 //   against the slot it missed, n intervals earlier, and none counts below zero. A frame shown
 //   more than kStallSlots slots late is a stall (a loading screen), not the pipeline's time: the
 //   estimate starts over.
-// - The estimate is held: a frame with less headroom lowers it at once, and it rises by only
-//   kHeadroomReleaseNsPerS a second, since the slowest frames come seconds apart (in the race at
-//   90 fps, single frames with twice the usual GPU time every 3-7 s, td-114).
+// - The estimate is held: the least headroom of the last kHeadroomWindowS seconds (in one-second
+//   buckets), since the slowest frames come seconds apart (in the race at 90 fps, single frames
+//   with twice the usual GPU time every 3-7 s, td-114). Released at a fixed rate instead (1 ms/s,
+//   td-113 to td-119), the estimate took over a minute to recover from one hitch at 30 fps, where
+//   the headroom spans three 33 ms intervals (td-121).
 // - D follows it by at most kDelayUpNs per frame up and kDelayDownNs down, and only down for
 //   kHeadroomFrames frames after the estimate started over, so the game's time steps stay within
 //   a fraction of a millisecond of the intervals shown.
 // - The interval is the shortest the display showed recently: the least median of three of the
 //   last kIntervalFrames. Frames begun just late enough to fill the display's slots cannot tell
-//   a frame limit from a pace they set themselves, so every kProbePeriodNs D eases down by half an
-//   interval, kProbeStepNs per frame, and holds there for kProbeHoldFrames frames. Under a limit
-//   only the latency changes, for a moment; without one the frames are shown at the faster pace,
-//   and the interval follows it.
+//   a frame limit from a pace they set themselves, so D probes: it eases down by half an interval,
+//   kProbeStepNs per frame, and holds there for kProbeHoldFrames frames. Under a limit only the
+//   latency changes, for a moment (20 ms for 2 s at 30 fps, td-122); without one the frames are
+//   shown at the faster pace, and the interval follows it. D probes kProbePeriodNs after the pace
+//   was set, then at twice the period before, up to kProbePeriodMaxNs; and at once when a frame
+//   was shown sooner than the pace allows, as the first frames are once a limit is lifted.
 //
 // "Shown" is the swapchain's frame latency waitable object: vkd3d-proton releases it once per
 // present when vkWaitForPresentKHR returns, but only in FIFO (with other present modes once the
@@ -116,11 +120,12 @@ class FramePacer {
   static constexpr uint32_t kIntervalFrames = 32;
   static constexpr uint32_t kIntervalMinFrames = 8;  // before IntervalLocked has an answer
   static constexpr uint32_t kHeadroomFrames = 64;
-  static constexpr int64_t kHeadroomReleaseNsPerS = 1'000'000;
+  static constexpr uint32_t kHeadroomWindowS = 10;
   static constexpr int64_t kStallSlots = 3;
   static constexpr int64_t kDelayUpNs = 500'000;
   static constexpr int64_t kDelayDownNs = 1'000'000;
   static constexpr uint64_t kProbePeriodNs = 10'000'000'000;
+  static constexpr uint64_t kProbePeriodMaxNs = 80'000'000'000;
   static constexpr int64_t kProbeStepNs = 500'000;  // D's step down per frame while probing
   static constexpr uint64_t kProbeHoldFrames = 8;   // for the median of three to see a faster pace
   static constexpr uint64_t kNoLag = ~0ull;
@@ -181,7 +186,11 @@ class FramePacer {
   int64_t interval_ns_ = 0;      // IntervalLocked when the headroom was last reset
   int64_t headroom_ns_ = 0;      // the held headroom
   uint64_t headroom_count_ = 0;  // frames since it was reset
+  // The least headroom shown in each of the last kHeadroomWindowS seconds, by second.
+  std::array<int64_t, kHeadroomWindowS> headroom_by_s_{};
+  uint64_t headroom_s_ = 0;  // the second the last headroom was shown in
   uint64_t probe_at_ns_ = 0, probe_end_frame_ = 0;
+  uint64_t probe_period_ns_ = kProbePeriodNs;
   int64_t probe_delay_ns_ = 0;  // D's ceiling until probe_end_frame_
 };
 
