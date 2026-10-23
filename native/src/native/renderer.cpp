@@ -78,6 +78,15 @@ REXCVAR_DEFINE_INT32(pgr4_native_frame_latency, 3, "PGR4 native",
                      "the pacing to the game's vblank wait (with --pgr4_native_csv the shown "
                      "presents are still logged)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(pgr4_native_low_latency, true, "PGR4 native",
+                    "With the frames paced on the display: begin each frame as late as the "
+                    "time the frames before it waited for the display allows (frame_pacer.h), "
+                    "so a frame limit lowers the latency instead of raising it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(pgr4_native_latency_margin_us, 4000, "PGR4 native",
+                     "With --pgr4_native_low_latency: how long before the display shows a frame "
+                     "the GPU should have finished it, in microseconds")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 
@@ -384,8 +393,12 @@ bool NativeRenderer::Initialize() {
       if (!(log = std::fopen(log_path.c_str(), "w")))
         REXLOG_ERROR("PGR4 native: cannot open {}", log_path);
     }
-    pacer_ = std::make_unique<FramePacer>(
-        uint32_t(std::max(0, REXCVAR_GET(pgr4_native_frame_latency))), log);
+    pacer_ = std::make_unique<FramePacer>(FramePacer::Options{
+        .frame_latency = uint32_t(std::max(0, REXCVAR_GET(pgr4_native_frame_latency))),
+        .low_latency = REXCVAR_GET(pgr4_native_low_latency),
+        .latency_margin_ns =
+            uint64_t(std::max(0, REXCVAR_GET(pgr4_native_latency_margin_us))) * 1000,
+        .log = log});
     if (pacer_->frame_latency() > 0)
       REXLOG_INFO("PGR4 native: frames paced on the display, at most {} begun but not shown",
                   pacer_->frame_latency());
@@ -753,7 +766,7 @@ bool NativeRenderer::OwnGameWindow(bool own) {
   if (pacer_) {
     HANDLE waitable = d.TakeFrameLatencyWaitable(FramePacer::kMaxFrameLatency);
     if (!waitable) return false;
-    pacer_->Attach(waitable);
+    pacer_->Attach(waitable, d.fence());
     paces_frames_.store(pacer_->pacing(), std::memory_order_relaxed);
   }
   return true;
@@ -786,7 +799,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_fence_ns = et.fence_ns;
   stats_.present = et.presented ? et.presents : 0;
   if (pacer_ && et.presented)
-    pacer_->Presented();
+    pacer_->Presented(fence);
   else if (pacer_)
     pacer_->RetireUnshown();
   ++frame_index_;

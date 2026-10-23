@@ -10,6 +10,8 @@ frame pacer's present log beside it (<csv stem>-presents.csv), in the window fra
   whatever the frame rate.
 - mismatch: per shown frame, its time step minus the interval the display showed it after the
   frame before; near zero when the steps follow the display.
+- waited: from the GPU finishing a frame (its fence, as the pacer saw it) to the display showing
+  it, and the delay the latency control began the frame with.
 
 usage: pacing.py <frames.csv> <game log> <start HH:MM:SS> [seconds=40]
 """
@@ -46,10 +48,11 @@ def main(argv):
     if not os.path.exists(presents_path):
         print(f"shown: no {os.path.basename(presents_path)} (pacer off)")
         return
-    shown_at = {int(r["present"]): float(r["shown_ms"]) for r in csv.DictReader(open(presents_path))}
-    # (frame begin, shown) per presented frame of the window, in present order.
-    shown = [(float(r["guest_begin_ms"]), shown_at[p]) for r in rows
-             if (p := int(r["present"])) and p in shown_at]
+    log_rows = {int(r["present"]): r for r in csv.DictReader(open(presents_path))}
+    # (frame begin, present log row) per presented frame of the window, in present order.
+    presented = [(float(r["guest_begin_ms"]), log_rows[p]) for r in rows
+                 if (p := int(r["present"])) in log_rows]
+    shown = [(b, float(r["shown_ms"])) for b, r in presented]
     if len(shown) < 10:
         print("shown: too few presents in the window")
         return
@@ -63,6 +66,10 @@ def main(argv):
     big = sum(1 for m in mism if abs(m) > 4.0)
     print(f"mismatch ms (time step - shown interval): {spread(mism)}; |x| > 4 ms: {big} of "
           f"{len(mism)}")
+    if "ready_ms" in presented[0][1]:
+        waited = [float(r["shown_ms"]) - float(r["ready_ms"]) for _, r in presented]
+        delay = [float(r["delay_ms"]) for _, r in presented]
+        print(f"waited ms (GPU finished to shown): {spread(waited)}; delay ms: {spread(delay)}")
 
 
 if __name__ == "__main__":

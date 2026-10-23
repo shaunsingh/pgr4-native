@@ -82,6 +82,7 @@ class D3D12Device {
   // Fence value EndFrame signals for the frame being recorded; last value the GPU reached.
   uint64_t frame_fence() const { return next_fence_; }
   uint64_t completed_fence() const { return fence_->GetCompletedValue(); }
+  ID3D12Fence* fence() const { return fence_.Get(); }
   // The frame being recorded's slot in [0, kFramesInFlight): its previous frame has completed,
   // so per-frame upload memory indexed by it is free to write.
   uint32_t frame_slot() const { return slot_; }

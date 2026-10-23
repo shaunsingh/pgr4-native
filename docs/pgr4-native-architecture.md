@@ -50,7 +50,7 @@ Two modes:
 | `PGR4 native pipelines` | `DrawRenderer` when `--pgr4_native_async_pipelines` (default on) | Creates PSOs, loads/stores them in the `ID3D12PipelineLibrary`, runs prewarm jobs |
 | texture-heap `std::async` | `TextureCache::StartSpareHeap` | Creates the next 128 MB texture heap while the current one fills |
 | window thread | `D3D12Device` | Owns the debug window (`--pgr4_native` without `_primary`) |
-| `PGR4 native pacer` | `FramePacer` while a swapchain is attached | Counts the frames the display showed (the swapchain's frame latency waitable) and lets the game thread begin the next |
+| `PGR4 native pacer` | `FramePacer` while a swapchain is attached | Waits on the frame fence and the swapchain's frame latency waitable (a frame finished on the GPU, shown by the display), lets the game thread begin the next and sets the latency delay |
 | `GPU Commands` (SDK) | Xenos plugin | PM4 parsing; in primary mode only fences/interrupts |
 
 Measured on the race (13900K): `Main XThread` ~98 % in every mode (the game itself fills it),
