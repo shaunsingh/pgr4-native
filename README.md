@@ -56,14 +56,15 @@ runs at 1280x800 in a gamescope window on the Deck's panel at 90 Hz with MTR-PGR
 patch, so it presents at most once per 90 Hz vblank. `proton/deck-run.sh` drives the scripted
 race and reports frame times, GPU load and the APU's power split (`proton/deck_sampler.py`).
 
-St Petersburg race, 9-45 s after the start (2026-10-23, td-51):
+St Petersburg race, 9-45 s after the start (2026-10-23, td-90; td-51, before the changes below
+from the Deck, in brackets):
 
 | | |
 |---|---|
-| Average | 78.7 fps |
-| 1 % low | 49.2 fps |
-| GPU | 90 % busy at 705-870 MHz (of 1600) |
-| APU power | 15 W cap reached in every sample: CPU 8.8 W, GPU 2.7 W, SoC 1.3 W |
+| Average | 87.0 fps (78.7) |
+| 1 % low | 56.8 fps (49.2) |
+| GPU | 86 % busy at 843 MHz (of 1600) (90 % at 705-870 MHz) |
+| APU power | 15 W cap reached in every sample: CPU 8.9 W, GPU 2.9 W, SoC 1.0 W (8.8, 2.7, 1.3) |
 
 The APU's 15 W limit is shared, and the CPU takes most of it, so the GPU runs at about half its
 top clock. CPU time saved on any thread becomes GPU clock; GPU work saved shortens the frame
@@ -419,6 +420,45 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   td-78 (wineserver trace): the GPU command thread makes no requests. td-79 against td-77: race
   83.4 fps (83.2), 1 % low 55.5 (54.6), no hitches in either, a difference within run-to-run
   noise.
+- `deck-run.sh` hides the Deck's own controller (28de:1205) from the game
+  (`SDL_GAMECONTROLLER_IGNORE_DEVICES`), as Steam does for the games it launches, which get its
+  virtual pad instead. Without it winebus read the controller's HID interfaces at about 22 % of
+  a core; with it the device driver process takes 2.3 %. The route types on the keyboard.
+- The Xenon's `db16cyc` (a 16-cycle delay hint, which the game's spin-wait loops issue) becomes
+  the host's spin-wait hint, `simde_mm_pause()` (PAUSE on x86, ISB on ARM), instead of nothing
+  (`rexglue-runtime-perf.patch`): a spinning thread draws less power and leaves its core to the
+  SMT sibling. td-81 against td-79: race 84.8 fps (83.4), 1 % low 55.7 (55.5), one hitch (none).
+- `native/build.sh` regenerates the game code when the codegen tool is newer than the codegen
+  stamp: codegen skips a module whose inputs it fingerprinted before, and the fingerprint leaves
+  out the tool itself, so a rebuilt tool regenerated nothing. `--force` does the same.
+- Constant buffer uploads write with streaming stores: `CachedCbv` keeps the current bytes in
+  its own memory and `CommitCbv` copies them to the upload ring with `_mm_stream_si128`, so the
+  ring is never read back and the copy goes around the cache instead of evicting the game's code
+  and data. The submit
+  issues an `sfence` before `ExecuteCommandLists`. The hot command and register vectors are
+  filled with `emplace_back`. td-82 against td-81: race 86.3 fps (84.8), 1 % low 58.2 (55.7),
+  0.1 % low 49.7, no hitches (one); the render thread took 61 % of a core (66 %).
+- A key switches between the native renderer and the Xenos plugin at the next Swap, for comparing
+  the two on the same scene: `bind_renderer_switch`, F9 by default, an SDK key bind that the
+  settings overlay and the config can change (`--pgr4_native_renderer_switch`, on with
+  `--pgr4_native_primary`). On the Deck a Steam Input binding sends it from a back grip (R5). It
+  is a key and not a pad combination because the game reads every button of the pad: td-86 tried
+  LB + RB + B, and the camera changed at every switch (in a race LB changes the camera, RB toggles
+  the driver names and B taunts). Handing over marks all of the guest D3D's state dirty, so the
+  plugin's next draw writes all of it, and clears `gpu_skip_draws`; the native window hides and
+  the plugin presents in the game window. Taking back resyncs the state tracker and sets
+  `gpu_skip_draws` again, and the next native frame shows the window. Until a switch, the cost is
+  a flag check per hooked call and one at each Swap. The SDK's key binds now ignore a held key's
+  auto-repeats (`rexglue-native-primary.patch`), which would switch back and forth. td-85 (with
+  the pad combination): three switches in a race, each window change within 50 ms of the switch,
+  the plugin at 36-46 fps; switching back compiled about 25 pipelines (36-76 ms each, on the
+  workers). td-87 (the pad combination, its buttons then kept from the game): four switches with
+  the car on the grid, the same camera throughout, the native and Xenos frames alike. td-89 (F9):
+  four switches, one of them a 1.5 s hold, each switching once. td-90 (no switch) against td-82:
+  race 87.0 fps (86.3), 1 % low 56.8 (58.2), one hitch (none), within run-to-run noise.
+- `deck-run.sh`: a route line `<at> mark shot <name>` saves a screenshot as `<name>.png` when
+  the player reaches it, and each `gamescopectl` screenshot gives up after 10 s (td-85's
+  periodic shots stopped for good after 24 s).
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -645,6 +685,7 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
 | `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |
 | `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) |
+| `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
 | `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
 | `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
