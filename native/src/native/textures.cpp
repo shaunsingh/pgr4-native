@@ -203,6 +203,12 @@ void TextureCache::FinishUploads() {
   stats_.untile_ns += worker_untile_ns_.exchange(0, std::memory_order_relaxed);
 }
 
+bool TextureCache::UploadsDone() {
+  if (workers_.empty()) return true;
+  std::lock_guard<std::mutex> lock(jobs_mutex_);
+  return jobs_busy_ == 0;
+}
+
 uint64_t TextureCache::RunUntile(const UntileJob& job, std::vector<uint8_t>* scratch) {
   const uint64_t t0 = NowNs();
   UntileTexture(job.key, job.guest, job.footprints, job.dst, scratch);

@@ -78,6 +78,11 @@ class D3D12Device {
   // next frame's list.
   // Returns false once the device or swapchain failed (logged once); the caller stops.
   bool EndFrame(bool present = true);
+  // Submits what the frame recorded so far and continues it in the same list, reset on the
+  // frame's allocator, so the GPU starts on it while the rest of the frame is recorded. The
+  // frame fence and slot stay the frame's (EndFrame signals once for all of its submissions).
+  // Nothing bound on the list carries over. Returns false on failure (logged).
+  bool Submit();
   // Where the last EndFrame spent its time.
   struct EndFrameTimes {
     uint64_t submit_ns = 0;   // Close + ExecuteCommandLists
@@ -100,6 +105,7 @@ class D3D12Device {
  private:
   bool CreateWindowThread(const wchar_t* title);
   bool OpenList();
+  bool CloseAndExecute();
   bool GetBackBuffers();
   bool FollowParentSize();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);

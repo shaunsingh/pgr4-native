@@ -117,6 +117,7 @@ struct FrameStats {
   // Parts of swap_ns: waiting for the texture untile workers, then D3D12Device::EndFrameTimes.
   uint64_t swap_untile_ns = 0, swap_submit_ns = 0, swap_present_ns = 0, swap_fence_ns = 0;
   uint64_t frames_held = 0;  // Swaps not presented (DrawRenderer::FrameIncomplete)
+  uint64_t submits = 0;      // lists submitted before the Swap's (--pgr4_native_submit_draws)
   // The guest's pad reads since the Swap before (rex_xam_take_frame_pad, taken at the Swap).
   uint64_t pad = 0;
 };
@@ -167,6 +168,9 @@ class NativeRenderer {
   void ExecuteClear(const ClearCall& clear);
   void ExecuteResolve(const ResolveParams& p);
   void ExecuteSwap(const SwapCall& swap);
+  // After a draw: submits the frame so far once --pgr4_native_submit_draws draws were recorded
+  // since the last submission.
+  void SubmitEarly();
   // Render thread mode.
   struct Queue;
   void QueueDraw(const uint8_t* base, const HookArgs& args);
@@ -189,6 +193,7 @@ class NativeRenderer {
   uint64_t frame_index_ = 0;
   uint64_t frame_start_ns_ = 0;
   FrameStats stats_;
+  uint64_t draws_submitted_ = 0;  // stats_.draws at the frame's last SubmitEarly
   struct Csv;
   std::unique_ptr<Csv> csv_;
 };

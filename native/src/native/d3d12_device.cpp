@@ -293,12 +293,25 @@ bool D3D12Device::OpenList() {
   return true;
 }
 
-bool D3D12Device::EndFrame(bool present) {
-  const uint64_t t0 = NowNs();
-  if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
+bool D3D12Device::CloseAndExecute() {
   if (Failed(list_->Close(), "CommandList::Close")) return false;
   ID3D12CommandList* lists[] = {list_.Get()};
   queue_->ExecuteCommandLists(1, lists);
+  return true;
+}
+
+bool D3D12Device::Submit() {
+  if (gpu_timer_) gpu_timer_->Pass(list_.Get(), GpuTimer::KeySubmit());
+  // A list may be reset while its submission runs; the allocator only once the frame's fence
+  // completed (OpenList).
+  return CloseAndExecute() &&
+         !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
+}
+
+bool D3D12Device::EndFrame(bool present) {
+  const uint64_t t0 = NowNs();
+  if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
+  if (!CloseAndExecute()) return false;
   const uint64_t t1 = NowNs();
   HRESULT hr = !shown_ || !present ? S_OK
                : vsync_ ? swapchain_->Present(1, 0)

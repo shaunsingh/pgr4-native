@@ -150,9 +150,9 @@ class DrawRenderer {
   void BeforeSubmit();
 
   // Something else set graphics/compute state or descriptor heaps on the command list (the
-  // Resolver does): set everything again at the next draw. A new frame's list is detected
-  // without this call.
-  void InvalidateListState();
+  // Resolver does), or the list was submitted and reset mid-frame: set everything again at the
+  // next draw. A new frame's list is detected without this call. `why` is for the draw log.
+  void InvalidateListState(const char* why = "resolve");
   // Write the clear or resolve into the draw log while one is open (draw-debug.txt bit 16).
   void LogClear(const ClearCall& c);
   void LogResolve(const ResolveParams& p);

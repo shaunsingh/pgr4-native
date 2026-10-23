@@ -58,6 +58,10 @@ REXCVAR_DEFINE_BOOL(pgr4_native_render_thread, true, "PGR4 native",
                     "Record the native frames on their own thread (\"PGR4 native render\"): the "
                     "game thread only copies what each D3D call reads from guest memory and "
                     "queues it, at most one frame ahead of the render thread");
+REXCVAR_DEFINE_INT32(pgr4_native_submit_draws, 256, "PGR4 native",
+                     "Submit the frame's commands every this many draws, so the GPU starts on them "
+                     "while the rest of the frame is recorded (0: one submission per frame, at the "
+                     "Swap)");
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 
@@ -318,7 +322,7 @@ bool NativeRenderer::Initialize() {
                    "hook_max_us,watch_faults,gpu_prev_ms,copy_batches,watch_arms,watch_arm_pages,t_ms,"
                    "hash_pages,hash_copies,pso_pending,pso_wait_us,held,tex_stale,coh_stale,coh_late,coh_gpu,coh_regs,"
                    "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic,"
-                   "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry");
+                   "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry,submits");
       if (profile::g.on) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file, ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -546,6 +550,7 @@ void NativeRenderer::OnDraw(const uint8_t* base, const HookArgs& args) {
   if (ok) {
     if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyDraw(state.regs));
     draw_->OnDraw(base, state);
+    SubmitEarly();
   } else {
     ++stats_.state_fail;
   }
@@ -606,6 +611,7 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     gpu_timer_->Pass(device_->command_list(), key);
   }
   draw_->OnDraw(base_, state, prep);
+  SubmitEarly();
   stats_.draw_ns += NowNs() - t0;
 }
 
@@ -628,6 +634,26 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   resolver_->Resolve(device_->command_list(), p);
   draw_->InvalidateListState();
   stats_.resolve_ns += NowNs() - t0;
+}
+
+// With one submission per frame the GPU idles from the end of a frame until the render thread
+// has recorded all of the next one. Every --pgr4_native_submit_draws draws, the frame so far is
+// submitted and recording goes on in a fresh list, where nothing bound carries over. The texture
+// copies recorded so far read upload memory the untile workers fill: while untiles are still
+// running, the next draw or resolve tries again.
+void NativeRenderer::SubmitEarly() {
+  const int32_t every = REXCVAR_GET(pgr4_native_submit_draws);
+  if (every <= 0 || stats_.draws - draws_submitted_ < uint64_t(every) || !textures_->UploadsDone())
+    return;
+  if (!device_->Submit()) {
+    g_failed = true;
+    REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
+                 frame_index_);
+    return;
+  }
+  draw_->InvalidateListState("submit");
+  draws_submitted_ = stats_.draws;
+  ++stats_.submits;
 }
 
 void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
@@ -683,6 +709,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   WriteCsv(stats_, t1 - frame_start_ns_);
   frame_start_ns_ = t1;
   stats_ = FrameStats{};
+  draws_submitted_ = 0;
 }
 
 void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
@@ -699,7 +726,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  "%llu,%llu,%llu,%llu,%llu,%.1f,%.1f,%.1f,%.1f,%.4f,%.3f,%llu,%llu,%llu,%llu,%llu,"
                  "%.1f,%llu,%llu,%d,%.1f,%.1f,%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%llu,%.3f,%llu,%llu,%llu,%.3f,"
                  "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.1f,%llu,%llu,%.1f,%llu,%llu,"
-                 "%04X,%u,%u,%d,%d,%d,%d",
+                 "%04X,%u,%u,%d,%d,%d,%d,%llu",
                  (unsigned long long)frame_index_ - 1, (unsigned long long)s.draws,
                  (unsigned long long)s.clears, (unsigned long long)s.resolves,
                  (unsigned long long)s.state_fail, s.draw_ns / 1000.0, s.clear_ns / 1000.0,
@@ -726,7 +753,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
                  (unsigned long long)ds.views, (unsigned long long)ds.pso_generic,
                  unsigned(s.pad & 0xFFFF), unsigned(uint8_t(s.pad >> 16)), unsigned(uint8_t(s.pad >> 24)),
                  int(int8_t(s.pad >> 32)), int(int8_t(s.pad >> 40)), int(int8_t(s.pad >> 48)),
-                 int(int8_t(s.pad >> 56)));
+                 int(int8_t(s.pad >> 56)), (unsigned long long)s.submits);
     csv_->evicted_prev = textures_->stats().evicted;
     csv_->evict_ns_prev = textures_->stats().evict_ns;
     if (profile::g.on) {

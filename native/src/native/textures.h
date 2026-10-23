@@ -135,6 +135,9 @@ class TextureCache {
   // queues the untile into their upload memory (offline it runs inline). Call this before the
   // command list Get recorded into is submitted; the GPU reads the upload memory only then.
   void FinishUploads();
+  // Without waiting: whether every untile queued so far has finished, so the list may be
+  // submitted now.
+  bool UploadsDone();
 
   // Recycles upload memory of frames the GPU finished and evicts textures over the budget. Once
   // per Swap, after the submission.

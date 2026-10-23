@@ -25,9 +25,9 @@ constexpr uint32_t kMaxQueries = GpuTimer::kMaxSpans + 1;
 // Key layout: kind in bits 0-2, the occurrence in the frame in bits 3-7 (set by Switch), then
 // the kind's fields from bit 8 in the order the Key* functions write them.
 // kShaders: draws keyed by their shader pair (per_shader_); counted as draws in the totals.
-enum Kind : uint32_t { kStart, kDraw, kClear, kResolve, kPresent, kShaders, kKindCount };
-constexpr const char* kKindNames[kKindCount] = {"start",   "draws",  "clears",
-                                                "resolves", "present", "shaders"};
+enum Kind : uint32_t { kStart, kDraw, kClear, kResolve, kPresent, kShaders, kSubmit, kKindCount };
+constexpr const char* kKindNames[kKindCount] = {"start",   "draws",   "clears", "resolves",
+                                                "present", "shaders", "submits"};
 constexpr uint32_t kKindMask = 7;
 constexpr uint32_t kOccurrenceShift = 3, kOccurrenceMax = 31;
 constexpr uint32_t kFieldShift = 8;
@@ -118,6 +118,8 @@ std::string GpuTimer::Describe(uint64_t key) const {
     }
     case kPresent:
       return "present blit";
+    case kSubmit:
+      return "submit  (the GPU waiting for the frame's next command list)";
     case kShaders: {
       const uint32_t pitch = r.Get(14), msaa = r.Get(2), id = r.Get(24);
       const auto [vs, ps] = id < pairs_.size() ? pairs_[id] : std::pair<uint64_t, uint64_t>{};
@@ -333,6 +335,8 @@ uint64_t GpuTimer::KeyResolve(const ResolveParams& p, ResolvePhase phase) {
 
 uint64_t GpuTimer::KeyPresent() { return KeyWriter(kPresent).key(); }
 
+uint64_t GpuTimer::KeySubmit() { return KeyWriter(kSubmit).key(); }
+
 uint64_t GpuTimer::KeyDrawShaders(const uint32_t* regs, uint64_t vs_hash, uint64_t ps_hash) {
   const reg::RB_SURFACE_INFO surface{.value = regs[XE_GPU_REG_RB_SURFACE_INFO]};
   const auto [it, added] = pair_ids_.try_emplace(vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull),
@@ -359,11 +363,12 @@ void GpuTimer::Log() {
   }
   REXLOG_INFO("PGR4 native GPU: frames {} | GPU {:.2f} ms/frame (max {:.2f}), idle between "
               "frames {:.2f} ms, spans/frame {:.0f} | {} {:.2f}, {} {:.2f}, {} {:.2f}, {} {:.2f}, "
-              "{} {:.2f} ms",
+              "{} {:.2f}, {} {:.2f} ms",
               frames_collected_, ms(frame_ticks_), double(frame_ticks_max_) * ms_per_tick,
               ms(idle_ticks_), double(spans_collected_) / n, kKindNames[kDraw], kind_ms[kDraw],
               kKindNames[kClear], kind_ms[kClear], kKindNames[kResolve], kind_ms[kResolve],
-              kKindNames[kPresent], kind_ms[kPresent], kKindNames[kStart], kind_ms[kStart]);
+              kKindNames[kPresent], kind_ms[kPresent], kKindNames[kSubmit], kind_ms[kSubmit],
+              kKindNames[kStart], kind_ms[kStart]);
   // The costliest groups, in frame order.
   constexpr size_t kTop = 24;
   const size_t shown = std::min(kTop, top.size());

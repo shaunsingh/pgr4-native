@@ -342,6 +342,16 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   and SDL sends nothing when they did not change. td-61: the game thread made 167 requests a
   second (1,103), and the race ran at 78.0 fps (77.1). `--kernel_wait_stats` logs, per guest
   thread every 5 s, how long its kernel waits blocked and which guest code called them.
+- Mid-frame submission. The render thread submitted each frame as one command list at the
+  Swap, so the GPU sat idle from the end of one frame until all of the next was recorded
+  (2.2-2.9 ms per frame in td-62), and the render thread then waited in Present. Now every 256
+  draws (`--pgr4_native_submit_draws`, 0: once per frame) the frame so far is submitted, once
+  the untile workers have filled the upload memory its texture copies read, and recording goes
+  on in a fresh list. td-65 against the same build with it off (td-66), race: 80.0 fps against
+  76.1, 1 % low 51.2 against 39.5, no hitches against 6, Present 0.9 ms per frame against 3.2,
+  the game thread waiting for the render thread 0.06 ms against 1.07, 12 submissions per frame.
+  The game thread is now the limit (92 % of a core), and the GPU still waits 1.0-1.6 ms per
+  frame for the next list.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -557,6 +567,7 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_generic_pipelines` | true | A draw whose bool/sign specialization is still compiling uses its unspecialized shaders' pipeline when that one is ready |
 | `--pgr4_native_pipeline_cache` | true | Keep pipelines across runs |
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
+| `--pgr4_native_submit_draws=<n>` | 256 | Submit the frame so far every n draws, so the GPU starts on it while the rest is recorded (0: once per frame) |
 | `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |
 | `--pgr4_native_profile` | false | Per-stage CPU time of the draw path, added to the CSV |
 | `--pgr4_native_capture_dir=<dir>` | off | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one, and `draw-debug.txt` there is read. Off, none of them is polled (`run.ps1 -Native`: `C:\recomp\logs\pgr4-native-captures`) |

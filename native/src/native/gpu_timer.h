@@ -63,6 +63,9 @@ class GpuTimer {
   enum ResolvePhase : uint32_t { kResolveSource, kResolveCopy, kResolveRelease, kResolveClear };
   static uint64_t KeyResolve(const ResolveParams& p, ResolvePhase phase = kResolveSource);
   static uint64_t KeyPresent();
+  // The end of a list submitted mid-frame (D3D12Device::Submit): its span runs to the first
+  // timestamp in the next list, the GPU's wait for that list.
+  static uint64_t KeySubmit();
 
   // --pgr4_native_gpu_timing_shaders: draws are timed per (vertex shader, pixel shader) pair on
   // a surface pitch and MSAA mode instead of per render target set (KeyDrawShaders), and all

@@ -3386,9 +3386,9 @@ void DrawRenderer::BeforeSubmit() {
   m.coherency_inflight.push_back(std::move(job));
 }
 
-void DrawRenderer::InvalidateListState() {
+void DrawRenderer::InvalidateListState(const char* why) {
   impl_->ResetListState();
-  if (impl_->draw_log) std::fprintf(impl_->draw_log, "resolve (after draw %u)\n", impl_->frame_draws);
+  if (impl_->draw_log) std::fprintf(impl_->draw_log, "%s (after draw %u)\n", why, impl_->frame_draws);
 }
 
 std::pair<uint64_t, uint64_t> DrawRenderer::ShaderHashes(const DrawPrep& prep) {
