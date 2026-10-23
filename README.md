@@ -459,6 +459,35 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
 - `deck-run.sh`: a route line `<at> mark shot <name>` saves a screenshot as `<name>.png` when
   the player reaches it, and each `gamescopectl` screenshot gives up after 10 s (td-85's
   periodic shots stopped for good after 24 s).
+- The native renderer presents from the game's own window. Its swapchain was on a child window
+  laid over the game window, and gamescope flips only a top-level window's surface: every
+  native frame went through Xwayland's copy instead, which ignores FIFO and frame limits
+  (td-100 to td-106: gamescope logged `flip: false`, and the frames' present feedback came 22-35
+  ms after the present). Now `NativeRenderer::OwnGameWindow` disconnects ReXGlue's presenter
+  from the game window before creating the swapchain on it, and releases the swapchain and
+  reconnects the presenter while a XAM dialog is up (the presenter draws them) or after F9.
+- Frames are paced on the display (`frame_pacer.h`). The game paced itself on ReXGlue's vblank
+  timer, a clock of its own beside the display's: the two drift apart, and a frame that misses a
+  tick by a little waits a whole tick. Now the guest presents immediately
+  (`Pgr4PresentationInterval`, from `title-update/apply_game_patches.patch`) and the game thread
+  begins a frame once the display has shown the frame `--pgr4_native_frame_latency` (3) before
+  it, counted on the swapchain's frame latency waitable (vkd3d-proton releases it when
+  `vkWaitForPresentKHR` returns, in FIFO only, so the paced swapchain presents with vsync). The
+  game's time steps then follow the intervals the display shows its frames at, whatever the
+  refresh rate or frame limit. td-107 (90 Hz): every swapchain flips, shown interval median
+  11.11 ms (sd 0.82), 18 frames shown late in the race, time step minus shown interval sd 1.04
+  ms, a frame's start to its display 33.3 ms; race 88.0 fps, 1 % low 56.1 (td-97: 86.3, 52.8).
+  With 2 frames (td-108) the latency was 22.2 ms but 79 frames were late (race 86.6, 1 % low
+  48.1).
+- `deck-run.sh --limit <fps>` sets gamescope's frame limit with `gamescopectl
+  debug_set_fps_limit`, as Steam's limiter does; `--framerate-limit` and the
+  `GAMESCOPE_FPS_LIMIT` property are overwritten by the app's refresh cycle at every paint
+  (td-109/110). td-111 (limit 45, 3 frames): 45.0 fps, shown interval sd 0.33 ms, no frame late,
+  APU 7.7 W, but 66.6 ms from a frame's start to its display. td-112 (2 frames): sd 0.57 ms, one
+  frame late, 44.4 ms, 7.5 W. A fixed frame count is the wrong unit: the pipeline takes about
+  the same time at any frame rate.
+  `native/tools/pacing.py` reports the time steps, the shown intervals, the latency and the
+  mismatch; `deck-run.sh` runs it after each race.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -685,6 +714,7 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
 | `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |
 | `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) |
+| `--pgr4_native_frame_latency=<n>` | 3 | Primary mode: the game thread begins a frame once the display showed the frame n before it (1-3; 0: the game's own vblank pacing) |
 | `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
 | `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
@@ -710,6 +740,7 @@ in the `REXCVAR_DEFINE_*` lines of `native/src`.
 | `compare_resolves.py` | Resolve outputs against the Xenos plugin's |
 | `flicker.py` | Flashing blocks or whole-image jumps in a glitch catcher dump, as PNG sheets |
 | `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
+| `pacing.py` | Frame pacing from the CSV and the pacer's present log: time steps, shown intervals, start-to-display latency, their mismatch |
 
 It also has a texture untiling harness and an offline shader translation test. `proton/` has the
 Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads and
@@ -740,6 +771,10 @@ and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
   shortcut's pipelines, adds nothing measurable (td-95). Ideas: smaller DXBC from the translator,
   fewer compile threads once the frame is shown.
 - Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
+- Steam Deck: a latency that follows the pipeline's time instead of a fixed frame count, so a
+  frame limit lowers it (66.6 ms at 45 fps with 3 frames, td-111) instead of raising it.
+  DXVK's built-in latency sleep knows the frame interval; under gamescope's limiter the game
+  does not, and must find it from the display without locking onto a slower cadence it caused.
 
 ## Tooling and agents
 
