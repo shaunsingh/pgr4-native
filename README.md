@@ -411,6 +411,14 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   `AfterCall`, `TakeChanges`, `ReadDrawState`). td-77 against td-74: race 83.2 fps (82.4), 1 %
   low 54.6 (56.6), no hitches in either. td-76, the same build run while this session's agent
   worked beside it, had 12: in each the render thread waited 8-34 ms for the GPU.
+- The Xenos command processor's register waits (`--gpu_wait_reg_mem_high_res`) sleep 0.5 ms at
+  a time on a high-resolution waitable timer. Under Wine a waitable timer is a wineserver
+  object, so every sleep was a `set_timer` request and a server wakeup, 987 a second in td-73.
+  Under Wine they now sleep through `NtDelayExecution`, which Wine runs in the process (a
+  `select` with a microsecond timeout); Windows keeps the timer (`rexglue-runtime-perf.patch`).
+  td-78 (wineserver trace): the GPU command thread makes no requests. td-79 against td-77: race
+  83.4 fps (83.2), 1 % low 55.5 (54.6), no hitches in either, a difference within run-to-run
+  noise.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game

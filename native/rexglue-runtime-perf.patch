@@ -1555,7 +1555,75 @@ diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor
  
  #include <rex/platform.h>
  #if REX_PLATFORM_WIN32
-@@ -499,6 +504,7 @@
+@@ -151,28 +156,45 @@
+ 
+ class HighResolutionPollTimer {
+  public:
+-  HighResolutionPollTimer()
+-      : handle_(CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+-                                       TIMER_ALL_ACCESS)) {}
+-
+-  ~HighResolutionPollTimer() {
+-    if (handle_) {
+-      CloseHandle(handle_);
+-    }
+-  }
+-
+-  bool WaitHalfMillisecond() const {
+-    if (!handle_) {
+-      return false;
+-    }
+-    LARGE_INTEGER due_time;
+-    due_time.QuadPart = -5000;  // Relative 0.5 ms, in 100 ns units.
+-    return SetWaitableTimer(handle_, &due_time, 0, nullptr, nullptr, FALSE) &&
+-           WaitForSingleObject(handle_, INFINITE) == WAIT_OBJECT_0;
+-  }
+-
+- private:
+-  HANDLE handle_;
++  HighResolutionPollTimer() {
++    // Under Wine a waitable timer is a wineserver object: arming it is a server round trip and
++    // its expiry a server wakeup, a thousand or more of each a second while the guest keeps the
++    // GPU waiting. Wine's NtDelayExecution sleeps in the process (a select with a microsecond
++    // timeout); on Windows it would round up to the system timer's period.
++    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++    if (ntdll && GetProcAddress(ntdll, "wine_get_version")) {
++      delay_ = reinterpret_cast<NtDelayExecutionFn>(GetProcAddress(ntdll, "NtDelayExecution"));
++    }
++    if (!delay_) {
++      handle_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                       TIMER_ALL_ACCESS);
++    }
++  }
++
++  ~HighResolutionPollTimer() {
++    if (handle_) {
++      CloseHandle(handle_);
++    }
++  }
++
++  bool WaitHalfMillisecond() const {
++    LARGE_INTEGER due_time;
++    due_time.QuadPart = -5000;  // Relative 0.5 ms, in 100 ns units.
++    if (delay_) {
++      return delay_(FALSE, &due_time) >= 0;
++    }
++    if (!handle_) {
++      return false;
++    }
++    return SetWaitableTimer(handle_, &due_time, 0, nullptr, nullptr, FALSE) &&
++           WaitForSingleObject(handle_, INFINITE) == WAIT_OBJECT_0;
++  }
++
++ private:
++  using NtDelayExecutionFn = LONG(WINAPI*)(BOOLEAN alertable, const LARGE_INTEGER* timeout);
++
++  NtDelayExecutionFn delay_ = nullptr;
++  HANDLE handle_ = nullptr;
+ };
+ #endif
+ 
+@@ -499,6 +521,7 @@
      fn();
    } else {
      pending_fns_.push(std::move(fn));
@@ -1563,7 +1631,7 @@ diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor
    }
  }
  
-@@ -584,21 +590,33 @@
+@@ -584,21 +607,33 @@
        // We spin here waiting for new ones, as the overhead of waiting on our
        // event is too high.
        PrepareForWait();
@@ -1611,7 +1679,7 @@ diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor
        ReturnFromWait();
        if (collect_stats && read_ptr_index_ != write_ptr_index) {
          const int64_t updated_ns = write_ptr_update_ns_.load(std::memory_order_relaxed);
-@@ -722,6 +740,8 @@
+@@ -722,6 +757,8 @@
          std::memory_order_relaxed);
    }
    write_ptr_index_ = value;
