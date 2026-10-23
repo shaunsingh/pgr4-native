@@ -27,6 +27,7 @@
 
 #include <rex/cvar.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -124,13 +125,23 @@ class NativeRenderer {
   // The renderer, created on first use when --pgr4_native is on; nullptr when it is off or
   // when D3D12 initialization failed (logged once). Cheap enough to call per hook.
   static NativeRenderer* Get();
+  // The renderer while it draws the game: Get(), except after the renderer switch handed the
+  // game to the Xenos plugin (primary mode, bind_renderer_switch). The hooks use this one; while
+  // it is null the guest D3D runs unchanged and nothing is tracked.
+  static NativeRenderer* Live() {
+    NativeRenderer* r = Get();
+    return r && r->live_.load(std::memory_order_relaxed) ? r : nullptr;
+  }
 
   // Hook entry points. `base` is the guest memory base the hook received (guest virtual
   // address a is at base + a, plus 0x1000 for a >= 0xE0000000 like the generated code).
   void OnDraw(const uint8_t* base, const HookArgs& args);
   void OnClear(const uint8_t* base, const HookArgs& args);
   void OnResolve(const uint8_t* base, const HookArgs& args);
-  void OnSwap(const uint8_t* base, const HookArgs& args);
+  void OnSwap(uint8_t* base, const HookArgs& args);
+  // A Swap while the Xenos plugin draws (Live() is null): the renderer switch takes the game
+  // back.
+  void OnSwapSuspended();
 
   // For modules.
   D3D12Device& device() { return *device_; }
@@ -175,8 +186,22 @@ class NativeRenderer {
   void QueueDraw(const uint8_t* base, const HookArgs& args);
   void QueueClear(const uint8_t* base, const HookArgs& args);
   void QueueResolve(const uint8_t* base, const HookArgs& args);
-  void QueueSwap(const uint8_t* base, const HookArgs& args);
+  void QueueSwap(uint8_t* base, const HookArgs& args);
   void RenderThreadMain();
+  // Renderer switch. The key bind_renderer_switch (F9; a Steam Input binding can send it from a
+  // back grip) requests it on the UI thread; the guest thread takes the request at its next
+  // Swap. A key rather than a pad combination: the game reads every button of the pad.
+  // HandOver: the Xenos plugin draws from the next frame on; TakeBack: native again.
+  bool SwitchRequested() {
+    return switch_requested_.load(std::memory_order_relaxed) &&
+           switch_requested_.exchange(false, std::memory_order_relaxed);
+  }
+  void HandOver(uint8_t* base, uint32_t device);
+  void TakeBack();
+
+  std::atomic<bool> live_{true};
+  std::atomic<bool> switch_requested_{false};
+  bool switch_bound_ = false;  // primary mode with --pgr4_native_renderer_switch
 
   std::unique_ptr<Queue> queue_;  // render thread mode only
 

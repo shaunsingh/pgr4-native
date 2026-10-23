@@ -30,6 +30,11 @@ Two modes:
   renderer sets at start-up. With it the Xenos command processor still parses the stream, runs
   fences, interrupts and `EVENT_WRITE_ZPD` (fake sample counts), but skips draws, copies, clears,
   shader loads and swaps. Its `GPU Commands` thread drops from ~98 % of a core to ~13 %.
+  The key `bind_renderer_switch` (F9) hands the game to the plugin at the next Swap and back:
+  handing over marks the guest D3D's whole state dirty (so the next draw writes all of it into
+  the stream), clears `gpu_skip_draws` and hides the child window; `NativeRenderer::Live()` is
+  then null, so the hooks leave the guest D3D alone and track nothing. Taking back resyncs the
+  state tracker from the device.
 
 ## Threads
 
@@ -171,6 +176,7 @@ scratch row.
 |---|---|---|
 | `pgr4_native` | false | Native renderer beside Xenos, debug window |
 | `pgr4_native_primary` | false | Native renderer is the game's output; sets `gpu_skip_draws` |
+| `pgr4_native_renderer_switch` | true | Primary mode: register the key bind `bind_renderer_switch` (F9) that switches to the Xenos plugin and back |
 | `pgr4_native_render_thread` | true | Capture on the game thread, record on `PGR4 native render`. On by default since 2026-10-21 23:20 although one race oracle capture in three drops to 29.5-29.6 dB (wrong geometry, unexplained) |
 | `pgr4_native_async_pipelines` | true | PSOs on workers; draws skipped until ready (`pso_pending`) |
 | `pgr4_native_pipeline_threads` | 0 | Compile threads (0: a quarter of the hardware threads, 1-4) |

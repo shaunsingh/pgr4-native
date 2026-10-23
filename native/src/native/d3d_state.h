@@ -57,6 +57,11 @@ struct CallEntry {
 };
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device);
 
+// Sets the dirty bits of every state block the draws flush (float constants, register blocks,
+// fetch and bool/loop constants, clip planes) and the shader rebind bits, so the next draw
+// writes the whole shadow and both shaders into the stream.
+void MarkAllDirty(uint8_t* base, uint32_t device);
+
 // The D3D functions that flush the shadow (directly or through the internal draw builders):
 // the draws, DrawIndx2Inline/Split, Clear/ClearF, Resolve, Swap and fn_826D6610. The dispatch
 // calls ReadDirtyMasks before and GuestState().AfterCall after each of them, at every
@@ -140,6 +145,12 @@ class GuestStateTracker {
   // regs_), and writes are recorded only from then on. The render thread replays these into its
   // own register file (renderer.cpp).
   void TakeChanges(std::vector<RegWrite>* out);
+  // Forgets the device after calls the tracker did not see: the next flushing call attaches
+  // again and copies the whole shadow (recording what changed).
+  void Resync() {
+    device_ = 0;
+    vs_imm_pending_valid_ = false;
+  }
 
   // For the trace tap (--pgr4_d3d_tap): compares the registers the tap has seen written in the
   // push buffer (`tap_written[r] != 0`) with this view at the current draw. Returns the number

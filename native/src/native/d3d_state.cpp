@@ -190,6 +190,16 @@ CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device) {
   return e;
 }
 
+void MarkAllDirty(uint8_t* base, uint32_t device) {
+  uint64_t add[6] = {~0ull, ~0ull, kShaderLoadBits, 0, 0, 0};  // masks +0, +8: all constants
+  for (const Block& b : kRegisterBlocks)
+    add[b.mask] |= (~0ull >> (64 - b.groups)) << (b.top + 1 - b.groups);
+  for (uint32_t i = 0; i < 6; ++i) {
+    const uint32_t a = device + dev::kDirtyMasks + i * 8;
+    Store64(base, a, Load64(base, a) | add[i]);
+  }
+}
+
 bool IsStateFlushingFn(uint32_t addr) {
   switch (addr) {
     case kFnBeginVertices:

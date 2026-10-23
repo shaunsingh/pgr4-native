@@ -49,6 +49,8 @@ struct SwapCall {
   uint32_t fetch[6] = {};  // its fetch constant (+28), as stored (virtual address)
   // -1: OnSwap checks for a capture request itself; 0/1: the caller did (CaptureRequested).
   int8_t capture_request = -1;
+  // The renderer switch hands the game to the Xenos plugin after this frame: hide the window.
+  bool hand_over = false;
 };
 
 class Presenter {

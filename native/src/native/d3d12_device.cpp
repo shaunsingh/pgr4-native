@@ -275,7 +275,7 @@ void D3D12Device::SetShown(bool shown) {
   if (!parent_ || shown == shown_) return;
   shown_ = shown;
   if (HWND hwnd = hwnd_.load()) ShowWindowAsync(hwnd, shown ? SW_SHOWNA : SW_HIDE);
-  REXLOG_INFO("PGR4 native: window {}", shown ? "shown again" : "hidden for an SDK dialog");
+  REXLOG_INFO("PGR4 native: window {}", shown ? "shown" : "hidden");
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {

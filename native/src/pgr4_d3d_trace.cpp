@@ -1096,7 +1096,7 @@ inline void RunOriginal(F original, PPCContext& c, uint8_t* b) {
 template <typename F>
 inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   namespace nat = pgr4::native;
-  nat::NativeRenderer* r = nat::NativeRenderer::Get();
+  nat::NativeRenderer* r = nat::NativeRenderer::Live();
   if (IsPassThrough(id) && !g_tap.enabled) {
     // A held BeginVertices draw is queued where the fast path would queue it too.
     if (!HasFastPath(id) && t_pending_vertices && r) {
@@ -1132,6 +1132,8 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   };
   if (!r) {
     OnCall(id, ctx, base, run);
+    if (id == kFn_826CB148)
+      if (nat::NativeRenderer* suspended = nat::NativeRenderer::Get()) suspended->OnSwapSuspended();
     return;
   }
   if (t_pending_vertices && !HasFastPath(id)) {
@@ -1232,7 +1234,7 @@ REX_HOOK_RAW(sub_826DEA78) {
   const uint32_t r[8] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                          ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
   __imp__sub_826DEA78(ctx, base);
-  if (pgr4::native::NativeRenderer::Get() || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap)) {
+  if (pgr4::native::NativeRenderer::Live() || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap)) {
     pgr4::native::profile::Scope scope(pgr4::native::profile::kImmediateVs);
     pgr4::native::GuestState().AfterImmediateVs(base, r);
   }

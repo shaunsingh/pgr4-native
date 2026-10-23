@@ -14,6 +14,7 @@
 #include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/keybinds.h>
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +63,9 @@ REXCVAR_DEFINE_INT32(pgr4_native_submit_draws, 256, "PGR4 native",
                      "Submit the frame's commands every this many draws, so the GPU starts on them "
                      "while the rest of the frame is recorded (0: one submission per frame, at the "
                      "Swap)");
+REXCVAR_DEFINE_BOOL(pgr4_native_renderer_switch, true, "PGR4 native",
+                    "With --pgr4_native_primary, the key bind_renderer_switch (F9) switches "
+                    "between the native renderer and the Xenos plugin at the next Swap");
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 
@@ -256,7 +260,9 @@ NativeRenderer* NativeRenderer::Get() {
   return g_failed ? nullptr : r;
 }
 
-NativeRenderer::~NativeRenderer() = default;
+NativeRenderer::~NativeRenderer() {
+  if (switch_bound_) rex::ui::UnregisterBind("bind_renderer_switch");
+}
 
 bool NativeRenderer::Initialize() {
   device_ = std::make_unique<D3D12Device>();
@@ -308,6 +314,12 @@ bool NativeRenderer::Initialize() {
     REXLOG_ERROR(
         "PGR4 native: could not set xam_keyboard_accept_default "
         "(rexglue-native-primary.patch missing?)");
+  if (primary && REXCVAR_GET(pgr4_native_renderer_switch)) {
+    rex::ui::RegisterBind("bind_renderer_switch", "F9",
+                          "PGR4 native: switch between the native renderer and the Xenos plugin",
+                          [this] { switch_requested_.store(true, std::memory_order_relaxed); });
+    switch_bound_ = true;
+  }
   csv_ = std::make_unique<Csv>();
   profile::g.on = REXCVAR_GET(pgr4_native_profile);
   csv_->tsc0 = profile::Now();
@@ -497,7 +509,7 @@ void NativeRenderer::QueueResolve(const uint8_t* base, const HookArgs& args) {
   q.AddHook(NowNs() - t0);
 }
 
-void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
+void NativeRenderer::QueueSwap(uint8_t* base, const HookArgs& args) {
   const uint64_t t0 = NowNs();
   Queue& q = *queue_;
   Queue::Batch& b = *q.current;
@@ -525,6 +537,7 @@ void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
   s.hook_max_ns = std::max(q.hook_max_ns, t1 - t0 - wait);
   s.track_calls = profile::g.track_calls;
   s.pad = rex_xam_take_frame_pad();
+  const bool hand_over = s.call.hand_over = SwitchRequested();
   std::memcpy(s.ticks, profile::g.ticks, sizeof(s.ticks));
   for (uint64_t& t : profile::g.ticks) t = 0;
   profile::g.track_calls = 0;
@@ -538,6 +551,7 @@ void NativeRenderer::QueueSwap(const uint8_t* base, const HookArgs& args) {
   q.hook_wait_ns = capture_wait;
   q.hook_ns = tail;
   q.hook_max_ns = tail - capture_wait;
+  if (hand_over) HandOver(base, args.device);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -565,12 +579,40 @@ void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
   if (ResolveParams p; DecodeResolve(base, args, &p)) ExecuteResolve(p);
 }
 
-void NativeRenderer::OnSwap(const uint8_t* base, const HookArgs& args) {
+void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
   if (queue_) return QueueSwap(base, args);
   SwapCall swap;
   Presenter::ReadSwap(base, args, &swap);
   stats_.pad = rex_xam_take_frame_pad();
+  swap.hand_over = SwitchRequested();
   ExecuteSwap(swap);
+  if (swap.hand_over) HandOver(base, args.device);
+}
+
+void NativeRenderer::OnSwapSuspended() {
+  if (SwitchRequested()) TakeBack();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Renderer switch (primary mode)
+
+void NativeRenderer::HandOver(uint8_t* base, uint32_t device) {
+  // The replaced draws (guest_d3d.h) cleared dirty bits without writing the state to the
+  // stream, and the plugin skipped the shader loads: it has neither. The next draw writes all
+  // of it.
+  MarkAllDirty(base, device);
+  rex::cvar::SetFlagByName("gpu_skip_draws", "false");
+  live_.store(false, std::memory_order_relaxed);
+  REXLOG_INFO("PGR4 native: renderer switch: the Xenos plugin draws");
+}
+
+void NativeRenderer::TakeBack() {
+  // The tracker saw none of the calls the plugin drew. The window is shown again by the next
+  // native frame's ExecuteSwap.
+  GuestState().Resync();
+  rex::cvar::SetFlagByName("gpu_skip_draws", "true");
+  live_.store(true, std::memory_order_relaxed);
+  REXLOG_INFO("PGR4 native: renderer switch: native draws");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -656,8 +698,9 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_untile_ns = NowNs() - u0;
   draw_->BeforeSubmit();
   const uint64_t fence = d.frame_fence();
-  // The SDK draws XAM dialogs into the game window, under the child window.
-  d.SetShown(!rex::kernel::xam::xeXamIsUIActive());
+  // The SDK draws XAM dialogs into the game window, under the child window, and after the
+  // renderer switch the Xenos plugin presents there.
+  d.SetShown(!swap.hand_over && !rex::kernel::xam::xeXamIsUIActive());
   if (!d.EndFrame(!incomplete)) return Fail();
   const D3D12Device::EndFrameTimes& et = d.end_frame_times();
   stats_.swap_submit_ns = et.submit_ns;

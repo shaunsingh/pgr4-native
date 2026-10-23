@@ -51,7 +51,8 @@ class D3D12Device {
   void set_vsync(bool vsync) { vsync_ = vsync; }
 
   // Child mode: hides the window (and skips presenting) while false, so the game window's own
-  // content, such as the SDK's XAM dialogs, shows instead. No effect on the debug window.
+  // content, such as the SDK's XAM dialogs or the Xenos plugin's frames, shows instead. No
+  // effect on the debug window.
   void SetShown(bool shown);
 
   ID3D12Device* device() const { return device_.Get(); }

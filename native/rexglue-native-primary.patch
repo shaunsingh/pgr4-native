@@ -505,3 +505,18 @@ index 131ea4c..d0ab459 100644
  // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
  u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION> vibration) {
    if (!vibration) {
+diff --git a/src/ui/keybinds.cpp b/src/ui/keybinds.cpp
+index 9822f3b..fe52bc4 100644
+--- a/src/ui/keybinds.cpp
++++ b/src/ui/keybinds.cpp
+@@ -215,7 +215,9 @@ bool ProcessKeyEvent(KeyEvent& e) {
+       continue;
+     VirtualKey vk = ParseVirtualKey(entry.current_key);
+     if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
+-      entry.callback();
++      // A held key's auto-repeats are consumed without running the bind again.
++      if (!e.prev_state())
++        entry.callback();
+       e.set_handled(true);
+       return true;
+     }

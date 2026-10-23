@@ -44,7 +44,7 @@ constexpr uint64_t kShaderBits = 0x1E0000ull;
 bool DrawIndexed(PPCContext& ctx, uint8_t* base) {
   if (!REXCVAR_GET(pgr4_native_replace_draws) || !REXCVAR_GET(pgr4_native_primary)) return false;
   const uint32_t device = ctx.r3.u32;
-  if (!device || !NativeRenderer::Get()) return false;
+  if (!device || !NativeRenderer::Live()) return false;
   static uint64_t calls = 0, tiled = 0;
   ++calls;
   tiled += *HostPtr(base, device + kTilingFlags) & 1;

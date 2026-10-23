@@ -32,5 +32,8 @@ inline uint64_t Load64(const uint8_t* base, uint32_t a) {
 inline float LoadFloat(const uint8_t* base, uint32_t a) {
   return std::bit_cast<float>(Load32(base, a));
 }
+inline void Store64(uint8_t* base, uint32_t a, uint64_t v) {
+  rex::memory::store_and_swap<uint64_t>(HostPtr(base, a), v);
+}
 
 }  // namespace pgr4::native
