@@ -29,10 +29,10 @@
 #include <thread>
 #include <vector>
 
-REXCVAR_DEFINE_STRING(pgr4_native_capture_dir, "C:\\recomp\\logs\\pgr4-native-captures",
-                      "PGR4 native",
-                      "Front buffer captures (native + Xenos PNGs, PSNR); <dir>\\capture.request, "
-                      "F12 triggers one");
+REXCVAR_DEFINE_STRING(pgr4_native_capture_dir, "", "PGR4 native",
+                      "Folder for front buffer captures (native + Xenos PNGs, PSNR), marks and draw "
+                      "logs; when set, <dir>\\capture.request and the mark key (F12) take a "
+                      "capture and <dir>\\draw-debug.txt is read. Empty: nothing is polled");
 REXCVAR_DEFINE_INT32(pgr4_native_capture_frame, -1, "PGR4 native",
                      "Capture the front buffer of this native frame index (-1 = off)");
 REXCVAR_DEFINE_INT32(pgr4_native_capture_hold_ms, 500, "PGR4 native",
@@ -60,7 +60,8 @@ REXCVAR_DEFINE_STRING(pgr4_native_glitch_catch, "", "PGR4 native",
                       "Keep the frames shown (as --pgr4_native_record would record them) in "
                       "memory and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump "
                       "away from the image and back; without --pgr4_native_record, also "
-                      "<prefix>mark-<frame>.rec with the last 2 s at a mark (F12)");
+                      "<prefix>mark-<frame>.rec with the last 5 s at a mark (F12, with "
+                      "--pgr4_native_capture_dir)");
 
 namespace pgr4::native {
 
@@ -318,8 +319,9 @@ struct Presenter::Impl {
   // frame whose mean block difference from the one before is at least 6x the median of the last
   // kSteps and 15, followed within kMaxLen frames by one that is back near the frame before).
   struct Catcher {
-    static constexpr uint32_t kRing = 180, kBlock = 10, kMaxLen = 4, kPad = 8, kSteps = 512;
-    static constexpr uint32_t kMaxDumps = 400, kMaxMarks = 30;  // ~14 MB and ~124 MB each
+    // kRing: 5 s at 90 Hz, since a mark comes a few seconds after what it marks.
+    static constexpr uint32_t kRing = 450, kBlock = 10, kMaxLen = 4, kPad = 8, kSteps = 512;
+    static constexpr uint32_t kMaxDumps = 400, kMaxMarks = 30;  // ~14 MB and ~310 MB each
     struct Frame {
       RecordHeader h;
       std::vector<uint8_t> rgb;
@@ -414,6 +416,9 @@ struct Presenter::Impl {
   // The mark key, F12 (a Steam Input binding can send it from a back grip). True on the press.
   bool MarkPressed();
   bool mark_down = false;
+  // --pgr4_native_capture_dir; empty: no request file and no mark key are polled.
+  std::filesystem::path capture_dir, capture_request;
+  uint32_t request_poll = 0;
 };
 
 bool Presenter::Impl::Initialize() {
@@ -488,8 +493,12 @@ bool Presenter::Impl::Initialize() {
       return false;
     ramp_mapped = static_cast<uint8_t*>(p);
   }
-  std::error_code ec;
-  std::filesystem::create_directories(REXCVAR_GET(pgr4_native_capture_dir), ec);
+  capture_dir = std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir));
+  if (!capture_dir.empty()) {
+    std::error_code ec;
+    std::filesystem::create_directories(capture_dir, ec);
+    capture_request = capture_dir / "capture.request";
+  }
   rec.path = REXCVAR_GET(pgr4_native_record);
   rec.catcher.prefix = REXCVAR_GET(pgr4_native_glitch_catch);
   rec.catching = !rec.catcher.prefix.empty();
@@ -848,19 +857,19 @@ bool Presenter::Impl::WriteRamp(RampMode mode, uint32_t slot) {
 }
 
 bool Presenter::Impl::CaptureRequested(uint64_t frame) {
-  bool want = false;
   const int32_t at = REXCVAR_GET(pgr4_native_capture_frame);
-  if (at >= 0 && frame == uint64_t(at)) want = true;
+  bool want = at >= 0 && frame == uint64_t(at);
+  if (capture_dir.empty()) return want;
   if (MarkPressed()) {
     REXLOG_INFO("PGR4 native mark at frame {}", frame);
     want = true;
   }
-  std::filesystem::path req = std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) /
-                              "capture.request";
-  std::error_code ec;
-  if (std::filesystem::exists(req, ec)) {
-    std::filesystem::remove(req, ec);
-    want = true;
+  // Every 16th frame: a file query goes through Wine's path translation, and the scripts that
+  // write the request do not mind a few frames' delay.
+  if (++request_poll >= 16) {
+    request_poll = 0;
+    std::error_code ec;
+    if (std::filesystem::remove(capture_request, ec)) want = true;
   }
   return want;
 }
@@ -900,8 +909,7 @@ void Presenter::Impl::WriteCapture() {
   if (c.writer.joinable()) c.writer.join();
   c.writer = std::thread([readback = std::move(c.readback), pitch = c.footprint.Footprint.RowPitch,
                           w = c.width, h = c.height, mapping = c.mapping, rgb10a2 = c.rgb10a2,
-                          frame = c.frame,
-                          dir = std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir))] {
+                          frame = c.frame, dir = capture_dir] {
     std::vector<uint8_t> rgb;
     if (!ReadbackRgb(readback.Get(), pitch, w, h, mapping, rgb10a2, &rgb)) return;
     const std::string name = "f" + std::to_string(frame) + "-native.png";
@@ -957,7 +965,7 @@ void Presenter::Impl::FinishCapture(const uint8_t* base) {
       c.height = h;
     }
   }
-  const std::filesystem::path dir(REXCVAR_GET(pgr4_native_capture_dir));
+  const std::filesystem::path& dir = capture_dir;
   const std::string stem = "f" + std::to_string(c.frame);
   bool ok = WritePng(dir / (stem + "-native.png"), native_rgb, c.width, c.height) &&
             WritePng(dir / (stem + "-xenos.png"), xenos_rgb, c.width, c.height);

@@ -6,9 +6,9 @@
 // constant's swizzle and the display controller's gamma ramp (present.cpp). Without a
 // resolved image the back buffer is cleared to black.
 //
-// Captures (oracle for M2): --pgr4_native_capture_dir (default
-// C:\recomp\logs\pgr4-native-captures) and either the file <dir>\capture.request (deleted
-// when taken), a mark (F12), or --pgr4_native_capture_frame=N. A request
+// Captures (oracle for M2): --pgr4_native_capture_dir (empty by default: no requests polled)
+// and either the file <dir>\capture.request (deleted when taken, read every 16 frames), a mark
+// (F12), or --pgr4_native_capture_frame=N. A request
 // at Swap F-1 switches the Xenos plugin to full readback (HoldFullReadback in resolve.h; with
 // "fast" guest memory holds the previous frame's resolves) and captures frame F:
 //   f<F>-native.png  the native front buffer (read back after the frame's fence)

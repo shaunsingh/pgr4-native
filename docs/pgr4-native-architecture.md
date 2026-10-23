@@ -182,7 +182,7 @@ scratch row.
 | `pgr4_native_csv` | "" | Frame CSV path (`run.ps1 -Native` sets `<log base>-native.csv`) |
 | `pgr4_native_profile` | false | Stage timers and counters in the CSV and the log |
 | `pgr4_native_width`, `_height` | 1280, 720 | Debug window size |
-| `pgr4_native_capture_dir` | `C:\recomp\logs\pgr4-native-captures` | Capture requests and outputs |
+| `pgr4_native_capture_dir` | "" | Capture requests (`capture.request`, F12) and outputs, the debug mask file; empty: none polled (`run.ps1 -Native` sets `C:\recomp\logs\pgr4-native-captures`) |
 | `pgr4_native_capture_frame`, `_capture_hold_ms` | -1, 500 | Capture a given frame; hold the guest so Xenos readback completes |
 | `pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and write the PSNR (guest held); false: the native PNG only, written off the guest thread |
 | `pgr4_native_resolve_dump` | "" | Dump every resolve of one frame (render thread off) |
@@ -190,7 +190,7 @@ scratch row.
 | `pgr4_native_texture_trace` | "" | Log every Get of one texture address (hex) |
 | `pgr4_d3d_tap`, `_control`, `_trace_dir`, `_skip`, `_frame_csv`, `_stats_frames` | | Push-buffer tap, control file, frame traces, skipping hook classes, per-frame hook counts, log interval (150) |
 
-The debug mask file `C:\recomp\logs\pgr4-native-captures\draw-debug.txt` (`"<mask> [max_draws]
+The debug mask file `<capture dir>\draw-debug.txt` (`"<mask> [max_draws]
 [skip_from] [skip_to]"`, polled every 15 frames) turns off depth (1), cull (2), blend (4), alpha
 test (8), logs one frame's draws (16) or uploads vertex data every draw (32). Delete it after use.
 

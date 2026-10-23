@@ -922,7 +922,7 @@ struct DrawRenderer::Impl {
   CachedCbv cb_system, cb_float_vs, cb_float_ps, cb_bool_loop, cb_fetch, cb_desc_vs, cb_desc_ps;
 
   // Logged once.
-  // Oracle toggles from <capture dir>\draw-debug.txt
+  // Oracle toggles from <capture dir>\draw-debug.txt (with --pgr4_native_capture_dir)
   // ("<mask> [max_draws] [skip_from] [skip_to] [shader hash]..."), read every 15 frames:
   // 1 depth/stencil off, 2 culling off, 4 blending off, 8 alpha test off, 16 log the next frame's
   // draws, 32 upload every draw, 64 polygon offset off, 128 issue only the draws the hashes
@@ -931,6 +931,7 @@ struct DrawRenderer::Impl {
   // Hashes stay stable across frames where draw indices do not.
   uint32_t debug_mask = 0, debug_max_draws = 0, frame_draws = 0, debug_poll = 0;
   uint32_t debug_skip_from = 0, debug_skip_to = 0;
+  std::string debug_path;  // empty without --pgr4_native_capture_dir: not polled
   std::array<uint64_t, 8> debug_hashes{};
   uint32_t debug_hash_count = 0;
   uint32_t draw_log_left = 0;  // frames still to log
@@ -1207,6 +1208,8 @@ bool DrawRenderer::Impl::Initialize() {
   membase = memory->physical_membase();
   vertex_upload.SetDevice(device);
   threaded = REXCVAR_GET(pgr4_native_render_thread);
+  if (const std::string dir = REXCVAR_GET(pgr4_native_capture_dir); !dir.empty())
+    debug_path = (std::filesystem::path(dir) / "draw-debug.txt").string();
   constant_upload.SetDevice(device);
   // Race start keeps 3 vertex and 10 constant blocks in flight; creating one there costs up to 16 ms.
   vertex_upload.Reserve(4);
@@ -3475,13 +3478,11 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
                 per(fc[0]), per(fc[1]), per(fc[2]), per(fc[3]), per(fc[4]), per(fc[5]), per(fc[6]));
     d = Impl::Diag{};
   }
-  if (++impl_->debug_poll >= 15) {
+  if (!impl_->debug_path.empty() && ++impl_->debug_poll >= 15) {
     impl_->debug_poll = 0;
     uint32_t mask = 0, max_draws = 0, skip_from = 0, skip_to = 0, hash_count = 0;
     std::array<uint64_t, 8> hashes{};
-    const std::filesystem::path debug_path =
-        std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) / "draw-debug.txt";
-    if (std::FILE* f = std::fopen(debug_path.string().c_str(), "r")) {
+    if (std::FILE* f = std::fopen(impl_->debug_path.c_str(), "r")) {
       if (std::fscanf(f, "%u %u %u %u", &mask, &max_draws, &skip_from, &skip_to) < 1) mask = 0;
       unsigned long long h;
       while (hash_count < hashes.size() && std::fscanf(f, "%llx", &h) == 1) hashes[hash_count++] = h;

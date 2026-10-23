@@ -10,8 +10,9 @@
 # its native 1280x720 mode, --mnk_mode), the SDK stream counters and the D3D hooks. -Tap turns on
 # the push-buffer decoder (--pgr4_d3d_tap: traces, draw counts; it costs the native path ~0.8 ms
 # per frame, so performance runs leave it off). Traces go to C:\recomp\logs\pgr4-native-traces.
-# -Native adds the native D3D12 renderer (--pgr4_native, debug window) and its frame CSV
-# (<base>-native.csv).
+# -Native adds the native D3D12 renderer (--pgr4_native, debug window), its frame CSV
+# (<base>-native.csv) and the capture folder <Logs>\pgr4-native-captures (capture.request,
+# draw-debug.txt; unless -Extra names another).
 param(
     [ValidateSet('start', 'stop', 'keys', 'ctl')][string]$Action = 'start',
     [string]$Keys = '',
@@ -78,7 +79,9 @@ $gameArgs = @(
     '--guest_frame_stats', '--gpu_stream_stats', "--gpu_stream_stats_file=$base-stream.log",
     $(if ($Tap) { '--pgr4_d3d_tap' } else { '' }), "--pgr4_d3d_control=$control", "--pgr4_d3d_trace_dir=$Logs\pgr4-native-traces",
     "--pgr4_d3d_frame_csv=$base-frames.csv",
-    $(if ($Native) { "--pgr4_native --pgr4_native_csv=$base-native.csv" } else { '' }), $Extra,
+    $(if ($Native) { "--pgr4_native --pgr4_native_csv=$base-native.csv" } else { '' }),
+    $(if ($Native -and $Extra -notmatch '--pgr4_native_capture_dir') { "--pgr4_native_capture_dir=$Logs\pgr4-native-captures" } else { '' }),
+    $Extra,
     "--log_file $base.log"
 ) -join ' '
 $cmd = "$base.cmd"

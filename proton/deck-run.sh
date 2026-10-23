@@ -35,8 +35,7 @@
 # --record "FROM FRAMES" records FRAMES frames (0: to the end) from native frame index FROM, as
 # shown at half size, into ~/pgr4-proton/rec-<tag>.rec (--pgr4_native_record); then
 # native/tools/flicker.py finds the frames that flash and writes them out as PNG strips.
-# --catch keeps the last 2 s of frames in memory instead and writes only the whole-image jumps
-# (and F12's last 2 s) to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch).
+# --catch keeps the last 5 s of frames in memory instead and writes only the whole-image jumps to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch).
 # --keys FILE drives the game with that route_player.py script instead of run/route-stpetersburg.keys.
 # --race-draws N is the median draws per frame that shows the race is on (St Petersburg draws
 # 4000+; a Quebec street race about 2000, its menus 1500-2000).

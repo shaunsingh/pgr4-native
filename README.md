@@ -260,7 +260,26 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   by the same map. DLC copied off a console as STFS packages goes in the game folder's
   `Content\` (or `--content_root`); the runtime installs each new package into the user data's
   content store at startup (td-41: Vehicle Pack 1 installed, World Challenge in the menu).
-
+- Play sessions are lean by default. The 15-minute play session (195,000 frames) had 70 stalls
+  over 100 ms, up to 2.3 s, spaced at multiples of 5 s: `play.sh` recorded every frame shown
+  (about 50 MB/s, 112 GB in the session), and the kernel's writeback paused the game's writing
+  threads (the frame CSV and the log among them). The scripted snow race without a recording
+  (td-39) had none. `play.sh` now starts the game alone, as a console would: no frame CSV, GPU
+  pass timing, sampler, glitch catcher or marks, and the game log, Wine and vkd3d-proton keep
+  warnings and errors only. `play.sh --debug` (or `PGR4_DEBUG=1`, and a second desktop entry) is
+  a debugging session with all of them; `PGR4_RECORD=1` adds the recording. The glitch catcher
+  keeps 5 s (it was 2 s), since a mark comes a few seconds after what it marks.
+- Capture requests are polled only when `--pgr4_native_capture_dir` is set; it has no default
+  folder now. Every frame had queried `capture.request` through Wine's path translation and
+  read the F12 key, and every 15 frames opened `draw-debug.txt`. The request file is now read
+  every 16th frame (td-44 took its 13 captures). `run.ps1 -Native` passes the Windows lab's
+  folder.
+- The title screen's Ferrari (its diffuser on the white floor, where play showed white
+  shimmering): 13 oracle captures of the slide-in (td-44) differ from Xenos by more than 48
+  levels in 2-19 pixels each (PSNR 45-49 dB). In a recording of 1,800 frames (td-45) the
+  diffuser's edge holds still from frame to frame (mean luma change 0.14, p99 2); the white that
+  comes and goes there is the title screen's rain, streaks of one or two frames that Xenos draws
+  too.
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
@@ -477,11 +496,11 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
 | `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |
 | `--pgr4_native_profile` | false | Per-stage CPU time of the draw path, added to the CSV |
-| `--pgr4_native_capture_dir=<dir>` | `C:\recomp\logs\pgr4-native-captures` | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one |
+| `--pgr4_native_capture_dir=<dir>` | off | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one, and `draw-debug.txt` there is read. Off, none of them is polled (`run.ps1 -Native`: `C:\recomp\logs\pgr4-native-captures`) |
 | `--pgr4_native_capture_frame=<n>` | -1 (off) | Capture the front buffers at this native frame |
 | `--pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and its PSNR, holding the game thread; false: the native PNG alone, written from a thread |
 | `--pgr4_native_record=<file>` | off | Record the frames shown at half size (`_record_from`, `_record_frames`, `_record_chunk_frames`) |
-| `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 2 s of frames; write whole-image jumps and F12's 2 s to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
+| `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 5 s of frames; write whole-image jumps and F12's 5 s (with a capture folder) to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
 | `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
 | `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
 | `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |

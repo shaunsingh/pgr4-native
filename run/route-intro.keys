@@ -1,0 +1,5 @@
+# Boot -> title screen, where the Ferrari slides in before PRESS START (and the "Welcome to
+# PGR4!" profile dialog). For captures of that scene: deck-run.sh --mode oracle --race-draws 1
+# --captures "..." (seconds after the intro FMV is skipped). Needs a fresh save.
+30000 return          # skip the intro FMV
++0 mark race
