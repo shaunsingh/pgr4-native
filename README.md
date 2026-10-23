@@ -401,6 +401,10 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   tracker changes without the trace, so no run measures the cleanup on its own. The PGO
   profile is stale in the changed functions, which clang compiles without it, until it is
   taken again.
+- `native/src` is formatted by `native/.clang-format`: ReXGlue SDK's (Google style, 100
+  columns) with Google's own short functions, if statements and loops on one line. Run
+  `clang-format -i` on the files a change touches (the distrobox has it). The formatting
+  commit is in `.git-blame-ignore-revs`.
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game

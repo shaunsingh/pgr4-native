@@ -1,0 +1,4 @@
+# Layout-only commits, skipped by `git blame` (git config blame.ignoreRevsFile .git-blame-ignore-revs;
+# GitHub reads this file itself).
+# Format native/src with clang-format
+3e39db8298c30949e6691a10f39d26166a6d11d5
