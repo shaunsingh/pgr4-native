@@ -164,6 +164,10 @@ export PROTON_LOG=1 PROTON_LOG_DIR=$top/logs DXVK_LOG_LEVEL=warn VKD3D_DEBUG=war
 # No xalia (Proton's gamepad-to-UI helper for launchers): the game has no use for it and it costs
 # ~10 % of a core during the race.
 export PROTON_USE_XALIA=0
+# Steam hides the Deck's own controller (28de:1205) from the games it launches and hands them its
+# virtual pad instead; without this, winebus reads the controller's HID interfaces at ~20 % of a
+# core, a cost the game never pays when started from Steam. The route types on the keyboard.
+export SDL_GAMECONTROLLER_IGNORE_DEVICES=${SDL_GAMECONTROLLER_IGNORE_DEVICES:-0x28de/0x1205}
 # One vkd3d-proton pipeline cache per build tree, outside the tree, unless the caller set one (0:
 # none, with MESA_SHADER_CACHE_DISABLE=true and --pgr4_native_pipeline_cache=false a cold start).
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$top/cache/$(basename "$(dirname "$(dirname "$runtime")")")}
