@@ -313,6 +313,19 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   1 % low 44.7 (41.9), p99 19.7 ms (20.8), GFX clock 772 MHz (716); the game thread refills its
   instruction cache from L2 16.5 times per 1000 instructions (22.1) at 1.21 instructions per
   cycle (1.16), the render thread 50 times (58).
+- A new XMA stream no longer reopens its decoder. When the game frees or clears an XMA context,
+  MTR's fix for a sound's tail bleeding into the next one cleared the decoder's cached format,
+  so the stream's first frame freed the FFmpeg context and opened another: about 450 KB
+  zeroed and MDCT tables for seven block sizes (up to 8192 points) rebuilt, about 55 times a
+  second in a race. FFmpeg's xmaframes decoder now has a flush that puts each channel back as
+  `decode_init` leaves it (overlap tail, previous block length, scale factor history), and a
+  reset calls it (`rexglue-runtime-perf.patch`). td-52 decoded each new stream's first 64
+  frames through both the flushed and a reopened decoder: 105,000 frames from 3,128 streams,
+  menus and race, and not one sample differed. `ff_mdct_init` and `split_radix_permutation`,
+  2.5 % of the audio thread in td-50, are gone from td-53's profile. The frame rate cannot
+  show a change this small: td-54 ran the race at 74.9 fps (td-51: 78.7) at a lower GPU clock
+  (774 MHz against 870, 2.5 W against 2.7), with one burst of 11 slow frames after the car left
+  the scripted line, and its audio thread took 44.5 % of a core (44.2).
 
 ## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game

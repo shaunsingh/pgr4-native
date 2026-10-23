@@ -1646,3 +1646,68 @@ diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
    } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
      // Context lock command.
      // This requests a lock by flagging the context.
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -241,13 +241,10 @@ void XmaContext::ResetDecoderState() {
+   trace_menu_loop_bytes_ = 0;
+   // A freed or re-initialized context is a new logical stream, so the previous
+   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
+-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
+-  // flush callback, so the call never reaches the code clearing channel[].out.
+-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
+-  // next decode, which does discard the history.
+-  if (av_context_) {
+-    av_context_->sample_rate = 0;
+-    av_context_->channels = 0;
++  // The xmaframes flush returns the decoder to its just-opened state; reopening
++  // it instead would rebuild its MDCT tables and zero ~450 KB per new stream.
++  if (av_context_ && avcodec_is_open(av_context_)) {
++    avcodec_flush_buffers(av_context_);
+   }
+   raw_frame_.fill(0);
+   decoded_frame_.fill(0);
+diff --git a/thirdparty/FFmpeg/libavcodec/wmaprodec.c b/thirdparty/FFmpeg/libavcodec/wmaprodec.c
+--- a/thirdparty/FFmpeg/libavcodec/wmaprodec.c
++++ b/thirdparty/FFmpeg/libavcodec/wmaprodec.c
+@@ -87,6 +87,7 @@
+  */
+ 
+ #include <inttypes.h>
++#include <stddef.h>
+ 
+ #include "libavutil/ffmath.h"
+ #include "libavutil/float_dsp.h"
+@@ -2034,6 +2035,24 @@ static av_cold int xmaframes_decode_end(AVCodecContext* avctx)
+     return 0;
+ }
+ 
++/**
++ *@brief Start a new stream: the next frame decodes as the first one after
++ *       xmaframes_decode_init would, without rebuilding the MDCT tables.
++ *@param avctx codec context
++ */
++static void xmaframes_flush(AVCodecContext *avctx)
++{
++    WMAProDecodeCtx *s = avctx->priv_data;
++    int i;
++
++    flush(s);
++    /** everything ahead of out is per-stream state that decode_init leaves zeroed,
++        except the previous block length, which starts at a whole frame */
++    for (i = 0; i < s->nb_channels; i++) {
++        memset(&s->channel[i], 0, offsetof(WMAProChannelCtx, out));
++        s->channel[i].prev_block_len = s->samples_per_frame;
++    }
++}
+ 
+ /**
+  *@brief Decode a single WMA frame. Packet parsing is out of this decoders scope.
+@@ -2152,6 +2171,7 @@ AVCodec ff_xmaframes_decoder = {
+     .init           = xmaframes_decode_init,
+     .close          = xmaframes_decode_end,
+     .decode         = xmaframes_decode_packet,
++    .flush          = xmaframes_flush,
+     .capabilities   = AV_CODEC_CAP_DR1,
+     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,
