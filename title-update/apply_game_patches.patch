@@ -17,7 +17,23 @@
  $hdrOriginal = "`t// stw r11,144(r1)`n`tREX_STORE_U32(ctx.r1.u32 + 144, ctx.r11.u32);`n`t// li r11,1`n`tctx.r11.s64 = 1;`n`t// stw r31,140(r1)"
  $hdrPatched = "`t// stw r11,144(r1)`n`tREX_STORE_U32(ctx.r1.u32 + 144, ctx.r11.u32);`n`t// Optional upscale flicker patch: 0x829DD9F4, li r11,1 -> li r11,0.`n`tctx.r11.s64 = Pgr4DisableHdr() ? 0 : 1;`n`t// stw r31,140(r1)"
  
-@@ -132,13 +138,14 @@
+@@ -65,6 +71,15 @@
+ $motionBlurPatched = "`t// Optional motion blur patch: 0x829DEAA4, li r11,1 -> li r11,0.`n`tctx.r11.s64 = Pgr4DisableMotionBlur() ? 0 : 1;`n`t// stw r31,140(r1)"
+ Update-GeneratedFile $motionBlurFile 'sub_829DEA18' $motionBlurOriginal $motionBlurPatched
+ 
++# Motion blur step (sub_82859FC0, fmuls f0,f0,f13: the tweak's strength times its per-sample
++# step, stored as the blur pass's c159). The pass smears each pixel along the scene's motion
++# since the previous frame, so its length was tuned for the console's 30 FPS and shrinks at
++# higher frame rates. Pgr4MotionBlurStep (pgr4-native, native/src/pgr4_d3d_trace.cpp) scales the
++# step to the motion of a 30 FPS frame.
++$blurStepOriginal = "`t// fmuls f0,f0,f13`n`tctx.f0.f64 = double(float(ctx.f0.f64 * ctx.f13.f64));`n`t// stfs f0,116(r1)"
++$blurStepPatched = "`t// fmuls f0,f0,f13 -> Pgr4MotionBlurStep(f0 * f13).`n`textern float Pgr4MotionBlurStep(float, uint8_t*);`n`tctx.f0.f64 = double(Pgr4MotionBlurStep(float(ctx.f0.f64 * ctx.f13.f64), base));`n`t// stfs f0,116(r1)"
++Update-GeneratedFile 'generated/default/pgr4_recompiled_recomp.19.cpp' 'sub_82859FC0' $blurStepOriginal $blurStepPatched
++
+ # This game-frame polling loop contains db16cyc instructions. The recompiler
+ # treats those as comments, so offer an opt-in host yield during the wait.
+ $frameWaitOriginal = "loc_826CCEF4:`n`t// db16cyc"
+@@ -132,13 +147,14 @@
  # Preserve its early near-zero rejection and normal collision resolution.
  $garageCallerOriginal = "`tuint32_t ea{};`n`t// mflr r12"
  $garageCallerPatched = "`tuint32_t ea{};`n`tconst uint32_t pgr4_walk_caller = uint32_t(ctx.lr);`n`t// mflr r12"

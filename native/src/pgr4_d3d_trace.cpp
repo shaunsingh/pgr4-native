@@ -137,6 +137,23 @@ uint32_t SkipClassOf(FnId id) {
   }
 }
 
+// The game's time step: the time between two frames' begins, which the Swap hook returns at
+// (after the frame pacer's wait in the native renderer, the plugin's vblank wait otherwise); the
+// game reads its timer just after. It draws a frame while it runs the next, so the frame it draws
+// moved by the step before the last: that one matches the game's within 0.11 ms in the median and
+// 1.4 ms in 99 % of the frames at 90 fps (td-125). NoteFrameBegin runs on the thread that calls
+// Swap; the motion blur pass reads g_drawn_step_ns.
+uint64_t g_frame_begin_ns = 0;
+int64_t g_frame_step_ns = 0;
+std::atomic<int64_t> g_drawn_step_ns{0};
+
+void NoteFrameBegin() {
+  const uint64_t now = pgr4::native::NowNs();
+  g_drawn_step_ns.store(g_frame_step_ns, std::memory_order_relaxed);
+  if (g_frame_begin_ns) g_frame_step_ns = int64_t(now - g_frame_begin_ns);
+  g_frame_begin_ns = now;
+}
+
 constexpr uint32_t kRegCount = 0x5000;
 constexpr uint32_t kDevPush = 48;  // last written dword; the limit is at device+56
 
@@ -1132,8 +1149,10 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
   };
   if (!r) {
     OnCall(id, ctx, base, run);
-    if (id == kFn_826CB148)
+    if (id == kFn_826CB148) {
       if (nat::NativeRenderer* suspended = nat::NativeRenderer::Get()) suspended->OnSwapSuspended();
+      NoteFrameBegin();
+    }
     return;
   }
   if (t_pending_vertices && !HasFastPath(id)) {
@@ -1189,6 +1208,7 @@ inline void OnHook(FnId id, PPCContext& ctx, uint8_t* base, F original) {
       break;
     case kNatSwap:
       r->OnSwap(base, a);
+      NoteFrameBegin();
       break;
     default:
       break;
@@ -1225,6 +1245,24 @@ extern "C" uint32_t Pgr4PresentationInterval(uint32_t guest) {
   constexpr uint32_t kOne = 1, kImmediate = 0x80000000;  // D3DPRESENT_INTERVAL_*
   if (pgr4::native::NativeRenderer::PacesFrames()) return kImmediate;
   return Pgr4Enable60Fps() ? kOne : guest;
+}
+
+// The motion blur pass (sub_82859FC0) smears each pixel along its reprojection to the previous
+// frame (c154-c157), which spans the scene's motion over one time step. Its per-sample step
+// (c159), the tweak's strength over the sample count, was tuned on the console's 30 FPS, so at
+// 90 fps the blur was a third as long. Scaled by the steps per 1/30 s, it is the blur of a 30 FPS
+// frame at any frame rate: in the same race at 30 and 90 fps the reprojection moved 2.95 times as
+// far per frame at 30, and its product with the step matched within 2 % (td-127, td-128).
+// title-update/apply_game_patches.patch calls this.
+extern "C" float Pgr4MotionBlurStep(float step, uint8_t*) {
+  constexpr double kConsoleFrameNs = 1e9 / 30;
+  constexpr int64_t kMinStepNs = 1'000'000, kMaxStepNs = 100'000'000;
+  // Not measured yet (the first frames): the console's step. Clamped: steps under 1 ms are frames
+  // queued behind a stall, which begin at once; steps over 100 ms are loads.
+  const int64_t drawn_ns = g_drawn_step_ns.load(std::memory_order_relaxed);
+  const int64_t frame_ns =
+      drawn_ns ? std::clamp(drawn_ns, kMinStepNs, kMaxStepNs) : int64_t(kConsoleFrameNs);
+  return float(step * (kConsoleFrameNs / double(frame_ns)));
 }
 
 #define D3D_FN(a, n, c)                                           \
