@@ -132,4 +132,5 @@ def main(argv):
           f"{summary([float(r['frame_ms']) for r in sel])}{route}")
 
 
-main(sys.argv[1:])
+if __name__ == "__main__":
+    main(sys.argv[1:])

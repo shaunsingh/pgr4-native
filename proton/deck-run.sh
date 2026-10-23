@@ -12,7 +12,7 @@
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
-#               [--output NAME] [--captures "5 10 15"] [--catch]
+#               [--display-refresh HZ] [--limit FPS] [--output NAME] [--captures "5 10 15"] [--catch]
 #               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu] [--server-trace]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
@@ -26,7 +26,14 @@
 # after the race mark) into ~/pgr4-proton/shots-<tag>/, to check that the route kept in step; a
 # route line "<at> mark shot <name>" saves <name>.png there when the player reaches it.
 # --refresh HZ sets the guest's vblank rate (video_mode_refresh_rate) and gamescope's refresh to
-# HZ: 90 matches the Deck OLED's panel. With vsync on the game presents once per guest vblank.
+# HZ: 90 matches the Deck OLED's panel. The native renderer's frame pacer starts the game's frames
+# on the display's presents; with --pgr4_native_frame_latency=0 the game presents once per guest
+# vblank instead.
+# --display-refresh HZ gives gamescope a refresh other than the guest's, and --limit FPS sets
+# gamescope's frame limit (a divisor of its refresh) the way Steam's frame limiter does in Game
+# Mode, through its app refresh cycle override (gamescopectl debug_set_fps_limit):
+# on the OLED a 60 fps limit switches the panel to 60 Hz (--display-refresh 60), a 30 fps one
+# keeps 90 Hz and shows every third refresh (--limit 30).
 # --output NAME (KDE Plasma, --view window) has a KWin script move gamescope's window to that
 # output and make it fullscreen (kscreen-doctor -o lists the outputs; eDP-1 is the Deck's panel),
 # so with an external monitor attached the game still shows on the panel at the panel's refresh.
@@ -63,6 +70,7 @@ set -euo pipefail
 tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
+display_refresh=""; limit=0
 captures="5 10 15"; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -81,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --shots) shots=$2; shift 2 ;;
     --perf) perf_secs=$2; shift 2 ;;
     --refresh) refresh=$2; shift 2 ;;
+    --display-refresh) display_refresh=$2; shift 2 ;;
+    --limit) limit=$2; shift 2 ;;
     --output) output=$2; shift 2 ;;
     --captures) captures=$2; shift 2 ;;
     --catch) catch=1; shift ;;
@@ -243,8 +253,8 @@ if [[ $session == gamescope ]]; then
     printf 'cd %q && exec' "$runtime"; printf ' %q' "${cmd[@]}"; echo
   } > "$inner"
   chmod +x "$inner"
-  setsid gamescope --backend "$backend" -W "$width" -H "$height" -w "$width" -h "$height" -r "$refresh" \
-    -- "$inner" > "$base-stdout.log" 2>&1 &
+  setsid gamescope --backend "$backend" -W "$width" -H "$height" -w "$width" -h "$height" \
+    -r "${display_refresh:-$refresh}" -- "$inner" > "$base-stdout.log" 2>&1 &
   gamescope=$!
   if [[ -n $output && $view == window ]]; then
     # gamescope's Wayland window has no app id and takes the game's title, so it is matched by
@@ -274,6 +284,13 @@ EOF
   [[ -s $envfile ]] || { echo "gamescope did not start (see $base-stdout.log)" >&2; exit 1; }
   # shellcheck disable=SC1090
   source "$envfile"
+  # Steam's frame limiter sets gamescope's app refresh cycle override, which gamescope applies at
+  # every paint (over --framerate-limit and the GAMESCOPE_FPS_LIMIT property); this command sets
+  # the same override.
+  if (( limit > 0 )); then
+    timeout 10 gamescopectl debug_set_fps_limit "$limit" >/dev/null 2>&1 ||
+      echo "gamescopectl debug_set_fps_limit $limit failed" >&2
+  fi
   player_args+=(--wm gamescope --input xtest)
   rm -rf "$shotdir"; mkdir -p "$shotdir"
   # gamescopectl can block for good (td-85: the periodic shots stopped after 24 s).
@@ -395,7 +412,8 @@ fps=$(python3 "$repo/native/tools/perf_fps.py" "$base.log" "$race_hms" 40 2>&1 |
 head -n 1 <<< "$fps"
 ref_draws=$repo/run/route-stpetersburg.draws
 [[ -s $base-frames.csv ]] && { python3 "$repo/native/tools/frame_times.py" "$base-frames.csv" "$base.log" "$race_hms" 40 \
-  ${ref_draws:+--ref "$ref_draws"} || true; }
+  ${ref_draws:+--ref "$ref_draws"} || true
+  python3 "$repo/native/tools/pacing.py" "$base-frames.csv" "$base.log" "$race_hms" 40 || true; }
 python3 "$here/deck_sampler.py" summary "$base-sampler.csv" "$race_hms" 40 || true
 if [[ -n ${tracer:-} ]]; then
   kill -USR1 "$tracer" 2>/dev/null || true; nap 2
