@@ -114,6 +114,9 @@ args+=("$@")
 export STEAM_COMPAT_DATA_PATH=$top/prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=$HOME/.local/share/Steam
 # As deck-run.sh: no xalia (Proton's gamepad-to-UI helper, ~10 % of a core during a race).
 export PROTON_USE_XALIA=0
+# HDR10 output where gamescope's display takes HDR (Game Mode with HDR on): DXVK's DXGI offers the
+# HDR10 color space only with DXVK_HDR=1. An SDR display stays SDR; DXVK_HDR=0 turns HDR off.
+export DXVK_HDR=${DXVK_HDR:-1}
 export VKD3D_SHADER_CACHE_PATH=$top/cache
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 { cat "$runtime/INSTALLED.txt" 2>/dev/null; echo "${cmd[*]}"; } > "$base-cmdline.txt"

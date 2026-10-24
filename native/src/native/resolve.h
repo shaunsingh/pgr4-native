@@ -59,6 +59,10 @@ struct ResolvedImage {
   // texture cache's k_24_8(_FLOAT) conversion gives when the game samples the k_8_8_8_8
   // destination as depth. Same size and state as `texture`.
   ID3D12Resource* depth_r32f = nullptr;
+  // With linear output (Resolver::set_linear_output), the last resolve from a float target into
+  // k_2_10_10_10: the copied color before the format's clamp to [0, 1], R16G16B16A16_FLOAT, same
+  // size and state as `texture`; nullptr otherwise.
+  ID3D12Resource* linear = nullptr;
   uint64_t seq = 0;  // increases with every write (global resolve counter)
 };
 
@@ -135,6 +139,9 @@ class Resolver {
   void SetChangedCallback(std::function<void(uint32_t guest_phys_base)> f) {
     changed_ = std::move(f);
   }
+  // HDR output: resolves from a float target into k_2_10_10_10 also keep their linear color
+  // (ResolvedImage::linear). Takes effect at the next resolve.
+  void set_linear_output(bool on) { linear_output_ = on; }
   // With GPU timing: Resolve marks its phases (GpuTimer::ResolvePhase).
   void set_gpu_timer(GpuTimer* timer) { timer_ = timer; }
 
@@ -188,6 +195,7 @@ class Resolver {
   uint32_t heap_stride_ = 0;
   uint32_t heap_next_ = 0;
   bool b5g6r5_store_ = false;  // typed UAV store of B5G6R5_UNORM (k_5_6_5 / k_6_5_5 images)
+  bool linear_output_ = false;
   std::unordered_map<uint32_t, Destination> destinations_;
   size_t image_count_ = 0;
   uint64_t frame_ = 0, frame_fence_ = 0;

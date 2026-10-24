@@ -124,17 +124,17 @@ reuse buffers sooner than on real hardware. The renderer therefore:
 |---|---|
 | `renderer.h/.cpp` | `NativeRenderer`: start-up, cvars, the On* entry points, the render thread and command queue, frame CSV and the periodic log line; `Fail` hands a failed run to the Xenos plugin |
 | `hook_args.h` | `HookFn` (the hooked guest D3D functions), `HookArgs` (their PPC arguments), `TilingCall` |
-| `d3d12_device.h/.cpp` | Own D3D12 queue, fence, 2 frames in flight, 3 back buffers, the debug window or the child swapchain over the game window, `EndFrame` (close, execute, Present, signal) |
+| `d3d12_device.h/.cpp` | Own D3D12 queue, fence, 2 frames in flight, 3 back buffers, the debug window or the child swapchain over the game window, the HDR10 color space and metadata when the display takes them (`hdr()`), `EndFrame` (close, execute, Present, signal) |
 | `d3d_state.h/.cpp` | `GuestStateTracker` (register file, change tracking), `ReadDrawState`, device offsets of the guest D3D |
 | `draw.h/.cpp` | `DrawRenderer`: shader selection, pipeline key and cache, textures and samplers (bindless), system/float/bool/fetch constants, vertex/index upload, fixed-function state, the draw call; `Prepare` for the capture step |
 | `shader_cache`, `shader_translate`, `shader_xlate.cmake` | Ucode → `DxbcShader` keyed by XXH3 of the guest ucode; `Translate` per `ShaderModifications` with ReXGlue's DXBC translator (BSD port) |
 | `geometry_shader` | Generated GS for points, rectangle lists and quads (Xenia's primitive processor port) |
 | `render_targets` | Host render targets for the guest's EDRAM surfaces (`Bind`), clears (`DecodeClear`/`Clear`) |
-| `resolve` | Guest Resolve → host images keyed by destination address (compute resolve, depth to R32F), `Find`, change callback; `resolve_debug.cpp`: oracle dumps and the self-test |
+| `resolve` | Guest Resolve → host images keyed by destination address (compute resolve, depth to R32F; with HDR output a float target resolved to 10-bit fixed point also gets an FP16 copy, `ResolvedImage::linear`), `Find`, change callback; `resolve_debug.cpp`: oracle dumps and the self-test |
 | `textures`, `texture_layout` | `TextureCache` (fetch constant → host texture), CPU untiling and format conversion, page watches, resolved-image copies, untile workers, placed texture heaps |
 | `upload_pool.h` | Persistently mapped upload blocks, linear sub-allocation, recycling by fence, `Reserve`, CPU-cached variant |
 | `pipeline_store` | Persistent pipeline list (`pipelines.bin`) and prewarm |
-| `present` | Front buffer → window blit (aspect-fit, linear), captures for the oracle; `present_debug`: PNG writer, glitch catcher, luma probe |
+| `present` | Front buffer → window blit (aspect-fit, linear; with HDR the front buffer's FP16 copy through the gamma ramp, a shoulder to the display's peak, BT.2020 and PQ), captures for the oracle; `present_debug`: PNG writer, glitch catcher, luma probe |
 | `profile.h` | RDTSC stage timers and per-frame counters (`--pgr4_native_profile`) |
 | `log.h` | Bounded warnings (`PGR4_LOG_FIRST`): a call site logs its first N times in the process |
 

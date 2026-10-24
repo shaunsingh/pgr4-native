@@ -38,16 +38,18 @@ executable. Keep `userdata/` when you update to a new release.
    example `~/Games/PGR4`.
 2. Steam > Games > Add a Non-Steam Game to My Library > Browse, select `pgr4_recompiled.exe`.
 3. In the shortcut's Properties > Compatibility, force a Proton version (tested: GE-Proton 11-5).
-4. In Properties > General > Launch Options, enter `PROTON_USE_XALIA=0 %command%`. Xalia,
-   Proton's gamepad helper for desktop programs, otherwise takes about a tenth of a CPU core
-   during races.
+4. In Properties > General > Launch Options, enter `PROTON_USE_XALIA=0 DXVK_HDR=1 %command%`.
+   Xalia, Proton's gamepad helper for desktop programs, otherwise takes about a tenth of a CPU
+   core during races. `DXVK_HDR=1` lets the game output HDR where the display takes it (the
+   OLED model, or an HDR TV, with HDR on in Steam's display settings).
 5. Play it from Game Mode. The frame rate follows the display: 90 fps on the OLED, 60 on the
    LCD model. Steam's frame limiter works too.
 
 ## Windows
 
 Run `pgr4_recompiled.exe`. It needs a GPU with Direct3D 12. Set `window_width` and
-`window_height` in `pgr4_recompiled.toml` to your display's resolution.
+`window_height` in `pgr4_recompiled.toml` to your display's resolution. With HDR on in
+Windows' display settings the game outputs HDR.
 
 ## Settings
 

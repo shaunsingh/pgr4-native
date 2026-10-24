@@ -46,6 +46,8 @@ class D3D12Device {
   static constexpr uint32_t kFramesInFlight = 2;
   static constexpr uint32_t kBackBuffers = 3;
   static constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  // With HDR output (--pgr4_native_hdr): HDR10, BT.2020 primaries and the PQ curve.
+  static constexpr DXGI_FORMAT kHdrBackBufferFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
 
   ~D3D12Device();
 
@@ -82,6 +84,11 @@ class D3D12Device {
   D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv() const;
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
+  // The swapchain presents HDR10 (kHdrBackBufferFormat): --pgr4_native_hdr is on and the display
+  // takes it (under Proton: gamescope with HDR on and DXVK_HDR=1, as in Steam's Game Mode).
+  bool hdr() const { return hdr_; }
+  // With hdr(): the luminance, in nits, that the presented image peaks at (the HDR10 metadata).
+  float hdr_peak_nits() const { return hdr_peak_nits_; }
 
   // Fence value EndFrame signals for the frame being recorded; last value the GPU reached.
   uint64_t frame_fence() const { return next_fence_; }
@@ -135,6 +142,8 @@ class D3D12Device {
  private:
   bool CreateWindowThread(const wchar_t* title);
   bool CreateSwapchain(HWND hwnd);
+  // Switches the new swapchain to HDR10 if wanted and supported, else to kBackBufferFormat.
+  bool SetUpColorSpace();
   bool OpenList();
   bool CloseAndExecute(std::span<ID3D12CommandList* const> first);
   bool GetBackBuffers();
@@ -166,6 +175,8 @@ class D3D12Device {
   UINT swapchain_flags_ = 0;  // DXGI_SWAP_CHAIN_FLAG_*: creation and every ResizeBuffers
   bool tearing_ = false;
   bool vsync_ = false;
+  bool hdr_ = false;
+  float hdr_peak_nits_ = 0.0f;
   bool latency_waitable_ = false;
   HWND game_window_ = nullptr;
 

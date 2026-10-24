@@ -150,6 +150,10 @@ uint32_t D3DCopyDestFormat(uint32_t f) {
   }
 }
 
+// Color render target formats (xenos::ColorRenderTargetFormat) that hold values above 1: 7e3
+// and 16-bit float.
+bool IsFloatTarget(uint32_t f) { return f == 3 || f == 7 || f == 12; }
+
 bool IsFloatFormat(uint32_t f) {
   switch (xenos::TextureFormat(f)) {
     case xenos::TextureFormat::k_16_FLOAT:
@@ -171,7 +175,8 @@ cbuffer Params : register(b0) {
   uint2 dest_origin;    // destination point in the image
   uint cb_dest_format;  // xenos::TextureFormat
   uint cb_src_format;   // xenos::ColorRenderTargetFormat, or the depth format
-  uint cb_flags;        // 1: swap, 4-6: sample select, 8-10: samples, 12-14: number
+  uint cb_flags;        // 1: swap, 4-6: sample select, 8-10: samples, 12-14: number,
+                        // 15: also the converted color into dst_float
   int cb_exp_bias;
   uint cb_dest_layout;  // DestLayout of dst
   uint pad;
@@ -206,8 +211,8 @@ Texture2DMS<float4> src : register(t0);
 Texture2D<float4> src : register(t0);
 #endif
 #endif
-// The destination image through its UINT view (Xenos texel bits), or (B5G6R5, and the R32_FLOAT
-// image of depth resolves) as floats.
+// The destination image through its UINT view (Xenos texel bits), or (B5G6R5, the R32_FLOAT
+// image of depth resolves, and the linear image of flag 15) as floats.
 RWTexture2D<uint4> dst : register(u0);
 RWTexture2D<float4> dst_float : register(u1);
 
@@ -283,10 +288,14 @@ float4 LoadColor(int2 p) {
 #endif
 }
 
-// Texels of the destination format (color copies are all conversions).
-uint4 PackDest(float4 c) {
+// The copied color before the destination format: exponent bias and red/blue swap applied.
+float4 Convert(float4 c) {
   c *= exp2((float)exp_bias);
-  if (flags & 2u) c = c.bgra;
+  return (flags & 2u) ? c.bgra : c;
+}
+
+// Texels of the destination format (color copies are all conversions) of a Convert result.
+uint4 PackDest(float4 c) {
   uint number = (flags >> 12) & 7u;
   switch (dest_format) {
     case 2u: return uint4(U(c.r, 255.0), 0, 0, 0);                                  // k_8
@@ -312,8 +321,8 @@ uint4 PackDest(float4 c) {
 }
 #endif
 
-uint4 PackPixel(int2 p, out float r32f) {
-  r32f = 0.0;
+// floats: the depth float image's value, or the converted color.
+uint4 PackPixel(int2 p, out float4 floats) {
 #if DEPTH
 #if MSAA
   // Depth is never averaged (ReXGlue SanitizeCopySampleSelect): 4x k23 -> sample 2, else 0.
@@ -327,10 +336,11 @@ uint4 PackPixel(int2 p, out float r32f) {
 #endif
   // D24S8: round to the nearest even like ReXGlue's EDRAM store (OpRoundNE of d * 0xFFFFFF).
   uint d24 = src_format == 1u ? F20e4(d) : (uint)round(saturate(d) * 16777215.0);
-  r32f = src_format == 1u ? F20e4ToF32(d24) : (float)d24 / 16777215.0;
+  floats = (src_format == 1u ? F20e4ToF32(d24) : (float)d24 / 16777215.0).xxxx;
   return uint4((d24 << 8) | (stencil & 0xFFu), 0, 0, 0);
 #else
-  return PackDest(LoadColor(p));
+  floats = Convert(LoadColor(p));
+  return PackDest(floats);
 #endif
 }
 
@@ -351,17 +361,19 @@ uint4 Unpack(uint4 v) {
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= size.x || id.y >= size.y) return;
-  float r32f;
-  uint4 v = PackPixel(src_origin + int2(id.xy), r32f);
+  float4 floats;
+  uint4 v = PackPixel(src_origin + int2(id.xy), floats);
   uint2 p = dest_origin + id.xy;
 #if DEPTH
   dst[p] = Unpack(v);
-  dst_float[p] = r32f.xxxx;
+  dst_float[p] = floats;
 #else
-  if (dest_layout == 8u)  // B5G6R5: R in bits 11-15, exact unorm steps
+  if (dest_layout == 8u) {  // B5G6R5: R in bits 11-15, exact unorm steps
     dst_float[p] = float4(float3((v.x >> 11) & 31u, (v.x >> 5) & 63u, v.x & 31u) / float3(31.0, 63.0, 31.0), 1.0);
-  else
+  } else {
     dst[p] = Unpack(v);
+    if (flags & 0x8000u) dst_float[p] = floats;
+  }
 #endif
 }
 )";
@@ -370,7 +382,7 @@ struct ShaderConstants {
   int32_t src_origin[2];
   uint32_t size[2];
   uint32_t dest_origin[2];
-  uint32_t dest_format, src_format, flags;
+  uint32_t dest_format, src_format, flags;  // flags: kShader's cb_flags
   int32_t exp_bias;
   uint32_t dest_layout, pad;
 };
@@ -567,10 +579,10 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
 // Resolver
 
 struct Resolver::Image {
-  ComPtr<ID3D12Resource> texture, depth_r32f;
+  ComPtr<ID3D12Resource> texture, depth_r32f, linear;
   const DestStorage* storage = nullptr;
   uint32_t width = 0, height = 0;
-  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;  // of both resources
+  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;  // of all its resources
   ResolvedImage view;
 };
 
@@ -882,8 +894,28 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
     return false;
   }
 
+  // A float target resolved into k_2_10_10_10 (PGR4's front buffer) loses everything above 1;
+  // for HDR output the linear image keeps the converted color.
+  const bool linear = linear_output_ && !depth &&
+                      p.dest_format == uint32_t(xenos::TextureFormat::k_2_10_10_10) &&
+                      IsFloatTarget(rt->guest_format);
+  if (linear && !img->linear) {
+    D3D12_RESOURCE_DESC d = img->texture->GetDesc();
+    d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, img->state, nullptr,
+                                                IID_PPV_ARGS(&img->linear)),
+               "resolve linear texture"))
+      return false;
+    REXLOG_INFO("PGR4 native resolve: linear image at {:08X} {}x{}", p.dest_base, img->width,
+                img->height);
+  }
+  // The image's second resource, in the same state as its texture.
+  ID3D12Resource* const extra = img->depth_r32f ? img->depth_r32f.Get() : img->linear.Get();
+
   // Descriptors: t0 = color / depth plane, t1 = stencil plane, u0 = the image's UINT view,
-  // u1 = its float view (B5G6R5) or the depth float image; null where unused.
+  // u1 = its float view (B5G6R5), the depth float image or the linear image; null where unused.
   if (heap_next_ + kViewsPerResolve > kHeapPerFrame) {
     // The frame's earlier dispatches read their descriptors when the GPU runs them.
     PGR4_LOG_FIRST(4, WARN, "PGR4 native resolve: more than {} resolves in a frame; skipped",
@@ -924,8 +956,12 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   ud.Format = float_texels ? DXGI_FORMAT_R32_UINT : storage->uav;
   device_->CreateUnorderedAccessView(float_texels ? nullptr : img->texture.Get(), nullptr, &ud,
                                      view(2));
-  ud.Format = float_texels ? storage->uav : DXGI_FORMAT_R32_FLOAT;
-  device_->CreateUnorderedAccessView(float_texels ? img->texture.Get() : img->depth_r32f.Get(),
+  ud.Format = float_texels ? storage->uav
+              : linear     ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                           : DXGI_FORMAT_R32_FLOAT;
+  device_->CreateUnorderedAccessView(float_texels ? img->texture.Get()
+                                     : linear     ? img->linear.Get()
+                                                  : img->depth_r32f.Get(),
                                      nullptr, &ud, view(3));
 
   // Source readable by the compute shader, the image(s) writable: one barrier batch.
@@ -939,9 +975,8 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   if (img->state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
     bs[nb++] =
         TransitionBarrier(img->texture.Get(), img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (img->depth_r32f)
-      bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), img->state,
-                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (extra)
+      bs[nb++] = TransitionBarrier(extra, img->state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   }
   if (nb) list->ResourceBarrier(nb, bs);
   ShaderConstants c = {};
@@ -953,8 +988,8 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   c.dest_origin[1] = uint32_t(dy);
   c.dest_format = p.dest_format;
   c.src_format = rt->guest_format;
-  c.flags =
-      (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) | (rt->samples << 8) | (p.dest_number << 12);
+  c.flags = (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) | (rt->samples << 8) |
+            (p.dest_number << 12) | (linear ? 0x8000u : 0u);
   c.exp_bias = p.exp_bias;
   c.dest_layout = storage->layout;
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
@@ -970,11 +1005,11 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   nb = 0;
   bs[nb++] =
       TransitionBarrier(img->texture.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
-  if (img->depth_r32f)
-    bs[nb++] = TransitionBarrier(img->depth_r32f.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                 kImageReadState);
+  if (extra)
+    bs[nb++] = TransitionBarrier(extra, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kImageReadState);
   list->ResourceBarrier(nb, bs);
   img->state = kImageReadState;
+  img->view.linear = linear ? img->linear.Get() : nullptr;
   img->view.width = std::max(img->view.width, uint32_t(dx) + w);
   img->view.height = std::max(img->view.height, uint32_t(dy) + h);
   img->view.seq = ++seq_;

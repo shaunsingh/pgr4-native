@@ -15,6 +15,7 @@
 #               [--display-refresh HZ] [--limit FPS] [--limit-at "SECS FPS"] [--output NAME]
 #               [--captures "5 10 15"] [--catch]
 #               [--keys FILE] [--race-draws 3000] [--draw-log FRAMES] [--pmu] [--server-trace]
+#               [--hdr] [--hdr-heatmap]
 #
 # --session gamescope (the default) runs the game in gamescope at WIDTHxHEIGHT, the compositor of
 # the Deck's Game Mode, whatever display the desktop has, and away from the desktop's keyboard
@@ -39,6 +40,12 @@
 # --output NAME (KDE Plasma, --view window) has a KWin script move gamescope's window to that
 # output and make it fullscreen (kscreen-doctor -o lists the outputs; eDP-1 is the Deck's panel),
 # so with an external monitor attached the game still shows on the panel at the panel's refresh.
+# --hdr runs gamescope with HDR on (--hdr-enabled, and --hdr-debug-force-support for a display
+# that takes no HDR, which gamescope then shows tone mapped to SDR) and the game with DXVK_HDR=1,
+# as Steam's Game Mode on an HDR display does, so the renderer presents HDR10. --hdr-heatmap
+# also has gamescope show the luminance of every pixel as a heat map (--hdr-debug-heatmap).
+# Screenshots (--shots) are then also saved as HDR10 AVIF; native/tools/hdr_shot.py prints their
+# luminance distribution in nits.
 # --perf N samples the game's user-space CPU time with perf for N seconds from the race mark and
 # prints its hottest functions per thread (native/tools/perf_symbols.py, with the .map files of
 # the runtime, linked with the modules into <log>-perf-modules/ for later analysis); sampling
@@ -77,7 +84,7 @@ tree=${1:?tree or runtime dir}; tag=${2:?tag}; shift 2
 mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=0; stretch=1.0
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
 display_refresh=""; limit=0; limit_at=""
-captures="5 10 15"; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0
+captures="5 10 15"; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0; hdr=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -106,6 +113,8 @@ while [[ $# -gt 0 ]]; do
     --draw-log) draw_log=$2; shift 2 ;;
     --pmu) pmu=1; shift ;;
     --server-trace) server_trace=1; shift ;;
+    --hdr) hdr=1; shift ;;
+    --hdr-heatmap) hdr=2; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -182,6 +191,7 @@ export PROTON_LOG=1 PROTON_LOG_DIR=$top/logs DXVK_LOG_LEVEL=warn VKD3D_DEBUG=war
 # No xalia (Proton's gamepad-to-UI helper for launchers): the game has no use for it and it costs
 # ~10 % of a core during the race.
 export PROTON_USE_XALIA=0
+(( hdr )) && export DXVK_HDR=1
 # Steam hides the Deck's own controller (28de:1205) from the games it launches and hands them its
 # virtual pad instead; without this, winebus reads the controller's HID interfaces at ~20 % of a
 # core, a cost the game never pays when started from Steam. The route types on the keyboard.
@@ -255,8 +265,11 @@ if [[ $session == gamescope ]]; then
     printf 'cd %q && exec' "$runtime"; printf ' %q' "${cmd[@]}"; echo
   } > "$inner"
   chmod +x "$inner"
+  hdr_args=()
+  (( hdr )) && hdr_args=(--hdr-enabled --hdr-debug-force-support)
+  (( hdr == 2 )) && hdr_args+=(--hdr-debug-heatmap)
   setsid gamescope --backend "$backend" -W "$width" -H "$height" -w "$width" -h "$height" \
-    -r "${display_refresh:-$refresh}" -- "$inner" > "$base-stdout.log" 2>&1 &
+    -r "${display_refresh:-$refresh}" "${hdr_args[@]}" -- "$inner" > "$base-stdout.log" 2>&1 &
   gamescope=$!
   if [[ -n $output && $view == window ]]; then
     # gamescope's Wayland window has no app id and takes the game's title, so it is matched by
@@ -304,8 +317,13 @@ EOF
   fi
   player_args+=(--wm gamescope --input xtest)
   rm -rf "$shotdir"; mkdir -p "$shotdir"
-  # gamescopectl can block for good (td-85: the periodic shots stopped after 24 s).
-  shoot() { timeout 10 gamescopectl screenshot "$shotdir/$1.png" >/dev/null 2>&1 || true; }
+  # gamescopectl can block for good (td-85: the periodic shots stopped after 24 s). With HDR,
+  # also an HDR10 AVIF of the same frame (hdr_shot.py measures its luminance).
+  shoot() {
+    timeout 10 gamescopectl screenshot "$shotdir/$1.png" >/dev/null 2>&1 || true
+    (( hdr )) && { timeout 10 gamescopectl screenshot "$shotdir/$1.avif" >/dev/null 2>&1 || true; }
+    true
+  }
   if (( shots > 0 )); then
     ( n=0; while sleep "$shots"; do n=$((n + shots)); shoot "t$(printf %04d $n)"; done ) &
     shooter=$!

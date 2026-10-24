@@ -45,10 +45,15 @@ REXCVAR_DEFINE_BOOL(pgr4_native_luma_probe, false, "PGR4 native",
                     "Read back three rows of every front buffer (at 10, 40 and 80 % of its "
                     "height) and log their mean brightness in the frame CSV, to find frames "
                     "drawn partly black");
+REXCVAR_DEFINE_INT32(pgr4_native_hdr_paper_white, 400, "PGR4 native",
+                     "HDR output: the luminance of SDR white (the HUD, the game's 1.0) in nits. "
+                     "400 is what gamescope shows SDR content at (--hdr-sdr-content-nits), so the "
+                     "game is as bright as in SDR up to white; ITU-R BT.2408's reference is 203");
 
 namespace pgr4::native {
 
 namespace xenos = rex::graphics::xenos;
+using present_debug::BlitConstants;
 using present_debug::ToRgb;
 using present_debug::WritePng;
 
@@ -70,9 +75,21 @@ static_assert(sizeof(rex::graphics::reg::DC_LUT_PWL_DATA) == 4 &&
 
 // image_size: the image in texels (the texture can be larger than the image); point: the
 // viewport is the image's size, every pixel is one texel.
+//
+// HDR output (hdr = 1): src is the front buffer's linear image (ResolvedImage::linear), the
+// game's color before the front buffer clips it at 1. The game renders linear light and leaves
+// the display curve to the gamma ramp, so up to 1 a texel is shown as in SDR: through the ramp,
+// then the 2.2 gamma of an SDR display, with SDR white at paper_white. Above 1 it continues
+// linearly from the ramp's white. A hue-preserving shoulder (Reinhard on the largest component,
+// slope 1 at the knee) fits the highlights under the display's peak; the HUD stays at paper
+// white. Then BT.709 -> BT.2020 and the PQ curve (SMPTE ST 2084).
 const char kBlitHlsl[] = R"(
 Texture2D<float4> src : register(t0);
-cbuffer blit : register(b0) { float2 image_size; uint ramp_mode; uint point_sampled; };
+cbuffer blit : register(b0) {
+  float2 image_size; uint ramp_mode; uint point_sampled;
+  uint hdr; float paper_white; float peak; float knee;  // paper_white in 10000 nits (PQ 1.0);
+  float3 white;                                         // peak and knee over SDR white
+};
 cbuffer gamma : register(b1) { uint4 ramp[96]; };
 void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 texel : TEXCOORD0) {
   float2 uv = float2((id << 1) & 2, id & 2);
@@ -94,16 +111,36 @@ float3 Gamma(float3 c) {
   }
   return c;
 }
-float3 Texel(int2 p) { return Gamma(src.Load(int3(p, 0)).rgb); }
-float4 ps(float4 pos : SV_Position, float2 texel : TEXCOORD0) : SV_Target {
+float3 Texel(int2 p) {
+  float3 c = src.Load(int3(p, 0)).rgb;
+  if (!hdr) return Gamma(c);
+  return c > 1.0 ? white * c : pow(Gamma(max(c, 0.0)), 2.2);
+}
+float3 Hdr10(float3 c) {
+  float m = max(max(c.r, c.g), c.b);
+  if (m > knee) {
+    float d = m - knee, room = peak - knee;
+    c *= (knee + d * room / (d + room)) / m;
+  }
+  c = mul(float3x3(0.6274040, 0.3292820, 0.0433136,
+                   0.0690970, 0.9195400, 0.0113612,
+                   0.0163916, 0.0880132, 0.8955950), c);
+  float3 y = pow(max(c, 0.0) * paper_white, 0.1593017578125);
+  return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+float3 Image(float2 texel) {
   int2 hi = int2(image_size) - 1;
-  if (point_sampled) return float4(Texel(min(int2(texel), hi)), 1.0);
+  if (point_sampled) return Texel(min(int2(texel), hi));
   float2 t = texel - 0.5;
   float2 f = t - floor(t);
   int2 a = clamp(int2(floor(t)), 0, hi), b = min(a + 1, hi);
   float3 top = lerp(Texel(a), Texel(int2(b.x, a.y)), f.x);
   float3 bottom = lerp(Texel(int2(a.x, b.y)), Texel(b), f.x);
-  return float4(lerp(top, bottom, f.y), 1.0);
+  return lerp(top, bottom, f.y);
+}
+float4 ps(float4 pos : SV_Position, float2 texel : TEXCOORD0) : SV_Target {
+  float3 c = Image(texel);
+  return float4(hdr ? Hdr10(c) : c, 1.0);
 }
 )";
 
@@ -163,7 +200,7 @@ bool ReadbackRgb(ID3D12Resource* readback, uint32_t row_pitch, uint32_t width, u
 struct Presenter::Impl {
   NativeRenderer& r;
   ComPtr<ID3D12RootSignature> root_signature;
-  ComPtr<ID3D12PipelineState> pso;
+  ComPtr<ID3D12PipelineState> pso, hdr_pso;  // into kBackBufferFormat, kHdrBackBufferFormat
   ComPtr<ID3D12DescriptorHeap> heap;
   uint32_t heap_stride = 0, heap_next = 0;
   static constexpr uint32_t kHeapSize = 16;
@@ -174,6 +211,7 @@ struct Presenter::Impl {
   uint32_t last_ramp[kPwlWords] = {};
   RampMode last_ramp_mode = kRampNone;
   uint32_t ramp_changes_logged = 0;
+  float ramp_white[3] = {1.0f, 1.0f, 1.0f};  // the last ramp's output for 1.0, display-encoded
 
   struct Capture {
     bool armed = false;  // requested: capture the next shown frame
@@ -245,7 +283,7 @@ bool Presenter::Impl::Initialize() {
   params[0].DescriptorTable = {1, &range};
   params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  params[1].Constants = {0, 0, 4};  // b0: image_size, ramp_mode, point_sampled
+  params[1].Constants = {0, 0, sizeof(BlitConstants) / 4};  // b0
   params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   params[2].Descriptor = {1, 0};  // b1: the gamma ramp
@@ -271,6 +309,10 @@ bool Presenter::Impl::Initialize() {
   d.RTVFormats[0] = D3D12Device::kBackBufferFormat;
   d.SampleDesc.Count = 1;
   if (Failed(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)), "present pipeline"))
+    return false;
+  d.RTVFormats[0] = D3D12Device::kHdrBackBufferFormat;
+  if (Failed(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&hdr_pso)),
+             "present HDR pipeline"))
     return false;
   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kHeapSize,
                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -311,6 +353,9 @@ bool Presenter::Impl::WriteRamp(RampMode mode, uint32_t slot) {
   if (mode != last_ramp_mode || std::memcmp(ramp, last_ramp, count * 4)) {
     last_ramp_mode = mode;
     std::memcpy(last_ramp, ramp, count * 4);
+    for (uint32_t c = 0; c < 3; ++c)
+      ramp_white[c] = mode == kRampPwl ? float(PwlOut(ramp, c, 1023))
+                                       : float((ramp[255] >> (20 - 10 * c)) & 1023) / 1023.0f;
     if (ramp_changes_logged < 8) {
       ++ramp_changes_logged;
       if (mode == kRampPwl)
@@ -470,6 +515,8 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
   }
   front_buffer_found = found;
   const bool rgb10a2 = format == xenos::TextureFormat::k_2_10_10_10;
+  const bool hdr = d.hdr();
+  ID3D12Resource* const linear = found && hdr ? image->linear : nullptr;
 
   uint32_t mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   D3D12_RESOURCE_DESC desc = {};
@@ -487,12 +534,11 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
                                                  D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ResourceBarrier(1, &b);
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = d.back_buffer_rtv();
-    // Black bars around the aspect-fit image (and a black frame when there is no image).
     const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    list->ClearRenderTargetView(rtv, black, 0, nullptr);
+    if (!found) list->ClearRenderTargetView(rtv, black, 0, nullptr);
     if (found) {
       D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-      sd.Format = host->unorm;
+      sd.Format = linear ? DXGI_FORMAT_R16G16B16A16_FLOAT : host->unorm;
       sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
       sd.Shader4ComponentMapping = mapping;
       sd.Texture2D.MipLevels = 1;
@@ -501,36 +547,54 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
       cpu.ptr += size_t(slot) * heap_stride;
       D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
       gpu.ptr += uint64_t(slot) * heap_stride;
-      device->CreateShaderResourceView(image->texture, &sd, cpu);
+      device->CreateShaderResourceView(linear ? linear : image->texture, &sd, cpu);
       ID3D12DescriptorHeap* heaps[] = {heap.Get()};
       list->SetDescriptorHeaps(1, heaps);
       list->SetGraphicsRootSignature(root_signature.Get());
-      list->SetPipelineState(pso.Get());
+      list->SetPipelineState(hdr ? hdr_pso.Get() : pso.Get());
       list->SetGraphicsRootDescriptorTable(0, gpu);
       // The image (1280x720 in PGR4's mode) scaled to fit the window, centred, aspect kept.
       const float iw = float(extent.width), ih = float(extent.height);
       const float ww = float(d.width()), wh = float(d.height());
       const float s = std::min(ww / iw, wh / ih);
       const float vw = std::round(iw * s), vh = std::round(ih * s);
+      const LONG vx = LONG(std::floor((ww - vw) * 0.5f)), vy = LONG(std::floor((wh - vh) * 0.5f));
+      // Black bars around the aspect-fit image. The swapchain's images get no fast clear, so
+      // a full clear would write every pixel the blit then writes again.
+      const LONG w = LONG(d.width()), h = LONG(d.height()), rx = vx + LONG(vw), ry = vy + LONG(vh);
+      const D3D12_RECT bars[4] = {{0, 0, w, vy}, {0, ry, w, h}, {0, vy, vx, ry}, {rx, vy, w, ry}};
+      D3D12_RECT clear[4];
+      UINT clears = 0;
+      for (const D3D12_RECT& bar : bars)
+        if (bar.right > bar.left && bar.bottom > bar.top) clear[clears++] = bar;
+      if (clears) list->ClearRenderTargetView(rtv, black, clears, clear);
       const RampMode wanted = rgb10a2 ? kRampPwl : kRampTable;
       const uint32_t ramp_slot = d.frame_slot();
-      struct {
-        float image_size[2];
-        uint32_t ramp_mode, point_sampled;
-      } constants = {
-          {iw, ih}, WriteRamp(wanted, ramp_slot) ? wanted : kRampNone, vw == iw && vh == ih};
-      list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+      const float paper_white = float(std::max(1, REXCVAR_GET(pgr4_native_hdr_paper_white)));
+      const float peak = d.hdr_peak_nits() / paper_white;
+      BlitConstants constants = {{iw, ih},
+                                 WriteRamp(wanted, ramp_slot) ? wanted : kRampNone,
+                                 vw == iw && vh == ih,
+                                 hdr,
+                                 paper_white / 10000.0f,
+                                 peak,
+                                 // The shoulder starts halfway to the peak, above white.
+                                 std::max(std::min(1.0f, peak), 0.5f * peak),
+                                 {}};
+      for (uint32_t c = 0; c < 3; ++c)
+        constants.white[c] =
+            constants.ramp_mode == kRampNone ? 1.0f : std::pow(ramp_white[c], 2.2f);
+      list->SetGraphicsRoot32BitConstants(1, sizeof(constants) / 4, &constants, 0);
       list->SetGraphicsRootConstantBufferView(
           2, ramp_buffer->GetGPUVirtualAddress() + uint64_t(ramp_slot) * kRampSlotBytes);
       list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-      D3D12_VIEWPORT vp = {
-          std::floor((ww - vw) * 0.5f), std::floor((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
+      D3D12_VIEWPORT vp = {float(vx), float(vy), vw, vh, 0.0f, 1.0f};
       D3D12_RECT sc = {0, 0, LONG(d.width()), LONG(d.height())};
       list->RSSetViewports(1, &vp);
       list->RSSetScissorRects(1, &sc);
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       list->DrawInstanced(3, 1, 0, 0);
-      if (glitch.on())
+      if (glitch.on() && !hdr)
         glitch.Record(device, list, ramp_slot, iw, ih, constants.ramp_mode, r.frame_index());
     }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);

@@ -438,6 +438,7 @@ uint64_t NativeRenderer::frame_fence() const { return device_->frame_fence(); }
 void NativeRenderer::BeginFrameModules() {
   const uint64_t fence = device_->frame_fence(), done = device_->completed_fence();
   rt_->BeginFrame(frame_index_, fence, done);
+  resolver_->set_linear_output(device_->hdr());
   resolver_->BeginFrame(frame_index_, fence, done);
   frame_begun_ = true;
 }

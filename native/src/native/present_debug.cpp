@@ -425,11 +425,8 @@ void GlitchCatch::Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, 
     return;
   }
   if (w != g.width || h != g.height) return;  // an image of another size: not recorded
-  const struct {
-    float image_size[2];
-    uint32_t ramp_mode, point_sampled;
-  } constants = {{iw, ih}, ramp_mode, 0};
-  list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+  const BlitConstants constants = {{iw, ih}, ramp_mode, 0};
+  list->SetGraphicsRoot32BitConstants(1, sizeof(constants) / 4, &constants, 0);
   const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g.rtv_heap->GetCPUDescriptorHandleForHeapStart();
   list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
   const D3D12_VIEWPORT vp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
