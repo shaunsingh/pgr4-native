@@ -605,6 +605,14 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   (the GPU finished late), two created about 80 textures each, and one is the frame CSV: the
   render thread stalled 27 ms between writing a row and finishing the frame (the row is flushed
   on that thread).
+- The frame CSV and the pacer's log go through a buffer that a background thread writes out
+  every 250 ms, so the render and pacer threads only format a row into memory. td-154 against
+  td-153: race 89.1 against 89.2 fps, 1 % low 59.2 against 54.6; shown frames more than 1.5
+  times the median interval apart, 11 of 3449 against 28, interval sd 0.65 against 1.02 ms. The
+  render thread takes 32 µs in the median and 44 µs at most from writing a row to finishing the
+  frame (78 µs and 27 ms). Of the race's frames over 20 ms, three waited in Present for the GPU
+  and one uploaded 2 MB of textures.
+
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
