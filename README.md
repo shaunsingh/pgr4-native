@@ -650,6 +650,15 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   (td-170), the copies in vkd3d and RADV. td-171, the coherency check: clean. td-172, the image
   check: 45.9-47.2 dB. td-173 against td-162: race 89.2 against 89.2 fps, 1 % low 58.1 against
   59.5, 0.1 % low 44.6 against 43.5, within the spread between runs.
+- The untile worker that untiles a first-bound texture records its barriers and copies too, on
+  an upload list of its own, so recording them (about 31 µs per texture in vkd3d-proton and
+  RADV) leaves the render thread. Each worker's command allocators are pooled by frame fence, as
+  Xenia's D3D12 command processor pools its own; the lists recorded since the last submission
+  run ahead of the frame's list in the same `ExecuteCommandLists`. td-175 against td-170
+  (profiled): the render thread's upload list work 34.5 against 291 ms over the race window,
+  0.14 against 3.9 ms in the worst frame; the workers take about 49 µs per upload. td-174, the
+  image check: 45.1-47.3 dB. td-176 against td-173: race 89.4 against 89.2 fps, 1 % low 59.2
+  against 58.1, 0.1 % low 45.3 against 44.6.
 
 ## Why a native renderer can beat emulation
 
