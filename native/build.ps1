@@ -13,7 +13,8 @@
 #            generated code) to $Dest\MTR-PGR4, apply rexglue-drawcount.patch and then
 #            rexglue-native-primary.patch (--gpu_skip_draws), rexglue-runtime-perf.patch
 #            (blocking timer queue, cheaper write-watch faults) and rexglue-content.patch (title
-#            update on update:\, DLC install, image check) to the SDK copy,
+#            update on update:\, DLC install, image check, game\ and userdata\ beside the exe by
+#            default) to the SDK copy,
 #            copy src\pgr4_d3d_trace.cpp and src\d3d_surface.inc into the game's src\ and add
 #            the .cpp to its CMakeLists.txt; mirror src\native\ to the game's src\native\ and
 #            append a CMake block that compiles src/native/*.cpp and links d3d12, dxgi, dxguid;

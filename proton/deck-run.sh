@@ -8,7 +8,7 @@
 # distribution (frame_times.py: 1 % lows, hitches) and what limited it: GPU load, clock and APU
 # power, and the busiest game threads (deck_sampler.py).
 #
-#   deck-run.sh <tree|runtime dir> <tag> [--mode primary|none|oracle] [--extra "<flags>"]
+#   deck-run.sh <tree|runtime dir> <tag> [--mode primary|none|oracle|release] [--extra "<flags>"]
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
 #               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
@@ -65,6 +65,9 @@
 # --mode none runs Xenos alone; primary runs the native renderer as the presenter; oracle runs
 # both and captures their front buffers 5, 10 and 15 s after the race mark (see run.sh), or at
 # the seconds after the mark that --captures lists (ascending, fractions allowed).
+# --mode release runs an unpacked release (native/tools/package_release.py) as a player starts
+# it: its own pgr4_recompiled.toml, and game/, title-update/ and userdata/ beside the exe (a
+# fresh save), with only the route's keyboard input and the measurement flags added.
 # --stretch scales every delay of the route, for a machine that loads slower than the PC it was
 # timed on. --cpus pins the game with taskset. Logs: ~/pgr4-proton/logs/.
 set -euo pipefail
@@ -107,7 +110,7 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
-case $mode in primary|none|oracle) ;; *) echo "unknown mode $mode" >&2; exit 2 ;; esac
+case $mode in primary|none|oracle|release) ;; *) echo "unknown mode $mode" >&2; exit 2 ;; esac
 case $session in gamescope|desktop) ;; *) echo "unknown session $session" >&2; exit 2 ;; esac
 case $view in window) backend=wayland ;; sdl) backend=sdl ;; headless) backend=headless ;; *) echo "unknown view $view" >&2; exit 2 ;; esac
 [[ -z $output || $output =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad output name $output" >&2; exit 2; }
@@ -121,6 +124,7 @@ else
   runtime=${PGR4_BUILDS:-$HOME/recomp/builds/pgr4}/native-$tree/run/runtime
 fi
 game=${PGR4_GAME:-$HOME/recomp/dumps/pgr4/game}
+[[ $mode == release ]] && game=$runtime/game
 keys=${keys:-$repo/run/route-stpetersburg.keys}
 [[ -f $keys ]] || { echo "no key script $keys" >&2; exit 2; }
 top=$HOME/pgr4-proton
@@ -136,18 +140,25 @@ fi
 export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 export DISPLAY=${DISPLAY:-:0}
 
-mkdir -p "$top/logs" "$top/prefix" "$top/userdata" "$top/cache"
-fresh_save "$top/userdata"
+userdata=$top/userdata
+[[ $mode == release ]] && userdata=$runtime/userdata
+mkdir -p "$top/logs" "$top/prefix" "$userdata" "$top/cache"
+fresh_save "$userdata"
 stamp=$(date +%Y%m%d-%H%M%S)
 base=$top/logs/pgr4-proton-$tag-$stamp
 ilog=$top/logs/pgr4-co-input-$tag.log
 rm -f "$ilog"
 
 # MTR's launcher arguments for 60 fps, then the measurement flags.
-mtr_args "$game" "$top/userdata" 60fps
-args+=("--window_width=$width" "--window_height=$height" "--video_mode_refresh_rate=$refresh"
-  --mnk_mode --guest_frame_stats --log_file "$(win "$base.log")")
-if [[ $fullscreen == 1 ]]; then args+=(--fullscreen); else args+=(--fullscreen=false); fi
+if [[ $mode == release ]]; then
+  # The reports read the renderer's frame lines, logged at info.
+  args=(--log_level=info)
+else
+  mtr_args "$game" "$userdata" 60fps
+  args+=("--window_width=$width" "--window_height=$height" "--video_mode_refresh_rate=$refresh")
+  if [[ $fullscreen == 1 ]]; then args+=(--fullscreen); else args+=(--fullscreen=false); fi
+fi
+args+=(--mnk_mode --guest_frame_stats --log_file "$(win "$base.log")")
 [[ $tap == 1 ]] && args+=(--pgr4_d3d_tap)
 [[ $mode == primary ]] && args+=(--pgr4_native --pgr4_native_primary)
 # Per-frame times for frame_times.py (1 % lows, hitches).

@@ -95,8 +95,30 @@
  // --- ReXApp ---
  
  ReXApp::~ReXApp() = default;
-@@ -120,11 +178,13 @@
-     user_dir = rex::filesystem::GetUserFolder() / GetName();
+@@ -105,26 +163,33 @@
+ bool ReXApp::SetupEnvironment() {
+   auto exe_dir = rex::filesystem::GetExecutableFolder();
+ 
++  // Game data: cvar override, or the game folder beside the executable, if any. The config file
++  // loads only after the paths are set, so a self-contained install needs defaults beside it.
+   std::filesystem::path game_dir;
+   std::string game_data_cvar = REXCVAR_GET(game_data_root);
+   if (!game_data_cvar.empty()) {
+     game_dir = game_data_cvar;
++  } else if (std::error_code ec; std::filesystem::is_directory(exe_dir / "game", ec)) {
++    game_dir = exe_dir / "game";
+   }
+ 
+-  // User data: cvar override, or platform user directory
++  // User data: cvar override, or beside the executable (the userdata folder MTR-PGR4's launcher
++  // passes)
+   std::filesystem::path user_dir;
+   std::string user_data_cvar = REXCVAR_GET(user_data_root);
+   if (!user_data_cvar.empty()) {
+     user_dir = user_data_cvar;
+   } else {
+-    user_dir = rex::filesystem::GetUserFolder() / GetName();
++    user_dir = exe_dir / "userdata";
    }
  
 -  // Update data: cvar override, or empty (opt-in)
@@ -110,7 +132,18 @@
    }
  
    // Cache: cvar override, or user_dir/cache
-@@ -291,6 +351,23 @@
+@@ -202,7 +267,9 @@
+ 
+ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   if (paths.game_data_root.empty()) {
+-    auto msg = std::string("--game_data_root was not provided.");
++    auto msg = std::string(
++        "No game data: put the game's files in the folder named game beside the executable, or "
++        "pass --game_data_root.");
+     REXLOG_ERROR("{}", msg);
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+     return false;
+@@ -291,6 +358,23 @@
      return false;
    }
  

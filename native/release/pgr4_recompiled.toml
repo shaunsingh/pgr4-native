@@ -1,0 +1,34 @@
+# Settings for pgr4_recompiled.exe, read from beside it at every start. A flag on the command line
+# (Steam's launch options: `%command% --name=value`) overrides the same setting here.
+
+# Window: 1280x800, the Steam Deck's panel. Elsewhere, set the display's own size.
+window_width = 1280
+window_height = 800
+fullscreen = true
+
+# The native D3D12 renderer presents the game, paced on the display: the display's refresh rate
+# (and Steam's frame limit, if set) sets the frame rate.
+pgr4_native = true
+pgr4_native_primary = true
+
+# MTR-PGR4's 60 FPS option (the frame rate unlocked from the console's 30) and the garage walking
+# fix it needs.
+pgr4_60fps = true
+pgr4_garage_walk_fix = true
+
+# MTR-PGR4's launcher settings.
+execute_unclipped_draw_vs_on_cpu = true
+gpu_plugin = "xenos"
+d3d12_present_vsync = true
+xmp_music_gain = 0.35
+d3d12_texture_shared_heaps = true
+gpu_vblank_deadline_timer = true
+gpu_wait_reg_mem_high_res = true
+clear_memory_page_state = false
+gpu_ring_wake_fast = true
+texture_resource_reuse = true
+texture_reuse_pool_limit_mib = 256
+texture_cache_memory_limit_soft_lifetime = 30
+
+# Errors only, in logs/ beside the executable ("warn" or "info" for a bug report).
+log_level = "error"
