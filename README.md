@@ -659,7 +659,15 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   0.14 against 3.9 ms in the worst frame; the workers take about 49 µs per upload. td-174, the
   image check: 45.1-47.3 dB. td-176 against td-173: race 89.4 against 89.2 fps, 1 % low 59.2
   against 58.1, 0.1 % low 45.3 against 44.6.
-
+- Vertex and index page watches are armed on a thread of their own. A protection change takes
+  about 20 µs under Wine, and geometry streamed in during the race armed 130-420 pages in a
+  burst frame, 1.6-6.5 ms of the guest D3D thread (td-177, watch trace). A run is now hashed
+  just before its copy and stays pending, hashed by every request, until the watch thread arms
+  it; a page whose hash changed in between stays invalid. td-178, the coherency check: clean,
+  12 pages caught by the hash. td-179, the image check: 45.6-47.8 dB. td-180 against td-175
+  (profiled): the guest thread's p99 1675 against 2516 µs, max 2464 against 7600 µs, frames over
+  16 ms 9 against 18. td-182 against td-176: race 89.5 against 89.4 fps, 1 % low 61.3 against
+  59.2, 0.1 % low 45.3 against 45.3, p99 frame 14.08 against 14.67 ms.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -946,7 +954,10 @@ keeps the sampled modules in `<log>-perf-modules/` for `perf_symbols.py`.
   rules out a missing synchronization object (that path logs) and leaves a buffer handle the
   kernel no longer knew. vkd3d-proton issue 2881 reports the same failure in another game. The
   rerun (td-152) and the ~150 runs before had none; watch for it.
-- Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
+- Steam Deck: one run (td-181) aborted at 130 s, before the race, with glibc's
+  `free(): invalid pointer` on Wine's Unix side (RADV, winevulkan or Wine itself) and no kernel
+  or GPU fault. The core was not kept and a review of the renderer's object lifetimes found
+  nothing; the rerun (td-182) was clean. Watch for it.- Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
   pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
   compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
   and neither has a Quebec snow race the bench never ran (td-91: 90.0 fps, 1 % low 67.7); a play
