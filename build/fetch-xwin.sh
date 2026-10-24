@@ -14,7 +14,10 @@ sdk_version=10.0.26100
 stamp="xwin $xwin_version manifest $manifest_version crt $crt_version sdk $sdk_version"
 
 [[ $(cat "$out/.pgr4-splat" 2>/dev/null) == "$stamp" ]] && { echo "$out: $stamp"; exit 0; }
-tmp=$(mktemp -d)
+# xwin moves the unpacked files into the splat, so its cache is on the output's file system (in
+# CI's container /tmp is not).
+mkdir -p "$(dirname "$out")"
+tmp=$(mktemp -d "$(dirname "$out")/.xwin-XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 tarball=xwin-$xwin_version-x86_64-unknown-linux-musl.tar.gz
 curl -sSfL -o "$tmp/$tarball" "https://github.com/Jake-Shadle/xwin/releases/download/$xwin_version/$tarball"
