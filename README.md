@@ -674,6 +674,10 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   (td-183). The PGO profile was retaken on this build: 0 stale profile warnings against 9.
   td-184: race 89.5 fps, 1 % low 60.7, 0.1 % low 40.1, p99 frame 14.25 ms; its worst frames
   wait about 16 ms on the swap fence, the GPU's time. td-185, the image check: 46.5-47.9 dB.
+- Title Update #2's two game files left the repository: like the disc and DLC they are the
+  player's own. `build.sh --update` (`build.ps1 -Update`) names the folder that holds them,
+  and the build checks them against `title-update/game-files.sha256`, the update the code is
+  generated for. The files stay in the repository's history.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -857,8 +861,10 @@ Several files port Xenia/ReXGlue code (BSD-3-Clause), among them `draw`, `render
 
 You need Windows 10 or 11, Visual Studio 2022 Build Tools (x64), LLVM (clang-cl), CMake, Ninja,
 PowerShell 7 and Git. You also need the files from your own PGR4 disc, extracted to a folder
-(`default.xex`, `gw.xex`, `Game\`, `UI\` and so on). This repository contains no game data, and
-the recompiled C++ that the build generates from `default.xex` must not be published.
+(`default.xex`, `gw.xex`, `Game\`, `UI\` and so on), and Title Update #2's `default.xexp` and
+`Pgr4TitleUpdate.bin` in another (`-Update <folder>`, `title-update/README.md`). This
+repository contains no game data, and the recompiled C++ that the build generates from
+`default.xex` must not be published.
 
 1. Build MTR-PGR4 and its patched ReXGlue SDK:
    `pwsh -File build\build-mtr.ps1 -Root C:\recomp\builds\pgr4 -Game <disc folder> -Stage prep,sdk`
