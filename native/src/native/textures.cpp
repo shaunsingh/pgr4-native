@@ -33,9 +33,11 @@ REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_hard_mb, 1024, "PGR4 native",
 #endif
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <string_view>
 
 namespace pgr4::native {
 
@@ -180,6 +182,9 @@ TextureCache::TextureCache(ID3D12Device* device, rex::memory::Memory* memory)
   budget_.hard_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_hard_mb));
   budget_.soft_lifetime_ms =
       uint64_t(std::max(REXCVAR_GET(pgr4_native_texture_memory_soft_lifetime_s), 0)) * 1000;
+  std::string_view trace = REXCVAR_GET(pgr4_native_texture_trace);
+  if (trace.starts_with("0x") || trace.starts_with("0X")) trace.remove_prefix(2);
+  std::from_chars(trace.data(), trace.data() + trace.size(), trace_address_, 16);
   // A quarter of the hardware threads, 1-4: 4 on an i9-13900K, 2 on a Steam Deck.
   const uint32_t n = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
   for (uint32_t i = 0; i < n; ++i) {
@@ -667,10 +672,12 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   }
 
   Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
-  const uint32_t bw =
-      t.host->block_compressed ? rex::graphics::FormatInfo::Get(key.format)->block_width : 1;
-  const uint32_t bh =
-      t.host->block_compressed ? rex::graphics::FormatInfo::Get(key.format)->block_height : 1;
+  uint32_t bw = 1, bh = 1;
+  if (t.host->block_compressed) {
+    const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
+    bw = info->block_width;
+    bh = info->block_height;
+  }
   for (const HostSubresource& s : footprints_) {
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = t.resource.Get();
@@ -869,16 +876,12 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
     t->resolve_pending = false;
   }
 #ifndef PGR4_TEXTURES_OFFLINE
-  static const uint32_t trace_address = [] {
-    std::string s = REXCVAR_GET(pgr4_native_texture_trace);
-    return s.empty() ? 0u : uint32_t(std::stoul(s, nullptr, 16));
-  }();
-  if (trace_address && (key.base_page << 12) == trace_address) {
-    const ResolvedImage* image = resolved_lookup_ ? resolved_lookup_(trace_address) : nullptr;
+  if (trace_address_ && (key.base_page << 12) == trace_address_) [[unlikely]] {
+    const ResolvedImage* image = resolved_lookup_ ? resolved_lookup_(trace_address_) : nullptr;
     REXLOG_INFO(
         "PGR4 native texture trace {:08X} {}x{} fmt{}: get #{} dirty_upload={} image_seq={} "
         "level0_seq {} -> {} image_fmt={} image_size={}x{}",
-        trace_address, key.width, key.height, uint32_t(key.format), stats_.gets, was_dirty,
+        trace_address_, key.width, key.height, uint32_t(key.format), stats_.gets, was_dirty,
         image ? image->seq : 0, seq_before, t->resolved_seq.empty() ? 0 : t->resolved_seq[0],
         image && image->texture ? uint32_t(image->texture->GetDesc().Format) : 0,
         image ? image->width : 0, image ? image->height : 0);

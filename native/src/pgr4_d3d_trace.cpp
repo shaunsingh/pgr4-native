@@ -42,7 +42,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -173,7 +172,7 @@ void NoteFrameBegin() {
 }
 
 constexpr uint32_t kRegCount = pgr4::native::kGuestRegisterCount;
-constexpr uint32_t kDevPush = 48;  // last written dword; the limit is at device+56
+namespace dev = pgr4::native::dev;
 // First register of each constant kind in SET_CONSTANT and LOAD_ALU_CONSTANT: ALU (float),
 // fetch, bool, loop, register.
 constexpr uint32_t kConstantBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
@@ -736,7 +735,7 @@ void Feed(Tap& t, uint8_t* base, uint32_t dw) {
 // so the dwords up to the new pointer (reserved patch space, the unwritten segment start) were
 // not written in this lap and are skipped.
 void Sync(Tap& t, uint8_t* base, bool segment_switch_expected, bool jump = false) {
-  uint32_t cur = Load32(base, t.device + kDevPush);
+  uint32_t cur = Load32(base, t.device + dev::kPush);
   if (cur == t.cursor) return;
   if (cur > t.cursor && cur - t.cursor <= (16u << 20) && !jump) {
     // Each window starts at a packet boundary: the D3D completes its packets before it calls
@@ -870,7 +869,7 @@ void PollControl(Tap& t, uint8_t* base) {
     } else if (cmd == "tap") {
       bool on = arg != "off";
       if (on && !t.enabled && t.device) {  // resume at the current push position
-        t.cursor = Load32(base, t.device + kDevPush);
+        t.cursor = Load32(base, t.device + dev::kPush);
         t.in_packet = false;
       }
       t.enabled = on;
@@ -987,7 +986,7 @@ inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
         REXLOG_INFO("PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it", kFns[kId].name,
                     r3, t.device);
       t.device = r3;
-      t.cursor = Load32(base, t.device + kDevPush);
+      t.cursor = Load32(base, t.device + dev::kPush);
       t.in_packet = false;
     }
   }
@@ -997,7 +996,7 @@ inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
       run(ctx, base);
       std::lock_guard lock(t.mutex);
       t.device = Load32(base, out);
-      t.cursor = t.device ? Load32(base, t.device + kDevPush) : 0;
+      t.cursor = t.device ? Load32(base, t.device + dev::kPush) : 0;
       t.enabled = REXCVAR_GET(pgr4_d3d_tap);
       t.check = t.enabled && REXCVAR_GET(pgr4_d3d_tap_check);
       g_hook_all.store(t.enabled || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);

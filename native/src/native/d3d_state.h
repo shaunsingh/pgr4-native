@@ -32,8 +32,6 @@
 
 namespace pgr4::native {
 
-using DrawArgs = HookArgs;
-
 constexpr uint32_t kGuestRegisterCount = 0x5000;
 
 // Device layout (byte offsets from the guest D3D device pointer).
@@ -47,6 +45,7 @@ constexpr uint32_t kBoolLoop = 10112;       // 0x4900, 40 dwords
 constexpr uint32_t kClipPlanes = 10272;     // 0x2388, 6 x 4 dwords
 constexpr uint32_t kScissorTL = 10436;      // window scissor x0 | y0 << 16 (15-bit signed)
 constexpr uint32_t kScissorBR = 10440;      // x1 | y1 << 16
+constexpr uint32_t kVertexStride = 11824;   // u8: BeginVertices' vertex stride in dwords
 constexpr uint32_t kIndexBuffer = 12428;    // guest D3D index buffer object
 constexpr uint32_t kPixelShader = 12684;    // guest D3D pixel shader object
 constexpr uint32_t kVertexShader = 12688;   // guest D3D vertex shader object
@@ -55,7 +54,7 @@ constexpr uint32_t kVertexShader = 12688;   // guest D3D vertex shader object
 // Captured by the hook dispatch at the entry of a flushing call, before the guest code runs.
 struct CallEntry {
   uint64_t dirty[6];             // device+0..+40, host order
-  uint8_t vertex_stride_dwords;  // device+11824 (BeginVertices rebinds the VS when it changes)
+  uint8_t vertex_stride_dwords;  // dev::kVertexStride (BeginVertices rebinds the VS on a change)
 };
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device);
 
@@ -190,7 +189,7 @@ class GuestStateTracker {
   // r5 vertex shader object, r10 variant). The copy is taken over by the draw that made it.
   void AfterImmediateVs(const uint8_t* base, const uint32_t r[8]);
   // State of the draw `args` describes; call after AfterCall for that draw (OnDraw).
-  bool ReadDrawState(const uint8_t* base, uint32_t device, const DrawArgs& args, DrawState* out);
+  bool ReadDrawState(const uint8_t* base, uint32_t device, const HookArgs& args, DrawState* out);
   const uint32_t* regs() const { return regs_; }
   uint32_t device() const { return device_; }
   // Shaders bound at the last draw (the IM_LOAD address the D3D uses for them).

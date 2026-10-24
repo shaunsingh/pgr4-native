@@ -459,8 +459,7 @@ void CheckAgainstShadow(const uint8_t* base, uint32_t device, const ResolveParam
   if (logged++ < 16)
     REXLOG_WARN(
         "PGR4 native resolve: decode vs D3D shadow: dest {:08X}/{:08X} pitch {:08X} (decoded "
-        "{}x{}, "
-        "rect {},{}-{},{} point {},{})",
+        "{}x{}, rect {},{}-{},{} point {},{})",
         dest, p.dest_base, pitch, p.dest_width, p.dest_height, p.x0, p.y0, p.x1, p.y1, p.dest_x,
         p.dest_y);
 }
@@ -1152,21 +1151,21 @@ void Resolver::DumpBeginFrame(uint64_t completed_fence) {
         std::fclose(f);
       }
       if (meta)
-        std::fprintf(
-            meta,
-            "{\"index\":%zu,\"source\":%u,\"surface_info\":%u,\"source_info\":%u,\"sample_select\":"
-            "%u,"
-            "\"copy_command\":%u,\"rect\":[%d,%d,%d,%d],\"dest_point\":[%d,%d],\"dest_base\":%u,"
-            "\"dest_format\":%u,\"dest_width\":%u,\"dest_height\":%u,\"endian\":%u,\"number\":%u,"
-            "\"swap\":%d,\"exp_bias\":%d,\"tiled\":%d,\"pitch_blocks\":%u,\"extent_bytes\":%u,"
-            "\"bpp\":%u,\"native_width\":%u,\"native_height\":%u,\"clear_flags\":%u,"
-            "\"copy_control\":%u,\"dest_info\":%u}\n",
-            i, p.source, p.regs.surface_info,
-            p.source == 4 ? p.regs.depth_info : p.regs.color_info[p.source & 3], p.sample_select,
-            p.copy_command, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y, p.dest_base, p.dest_format,
-            p.dest_width, p.dest_height, p.dest_endian, p.dest_number, p.dest_swap ? 1 : 0,
-            p.exp_bias, p.dest_tiled ? 1 : 0, p.dest_pitch_blocks, p.dest_extent_bytes, e.bpp,
-            e.width, e.height, p.clear_flags, CopyControlOf(p), DestInfoOf(p));
+        std::fprintf(meta,
+                     "{\"index\":%zu,\"source\":%u,\"surface_info\":%u,\"source_info\":%u,"
+                     "\"sample_select\":%u,\"copy_command\":%u,\"rect\":[%d,%d,%d,%d],"
+                     "\"dest_point\":[%d,%d],\"dest_base\":%u,\"dest_format\":%u,\"dest_width\":%u,"
+                     "\"dest_height\":%u,\"endian\":%u,\"number\":%u,\"swap\":%d,\"exp_bias\":%d,"
+                     "\"tiled\":%d,\"pitch_blocks\":%u,\"extent_bytes\":%u,\"bpp\":%u,"
+                     "\"native_width\":%u,\"native_height\":%u,\"clear_flags\":%u,"
+                     "\"copy_control\":%u,\"dest_info\":%u}\n",
+                     i, p.source, p.regs.surface_info,
+                     p.source == 4 ? p.regs.depth_info : p.regs.color_info[p.source & 3],
+                     p.sample_select, p.copy_command, p.x0, p.y0, p.x1, p.y1, p.dest_x, p.dest_y,
+                     p.dest_base, p.dest_format, p.dest_width, p.dest_height, p.dest_endian,
+                     p.dest_number, p.dest_swap ? 1 : 0, p.exp_bias, p.dest_tiled ? 1 : 0,
+                     p.dest_pitch_blocks, p.dest_extent_bytes, e.bpp, e.width, e.height,
+                     p.clear_flags, CopyControlOf(p), DestInfoOf(p));
     }
     if (meta) std::fclose(meta);
     REXLOG_INFO("PGR4 native resolve: dumped {} resolves (native + guest) of frame {} to {}",
@@ -1538,8 +1537,7 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       else
         REXLOG_ERROR(
             "PGR4 native resolve selftest: FAIL {} {}: {} of {} texels wrong, first at ({}, {}) = "
-            "{:08X} "
-            "{:08X}, expected {:08X} {:08X}, r32f {} (expected {}){}",
+            "{:08X} {:08X}, expected {:08X} {:08X}, r32f {} (expected {}){}",
             mode_name, c.name, bad, w * h, first_x, first_y, first_bad[0], first_bad[1],
             c.expect[0], c.expect[1], r32f_seen, c.expect_r32f, img ? "" : ", resolve failed");
     }

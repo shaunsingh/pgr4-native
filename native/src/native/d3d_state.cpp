@@ -233,7 +233,7 @@ void GuestStateTracker::LoadLiterals(const uint8_t* base, uint32_t table, uint32
 CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device) {
   CallEntry e;
   for (uint32_t i = 0; i < 6; ++i) e.dirty[i] = Load64(base, device + dev::kDirtyMasks + i * 8);
-  e.vertex_stride_dwords = *HostPtr(base, device + 11824);
+  e.vertex_stride_dwords = *HostPtr(base, device + dev::kVertexStride);
   return e;
 }
 
@@ -328,9 +328,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     Put(0x2082, ((field(br >> 16) << 16) & 0x3FFF0000u) | (field(br) & 0x3FFFu));
   }
 
-  const bool draw = fn_addr == guest_fn::kBeginVertices || fn_addr == guest_fn::kDrawVertices ||
-                    fn_addr == guest_fn::kDrawIndexed || fn_addr == guest_fn::k10A8;
-  if (draw) {
+  if (game_draw || fn_addr == guest_fn::k10A8) {
     // Bound shaders and the literal constants sub_826DEDC8 loads when they are rebound (after
     // the constant flush, so they win over the shadow). That load, under the mask +16 bits
     // 17..20, is the only place the D3D changes which ucode the GPU runs and patches a variant
@@ -428,7 +426,7 @@ void GuestStateTracker::AfterImmediateVs(const uint8_t* base, const uint32_t r[8
   vs_imm_pending_valid_ = true;
 }
 
-bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, const DrawArgs& a,
+bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, const HookArgs& a,
                                       DrawState* s) {
   if (!device || device != device_) return false;
   *s = DrawState{};

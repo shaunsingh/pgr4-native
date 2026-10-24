@@ -566,8 +566,7 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
       if (log_shape++ < 4)
         REXLOG_INFO(
             "PGR4 native RT: EDRAM fill at tile {} pitch {} ({}x{} dwords x rows) does not map "
-            "onto base {} "
-            "pitch {}",
+            "onto base {} pitch {}",
             f.base, f.pitch, f.x1 - f.x0, f.y1 - f.y0, g.base, g.pitch);
       continue;
     }
@@ -585,8 +584,8 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
     if (f.format != format) {
       if (log_format++ < 4)
         REXLOG_INFO(
-            "PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at base "
-            "{}",
+            "PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at "
+            "base {}",
             f.format, f.base, format, g.base);
       continue;
     }
@@ -595,16 +594,14 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
     if (log_)
       std::fprintf(log_,
                    "edram fill seq %llu at tile %u pitch %u color %g,%g,%g,%g applied to base %u "
-                   "pitch %u x%u "
-                   "rows %ld-%ld (%u rects)\n",
+                   "pitch %u x%u rows %ld-%ld (%u rects)\n",
                    (unsigned long long)f.seq, f.base, f.pitch, f.color[0], f.color[1], f.color[2],
                    f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom,
                    nr);
     if (log_applied++ < 4)
       REXLOG_INFO(
           "PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} pitch {} "
-          "x{} rows "
-          "{}-{}",
+          "x{} rows {}-{}",
           f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top,
           rects[nr - 1].bottom);
   }

@@ -255,6 +255,7 @@ class TextureCache {
   bool capture_order_ = true;
   static constexpr uint32_t kStaleLogLimit = 96;  // log lines about stale textures
   uint32_t stale_logged_ = 0;
+  uint32_t trace_address_ = 0;  // --pgr4_native_texture_trace (0: none)
 
   std::vector<Slot> slots_;  // owns the textures
   std::vector<uint32_t> free_slots_;

@@ -463,7 +463,9 @@ xenos::ClampMode NormalizeClampMode(xenos::ClampMode m) {
   return m;
 }
 
-SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBinding& binding) {
+// `min_aniso`: --pgr4_native_anisotropy (DrawRenderer::Impl::min_aniso).
+SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBinding& binding,
+                         xenos::AnisoFilter min_aniso) {
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
   SamplerKey k{};
   xenos::ClampMode cx, cy, cz;
@@ -491,13 +493,11 @@ SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBind
   auto aniso = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst ? fetch.aniso_filter
                                                                           : binding.aniso_filter;
   aniso = std::min(aniso, xenos::AnisoFilter::kMax_16_1);
-  // Linearly filtered textures with mips get at least the configured anisotropy; render
-  // targets, lookup tables and other point-sampled or single-level textures keep the game's
-  // filtering. kMax_N_1 is log2(N) + 1.
-  if (const uint32_t samples = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_anisotropy), 1, 16));
-      samples > 1 && mag == xenos::TextureFilter::kLinear && min == xenos::TextureFilter::kLinear &&
+  // Linearly filtered textures with mips get at least `min_aniso`; render targets, lookup
+  // tables and other point-sampled or single-level textures keep the game's filtering.
+  if (mag == xenos::TextureFilter::kLinear && min == xenos::TextureFilter::kLinear &&
       mip != xenos::TextureFilter::kBaseMap && mip_max_level > mip_min_level)
-    aniso = std::max(aniso, xenos::AnisoFilter(std::bit_width(samples)));
+    aniso = std::max(aniso, min_aniso);
   k.aniso = uint32_t(aniso);
   if (aniso != xenos::AnisoFilter::kDisabled) {
     k.mag_linear = k.min_linear = k.mip_linear = 1;
@@ -775,6 +775,7 @@ struct DrawRenderer::Impl {
   static constexpr uint32_t kSamplerMemoBits = 10;
   std::unique_ptr<SamplerMemo[]> sampler_memo =
       std::make_unique<SamplerMemo[]>(size_t(1) << kSamplerMemoBits);
+  xenos::AnisoFilter min_aniso = xenos::AnisoFilter::kDisabled;  // --pgr4_native_anisotropy
   // Fetch constants a shader reads (texture and sampler bindings), its descriptor table size and
   // its last BindMemo entry (checked before hashing), direct-mapped by shader.
   struct BindMemo;
@@ -960,14 +961,23 @@ struct DrawRenderer::Impl {
   CachedCbv cb_system, cb_float_vs, cb_float_ps, cb_bool_loop, cb_fetch, cb_desc_vs, cb_desc_ps;
 
   // Oracle toggles from <capture dir>\draw-debug.txt (with --pgr4_native_capture_dir)
-  // ("<mask> [max_draws] [skip_from] [skip_to] [shader hash]..."), read every 15 frames:
-  // 1 depth/stencil off, 2 culling off, 4 blending off, 8 alpha test off, 16 log the next frame's
-  // draws, 32 upload every draw, 64 polygon offset off, 128 issue only the draws the hashes
-  // select, 256 snapshots (below). max_draws > 0 issues only the first N draws of a frame;
-  // draws whose vertex or pixel shader ucode hash is listed are skipped (selected with 128).
-  // Hashes stay stable across frames where draw indices do not.
+  // ("<mask> [max_draws] [skip_from] [skip_to] [shader hash]..."), read every 15 frames.
+  // max_draws > 0 issues only the first N draws of a frame; draws whose vertex or pixel shader
+  // ucode hash is listed are skipped (selected with kDebugOnlyListed). Hashes stay stable across
+  // frames where draw indices do not.
+  enum DebugBit : uint32_t {
+    kDebugNoDepth = 1,  // depth and stencil off
+    kDebugNoCull = 2,
+    kDebugNoBlend = 4,
+    kDebugNoAlphaTest = 8,
+    kDebugLogDraws = 16,  // log the next frames' draws
+    kDebugUploadEveryDraw = 32,
+    kDebugNoDepthBias = 64,
+    kDebugOnlyListed = 128,  // issue only the draws the hashes select
+    kDebugSnapshots = 256,   // snap_pending (below)
+  };
   uint32_t debug_mask = 0, debug_max_draws = 0, frame_draws = 0, debug_poll = 0;
-  std::atomic<bool> upload_every_draw{false};  // debug_mask & 32, for RequestRange's thread
+  std::atomic<bool> upload_every_draw{false};  // kDebugUploadEveryDraw, for RequestRange's thread
   uint32_t debug_skip_from = 0, debug_skip_to = 0;
   std::string debug_path;  // empty without --pgr4_native_capture_dir: not polled
   std::array<uint64_t, 8> debug_hashes{};
@@ -1259,6 +1269,9 @@ bool DrawRenderer::Impl::Initialize() {
   membase = memory->physical_membase();
   vertex_upload.SetDevice(device);
   threaded = REXCVAR_GET(pgr4_native_render_thread);
+  // kMax_N_1 is log2(N) + 1.
+  if (const int32_t samples = std::clamp(REXCVAR_GET(pgr4_native_anisotropy), 1, 16); samples > 1)
+    min_aniso = xenos::AnisoFilter(std::bit_width(uint32_t(samples)));
   if (const std::string dir = REXCVAR_GET(pgr4_native_capture_dir); !dir.empty())
     debug_path = (std::filesystem::path(dir) / "draw-debug.txt").string();
   constant_upload.SetDevice(device);
@@ -2680,15 +2693,15 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     }
     if (key.num_rts || key.dsv != DXGI_FORMAT_UNKNOWN) key.samples = uint8_t(targets.samples);
   }
-  if (debug_mask & 1) {
+  if (debug_mask & kDebugNoDepth) {
     key.depth_enable = key.depth_write = key.stencil_enable = 0;
     key.dsv = DXGI_FORMAT_UNKNOWN;
     if (!key.num_rts) key.samples = 1;
   }
-  if (debug_mask & 2) key.cull = uint8_t(D3D12_CULL_MODE_NONE);
-  if (debug_mask & 4)
+  if (debug_mask & kDebugNoCull) key.cull = uint8_t(D3D12_CULL_MODE_NONE);
+  if (debug_mask & kDebugNoBlend)
     for (auto& rt : key.rt) rt.blend = 0;
-  if (debug_mask & 64) {
+  if (debug_mask & kDebugNoDepthBias) {
     key.depth_bias = 0;
     key.slope_scaled_depth_bias = 0;
   }
@@ -2701,10 +2714,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     uint32_t listed = 0;
     for (uint32_t i = 0; i < debug_hash_count; ++i)
       if (debug_hashes[i] == vs_hash || (ps && debug_hashes[i] == ps_hash)) listed |= 1u << i;
-    if (debug_mask & 256)
+    if (debug_mask & kDebugSnapshots)
       snap_now = listed & snap_pending;
     else
-      debug_skip |= bool(listed) != bool(debug_mask & 128);
+      debug_skip |= bool(listed) != bool(debug_mask & kDebugOnlyListed);
   } else if ((snap_pending >> 31) && draw_index == debug_skip_from) {
     snap_now = 1u << 31;
   }
@@ -3017,7 +3030,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0) {
         index = m.index;
       } else {
-        index = SamplerDescriptor(GetSamplerKey(regs, sb));
+        index = SamplerDescriptor(GetSamplerKey(regs, sb, min_aniso));
         std::memcpy(m.filters, filters, 4);
         std::memcpy(m.fetch, fetch, sizeof(m.fetch));
         m.index = index;
@@ -3065,13 +3078,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     // scale oDepth into the plugin's host 0...0.5 float24 range, while viewports, clears and
     // resolves here keep D24FS8 in 0...1 (HostViewportInfo). Setting it halves the depth that
     // depth-restoring passes write.
-    xenos::CompareFunction alpha_func =
-        colorcontrol.alpha_test_enable ? colorcontrol.alpha_func : xenos::CompareFunction::kAlways;
+    const xenos::CompareFunction alpha_func =
+        colorcontrol.alpha_test_enable && !(debug_mask & kDebugNoAlphaTest)
+            ? colorcontrol.alpha_func
+            : xenos::CompareFunction::kAlways;
     flags |= uint32_t(alpha_func) << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
     // Gamma render targets are unorm16 on the host (the plugin's setting): no conversion flag.
-    if (debug_mask & 8)
-      flags &= ~(7u << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift),
-          flags |= 7u << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
     sys.flags = flags;
     sys.tessellation_factor_range_min = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
     sys.tessellation_factor_range_max = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
@@ -3520,9 +3532,8 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     auto per = [&](uint64_t v) { return double(v) / n; };
     REXLOG_INFO(
         "PGR4 native draw diag: {} draws/frame; per draw: shader loads {:.3f} ({:.3f} immediate), "
-        "mods hits {:.3f}, "
-        "translation hits {:.3f}, pso hits {:.3f}, ranges {:.3f} (pages {:.1f}, copied runs "
-        "{:.3f}), unwatched copies {:.3f}, copy flushes {:.3f}",
+        "mods hits {:.3f}, translation hits {:.3f}, pso hits {:.3f}, ranges {:.3f} (pages "
+        "{:.1f}, copied runs {:.3f}), unwatched copies {:.3f}, copy flushes {:.3f}",
         d.draws / d.frames, per(d.shader_loads), per(d.shader_loads_immediate), per(d.mods_hits),
         per(d.translation_hits), per(d.pso_hits), per(d.ranges), per(d.range_pages),
         per(d.range_runs), per(d.unwatched), per(d.flushes));
@@ -3560,13 +3571,15 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
                   mask, max_draws, skip_from, skip_to, hash_count);
     impl_->debug_hashes = hashes;
     impl_->debug_hash_count = hash_count;
-    // Bit 16: log the next frames' draws once (to <capture dir>\draws-f<frame>.txt).
-    if ((mask & 16) && !(impl_->debug_mask & 16))
+    // Set, not held: the next frames' draws are logged once (to <capture dir>\draws-f<frame>.txt)
+    // and the snapshots taken once.
+    const auto set = [&](uint32_t bit) { return (mask & bit) && !(impl_->debug_mask & bit); };
+    if (set(Impl::kDebugLogDraws))
       impl_->draw_log_left = uint32_t(std::max(REXCVAR_GET(pgr4_native_draw_log_frames), 1));
-    if ((mask & 256) && !(impl_->debug_mask & 256))
+    if (set(Impl::kDebugSnapshots))
       impl_->snap_pending = hash_count ? (1u << hash_count) - 1 : 1u << 31;
     impl_->debug_mask = mask;
-    impl_->upload_every_draw.store(mask & 32, std::memory_order_relaxed);
+    impl_->upload_every_draw.store(mask & Impl::kDebugUploadEveryDraw, std::memory_order_relaxed);
     impl_->debug_max_draws = max_draws;
     impl_->debug_skip_from = skip_from;
     impl_->debug_skip_to = skip_to;
