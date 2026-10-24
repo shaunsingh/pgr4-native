@@ -678,6 +678,14 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   player's own. `build.sh --update` (`build.ps1 -Update`) names the folder that holds them,
   and the build checks them against `title-update/game-files.sha256`, the update the code is
   generated for. The files stay in the repository's history.
+- A release package (`native/tools/package_release.py`): the program, its settings
+  (`native/release/pgr4_recompiled.toml`), a player README and the licenses, from an explicit
+  file list, refusing anything else and an instrumented build. With no path flags the runtime
+  now takes `game/` and `userdata/` beside the executable, so the package runs as it is from a
+  Steam shortcut. The settings leave the guest vblank at 60 Hz: the pacer paces on the display.
+  `deck-run.sh --mode release` runs an unpacked package as a player starts it. td-186: the
+  package found `game/` and created its save in `userdata/`. td-188: race 89.4 fps, 1 % low
+  66.1, 0.1 % low 56.9, p99 frame 14.16 ms.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -882,6 +890,9 @@ repository contains no game data, and the recompiled C++ that the build generate
 
 Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` with
 `proton run` and the game flags that `run.ps1` passes.
+
+A release ZIP for players comes from `native/tools/package_release.py --version <tag>` after
+a build; its `README.md` (`native/release/README.md`) says where the game files go.
 
 ## Flags
 
