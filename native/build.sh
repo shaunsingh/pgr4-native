@@ -397,12 +397,14 @@ install_stage() {
   local files=("$tree/out/pgr4/pgr4_recompiled.exe" "$sdk/bin/rexruntime.dll" "$sdk/bin/rexgpu-xenos.dll")
   need "${files[@]}"
   mkdir -p "$runtime/title-update"
-  cp -f "${files[@]}" "$runtime/"
+  # New files, not rewritten ones: a running game keeps the image it mapped, and a perf run's
+  # hard links (deck-run.sh --perf) keep the modules it sampled.
+  cp --remove-destination "${files[@]}" "$runtime/"
   cp -f "$title_update/default.xexp" "$title_update/Pgr4TitleUpdate.bin" "$runtime/title-update/"
   # Their linker maps, for deck-run.sh --perf (perf_symbols.py).
   local map
   for map in "$tree/out/pgr4/pgr4_recompiled.map" "$sdk_src"/out/win-amd64/{rexruntime,rexgpu-xenos}.map; do
-    [[ -f $map ]] && cp -f "$map" "$runtime/"
+    [[ -f $map ]] && cp --remove-destination "$map" "$runtime/"
   done
   ls -l "$runtime"
 }

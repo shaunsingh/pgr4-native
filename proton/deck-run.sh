@@ -41,7 +41,8 @@
 # so with an external monitor attached the game still shows on the panel at the panel's refresh.
 # --perf N samples the game's user-space CPU time with perf for N seconds from the race mark and
 # prints its hottest functions per thread (native/tools/perf_symbols.py, with the .map files of
-# the runtime); sampling costs some speed, so such a run's frame rate is not a measurement.
+# the runtime, linked with the modules into <log>-perf-modules/ for later analysis); sampling
+# costs some speed, so such a run's frame rate is not a measurement.
 # --pmu (with --perf) counts the front end over the same seconds, per thread: instructions per
 # cycle, fetch stalls, instruction cache fills and iTLB misses (pmu_summary.py).
 # --catch keeps the last 5 s of frames shown in memory and writes the frames around each
@@ -375,8 +376,13 @@ race_epoch=$(date -d "$race_iso" +%s)
 race_hms=${race_iso:11:8}
 if (( perf_secs > 0 )); then
   pid=$(game_pid)
-  # The PE modules' load addresses, for perf_symbols.py.
+  # The PE modules' load addresses, and the modules with their linker maps as they were sampled
+  # (hard links: the next build installs new files), for perf_symbols.py and disassembly.
   cp "/proc/$pid/maps" "$base-perf.maps"
+  mkdir -p "$base-perf-modules"
+  for module in "$runtime"/*.exe "$runtime"/*.dll "$runtime"/*.map; do
+    ln -f "$module" "$base-perf-modules/" 2>/dev/null || cp "$module" "$base-perf-modules/"
+  done
   perf record -q -e cycles:u -F 999 -p "$pid" -o "$base-perf.data" -- sleep "$perf_secs" \
     > "$base-perf.out" 2>&1 &
   perfrec=$!
@@ -405,7 +411,7 @@ echo "alive at end: $alive $(date +%T)"
 kill "$sampler" 2>/dev/null || true; wait "$sampler" 2>/dev/null || true; sampler=""
 if [[ -n ${perfrec:-} ]]; then
   wait "$perfrec" 2>/dev/null || true; perfrec=""
-  shopt -s nullglob; module_maps=("$runtime"/*.map); shopt -u nullglob
+  shopt -s nullglob; module_maps=("$base-perf-modules"/*.map); shopt -u nullglob
   if (( ${#module_maps[@]} )); then
     python3 "$repo/native/tools/perf_symbols.py" "$base-perf.data" "$base-perf.maps" "${module_maps[@]}" \
       > "$base-perf.txt" 2>&1 || true
