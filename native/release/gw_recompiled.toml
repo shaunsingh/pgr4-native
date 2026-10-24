@@ -6,5 +6,9 @@ window_width = 1280
 window_height = 800
 fullscreen = true
 
+# Geometry Wars draws through ReXGlue's Xenos plugin (the SDK loads none by default).
+gpu_plugin = "xenos"
+d3d12_present_vsync = true
+
 # Errors only, in logs/ beside the executable ("warn" or "info" for a bug report).
 log_level = "error"

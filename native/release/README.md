@@ -54,9 +54,10 @@ Run `pgr4_recompiled.exe`. It needs a GPU with Direct3D 12. Set `window_width` a
 `pgr4_recompiled.toml` beside the executable holds the settings, one per line. A flag on the
 command line overrides it: in Steam's launch options, `%command% --fullscreen=false` for one.
 
-## Not included
+## Geometry Wars
 
-- The Geometry Wars arcade cabinet in the garage.
+The arcade cabinet in the garage starts `gw_recompiled.exe`, which must stay beside
+`pgr4_recompiled.exe`. Its settings are in `gw_recompiled.toml`.
 
 ## Licenses
 
