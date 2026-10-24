@@ -115,19 +115,21 @@ reuse buffers sooner than on real hardware. The renderer therefore:
 
 | File | Owns |
 |---|---|
-| `renderer.h/.cpp` | `NativeRenderer`: start-up, cvars, the On* entry points, the render thread and command queue, frame CSV and the periodic log line |
+| `renderer.h/.cpp` | `NativeRenderer`: start-up, cvars, the On* entry points, the render thread and command queue, frame CSV and the periodic log line; `Fail` hands a failed run to the Xenos plugin |
+| `hook_args.h` | `HookFn` (the hooked guest D3D functions), `HookArgs` (their PPC arguments), `TilingCall` |
 | `d3d12_device.h/.cpp` | Own D3D12 queue, fence, 2 frames in flight, 3 back buffers, the debug window or the child swapchain over the game window, `EndFrame` (close, execute, Present, signal) |
 | `d3d_state.h/.cpp` | `GuestStateTracker` (register file, change tracking), `ReadDrawState`, device offsets of the guest D3D |
 | `draw.h/.cpp` | `DrawRenderer`: shader selection, pipeline key and cache, textures and samplers (bindless), system/float/bool/fetch constants, vertex/index upload, fixed-function state, the draw call; `Prepare` for the capture step |
 | `shader_cache`, `shader_translate`, `shader_xlate.cmake` | Ucode → `DxbcShader` keyed by XXH3 of the guest ucode; `Translate` per `ShaderModifications` with ReXGlue's DXBC translator (BSD port) |
 | `geometry_shader` | Generated GS for points, rectangle lists and quads (Xenia's primitive processor port) |
 | `render_targets` | Host render targets for the guest's EDRAM surfaces (`Bind`), clears (`DecodeClear`/`Clear`) |
-| `resolve` | Guest Resolve → host images keyed by destination address (compute resolve, depth to R32F), `Find`, change callback, dumps and the self-test |
+| `resolve` | Guest Resolve → host images keyed by destination address (compute resolve, depth to R32F), `Find`, change callback; `resolve_debug.cpp`: oracle dumps and the self-test |
 | `textures`, `texture_layout` | `TextureCache` (fetch constant → host texture), CPU untiling and format conversion, page watches, resolved-image copies, untile workers, placed texture heaps |
 | `upload_pool.h` | Persistently mapped upload blocks, linear sub-allocation, recycling by fence, `Reserve`, CPU-cached variant |
 | `pipeline_store` | Persistent pipeline list (`pipelines.bin`) and prewarm |
-| `present` | Front buffer → window blit (aspect-fit, linear), captures for the oracle |
+| `present` | Front buffer → window blit (aspect-fit, linear), captures for the oracle; `present_debug`: PNG writer, glitch catcher, luma probe |
 | `profile.h` | RDTSC stage timers and per-frame counters (`--pgr4_native_profile`) |
+| `log.h` | Bounded warnings (`PGR4_LOG_FIRST`): a call site logs its first N times in the process |
 
 ## Caches and memos, with what invalidates each
 
@@ -142,15 +144,15 @@ unless noted.
 | Ready-pipeline cache | key hash after depth-bias zeroing | pipeline ready | draw.cpp, 99 % hits, in front of `GetPipeline` |
 | Pipelines | XXH3 of `PipelineKey` | never removed; `kCompiling`/`kReady`/`kFailed` | draw.cpp, async on `PGR4 native pipelines` |
 | RT lookup memo | surface registers | equal | render_targets.cpp (16 entries) |
-| `TextureCache::Get` memo | the 6 fetch dwords (1,024 entries, hashed) | `Unchanged(texture)`: not dirty (guest write) and no pending resolve | textures.cpp |
-| `BindMemo` | (shader, the fetch constants it reads), 2-way set-associative, 2^11 sets, plus each shader's last entry checked first (87 % of hits) | `change_epoch` equal, or every bound texture `Unchanged`; shaders with a missing texture or more than the slot limit are not memoized | draw.cpp `bind_textures` |
+| `TextureCache::Get` memo | the 6 fetch dwords (1,024 entries, hashed) | not dirty (guest write), no pending resolve, and the slot generation it was filled with (eviction and alias changes bump it) | textures.cpp |
+| `BindMemo` | (shader, the fetch constants it reads), 2-way set-associative, 2^11 sets, plus each shader's last entry checked first (87 % of hits) | `change_epoch` equal, or every bound texture `Unchanged`; shaders with a missing texture or more than the slot limit are not memoized | draw.cpp `BindTextures` |
 | SRV memo | texture resource (not the fetch slot) | resource + view desc equal | draw.cpp |
 | Sampler memo | hashed table of (fetch dwords, filter overrides) | equal | draw.cpp |
 | `CachedCbv` (b0-b4) | each constant buffer's current bytes, kept in the CPU's copy (`last`); uploads are streaming stores the CPU never reads back | bytes equal | draw.cpp |
 | Valid-page bitmap | 4 KB guest pages mirrored into the shared-memory buffer | cleared by the page-watch callback on a guest write | draw.cpp (`RequestRange`) |
 | Resolve targets | every subresource address `CopyResolved` looks up → textures there | `OnResolved(address)` marks those textures `resolve_pending` and bumps `change_epoch` | textures.cpp |
-| Pipeline library | hash of description + bytecode | the driver accepts the library; otherwise it is rebuilt | `<cache_root>\pgr4-native\pipelines.d3d12lib` |
-| Pipeline list | key (shader pointers replaced by ucode hash + modification) + shader ucode | header matches `sizeof(PipelineKey)` and `kPipelineKeyVersion` (2) | `<cache_root>\pgr4-native\pipelines.bin` |
+| Pipeline library | hash of the root signature, the description and the bytecode | the driver accepts the library; otherwise it is rebuilt | `<cache_root>\pgr4-native\pipelines.d3d12lib` |
+| Pipeline list | key (shader pointers replaced by ucode hash + modification) + shader ucode | header matches `sizeof(PipelineKey)` and `kPipelineKeyVersion` (3) | `<cache_root>\pgr4-native\pipelines.bin` |
 
 `change_epoch` (textures.h) goes up on every guest write that marks a texture dirty, every
 resolve into a texture, every upload and every creation. The fault thread increments it after

@@ -14,10 +14,13 @@
 #define REXLOG_INFO(...) TEXLOG("info", __VA_ARGS__)
 #define REXLOG_WARN(...) TEXLOG("warn", __VA_ARGS__)
 #define REXLOG_ERROR(...) TEXLOG("error", __VA_ARGS__)
+#include "log.h"
 #else
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
+
+#include "log.h"
 
 REXCVAR_DEFINE_STRING(pgr4_native_texture_trace, "", "PGR4 native",
                       "Log every TextureCache::Get of the texture at this guest physical address "
@@ -34,9 +37,7 @@ REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_hard_mb, 1024, "PGR4 native",
 
 #include <algorithm>
 #include <charconv>
-#include <chrono>
 #include <cstring>
-#include <string>
 #include <string_view>
 
 namespace pgr4::native {
@@ -237,12 +238,12 @@ bool TextureCache::UploadsDone() {
 
 uint64_t TextureCache::RunUntile(const UntileJob& job, std::vector<uint8_t>* scratch) {
   const uint64_t t0 = NowNs();
-  UntileTexture(job.key, job.guest, job.footprints, job.dst, scratch);
+  UntileTexture(job.key, job.layout, job.guest, job.footprints, job.dst, scratch);
   const uint64_t ns = NowNs() - t0;
-  static std::atomic<uint32_t> slow_logged{0};
-  if (ns > 500000 && slow_logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+  if (ns > 500000) {
     const TextureKey& key = job.key;
-    REXLOG_INFO(
+    PGR4_LOG_FIRST(
+        40, INFO,
         "PGR4 native textures: slow upload #{} of {:08X} {}x{}x{} {} dim{} tiled{} endian{} "
         "mips{} packed{} conv{}: host {} B, guest base {} B mips {} B, untile {} us",
         job.upload_number, key.base_page << 12, key.width, key.height, key.depth_or_array_size,
@@ -251,6 +252,12 @@ uint64_t TextureCache::RunUntile(const UntileJob& job, std::vector<uint8_t>* scr
         uint32_t(job.conversion), job.size, job.base_bytes, job.mips_bytes, ns / 1000);
   }
   return ns;
+}
+
+bool TextureCache::ClampRange(uint32_t start, uint32_t length, uint32_t* end) {
+  if (!length || start >= kMemorySize) return false;
+  *end = start + std::min(length, kMemorySize - start);
+  return true;
 }
 
 void TextureCache::ArmWatch(uint32_t physical, uint32_t length) {
@@ -267,9 +274,8 @@ std::pair<uint32_t, uint32_t> TextureCache::InvalidationThunk(void* context, uin
 
 std::pair<uint32_t, uint32_t> TextureCache::Invalidate(uint32_t start, uint32_t length,
                                                        bool exact) {
-  constexpr uint32_t kMemorySize = kWatchBucketCount << kWatchBucketShift;
-  if (start >= kMemorySize || !length) return {start, length};
-  const uint32_t end = start + std::min(length, kMemorySize - start);
+  uint32_t end;
+  if (!ClampRange(start, length, &end)) return {start, length};
   uint32_t lo = start, hi = end;
   bool any = false;
   {
@@ -330,6 +336,29 @@ bool TextureCache::Clean(const Texture& t) {
   return !t.dirty.load(std::memory_order_acquire) && !t.resolve_pending;
 }
 
+void TextureCache::SetAlias(Texture& t, ID3D12Resource* alias) {
+  if (t.alias == alias) return;
+  t.alias = alias;
+  // Bindings of the texture memoized by other fetch constants (GetMemo, callers' memos through
+  // Unchanged) still name the previous resource.
+  ++slots_[t.slot].generation;
+  change_epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void TextureCache::ClearDirty(Texture& t) {
+  // Clear the flag, re-arm the page watches, then read: a write after the watch is armed marks
+  // the texture stale again, a write before it is already in the data the untile reads.
+  t.dirty.store(false, std::memory_order_release);
+  ArmWatch(t.key.base_page << 12, t.base_bytes);
+  ArmWatch(t.key.mip_page << 12, t.mips_bytes);
+}
+
+void TextureCache::ResetResolved(Texture& t) {
+  std::fill(t.resolved_seq.begin(), t.resolved_seq.end(), 0);
+  t.resolve_pending = true;
+  change_epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
 bool TextureCache::Unchanged(TextureHandle entry) const {
   const Slot& s = slots_[entry.slot];
   return s.generation == entry.generation && Clean(*s.texture);
@@ -356,9 +385,8 @@ void TextureCache::MarkUsed(Texture& t, uint64_t frame_fence) {
 }
 
 void TextureCache::WatchRange(Texture& t, uint32_t start, uint32_t length) {
-  constexpr uint32_t kMemorySize = kWatchBucketCount << kWatchBucketShift;
-  if (!length || start >= kMemorySize) return;
-  const uint32_t end = start + std::min(length, kMemorySize - start);
+  uint32_t end;
+  if (!ClampRange(start, length, &end)) return;
   std::lock_guard<std::mutex> lock(watch_mutex_);
   for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b)
     watch_buckets_[b].push_back({start, end, &t});
@@ -385,18 +413,16 @@ TextureCache::Texture* TextureCache::NewTexture(const TextureKey& key) {
 TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFormat& host) {
   Texture& t = *NewTexture(key);
   t.host = &host;
-  t.layout = texture_util::GetGuestTextureLayout(
-      key.dimension, key.pitch, key.width, key.height, key.depth_or_array_size, key.tiled,
-      key.format, key.packed_mips, key.base_page != 0, key.mip_max_level);
-  GetGuestExtents(key, &t.base_bytes, &t.mips_bytes);
+  t.layout = GetGuestLayout(key);
+  GetGuestExtents(key, t.layout, &t.base_bytes, &t.mips_bytes);
   t.resolved_seq.assign(size_t(key.mip_levels()) * key.array_size(), 0);
 
   const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
   bool unaligned = (key.width % info->block_width) || (key.height % info->block_height);
   if (host.block_compressed && unaligned && !unaligned_bc_supported_) {
-    REXLOG_WARN(
+    PGR4_WARN_ONCE(
         "PGR4 native textures: {}x{} {} needs decompression (no unaligned BC support); "
-        "not supported",
+        "not supported (logged once)",
         key.width, key.height, info->name);
     t.failed = true;
   } else {
@@ -412,8 +438,10 @@ TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFor
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     HRESULT hr = CreateTextureResource(desc, &t.resource, &t.placed, &t.bytes);
     if (FAILED(hr)) {
-      REXLOG_ERROR("PGR4 native textures: texture resource {}x{}x{} {} failed: {:08X}", key.width,
-                   key.height, key.depth_or_array_size, info->name, uint32_t(hr));
+      PGR4_LOG_FIRST(1, ERROR,
+                     "PGR4 native textures: texture resource {}x{}x{} {} failed: {:08X} (logged "
+                     "once)",
+                     key.width, key.height, key.depth_or_array_size, info->name, uint32_t(hr));
       t.failed = true;
     } else {
       resident_bytes_ += t.bytes;
@@ -429,9 +457,8 @@ TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFor
 }
 
 void TextureCache::UnwatchRange(Texture& t, uint32_t start, uint32_t length) {
-  constexpr uint32_t kMemorySize = kWatchBucketCount << kWatchBucketShift;
-  if (!length || start >= kMemorySize) return;
-  const uint32_t end = start + std::min(length, kMemorySize - start);
+  uint32_t end;
+  if (!ClampRange(start, length, &end)) return;
   std::lock_guard<std::mutex> lock(watch_mutex_);
   for (uint32_t b = start >> kWatchBucketShift; b <= (end - 1) >> kWatchBucketShift; ++b) {
     std::vector<Watch>& v = watch_buckets_[b];
@@ -493,6 +520,10 @@ void TextureCache::EvictOverBudget(uint64_t completed_fence) {
       m.texture = nullptr;
   }
   for (Texture* t : evict_batch_) Destroy(*t);
+  if (heap_failed_) {
+    heap_failed_ = false;
+    if (!spare_heap_.valid()) StartSpareHeap();
+  }
   stats_.evicted += evict_batch_.size();
   change_epoch_.fetch_add(1, std::memory_order_acq_rel);
   stats_.evict_ns += NowNs() - t0;
@@ -540,17 +571,15 @@ void TextureCache::FreePlaced(uint64_t offset, uint64_t size) {
 
 bool TextureCache::AddHeap() {
   if (!spare_heap_.valid()) StartSpareHeap();
-  const auto t0 = std::chrono::steady_clock::now();
+  const uint64_t t0 = NowNs();
   ComPtr<ID3D12Heap> heap = spare_heap_.get();
-  const double wait_ms =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  if (wait_ms >= 1.0)
-    REXLOG_INFO("PGR4 native textures: waited {:.1f} ms for texture heap {}", wait_ms,
+  const uint64_t wait_ns = NowNs() - t0;
+  if (wait_ns >= 1000000)
+    REXLOG_INFO("PGR4 native textures: waited {:.1f} ms for texture heap {}", wait_ns / 1e6,
                 heaps_.size() + 1);
   if (!heap) {
-    static bool logged = false;
-    if (!logged) REXLOG_WARN("PGR4 native textures: heap creation failed; committed textures");
-    logged = true;
+    heap_failed_ = true;
+    PGR4_WARN_ONCE("PGR4 native textures: heap creation failed; committed textures");
     return false;
   }
   AddFreeRange(heaps_.size() * kTextureHeapSize, kTextureHeapSize);
@@ -572,7 +601,7 @@ HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc, ComPtr<ID
   *bytes = info.SizeInBytes == UINT64_MAX ? 0 : info.SizeInBytes;
   if (info.SizeInBytes != UINT64_MAX && info.SizeInBytes <= kTextureHeapSize) {
     uint64_t offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
-    if (offset == kCommitted && AddHeap())
+    if (offset == kCommitted && !heap_failed_ && AddHeap())
       offset = AllocatePlaced(info.SizeInBytes, info.Alignment);
     if (offset != kCommitted) {
       if (SUCCEEDED(device_->CreatePlacedResource(heaps_[offset / kTextureHeapSize].Get(),
@@ -594,7 +623,7 @@ HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc, ComPtr<ID
 
 void TextureCache::StartSpareHeap() {
   spare_heap_ = std::async(std::launch::async, [device = device_, n = heaps_.size() + 1] {
-    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t t0 = NowNs();
     D3D12_HEAP_DESC hd = {};
     hd.SizeInBytes = kTextureHeapSize;
     hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -602,9 +631,8 @@ void TextureCache::StartSpareHeap() {
     hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
     ComPtr<ID3D12Heap> heap;
     if (FAILED(device->CreateHeap(&hd, IID_PPV_ARGS(&heap)))) return ComPtr<ID3D12Heap>();
-    REXLOG_INFO(
-        "PGR4 native textures: texture heap {} created in {:.1f} ms (background)", n,
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    REXLOG_INFO("PGR4 native textures: texture heap {} created in {:.1f} ms (background)", n,
+                (NowNs() - t0) / 1e6);
     return heap;
   });
 }
@@ -625,12 +653,8 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
     // The CopyResolved that follows overwrites every subresource in full (it copies even over
     // fresh guest data), so the untile and its copies would be dead work: 1280x720 RGBA8
     // resolve destinations took 1.6-3.4 ms of untile each.
-    t.dirty.store(false, std::memory_order_release);
-    if (t.base_bytes) ArmWatch(key.base_page << 12, t.base_bytes);
-    if (t.mips_bytes) ArmWatch(key.mip_page << 12, t.mips_bytes);
-    std::fill(t.resolved_seq.begin(), t.resolved_seq.end(), 0);
-    t.resolve_pending = true;
-    change_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    ClearDirty(t);
+    ResetResolved(t);
     profile::Count(profile::kUploadSkipped);
     return true;
   }
@@ -638,39 +662,8 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   if (!upload_.Allocate(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, frame_fence, &a))
     return false;
 
-  // Clear the flag, re-arm the page watches, then read: a write after the watch is armed marks
-  // the texture stale again, a write before it is already in the data the untile reads.
-  t.dirty.store(false, std::memory_order_release);
-  if (t.base_bytes) ArmWatch(key.base_page << 12, t.base_bytes);
-  if (t.mips_bytes) ArmWatch(key.mip_page << 12, t.mips_bytes);
-  UntileJob job;
-  job.key = key;
-  if (key.base_page) {
-    job.guest.base = membase_ + (key.base_page << 12);
-    job.guest.base_size = t.base_bytes;
-  }
-  if (key.mip_page) {
-    job.guest.mips = membase_ + (key.mip_page << 12);
-    job.guest.mips_size = t.mips_bytes;
-  }
-  job.footprints = footprints_;
-  job.dst = a.cpu;
-  job.size = size;
-  job.upload_number = ++t.uploads;
-  job.base_bytes = t.base_bytes;
-  job.mips_bytes = t.mips_bytes;
-  job.conversion = t.host->conversion;
-  if (workers_.empty()) {
-    stats_.untile_ns += RunUntile(job, &untile_scratch_);
-  } else {
-    {
-      std::lock_guard<std::mutex> lock(jobs_mutex_);
-      jobs_.push_back(std::move(job));
-      ++jobs_busy_;
-    }
-    jobs_cv_.notify_one();
-  }
-
+  ClearDirty(t);
+  // The copies read the upload memory only once the list is submitted, after FinishUploads.
   Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
   uint32_t bw = 1, bh = 1;
   if (t.host->block_compressed) {
@@ -694,10 +687,39 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
     src.PlacedFootprint.Footprint.RowPitch = s.row_pitch;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   }
-  std::fill(t.resolved_seq.begin(), t.resolved_seq.end(), 0);
-  t.resolve_pending = true;
-  t.alias = nullptr;  // the resource holds the newer data now
-  change_epoch_.fetch_add(1, std::memory_order_acq_rel);
+
+  UntileJob job;
+  job.key = key;
+  job.layout = t.layout;
+  if (key.base_page) {
+    job.guest.base = membase_ + (key.base_page << 12);
+    job.guest.base_size = t.base_bytes;
+  }
+  if (key.mip_page) {
+    job.guest.mips = membase_ + (key.mip_page << 12);
+    job.guest.mips_size = t.mips_bytes;
+  }
+  job.footprints = std::move(footprints_);
+  job.dst = a.cpu;
+  job.size = size;
+  job.upload_number = ++t.uploads;
+  job.base_bytes = t.base_bytes;
+  job.mips_bytes = t.mips_bytes;
+  job.conversion = t.host->conversion;
+  if (workers_.empty()) {
+    stats_.untile_ns += RunUntile(job, &untile_scratch_);
+    footprints_ = std::move(job.footprints);
+  } else {
+    {
+      std::lock_guard<std::mutex> lock(jobs_mutex_);
+      jobs_.push_back(std::move(job));
+      ++jobs_busy_;
+    }
+    jobs_cv_.notify_one();
+  }
+
+  SetAlias(t, nullptr);  // the resource holds the newer data now
+  ResetResolved(t);
   ++stats_.uploads;
   stats_.upload_bytes += size;
   return true;
@@ -747,7 +769,7 @@ bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
     if (source) {
       const D3D12_RESOURCE_DESC sd = source->GetDesc();
       if (sd.Width == key.width && sd.Height == key.height) {
-        t.alias = source;
+        SetAlias(t, source);
         t.resolved_seq[0] = image->seq;
         ++stats_.resolved_aliases;
         return true;
@@ -766,7 +788,7 @@ bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     ++stats_.resolved_copies;
-    t.alias = nullptr;
+    SetAlias(t, nullptr);
   }
   bool any = false;
   ForEachResolveAddress(key, t.layout, [&](size_t index, uint32_t address) {
@@ -808,7 +830,9 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   GetMemo& memo = get_memo_[hash >> (32 - kGetMemoBits)];
   const bool same_fetch =
       memo.texture && std::memcmp(memo.fetch, fetch_dwords, sizeof(memo.fetch)) == 0;
-  if (same_fetch && Clean(*memo.texture)) {
+  // The generation also changes when the texture's alias does, which Clean does not see.
+  if (same_fetch && Clean(*memo.texture) &&
+      memo.binding.entry.generation == slots_[memo.texture->slot].generation) {
     MarkUsed(*memo.texture, frame_fence);
     if (!memo.texture->alias) Transition(*memo.texture, list, kShaderRead);
     *out = memo.binding;
@@ -825,12 +849,16 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   } else {
     const HostFormat* host = GetHostFormat(key.format);
     if (!host) {
-      // Remember the key so the warning is logged once.
+      // Remembered so the key is not looked up again; the warning goes once per format.
       t = NewTexture(key);
       t->failed = true;
-      REXLOG_WARN("PGR4 native textures: unsupported format {} ({}x{} at {:08X})",
-                  rex::graphics::FormatInfo::Get(key.format)->name, key.width, key.height,
-                  key.base_page << 12);
+      const uint64_t bit = uint64_t(1) << (uint32_t(key.format) & 63);
+      if (!(unsupported_logged_ & bit)) {
+        unsupported_logged_ |= bit;
+        REXLOG_WARN("PGR4 native textures: unsupported format {} (first {}x{} at {:08X})",
+                    rex::graphics::FormatInfo::Get(key.format)->name, key.width, key.height,
+                    key.base_page << 12);
+      }
     } else {
       const uint64_t c0 = NowNs();
       t = Create(key, *host);
@@ -838,25 +866,20 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
       ++stats_.created;
     }
   }
-  if (t->failed) {
-    ++stats_.unsupported;
-    return false;
-  }
+  if (t->failed) return false;
   MarkUsed(*t, frame_fence);
   const bool was_dirty = t->dirty.load(std::memory_order_acquire);
   const bool stale =
       was_dirty && t->uploads && captured <= t->write_mark.load(std::memory_order_relaxed);
-  stats_.stale += stale;
   // Logged at its 1st, 256th, 512th, 1024th... stale Get.
-  if (stale && stale_logged_ < kStaleLogLimit &&
+  if (stale &&
       (++t->stale_gets == 1 || (t->stale_gets >= 256 && !(t->stale_gets & (t->stale_gets - 1))))) {
-    ++stale_logged_;
-    REXLOG_INFO(
-        "PGR4 native textures: {:08X} {}x{}x{} {} mips {} rewritten after a draw that "
-        "reads it was queued: {} times (upload {}, get {})",
-        key.base_page << 12, key.width, key.height, key.depth_or_array_size,
-        rex::graphics::FormatInfo::Get(key.format)->name, key.mip_levels(), t->stale_gets,
-        t->uploads, stats_.gets);
+    PGR4_LOG_FIRST(96, INFO,
+                   "PGR4 native textures: {:08X} {}x{}x{} {} mips {} rewritten after a draw that "
+                   "reads it was queued: {} times (upload {}, get {})",
+                   key.base_page << 12, key.width, key.height, key.depth_or_array_size,
+                   rex::graphics::FormatInfo::Get(key.format)->name, key.mip_levels(),
+                   t->stale_gets, t->uploads, stats_.gets);
   }
   if (was_dirty && !(stale && capture_order_)) {
     const uint64_t u0 = NowNs();
@@ -864,7 +887,9 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
     stats_.upload_ns += NowNs() - u0;
     if (!uploaded) return false;
   }
+#ifndef PGR4_TEXTURES_OFFLINE
   const uint64_t seq_before = t->resolved_seq.empty() ? 0 : t->resolved_seq[0];
+#endif
   // CopyResolved only changes anything after an Upload or a resolve into one of the texture's
   // subresource addresses (OnResolved); both set resolve_pending.
   if (t->resolve_pending) {

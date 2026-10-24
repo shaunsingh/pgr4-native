@@ -1,12 +1,15 @@
 // Shader modification selection and root signatures for the DXBC translator.
 //
-// SelectModifications and the two root signature builders follow ReXGlue's
+// SelectModifications and the root signature builder follow ReXGlue's
 // src/graphics/d3d12/command_processor.cpp and pipeline_cache.cpp (Xenia, Copyright Ben Vanik,
 // BSD-3; adapted for ReXGlue by Tom Clay), reduced to the host-render-target path.
 #include "shader_translate.h"
 
+#include <array>
 #include <bit>
 #include <string>
+
+#include <xxhash.h>
 
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -98,7 +101,8 @@ D3D12_DESCRIPTOR_RANGE Range(D3D12_DESCRIPTOR_RANGE_TYPE type, uint32_t count, u
   return {type, count, base, space, offset};
 }
 
-ComPtr<ID3D12RootSignature> Create(ID3D12Device* device, const D3D12_ROOT_SIGNATURE_DESC& desc) {
+ComPtr<ID3D12RootSignature> Create(ID3D12Device* device, const D3D12_ROOT_SIGNATURE_DESC& desc,
+                                   uint64_t* blob_hash) {
   ComPtr<ID3DBlob> blob, error;
   HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error);
   if (FAILED(hr)) {
@@ -106,6 +110,7 @@ ComPtr<ID3D12RootSignature> Create(ID3D12Device* device, const D3D12_ROOT_SIGNAT
                  error ? static_cast<const char*>(error->GetBufferPointer()) : "");
     return nullptr;
   }
+  if (blob_hash) *blob_hash = XXH3_64bits(blob->GetBufferPointer(), blob->GetBufferSize());
   ComPtr<ID3D12RootSignature> rs;
   hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
                                    IID_PPV_ARGS(&rs));
@@ -116,13 +121,13 @@ ComPtr<ID3D12RootSignature> Create(ID3D12Device* device, const D3D12_ROOT_SIGNAT
   return rs;
 }
 
-D3D12_DESCRIPTOR_RANGE SharedMemoryRanges(uint32_t i) {
-  return i == 0 ? Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
-                        uint32_t(DxbcShaderTranslator::SRVMainRegister::kSharedMemory),
-                        uint32_t(DxbcShaderTranslator::SRVSpace::kMain), 0)
-                : Range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1,
-                        uint32_t(DxbcShaderTranslator::UAVRegister::kSharedMemory), 0, 1);
-}
+constexpr std::array<D3D12_DESCRIPTOR_RANGE, 2> kSharedMemoryRanges = {{
+    {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+     uint32_t(DxbcShaderTranslator::SRVMainRegister::kSharedMemory),
+     uint32_t(DxbcShaderTranslator::SRVSpace::kMain), 0},
+    {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, uint32_t(DxbcShaderTranslator::UAVRegister::kSharedMemory),
+     0, 1},
+}};
 
 }  // namespace
 
@@ -213,7 +218,7 @@ ShaderModifications SelectModifications(const DxbcShaderTranslator& translator,
   return out;
 }
 
-ComPtr<ID3D12RootSignature> CreateBindlessRootSignature(ID3D12Device* device) {
+ComPtr<ID3D12RootSignature> CreateBindlessRootSignature(ID3D12Device* device, uint64_t* blob_hash) {
   using CB = DxbcShaderTranslator::CbufferRegister;
   using Space = DxbcShaderTranslator::SRVSpace;
   D3D12_ROOT_PARAMETER p[kBindlessRoot_Count];
@@ -226,8 +231,9 @@ ComPtr<ID3D12RootSignature> CreateBindlessRootSignature(ID3D12Device* device) {
       Cbv(CB::kDescriptorIndices, D3D12_SHADER_VISIBILITY_VERTEX);
   p[kBindlessRoot_SystemConstants] = Cbv(CB::kSystemConstants, D3D12_SHADER_VISIBILITY_ALL);
   p[kBindlessRoot_BoolLoopConstants] = Cbv(CB::kBoolLoopConstants, D3D12_SHADER_VISIBILITY_ALL);
-  D3D12_DESCRIPTOR_RANGE shared[2] = {SharedMemoryRanges(0), SharedMemoryRanges(1)};
-  p[kBindlessRoot_SharedMemory] = Table(shared, 2, D3D12_SHADER_VISIBILITY_ALL);
+  p[kBindlessRoot_SharedMemory] =
+      Table(kSharedMemoryRanges.data(), uint32_t(kSharedMemoryRanges.size()),
+            D3D12_SHADER_VISIBILITY_ALL);
   D3D12_DESCRIPTOR_RANGE samplers = Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, UINT_MAX, 0, 0, 0);
   p[kBindlessRoot_SamplerHeap] = Table(&samplers, 1, D3D12_SHADER_VISIBILITY_ALL);
   // The three texture dimensions alias the same unbounded range of the view heap; the bindless
@@ -242,41 +248,7 @@ ComPtr<ID3D12RootSignature> CreateBindlessRootSignature(ID3D12Device* device) {
   p[kBindlessRoot_ViewHeap] = Table(views, 3, D3D12_SHADER_VISIBILITY_ALL);
   D3D12_ROOT_SIGNATURE_DESC desc = {kBindlessRoot_Count, p, 0, nullptr,
                                     D3D12_ROOT_SIGNATURE_FLAG_NONE};
-  return Create(device, desc);
-}
-
-ComPtr<ID3D12RootSignature> CreateBindfulRootSignature(ID3D12Device* device, const DxbcShader& vs,
-                                                       const DxbcShader* ps) {
-  using CB = DxbcShaderTranslator::CbufferRegister;
-  uint32_t textures_vs = uint32_t(vs.GetTextureBindingsAfterTranslation().size());
-  uint32_t samplers_vs = uint32_t(vs.GetSamplerBindingsAfterTranslation().size());
-  uint32_t textures_ps = ps ? uint32_t(ps->GetTextureBindingsAfterTranslation().size()) : 0;
-  uint32_t samplers_ps = ps ? uint32_t(ps->GetSamplerBindingsAfterTranslation().size()) : 0;
-  D3D12_ROOT_PARAMETER p[kBindfulRoot_CountBase + 4];
-  p[kBindfulRoot_FetchConstants] = Cbv(CB::kFetchConstants, D3D12_SHADER_VISIBILITY_ALL);
-  p[kBindfulRoot_FloatConstantsVertex] = Cbv(CB::kFloatConstants, D3D12_SHADER_VISIBILITY_VERTEX);
-  p[kBindfulRoot_FloatConstantsPixel] = Cbv(CB::kFloatConstants, D3D12_SHADER_VISIBILITY_PIXEL);
-  p[kBindfulRoot_SystemConstants] = Cbv(CB::kSystemConstants, D3D12_SHADER_VISIBILITY_ALL);
-  p[kBindfulRoot_BoolLoopConstants] = Cbv(CB::kBoolLoopConstants, D3D12_SHADER_VISIBILITY_ALL);
-  D3D12_DESCRIPTOR_RANGE shared[2] = {SharedMemoryRanges(0), SharedMemoryRanges(1)};
-  p[kBindfulRoot_SharedMemory] = Table(shared, 2, D3D12_SHADER_VISIBILITY_ALL);
-  uint32_t n = kBindfulRoot_CountBase;
-  uint32_t textures_start = uint32_t(DxbcShaderTranslator::SRVMainRegister::kBindfulTexturesStart);
-  uint32_t main_space = uint32_t(DxbcShaderTranslator::SRVSpace::kMain);
-  D3D12_DESCRIPTOR_RANGE ranges[4] = {
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, textures_ps, textures_start, main_space, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, samplers_ps, 0, 0, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, textures_vs, textures_start, main_space, 0),
-      Range(D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, samplers_vs, 0, 0, 0),
-  };
-  const D3D12_SHADER_VISIBILITY vis[4] = {
-      D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_VERTEX,
-      D3D12_SHADER_VISIBILITY_VERTEX};
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (ranges[i].NumDescriptors) p[n++] = Table(&ranges[i], 1, vis[i]);
-  }
-  D3D12_ROOT_SIGNATURE_DESC desc = {n, p, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-  return Create(device, desc);
+  return Create(device, desc, blob_hash);
 }
 
 }  // namespace pgr4::native

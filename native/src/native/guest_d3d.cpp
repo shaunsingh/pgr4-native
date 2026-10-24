@@ -15,19 +15,12 @@ REXCVAR_DECLARE(bool, pgr4_native_primary);
 REX_EXTERN(sub_826DEDC8);
 
 namespace pgr4::native::guest_d3d {
-namespace {
-
-// Bits of the mask at +16 that make the draw call sub_826DEDC8 (shader rebind and the related
-// state bits 17..20; 19 = vertex shader, 20 = pixel shader).
-constexpr uint64_t kShaderBits = 0x1E0000ull;
-
-}  // namespace
 
 // The original (sub_826D0340(device, primitive, base vertex, start index, index count)):
 //   1. flushes the dirty float constants (masks +0, +8, sub_826DE030), clears both masks;
-//   2. mask +16 & kShaderBits: sub_826DEDC8 (shader load; the immediate, patched VS copy comes
-//      from its call to sub_826DEA78), which returns the new mask +16; that mask & mask +40:
-//      sub_826DD8F8 (stream-only registers derived from it);
+//   2. mask +16 & kShaderLoadBits (d3d_state.h): sub_826DEDC8 (shader load; the immediate,
+//      patched VS copy comes from its call to sub_826DEA78), which returns the new mask +16;
+//      that mask & mask +40: sub_826DD8F8 (stream-only registers derived from it);
 //   3. flushes the register blocks of masks +16, +24, +32 (sub_826DDC90, the fetch constants
 //      sub_826DDED0, clip planes sub_826DDD50), clears the three masks;
 //   4. writes VGT_INDX_OFFSET and DRAW_INDX (in pieces of at most 65535 indices), MakeSpace
@@ -49,7 +42,7 @@ bool DrawIndexed(PPCContext& ctx, uint8_t* base) {
   // may dirty constants again), the register masks after it.
   std::memset(masks, 0, 16);
   const uint64_t shader = Load64(base, device + dev::kDirtyMasks + 16);
-  if (shader & kShaderBits) {
+  if (shader & kShaderLoadBits) {
     // Volatile registers are the callee's, as in the original; r1 gets a frame below ours.
     const uint32_t sp = ctx.r1.u32;
     ctx.r1.u64 = sp - 256;

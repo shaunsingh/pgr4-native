@@ -38,11 +38,6 @@ class BoolSpecializer {
   // SHADER_CONSTANT_BOOL_000_031), or `shader` itself if its control flow tests none.
   DxbcShader* Get(DxbcShader* shader, const uint32_t* bools);
 
-  // Specialized shaders created (distinct shader and bool combinations), and combinations whose
-  // specialization would change the shader's outputs (the generic shader is used).
-  uint64_t created() const { return created_; }
-  uint64_t kept_generic() const { return kept_generic_; }
-
  private:
   struct Key {
     const DxbcShader* shader;
@@ -53,16 +48,12 @@ class BoolSpecializer {
     size_t operator()(const Key& k) const;
   };
 
-  static constexpr uint64_t kLogged = 64;
-
   DxbcShader* Create(DxbcShader& shader, const uint32_t* bools);
 
   ShaderCache& cache_;
   std::unordered_map<Key, DxbcShader*, KeyHash> specialized_;
   Key last_{};
   DxbcShader* last_result_ = nullptr;
-  uint64_t created_ = 0;
-  uint64_t kept_generic_ = 0;
 };
 
 }  // namespace pgr4::native

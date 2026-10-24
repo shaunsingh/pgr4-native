@@ -2,6 +2,7 @@
 #include "pipeline_store.h"
 
 #include <rex/logging.h>
+#include <rex/types.h>
 
 #include <xxhash.h>
 
@@ -21,10 +22,6 @@ struct Header {
   char magic[4];
   uint32_t format, key_size, key_version;
 };
-
-uint32_t Swap32(uint32_t v) {
-  return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24);
-}
 
 std::vector<uint8_t> ReadFile(const std::filesystem::path& path) {
   std::vector<uint8_t> data;
@@ -49,6 +46,12 @@ PipelineStore::~PipelineStore() {
 
 void PipelineStore::Open(const std::filesystem::path& dir, uint32_t key_size,
                          uint32_t key_version) {
+  if (key_size > kMaxKeySize) {
+    REXLOG_WARN("PGR4 native pipelines: key of {} bytes is over {}, no pipeline store", key_size,
+                kMaxKeySize);
+    return;
+  }
+  key_size_ = key_size;
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   const std::filesystem::path path = dir / "pipelines.bin";
@@ -93,8 +96,19 @@ void PipelineStore::Open(const std::filesystem::path& dir, uint32_t key_size,
       good = pos;
     }
   }
+  if (good && good != data.size()) {
+    std::filesystem::resize_file(path, good, ec);
+    if (ec) {
+      // Appending after the torn tail would hide every later record from the next run. The
+      // records read stay for this run's prewarm and are written again when next created.
+      REXLOG_WARN("PGR4 native pipelines: cannot cut {} ({}), starting over", path.string(),
+                  ec.message());
+      good = 0;
+      shaders_written_.clear();
+      pipelines_written_.clear();
+    }
+  }
   if (good) {
-    if (good != data.size()) std::filesystem::resize_file(path, good, ec);
     file_ = _wfopen(path.c_str(), L"ab");
   } else {
     file_ = _wfopen(path.c_str(), L"wb");
@@ -120,7 +134,7 @@ void PipelineStore::RecordShader(uint32_t type, uint64_t hash, const uint32_t* h
                                  size_t dwords) {
   if (!file_ || !shaders_written_.insert(hash).second) return;
   std::vector<uint32_t> guest(dwords);
-  for (size_t i = 0; i < dwords; ++i) guest[i] = Swap32(host_ucode[i]);
+  for (size_t i = 0; i < dwords; ++i) guest[i] = rex::byte_swap(host_ucode[i]);
   const uint32_t n = uint32_t(dwords);
   std::fwrite(&kShaderTag, 4, 1, file_);
   std::fwrite(&type, 4, 1, file_);
@@ -131,18 +145,17 @@ void PipelineStore::RecordShader(uint32_t type, uint64_t hash, const uint32_t* h
 }
 
 void PipelineStore::RecordPipeline(uint64_t vs_hash, uint64_t vs_mod, uint64_t ps_hash,
-                                   uint64_t ps_mod, const void* key, size_t key_size) {
+                                   uint64_t ps_mod, const void* key) {
   if (!file_) return;
-  uint8_t record[32 + 256];
-  if (key_size > 256) return;
+  uint8_t record[32 + kMaxKeySize];
   std::memcpy(record, &vs_hash, 8);
   std::memcpy(record + 8, &vs_mod, 8);
   std::memcpy(record + 16, &ps_hash, 8);
   std::memcpy(record + 24, &ps_mod, 8);
-  std::memcpy(record + 32, key, key_size);
-  if (!pipelines_written_.insert(XXH3_64bits(record, 32 + key_size)).second) return;
+  std::memcpy(record + 32, key, key_size_);
+  if (!pipelines_written_.insert(XXH3_64bits(record, 32 + key_size_)).second) return;
   std::fwrite(&kPipelineTag, 4, 1, file_);
-  std::fwrite(record, 1, 32 + key_size, file_);
+  std::fwrite(record, 1, 32 + key_size_, file_);
   dirty_ = true;
 }
 
@@ -152,9 +165,11 @@ void PipelineStore::Flush() {
   std::fflush(file_);
 }
 
-void PipelineLibrary::Open(ID3D12Device* device, const std::filesystem::path& path) {
+void PipelineLibrary::Open(ID3D12Device* device, const std::filesystem::path& path,
+                           uint64_t root_signature_hash) {
   device_ = device;
   path_ = path;
+  root_signature_hash_ = root_signature_hash;
   if (path.empty()) return;  // cache off: Create compiles every pipeline
   Microsoft::WRL::ComPtr<ID3D12Device1> device1;
   if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
@@ -186,7 +201,7 @@ HRESULT PipelineLibrary::Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
                                 ID3D12PipelineState** out, bool* loaded) {
   *loaded = false;
   if (!library_) return device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(out));
-  // Name: the description without its pointers, then every shader's bytecode.
+  // Name: the root signature, the description without its pointers, then every shader's bytecode.
   D3D12_GRAPHICS_PIPELINE_STATE_DESC plain;
   std::memcpy(&plain, &desc, sizeof(plain));  // with the padding the caller zeroed
   plain.pRootSignature = nullptr;
@@ -195,7 +210,7 @@ HRESULT PipelineLibrary::Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
   plain.StreamOutput = {};
   plain.InputLayout = {};
   plain.CachedPSO = {};
-  uint64_t h = XXH3_64bits(&plain, sizeof(plain));
+  uint64_t h = XXH3_64bits_withSeed(&plain, sizeof(plain), root_signature_hash_);
   for (const D3D12_SHADER_BYTECODE* b : {&desc.VS, &desc.PS, &desc.DS, &desc.HS, &desc.GS})
     if (b->BytecodeLength) h = XXH3_64bits_withSeed(b->pShaderBytecode, b->BytecodeLength, h);
   {

@@ -57,8 +57,7 @@ inline constexpr const char* kStageNames[kStageCount] = {
     "track",      "imm_vs",   "cap_shaders", "cap_vertices", "cap_record", "tex_miss",
     "tex_get",    "tex_srv",  "cap_watch",   "guest_d3d"};
 
-// Per-frame event counts (CSV columns, reset every frame). Counted whether or not the profiler
-// is on (one increment each).
+// Per-frame event counts (CSV columns, reset every frame), counted while the profiler is on.
 enum Counter : uint32_t {
   kBindHit,          // BindMemo hits (whole shader)
   kBindMru,          // lookups answered by the shader's last entry, without hashing
@@ -90,18 +89,18 @@ struct State {
 };
 inline thread_local State g;
 
-inline void Count(Counter c) { ++g.counters[c]; }
-
-inline uint64_t Now() { return Ticks(); }
+inline void Count(Counter c) {
+  if (On()) ++g.counters[c];
+}
 
 // Starts a run of stages.
 inline void Begin() {
-  if (On()) g.last = Now();
+  if (On()) g.last = Ticks();
 }
 // Charges the time since the previous Begin/Mark to `stage`.
 inline void Mark(Stage stage) {
   if (!On()) return;
-  const uint64_t t = Now();
+  const uint64_t t = Ticks();
   g.ticks[stage] += t - g.last;
   g.last = t;
 }
@@ -109,9 +108,9 @@ inline void Mark(Stage stage) {
 // Times one call outside the Begin/Mark chain.
 class Scope {
  public:
-  explicit Scope(Stage s) : stage_(s), start_(On() ? Now() : 0) {}
+  explicit Scope(Stage s) : stage_(s), start_(On() ? Ticks() : 0) {}
   ~Scope() {
-    if (start_) g.ticks[stage_] += Now() - start_;
+    if (start_) g.ticks[stage_] += Ticks() - start_;
   }
   Scope(const Scope&) = delete;
   Scope& operator=(const Scope&) = delete;

@@ -22,6 +22,7 @@ namespace pgr4::native {
 using namespace rex::graphics;
 using PipelineGeometryShader = GeometryShaderType;
 
+namespace {
 GeometryShaderType GeometryShaderForPrimitive(xenos::PrimitiveType type) {
   switch (type) {
     case xenos::PrimitiveType::kPointList:
@@ -34,6 +35,7 @@ GeometryShaderType GeometryShaderForPrimitive(xenos::PrimitiveType type) {
       return GeometryShaderType::kNone;
   }
 }
+}  // namespace
 
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeForPrimitive(xenos::PrimitiveType type) {
   switch (type) {
@@ -49,9 +51,10 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeForPrimitive(xenos::PrimitiveType type
   }
 }
 
-bool GetGeometryShaderKey(GeometryShaderType type, uint64_t vertex_modification,
-                          uint64_t pixel_modification, GeometryShaderKey& key_out) {
-  if (type == GeometryShaderType::kNone) return false;
+uint32_t GeometryShaderKeyFor(xenos::PrimitiveType primitive_type, uint64_t vertex_modification,
+                              uint64_t pixel_modification) {
+  const GeometryShaderType type = GeometryShaderForPrimitive(primitive_type);
+  if (type == GeometryShaderType::kNone) return 0;
   DxbcShaderTranslator::Modification vm(vertex_modification), pm(pixel_modification);
   GeometryShaderKey key;
   key.type = type;
@@ -62,8 +65,7 @@ bool GetGeometryShaderKey(GeometryShaderType type, uint64_t vertex_modification,
   key.has_point_size = vm.vertex.output_point_size;
   key.has_point_coordinates = pm.pixel.param_gen_point;
   key.point_ps_ucp_mode = vm.vertex.point_ps_ucp_mode;
-  key_out = key;
-  return true;
+  return key.key;
 }
 
 namespace {

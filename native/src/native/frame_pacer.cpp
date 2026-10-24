@@ -3,6 +3,7 @@
 
 #include "clock.h"
 
+#include <d3d12.h>
 #include <rex/logging.h>
 
 #include <algorithm>

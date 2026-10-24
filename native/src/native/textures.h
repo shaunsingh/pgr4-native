@@ -15,8 +15,9 @@
 // cache evicts the least recently used textures over a memory budget (Xenia's texture cache
 // policy, see Budget) once the GPU has finished the frames that used them.
 //
-// Threading: Get/Retire run on the guest render thread (the renderer's On* calls); the
-// invalidation callback runs on any guest thread that faults on a watched page.
+// Threading: everything but MarkCapture runs on the thread that records the frame (the render
+// thread by default); MarkCapture runs on the guest D3D thread, and the invalidation callback on
+// any guest thread that faults on a watched page.
 #pragma once
 
 #include "resolve.h"  // ResolvedImage
@@ -49,8 +50,10 @@ namespace pgr4::native {
 // Returns the image last resolved to a guest physical address (Resolver::Find), or nullptr.
 using ResolvedLookup = std::function<const ResolvedImage*(uint32_t guest_physical)>;
 
-// One texture of the cache for as long as it lives: an evicted texture's slot is reused with
-// the next generation, so a handle kept past an eviction no longer matches.
+// One texture of the cache bound through one resource: the slot's generation goes up when the
+// texture is evicted (its slot is reused) and when the resource it binds changes (a resolved
+// image aliased in place of its own resource, or the alias dropped), so a handle kept past
+// either no longer matches.
 struct TextureHandle {
   uint32_t slot = 0, generation = 0;  // generation 0: no texture
 };
@@ -77,8 +80,7 @@ class TextureCache {
  public:
   struct Stats {
     uint64_t gets = 0, uploads = 0, upload_bytes = 0, resolved_copies = 0, resolved_aliases = 0;
-    uint64_t unsupported = 0, untile_ns = 0;
-    uint64_t stale = 0;  // Gets for draws queued before a newer guest write of the texture
+    uint64_t untile_ns = 0;
     // Profile counters (cumulative): memo misses, textures created, time in Create (resource
     // creation), Upload (buffer creation + untile + copies) and CopyResolved.
     uint64_t memo_misses = 0, created = 0, create_ns = 0, upload_ns = 0, copy_resolved_ns = 0;
@@ -106,7 +108,6 @@ class TextureCache {
   TextureCache& operator=(const TextureCache&) = delete;
 
   void SetResolvedLookup(ResolvedLookup lookup) { resolved_lookup_ = std::move(lookup); }
-  void SetBudget(const Budget& budget) { budget_ = budget; }
   void SetEvictCallback(EvictCallback callback) { evict_callback_ = std::move(callback); }
   // The resolver's Find result for this guest physical address may have changed
   // (Resolver::SetChangedCallback): textures with a subresource there recheck it at their next
@@ -132,7 +133,8 @@ class TextureCache {
   // The texture for a fetch constant (6 dwords as in the register file), uploaded or copied on
   // `list` first if needed. frame_fence: the fence value that completes the frame `list`
   // belongs to (upload buffers are kept until then). captured: the draw's MarkCapture stamp.
-  // False: no data, unsupported format, or a D3D12 failure (each logged once per key).
+  // False: no data, unsupported format, or a D3D12 failure (each logged once per format or
+  // reason; the key is remembered and not retried).
   bool Get(const uint32_t fetch[6], ID3D12GraphicsCommandList* list, uint64_t frame_fence,
            TextureBinding* out, uint64_t captured = kCapturedNow);
 
@@ -148,16 +150,17 @@ class TextureCache {
   // per Swap, after the submission.
   void Retire(uint64_t completed_fence);
 
-  // Whether the texture behind a binding Get returned can be bound again without a Get: not
-  // evicted, no guest write and no resolve into it since, so its data, view and shader-read
-  // state are unchanged. Callers that memoize bindings check this per texture.
+  // Whether the binding Get returned for this texture can be bound again without a Get: not
+  // evicted, still bound through the same resource (no alias set or dropped), no guest write
+  // and no resolve into it since, so its resource, data, view and shader-read state are
+  // unchanged. Callers that memoize bindings check this per texture.
   bool Unchanged(TextureHandle entry) const;
   // A binding bound again without a Get is used by the frame completing at frame_fence: keeps
   // its texture from eviction while that frame is in flight. Callers that memoize bindings
   // call this once per frame for each texture they bind that way.
   void Touch(TextureHandle entry, uint64_t frame_fence);
   // Goes up whenever a texture may stop being Unchanged (guest write, resolve into it, upload,
-  // eviction).
+  // alias change, eviction).
   // A caller that checked Unchanged on its textures after reading the epoch may skip the checks
   // while the epoch still has that value.
   uint64_t change_epoch() const { return change_epoch_.load(std::memory_order_acquire); }
@@ -170,7 +173,9 @@ class TextureCache {
   struct Texture;
   struct Slot {
     std::unique_ptr<Texture> texture;  // null while free
-    uint32_t generation = 1;           // goes up when the texture is evicted
+    // Goes up when the texture is evicted and when the resource it binds changes (SetAlias):
+    // TextureHandle and GetMemo entries of an older generation no longer match.
+    uint32_t generation = 1;
   };
   struct Watch {
     uint32_t start, end;  // physical [start, end)
@@ -181,6 +186,12 @@ class TextureCache {
   Texture* NewTexture(const TextureKey& key);
   Texture* Create(const TextureKey& key, const HostFormat& host);
   static bool Clean(const Texture& t);
+  // Binds `alias` (a resolved image, or null for the texture's own resource) for t.
+  void SetAlias(Texture& t, ID3D12Resource* alias);
+  // Clears t's dirty flag and re-arms the watches of its guest pages, before their data is read.
+  void ClearDirty(Texture& t);
+  // t's resource holds guest-memory data in every subresource: the next Get runs CopyResolved.
+  void ResetResolved(Texture& t);
   // Moves t to the end of the LRU list, once per frame.
   void MarkUsed(Texture& t, uint64_t frame_fence);
   void EvictOverBudget(uint64_t completed_fence);
@@ -200,6 +211,10 @@ class TextureCache {
   bool AddHeap();
   void AddFreeRange(uint64_t offset, uint64_t size);
   void UnwatchRange(Texture& t, uint32_t start, uint32_t length);
+  // Guest physical memory the watches cover.
+  static constexpr uint32_t kMemorySize = (512u << 20);
+  // [start, *end) of [start, start + length) within kMemorySize; false if that is empty.
+  static bool ClampRange(uint32_t start, uint32_t length, uint32_t* end);
   bool CopyResolved(Texture& t, ID3D12GraphicsCommandList* list);
   // The resolved image CopyResolved copies into t from `image`, or null if its format family
   // does not match.
@@ -217,6 +232,7 @@ class TextureCache {
   std::pair<uint32_t, uint32_t> Invalidate(uint32_t start, uint32_t length, bool exact);
   struct UntileJob {
     TextureKey key;
+    rex::graphics::texture_util::TextureGuestLayout layout;
     GuestTextureMemory guest;
     std::vector<HostSubresource> footprints;
     uint8_t* dst = nullptr;
@@ -253,9 +269,8 @@ class TextureCache {
     std::atomic<uint64_t> value{0};
   } capture_seq_;
   bool capture_order_ = true;
-  static constexpr uint32_t kStaleLogLimit = 96;  // log lines about stale textures
-  uint32_t stale_logged_ = 0;
-  uint32_t trace_address_ = 0;  // --pgr4_native_texture_trace (0: none)
+  uint64_t unsupported_logged_ = 0;  // bit per xenos::TextureFormat
+  uint32_t trace_address_ = 0;       // --pgr4_native_texture_trace (0: none)
 
   std::vector<Slot> slots_;  // owns the textures
   std::vector<uint32_t> free_slots_;
@@ -277,7 +292,7 @@ class TextureCache {
   // The memory unwatches at most the 4 MB-aligned block around a write fault
   // (PhysicalHeap::TriggerCallbacks).
   static constexpr uint32_t kUnwatchWindow = 4u << 20;
-  static constexpr uint32_t kWatchBucketCount = (512u << 20) >> kWatchBucketShift;
+  static constexpr uint32_t kWatchBucketCount = kMemorySize >> kWatchBucketShift;
   std::mutex watch_mutex_;  // guards watch_buckets_ (callback vs render thread)
   std::vector<std::vector<Watch>> watch_buckets_{kWatchBucketCount};
   // Guest physical address of every subresource CopyResolved looks up -> the textures there.
@@ -294,6 +309,9 @@ class TextureCache {
   // game thread took 20-130 ms in the frames where a heap ran full (HitchFix).
   std::future<Microsoft::WRL::ComPtr<ID3D12Heap>> spare_heap_;
   void StartSpareHeap();
+  // A heap creation failed: textures that do not fit go committed without trying another
+  // (each try blocks for 20-130 ms) until an eviction frees memory.
+  bool heap_failed_ = false;
   std::vector<HostSubresource> footprints_;  // scratch
   std::vector<uint8_t> untile_scratch_;      // inline untiles (offline)
   std::vector<std::thread> workers_;         // empty offline

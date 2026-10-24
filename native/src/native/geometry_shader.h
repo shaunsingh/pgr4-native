@@ -8,7 +8,7 @@
 
 #include <d3d12.h>
 
-#include "shader_translate.h"
+#include <rex/graphics/xenos.h>
 
 namespace pgr4::native {
 
@@ -28,15 +28,18 @@ union GeometryShaderKey {
     uint32_t point_ps_ucp_mode : 2;  // PA_CL_CLIP_CNTL::ps_ucp_mode for point primitives
   };
 };
+// Stored in pipelines.bin inside the pipeline key.
+static_assert(sizeof(GeometryShaderKey) == sizeof(uint32_t));
 
-// Geometry shader type and host input topology for a guest primitive type (after the primitive
-// processor: triangle fans/strips etc. need no geometry shader).
-GeometryShaderType GeometryShaderForPrimitive(rex::graphics::xenos::PrimitiveType type);
+// Host input topology for a guest primitive type (after the primitive processor: triangle
+// fans/strips etc. need no geometry shader).
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeForPrimitive(rex::graphics::xenos::PrimitiveType type);
 
-// False for kNone. pixel_modification is 0 when the draw has no pixel shader.
-bool GetGeometryShaderKey(GeometryShaderType type, uint64_t vertex_modification,
-                          uint64_t pixel_modification, GeometryShaderKey& key_out);
+// GeometryShaderKey::key of the geometry shader a draw of `type` needs, 0 for none (a key's type
+// is never kNone, so a valid key is nonzero). pixel_modification is 0 when the draw has no pixel
+// shader.
+uint32_t GeometryShaderKeyFor(rex::graphics::xenos::PrimitiveType type,
+                              uint64_t vertex_modification, uint64_t pixel_modification);
 
 // DXBC of the geometry shader for a key (cache the result per key).
 std::vector<uint32_t> CreateGeometryShader(GeometryShaderKey key);

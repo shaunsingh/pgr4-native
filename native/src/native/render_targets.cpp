@@ -3,8 +3,10 @@
 #include "render_targets.h"
 
 #include "guest_memory.h"
-#include "renderer.h"
+#include "hook_args.h"
+#include "log.h"
 
+#include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 
 #include <algorithm>
@@ -14,19 +16,43 @@
 namespace pgr4::native {
 namespace {
 
+namespace xenos = rex::graphics::xenos;
+
 constexpr uint32_t kMaxViews = 256;     // RTVs and DSVs each; PGR4 uses ~20 surfaces per frame
 constexpr uint32_t kNullRtvs = 3;       // null RTVs for 1, 2 and 4 samples, at the heap's start
 constexpr uint32_t kEdramTiles = 2048;  // 10 MiB of 80x16-sample tiles
 constexpr uint32_t kMaxHeight = 2048;
 
-uint32_t SamplesOf(uint32_t surface_info) {
-  uint32_t m = (surface_info >> 16) & 3;
-  return m >= 2 ? 4 : m == 1 ? 2 : 1;
+bool Is64bpp(uint32_t color_format) {
+  return xenos::IsColorRenderTargetFormat64bpp(xenos::ColorRenderTargetFormat(color_format));
 }
 
-bool Is64bpp(uint32_t color_format) {
-  // 16_16_16_16, 16_16_16_16_FLOAT, 32_32_FLOAT (xenos::IsColorRenderTargetFormat64bpp).
-  return color_format == 5 || color_format == 7 || color_format == 15;
+// Host DXGI format of a guest color render target format (UNKNOWN if unsupported).
+DXGI_FORMAT ColorFormat(uint32_t f) {
+  switch (f) {
+    case 0:  // k_8_8_8_8
+    case 1:  // k_8_8_8_8_GAMMA (gamma not applied on the host yet)
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 2:   // k_2_10_10_10
+    case 10:  // k_2_10_10_10_AS_10_10_10_10
+      return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case 3:   // k_2_10_10_10_FLOAT (7e3)
+    case 12:  // k_2_10_10_10_FLOAT_AS_16_16_16_16: same EDRAM data, 16-bit blending
+    case 7:   // k_16_16_16_16_FLOAT
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 4:
+      return DXGI_FORMAT_R16G16_SNORM;  // k_16_16 (-32..32 on Xenos; scaled)
+    case 5:
+      return DXGI_FORMAT_R16G16B16A16_SNORM;  // k_16_16_16_16
+    case 6:
+      return DXGI_FORMAT_R16G16_FLOAT;
+    case 14:
+      return DXGI_FORMAT_R32_FLOAT;
+    case 15:
+      return DXGI_FORMAT_R32G32_FLOAT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
+  }
 }
 
 // Rows of pixels the EDRAM holds from `base` for this surface (what a non-tiling guest could
@@ -126,33 +152,6 @@ SurfaceRegs SurfaceRegsFromDevice(const uint8_t* base, uint32_t device) {
   s.color_info[2] = Load32(base, b + 4 * 4);
   s.color_info[3] = Load32(base, b + 5 * 4);
   return s;
-}
-
-DXGI_FORMAT RenderTargets::ColorFormat(uint32_t f) {
-  switch (f) {
-    case 0:  // k_8_8_8_8
-    case 1:  // k_8_8_8_8_GAMMA (gamma not applied on the host yet)
-      return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case 2:   // k_2_10_10_10
-    case 10:  // k_2_10_10_10_AS_10_10_10_10
-      return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case 3:   // k_2_10_10_10_FLOAT (7e3)
-    case 12:  // k_2_10_10_10_FLOAT_AS_16_16_16_16: same EDRAM data, 16-bit blending
-    case 7:   // k_16_16_16_16_FLOAT
-      return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case 4:
-      return DXGI_FORMAT_R16G16_SNORM;  // k_16_16 (-32..32 on Xenos; scaled)
-    case 5:
-      return DXGI_FORMAT_R16G16B16A16_SNORM;  // k_16_16_16_16
-    case 6:
-      return DXGI_FORMAT_R16G16_FLOAT;
-    case 14:
-      return DXGI_FORMAT_R32_FLOAT;
-    case 15:
-      return DXGI_FORMAT_R32G32_FLOAT;
-    default:
-      return DXGI_FORMAT_UNKNOWN;
-  }
 }
 
 RenderTargets::RenderTargets() = default;
@@ -266,7 +265,7 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
 RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t info,
                                  uint32_t height) {
   const uint32_t pitch = surface_info & 0x3FFF;
-  const uint32_t samples = SamplesOf(surface_info);
+  const uint32_t samples = SurfaceSamples(surface_info);
   const uint32_t base = info & 0xFFF;
   DXGI_FORMAT resource, view, srv, stencil_srv = DXGI_FORMAT_UNKNOWN;
   uint32_t guest_format;
@@ -288,8 +287,7 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     guest_format = (info >> 16) & 0xF;
     view = ColorFormat(guest_format);
     if (view == DXGI_FORMAT_UNKNOWN) {
-      static uint32_t logged = 0;
-      if (logged++ < 8) REXLOG_WARN("PGR4 native RT: unsupported color format {}", guest_format);
+      PGR4_LOG_FIRST(8, WARN, "PGR4 native RT: unsupported color format {}", guest_format);
       return nullptr;
     }
     resource = srv = view;
@@ -311,7 +309,6 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
   if (it == targets_.end()) {
     auto owned = std::make_unique<RenderTarget>();
     rt = owned.get();
-    rt->key = key;
     rt->depth = depth;
     rt->edram_base = base;
     rt->pitch = pitch;
@@ -361,7 +358,7 @@ void RenderTargets::Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt
 bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
                          uint32_t color_mask, bool depth_used, uint32_t height, BoundTargets* out) {
   *out = BoundTargets{};
-  const uint32_t samples = SamplesOf(regs.surface_info);
+  const uint32_t samples = SurfaceSamples(regs.surface_info);
   out->samples = samples;
   out->width = UINT32_MAX;
   out->height = UINT32_MAX;
@@ -551,7 +548,6 @@ void RenderTargets::DropFills(const RenderTarget& rt, uint32_t rows) {
 }
 
 void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
-  static uint32_t log_applied = 0, log_format = 0, log_shape = 0;
   const uint64_t since = rt->fill_seq;
   rt->fill_seq = fill_seq_;
   if (rt->depth || since == fill_seq_) return;
@@ -560,14 +556,21 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
   const uint32_t format = StorageFormat(rt->guest_format);
   for (const EdramFill& f : fills_) {
     if (f.seq <= since || f.first_tile() >= end || f.end_tile() <= g.base) continue;
+    if (f.format != format) {
+      PGR4_LOG_FIRST(
+          4, INFO,
+          "PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at base {}",
+          f.format, f.base, format, g.base);
+      continue;
+    }
     GridSpan spans[3];
     const int32_t n = MapSpan(f.base, f.pitch, {f.x0, f.x1, f.y0, f.y1}, g, spans);
     if (n < 0) {
-      if (log_shape++ < 4)
-        REXLOG_INFO(
-            "PGR4 native RT: EDRAM fill at tile {} pitch {} ({}x{} dwords x rows) does not map "
-            "onto base {} pitch {}",
-            f.base, f.pitch, f.x1 - f.x0, f.y1 - f.y0, g.base, g.pitch);
+      PGR4_LOG_FIRST(
+          4, INFO,
+          "PGR4 native RT: EDRAM fill at tile {} pitch {} ({}x{} dwords x rows) does not map onto "
+          "base {} pitch {}",
+          f.base, f.pitch, f.x1 - f.x0, f.y1 - f.y0, g.base, g.pitch);
       continue;
     }
     // The whole pixels inside each span, clipped to the target.
@@ -581,14 +584,6 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
       if (x1 > x0 && y1 > y0) rects[nr++] = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
     }
     if (!nr) continue;
-    if (f.format != format) {
-      if (log_format++ < 4)
-        REXLOG_INFO(
-            "PGR4 native RT: EDRAM fill of format {} at tile {} not applied to format {} at "
-            "base {}",
-            f.format, f.base, format, g.base);
-      continue;
-    }
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ClearRenderTargetView(rt->view, f.color, nr, rects);
     if (log_)
@@ -598,12 +593,11 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
                    (unsigned long long)f.seq, f.base, f.pitch, f.color[0], f.color[1], f.color[2],
                    f.color[3], g.base, g.pitch, rt->samples, rects[0].top, rects[nr - 1].bottom,
                    nr);
-    if (log_applied++ < 4)
-      REXLOG_INFO(
-          "PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} pitch {} "
-          "x{} rows {}-{}",
-          f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top,
-          rects[nr - 1].bottom);
+    PGR4_LOG_FIRST(4, INFO,
+                   "PGR4 native RT: EDRAM fill at tile {} pitch {} (alpha {}) applied to base {} "
+                   "pitch {} x{} rows {}-{}",
+                   f.base, f.pitch, f.color[3], g.base, g.pitch, rt->samples, rects[0].top,
+                   rects[nr - 1].bottom);
   }
 }
 

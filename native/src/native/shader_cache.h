@@ -1,9 +1,10 @@
 // Ucode -> DXBC cache of the native renderer. Shaders are keyed by the XXH3 hash of their
 // guest (big-endian) ucode, the same ucode_data_hash the Xenos plugin uses in its dumps and in
 // its shader storage (.xsh), and translations by (shader, modification).
-// Threading: Translate on one thread (the renderer's recording thread). Load may also be called
-// from the guest thread (render thread mode: DrawRenderer::Prepare) while the recording thread
-// calls it from Prewarm, so it takes a lock.
+// Threading: Translate on the renderer's recording thread only. Load and Find take a lock: Load
+// also runs on the guest thread (DrawRenderer::Prepare in render thread mode, and
+// BoolSpecializer::Create) while the recording thread calls it from Prewarm, and Find serves
+// DrawRenderer::ShaderDisassembly.
 #pragma once
 
 #include <cstdint>
@@ -28,7 +29,7 @@ struct ShaderCacheStats {
 
 class ShaderCache {
  public:
-  explicit ShaderCache(const ShaderTranslatorConfig& config = {});
+  ShaderCache();
   ~ShaderCache();
 
   const DxbcShaderTranslator& translator() const { return translator_; }

@@ -11,8 +11,10 @@
 //     buffer mirroring guest physical memory (t0). Ranges named by the vertex fetch constants
 //     the VS uses, and the index buffer, are uploaded at their guest offsets; uploaded pages
 //     stay valid until a CPU write hits them (physical memory access watches, like the
-//     plugin's shared memory). The inline vertices of BeginVertices/DrawVerticesUP live in the
-//     push buffer and are uploaded on every draw, never watched;
+//     plugin's shared memory), except hot pages, which the game rewrites every few frames:
+//     those are not watched but hashed on each request, and copied when their content changed.
+//     The inline vertices of BeginVertices/DrawVerticesUP live in the push buffer and are
+//     uploaded on every draw, never watched;
 //   - indices: DMA index buffers are bound straight from shared memory (big-endian, the VS
 //     swaps them by SystemConstants::vertex_index_endian); auto-indexed draws are non-indexed;
 //   - constants: the translator's b0 system constants (port of
@@ -111,9 +113,17 @@ class DrawRenderer {
     uint64_t gpu_mismatch_pages = 0;
     uint64_t reg_mismatches = 0;  // draws whose register file differs from Prepare's
   };
-  // Prepare's numbers for one frame (EndFramePrepare), added to stats() by AddPrepareCounters.
+  // Prepare's draw path counters (the draw diag of --pgr4_native_profile).
+  struct PrepareDiag {
+    uint64_t shader_loads = 0, shader_loads_immediate = 0;
+    uint64_t ranges = 0, range_pages = 0, range_runs = 0;  // watched ranges, their pages, copies
+    uint64_t unwatched = 0;                                // unwatched ranges (copied whole)
+  };
+  // Prepare's numbers for one frame (EndFramePrepare), added to stats() and the draw diag by
+  // AddPrepareCounters.
   struct PrepareCounters {
     uint64_t upload_bytes = 0, uploads = 0, stale_pages = 0, late_pages = 0;
+    PrepareDiag diag;
     std::shared_ptr<CoherencyJob> job;  // the frame's copied ranges to read back, or null
   };
 
@@ -131,8 +141,8 @@ class DrawRenderer {
   void OnDraw(const DrawState& state, const DrawPrep* prep = nullptr);
 
   // Guest thread, render thread mode: shader lookup and vertex/index copies for `state` (whose
-  // regs are the tracker's, current). Copies go to the end of `copies`; upload memory is
-  // tagged with `upload_tag` (EndFramePrepare's units).
+  // regs are the tracker's, current), into a default-constructed `prep`. Copies go to the end
+  // of `copies`; upload memory is tagged with `upload_tag` (EndFramePrepare's units).
   //
   // Copy segments: the render thread records all copies of a segment ahead of the segment's
   // first draw that needs them, so a segment costs one pair of shared-memory barriers instead
@@ -150,10 +160,13 @@ class DrawRenderer {
   // Render thread, the last thing recorded into a frame's command list.
   void BeforeSubmit();
 
-  // Something else set graphics/compute state or descriptor heaps on the command list (the
-  // Resolver does), or the list was submitted and reset mid-frame: set everything again at the
-  // next draw. A new frame's list is detected without this call. `why` is for the draw log.
-  void InvalidateListState(const char* why = "resolve");
+  // Why the next draw must set everything on the command list again. A new frame's list is
+  // detected without InvalidateListState.
+  enum class ListBreak : uint8_t {
+    kResolve,  // the Resolver set its own state and descriptor heaps
+    kSubmit,   // the list was submitted and reset mid-frame
+  };
+  void InvalidateListState(ListBreak why = ListBreak::kResolve);
   // Write the clear or resolve into the draw log while one is open (draw-debug.txt bit 16).
   void LogClear(const ClearCall& c);
   void LogResolve(const ResolveParams& p);

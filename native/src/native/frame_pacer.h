@@ -53,13 +53,6 @@
 // pacer counts across swapchains, each one's waitable bound from Attach to Detach.
 #pragma once
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-
-#include <d3d12.h>
-
 #include <array>
 #include <condition_variable>
 #include <cstdint>
@@ -68,7 +61,9 @@
 #include <thread>
 
 #include "async_file.h"
-#include "win_handle.h"
+#include "win_handle.h"  // windows.h
+
+struct ID3D12Fence;
 
 namespace pgr4::native {
 

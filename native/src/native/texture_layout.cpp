@@ -8,7 +8,9 @@
 #include <rex/graphics/pipeline/texture/util.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <iterator>
 
 namespace pgr4::native {
 
@@ -16,13 +18,6 @@ namespace xenos = rex::graphics::xenos;
 namespace texture_util = rex::graphics::texture_util;
 using rex::graphics::FormatInfo;
 using xenos::TextureFormat;
-
-bool TextureKey::operator==(const TextureKey& o) const {
-  return base_page == o.base_page && mip_page == o.mip_page && width == o.width &&
-         height == o.height && depth_or_array_size == o.depth_or_array_size && pitch == o.pitch &&
-         mip_max_level == o.mip_max_level && format == o.format && endianness == o.endianness &&
-         dimension == o.dimension && tiled == o.tiled && packed_mips == o.packed_mips;
-}
 
 size_t TextureKey::Hash() const {
   uint64_t a = uint64_t(base_page) | uint64_t(mip_page) << 20 | uint64_t(uint32_t(format)) << 40 |
@@ -74,68 +69,87 @@ constexpr uint32_t kRRRR = xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR;
 constexpr uint32_t kRBGG = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, B, G, G);
 
 using C = TextureConversion;
+struct FormatEntry {
+  TextureFormat format;
+  HostFormat host;
+};
 // Same DXGI formats and load conversions as D3D12TextureCache::host_formats_ (non-decompressing
 // path; BCn with unaligned sizes needs D3D12 UnalignedBlockTexturesSupported, checked by the
 // cache). Formats not listed are not used by PGR4's menus and race (tap traces) and are
 // reported as unsupported.
-const HostFormat kFormats[] = {
-    // k_8
-    {DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_SNORM, C::kCopy, false, kRRRR},
-    // k_5_6_5
-    {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_UNKNOWN, C::kR5G6B5ToB5G6R5,
-     false, kRGBB},
-    // k_6_5_5
-    {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_UNKNOWN,
-     C::kR5G5B6ToB5G6R5WithRBGASwizzle, false, kRBGG},
-    // k_8_8_8_8
-    {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_SNORM,
-     C::kCopy, false, kRGBA},
-    // k_2_10_10_10
-    {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy,
-     false, kRGBA},
-    // k_8_8
-    {DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_SNORM, C::kCopy, false,
-     kRGGG},
-    // k_DXT1
-    {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA},
-    // k_DXT2_3
-    {DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA},
-    // k_DXT4_5
-    {DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA},
-    // k_24_8 (R32_FLOAT: shaders get no stencil, as in ReXGlue)
-    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kDepthUnorm24ToFloat32,
-     false, kRRRR},
-    // k_24_8_FLOAT
-    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kDepthFloat24ToFloat32,
-     false, kRRRR},
-    // k_16
-    {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_SNORM, C::kCopy, false,
-     kRRRR},
-    // k_16_16
-    {DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM, C::kCopy,
-     false, kRGGG},
-    // k_16_16_16_16
-    {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM,
-     DXGI_FORMAT_R16G16B16A16_SNORM, C::kCopy, false, kRGBA},
-    // k_16_FLOAT (also k_16_EXPAND)
-    {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, C::kCopy, false, kRRRR},
-    // k_16_16_FLOAT (also k_16_16_EXPAND)
-    {DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT, C::kCopy, false,
-     kRGGG},
-    // k_16_16_16_16_FLOAT (also k_16_16_16_16_EXPAND)
-    {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-     C::kCopy, false, kRGBA},
-    // k_32_FLOAT
-    {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kCopy, false, kRRRR},
-    // k_32_32_FLOAT
-    {DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, C::kCopy, false,
-     kRGGG},
-    // k_32_32_32_32_FLOAT
-    {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-     C::kCopy, false, kRGBA},
-    // k_DXN
-    {DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGGG},
+constexpr FormatEntry kFormats[] = {
+    {TextureFormat::k_8,
+     {DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_SNORM, C::kCopy, false, kRRRR}},
+    {TextureFormat::k_5_6_5,
+     {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_UNKNOWN, C::kR5G6B5ToB5G6R5,
+      false, kRGBB}},
+    {TextureFormat::k_6_5_5,
+     {DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_UNKNOWN,
+      C::kR5G5B6ToB5G6R5WithRBGASwizzle, false, kRBGG}},
+    {TextureFormat::k_8_8_8_8,
+     {DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_SNORM,
+      C::kCopy, false, kRGBA}},
+    {TextureFormat::k_2_10_10_10,
+     {DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_UNKNOWN,
+      C::kCopy, false, kRGBA}},
+    {TextureFormat::k_8_8,
+     {DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_SNORM, C::kCopy, false,
+      kRGGG}},
+    {TextureFormat::k_DXT1,
+     {DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA}},
+    {TextureFormat::k_DXT2_3,
+     {DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA}},
+    {TextureFormat::k_DXT4_5,
+     {DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_BC3_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGBA}},
+    // R32_FLOAT: shaders get no stencil, as in ReXGlue.
+    {TextureFormat::k_24_8,
+     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT,
+      C::kDepthUnorm24ToFloat32, false, kRRRR}},
+    {TextureFormat::k_24_8_FLOAT,
+     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT,
+      C::kDepthFloat24ToFloat32, false, kRRRR}},
+    {TextureFormat::k_16,
+     {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_SNORM, C::kCopy, false,
+      kRRRR}},
+    {TextureFormat::k_16_16,
+     {DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM, C::kCopy,
+      false, kRGGG}},
+    {TextureFormat::k_16_16_16_16,
+     {DXGI_FORMAT_R16G16B16A16_TYPELESS, DXGI_FORMAT_R16G16B16A16_UNORM,
+      DXGI_FORMAT_R16G16B16A16_SNORM, C::kCopy, false, kRGBA}},
+    // The _FLOAT formats also serve their _EXPAND variants (GetBaseFormat).
+    {TextureFormat::k_16_FLOAT,
+     {DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT, C::kCopy, false, kRRRR}},
+    {TextureFormat::k_16_16_FLOAT,
+     {DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16G16_FLOAT, C::kCopy, false,
+      kRGGG}},
+    {TextureFormat::k_16_16_16_16_FLOAT,
+     {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
+      DXGI_FORMAT_R16G16B16A16_FLOAT, C::kCopy, false, kRGBA}},
+    {TextureFormat::k_32_FLOAT,
+     {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT, C::kCopy, false, kRRRR}},
+    {TextureFormat::k_32_32_FLOAT,
+     {DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, C::kCopy, false,
+      kRGGG}},
+    {TextureFormat::k_32_32_32_32_FLOAT,
+     {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+      DXGI_FORMAT_R32G32B32A32_FLOAT, C::kCopy, false, kRGBA}},
+    {TextureFormat::k_DXN,
+     {DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_UNKNOWN, C::kCopy, true, kRGGG}},
 };
+
+// Fetch constant formats are 6 bits.
+constexpr uint32_t kFormatCount = 64;
+// kFormats index per format, -1 for formats it does not list.
+constexpr std::array<int8_t, kFormatCount> kFormatIndex = [] {
+  std::array<int8_t, kFormatCount> index{};
+  index.fill(-1);
+  for (size_t i = 0; i < std::size(kFormats); ++i) index[size_t(kFormats[i].format)] = int8_t(i);
+  return index;
+}();
+static_assert(size_t(std::count_if(kFormatIndex.begin(), kFormatIndex.end(),
+                                   [](int8_t i) { return i >= 0; })) == std::size(kFormats),
+              "a format is listed twice in kFormats");
 
 uint32_t Float20e4To32Bits(uint32_t f24) {
   // xenos::Float20e4To32 (Xenia, BSD-3); that definition lives in rexgpu-xenos only.
@@ -223,52 +237,9 @@ void SwapCopy(uint8_t* dst, const uint8_t* src, size_t size, xenos::Endian endia
 }  // namespace
 
 const HostFormat* GetHostFormat(TextureFormat f) {
-  switch (f) {
-    case TextureFormat::k_8:
-      return &kFormats[0];
-    case TextureFormat::k_5_6_5:
-      return &kFormats[1];
-    case TextureFormat::k_6_5_5:
-      return &kFormats[2];
-    case TextureFormat::k_8_8_8_8:
-      return &kFormats[3];
-    case TextureFormat::k_2_10_10_10:
-      return &kFormats[4];
-    case TextureFormat::k_8_8:
-      return &kFormats[5];
-    case TextureFormat::k_DXT1:
-      return &kFormats[6];
-    case TextureFormat::k_DXT2_3:
-      return &kFormats[7];
-    case TextureFormat::k_DXT4_5:
-      return &kFormats[8];
-    case TextureFormat::k_24_8:
-      return &kFormats[9];
-    case TextureFormat::k_24_8_FLOAT:
-      return &kFormats[10];
-    case TextureFormat::k_16:
-      return &kFormats[11];
-    case TextureFormat::k_16_16:
-      return &kFormats[12];
-    case TextureFormat::k_16_16_16_16:
-      return &kFormats[13];
-    case TextureFormat::k_16_FLOAT:
-      return &kFormats[14];
-    case TextureFormat::k_16_16_FLOAT:
-      return &kFormats[15];
-    case TextureFormat::k_16_16_16_16_FLOAT:
-      return &kFormats[16];
-    case TextureFormat::k_32_FLOAT:
-      return &kFormats[17];
-    case TextureFormat::k_32_32_FLOAT:
-      return &kFormats[18];
-    case TextureFormat::k_32_32_32_32_FLOAT:
-      return &kFormats[19];
-    case TextureFormat::k_DXN:
-      return &kFormats[20];
-    default:
-      return nullptr;
-  }
+  if (uint32_t(f) >= kFormatCount) return nullptr;
+  const int8_t i = kFormatIndex[uint32_t(f)];
+  return i < 0 ? nullptr : &kFormats[i].host;
 }
 
 uint64_t SignedViewIsUnsignedFormats() {
@@ -293,12 +264,20 @@ uint32_t GuestToHostComponentMapping(uint32_t guest_swizzle, uint32_t host_swizz
   return mapping | (1u << 12);
 }
 
-void GetGuestExtents(const TextureKey& key, uint32_t* base_bytes, uint32_t* mips_bytes) {
-  texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
+texture_util::TextureGuestLayout GetGuestLayout(const TextureKey& key) {
+  return texture_util::GetGuestTextureLayout(
       key.dimension, key.pitch, key.width, key.height, key.depth_or_array_size, key.tiled,
       key.format, key.packed_mips, key.base_page != 0, key.mip_max_level);
+}
+
+void GetGuestExtents(const TextureKey& key, const texture_util::TextureGuestLayout& layout,
+                     uint32_t* base_bytes, uint32_t* mips_bytes) {
   *base_bytes = key.base_page ? layout.base.level_data_extent_bytes : 0;
   *mips_bytes = key.mip_page ? layout.mips_total_extent_bytes : 0;
+}
+
+void GetGuestExtents(const TextureKey& key, uint32_t* base_bytes, uint32_t* mips_bytes) {
+  GetGuestExtents(key, GetGuestLayout(key), base_bytes, mips_bytes);
 }
 
 uint64_t GetHostFootprints(const TextureKey& key, bool d3d12_placement,
@@ -306,6 +285,7 @@ uint64_t GetHostFootprints(const TextureKey& key, bool d3d12_placement,
   subresources->clear();
   const HostFormat* host = GetHostFormat(key.format);
   if (!host) return 0;
+  subresources->reserve(size_t(key.array_size()) * key.mip_levels());
   const FormatInfo* info = FormatInfo::Get(key.format);
   uint32_t bw = host->block_compressed ? info->block_width : 1;
   uint32_t bh = host->block_compressed ? info->block_height : 1;
@@ -341,14 +321,18 @@ uint64_t GetHostFootprints(const TextureKey& key, bool d3d12_placement,
 bool UntileTexture(const TextureKey& key, const GuestTextureMemory& memory,
                    const std::vector<HostSubresource>& subresources, uint8_t* dst,
                    std::vector<uint8_t>* scratch, UntileStats* stats) {
+  return UntileTexture(key, GetGuestLayout(key), memory, subresources, dst, scratch, stats);
+}
+
+bool UntileTexture(const TextureKey& key, const texture_util::TextureGuestLayout& layout,
+                   const GuestTextureMemory& memory,
+                   const std::vector<HostSubresource>& subresources, uint8_t* dst,
+                   std::vector<uint8_t>* scratch, UntileStats* stats) {
   const HostFormat* host = GetHostFormat(key.format);
   if (!host) return false;
   const FormatInfo* info = FormatInfo::Get(key.format);
   const uint32_t bpb = info->bytes_per_block();
   const uint32_t bpb_log2 = rex::log2_floor(bpb);
-  texture_util::TextureGuestLayout layout = texture_util::GetGuestTextureLayout(
-      key.dimension, key.pitch, key.width, key.height, key.depth_or_array_size, key.tiled,
-      key.format, key.packed_mips, key.base_page != 0, key.mip_max_level);
   const bool is_3d = key.is_3d();
 
   // Endian-swapped copies of the base and mip regions, then one row of scratch: rows that need

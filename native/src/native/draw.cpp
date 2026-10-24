@@ -11,6 +11,7 @@
 #include "draw.h"
 
 #include "geometry_shader.h"
+#include "log.h"
 #include "pipeline_store.h"
 #include "profile.h"
 #include "render_targets.h"
@@ -47,10 +48,12 @@
 #include <thread>
 #include <bit>
 #include <cfloat>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -112,14 +115,6 @@ namespace texture_util = rex::graphics::texture_util;
 
 namespace {
 
-#define DRAW_LOG_ONCE(flag, ...) \
-  do {                           \
-    if (!(flag)) {               \
-      (flag) = true;             \
-      REXLOG_WARN(__VA_ARGS__);  \
-    }                            \
-  } while (0)
-
 constexpr uint32_t kSharedMemorySize = 512u << 20;  // guest physical address space
 // Shared memory is a reserved buffer whose 4 MB chunks get memory when a range in them is first
 // requested (the Xenos plugin's shared memory does the same): a committed 512 MB buffer took half
@@ -131,6 +126,10 @@ constexpr uint32_t kPageCount = kSharedMemorySize >> kPageShift;
 // The memory unwatches at most the 4 MB-aligned block around a write fault
 // (PhysicalHeap::TriggerCallbacks), so the invalidation callback looks no further.
 constexpr uint32_t kUnwatchWindow = 4u << 20;
+// The Xenos plugin's invalidation callbacks let the memory unwatch at most the 256 KB-aligned
+// block around a fault: the pages of one 64-bit word of the valid bits.
+constexpr uint32_t kPluginUnwatchBlock = 256u << 10;
+static_assert(kPluginUnwatchBlock == 64u << kPageShift);
 constexpr uint32_t kViewHeapSize = 65536;
 constexpr uint32_t kSamplerHeapSize = 2048;
 // View heap: 0 shared memory SRV, 1 shared memory UAV, then the bindless table (descriptor
@@ -142,6 +141,12 @@ constexpr uint32_t NullView(D3D12_SRV_DIMENSION dim) {
   return dim == D3D12_SRV_DIMENSION_TEXTURECUBE ? kNullCube
          : dim == D3D12_SRV_DIMENSION_TEXTURE3D ? kNull3D
                                                 : kNull2DArray;
+}
+// ... and for a texture binding of fetch dimension `dim`.
+constexpr uint32_t NullView(xenos::FetchOpDimension dim) {
+  return dim == xenos::FetchOpDimension::kCube          ? kNullCube
+         : dim == xenos::FetchOpDimension::k3DOrStacked ? kNull3D
+                                                        : kNull2DArray;
 }
 constexpr D3D12_RESOURCE_STATES kSharedReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
@@ -380,13 +385,17 @@ struct PipelineKey {
   uint8_t depth_enable, depth_write, depth_func, stencil_enable;
   uint8_t stencil_read_mask, stencil_write_mask;
   uint8_t front[4], back[4];  // fail, depth fail, pass, func (D3D12 values)
-  uint8_t num_rts, pad[3];
+  uint8_t num_rts, pad[5];
   DXGI_FORMAT dsv;
   DXGI_FORMAT rtv[4];
   struct Rt {
     uint8_t blend, src, dst, op, src_a, dst_a, op_a, mask;
   } rt[4];
+  uint8_t pad_end[4];
 };
+// No implicit padding: keys are hashed and stored as bytes, and a copy need not carry padding.
+static_assert(offsetof(PipelineKey, depth_bias) == 28 && offsetof(PipelineKey, dsv) == 56 &&
+              offsetof(PipelineKey, rt) == 76 && sizeof(PipelineKey) == 112);
 // Bump when PipelineKey's layout or the meaning of a field changes: keys are stored on disk
 // (PipelineStore) and an old file is then discarded.
 // 2: depth bias zero with dynamic depth bias; 3: pixel shaders specialized for unsigned textures
@@ -532,7 +541,6 @@ D3D12_SAMPLER_DESC SamplerDesc(const SamplerKey& k) {
   d.AddressU = kAddress[k.clamp_x];
   d.AddressV = kAddress[k.clamp_y];
   d.AddressW = kAddress[k.clamp_z];
-  d.MipLODBias = 0.0f;
   d.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   switch (xenos::BorderColor(k.border)) {
     case xenos::BorderColor::k_ABGR_White:
@@ -593,11 +601,11 @@ struct CachedCbv {
   alignas(16) uint8_t last[kMaxSize];
   uint32_t size = 0;
   D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
-  D3D12_GPU_VIRTUAL_ADDRESS bound = 0;
+  D3D12_GPU_VIRTUAL_ADDRESS bound = 0;  // list state (ResetListState)
+  // Forgets the upload, whose memory may be recycled: the next commit uploads `last` again.
   void Reset() {
     size = 0;
     gpu = 0;
-    bound = 0;
   }
 };
 
@@ -650,10 +658,14 @@ struct DrawRenderer::Impl {
   BoolSpecializer vs_bools{shaders}, ps_bools{shaders};
   bool bool_specialize = REXCVAR_GET(pgr4_native_bool_specialize);
   ComPtr<ID3D12RootSignature> root_signature;
+  uint64_t root_signature_hash = 0;  // names in the pipeline library depend on it
 
   // Shared memory: guest physical memory mirror and its page validity (cleared by CPU writes).
   ComPtr<ID3D12Resource> shared;
-  D3D12_RESOURCE_STATES shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
+  // Its state in the list being recorded. Buffers are created in the common state and decay to
+  // it when ExecuteCommandLists completes, so every new list starts from there (SyncListFrame,
+  // and InvalidateListState after a submission).
+  D3D12_RESOURCE_STATES shared_state = D3D12_RESOURCE_STATE_COMMON;
   D3D12_GPU_VIRTUAL_ADDRESS shared_gpu = 0;
   // Reserved shared buffer: which chunks have memory (set under shared_map_mutex, read without
   // it), and the tile heaps behind them. False: a committed buffer.
@@ -664,15 +676,15 @@ struct DrawRenderer::Impl {
   uint32_t shared_mapped_chunks = 0;
   std::unique_ptr<std::atomic<uint64_t>[]> valid;
   void* invalidation_handle = nullptr;
-  using PendingCopy = VertexCopy;
   // Without the render thread: the copies of the draw being recorded. With it, Prepare
   // (guest thread) writes into the batch's vector instead: this one is the render thread's.
-  std::vector<PendingCopy> copies;
+  std::vector<VertexCopy> copies;
   // Fence (or Prepare's tag) RequestRange tags vertex upload memory with.
   uint64_t upload_fence = 0;
   // Render thread mode: vertex_upload belongs to the guest thread (Prepare/EndFramePrepare).
   bool threaded = false;
   uint64_t prep_upload_bytes = 0, prep_uploads = 0;
+  PrepareDiag prep_diag;  // the guest thread's, until EndFramePrepare hands it over
   // Copy segments (DrawRenderer::Prepare): what the current segment's draws read. Watched
   // ranges are copied in whole pages, so their reads are kept one bit per page, valid in the
   // 64-page words whose epoch is the segment's. Unwatched ranges (inline vertices, packed
@@ -862,6 +874,7 @@ struct DrawRenderer::Impl {
   PipelineStore store;
   // What made the pipelines created while running new (logged, kNewPipelineLog lines): a
   // shader pair or a render state no pipeline had before, bool or texture-sign variants.
+  // Counted only while those lines are logged: nothing reads them afterwards.
   std::unordered_map<uint64_t, uint32_t> pipeline_states, pipeline_pairs;  // digest -> pipelines
   uint32_t new_pipelines_logged = 0;
   static constexpr uint32_t kNewPipelineLog = 64;
@@ -903,7 +916,6 @@ struct DrawRenderer::Impl {
     uint32_t sample[kSample] = {};
     DxbcShader* shader = nullptr;
   };
-  uint64_t vs_repatches = 0;  // built-in VS variants found patched in place for another declaration
   ShaderMemo vs_memo[ShaderMemo::kEntries], ps_memo[ShaderMemo::kEntries];
   ShaderMemo* vs_last = nullptr;  // the entry the previous draw used
   ShaderMemo* ps_last = nullptr;
@@ -934,15 +946,16 @@ struct DrawRenderer::Impl {
 
   // Draw path counters, logged every 300 frames with --pgr4_native_profile.
   struct Diag {
-    uint64_t frames = 0, draws = 0, shader_loads = 0, shader_loads_immediate = 0, mods_hits = 0,
-             translation_hits = 0, pso_hits = 0, ranges = 0, range_runs = 0, range_pages = 0,
-             unwatched = 0, flushes = 0;
+    uint64_t frames = 0, draws = 0, mods_hits = 0, translation_hits = 0, pso_hits = 0, flushes = 0;
+    PrepareDiag prep;  // with the render thread, added at each Swap (AddPrepareCounters)
     uint64_t cbv_uploads[16] = {}, cbv_bytes[16] = {};  // by root parameter
     // Textures bound, by the fetch constant state the shaders read at run time: swizzled signs
     // all unsigned, gamma RGB + unsigned A, all gamma, all signed, other; then exponent bias
     // set, LOD bias set (any signs).
     uint64_t fetch_classes[7] = {};
   } diag;
+  // Where Prepare's counters go: with the render thread, which owns diag, the guest thread's own.
+  PrepareDiag& PrepDiag() { return threaded ? prep_diag : diag.prep; }
 
   // List state.
   uint64_t list_frame = UINT64_MAX;
@@ -959,6 +972,10 @@ struct DrawRenderer::Impl {
   uint32_t bound_rt_count = UINT32_MAX;
   D3D12_INDEX_BUFFER_VIEW bound_ibv{};
   CachedCbv cb_system, cb_float_vs, cb_float_ps, cb_bool_loop, cb_fetch, cb_desc_vs, cb_desc_ps;
+  std::array<CachedCbv*, 7> Cbvs() {
+    return {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop,
+            &cb_fetch,  &cb_desc_vs,  &cb_desc_ps};
+  }
 
   // Oracle toggles from <capture dir>\draw-debug.txt (with --pgr4_native_capture_dir)
   // ("<mask> [max_draws] [skip_from] [skip_to] [shader hash]..."), read every 15 frames.
@@ -1002,10 +1019,6 @@ struct DrawRenderer::Impl {
                        uint32_t draw_index);
   void Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem);
   void WriteSnapshots(uint64_t completed_fence);
-  // DRAW_LOG_ONCE: the message was logged.
-  bool log_memexport = false, log_tess = false, log_reset = false, log_prim = false,
-       log_vfetch = false, log_pso = false, log_rt = false, log_upload = false, log_shader = false,
-       log_heap = false;
 
   Impl(NativeRenderer& renderer, DrawRenderer::Stats& s) : r(renderer), stats(s) {}
   ~Impl() {
@@ -1030,10 +1043,51 @@ struct DrawRenderer::Impl {
 
   bool Initialize();
   void Draw(const DrawState& s, const DrawPrep* prep);
+  // Draw's parts. Each has one call site, in Draw.
+  //
+  // At the first use of a frame's command list: forgets the previous list's state.
+  void SyncListFrame();
+  // The translation of `shader` with `modification` (translation_memo first), null on failure.
+  DxbcShader::Translation* Translated(DxbcShader& shader, uint64_t modification);
+  PipelineKey BuildPipelineKey(const RegisterFile& regs, xenos::PrimitiveType prim,
+                               const ShaderModifications& mods, const DxbcShader::Translation* vst,
+                               const DxbcShader::Translation* pst, uint8_t strip_cut,
+                               bool rasterization, bool polygonal, reg::PA_SU_SC_MODE_CNTL sc,
+                               reg::RB_DEPTHCONTROL depth_control, uint32_t color_mask,
+                               const BoundTargets& targets) const;
+  // The draw's line in draw_log (open).
+  void LogDraw(const DrawState& s, const RegisterFile& regs, uint32_t draw_index, uint32_t count,
+               const DxbcShader& vs, const DxbcShader* ps, const ShaderModifications& mods,
+               const PipelineKey& key, const ViewportInfo& vp, const Scissor& scissor);
+  // The ready pipeline for `key` (hashed here), or null when the draw is skipped (compiling or
+  // failed, counted). Drawing with the pipeline of the unspecialized shaders sets `vs` and `ps`
+  // to those.
+  ID3D12PipelineState* SelectPipeline(const PipelineKey& key, const DxbcShader::Translation& vst,
+                                      const DxbcShader::Translation* pst, DxbcShader*& vs,
+                                      DxbcShader*& ps, DxbcShader* vs_generic,
+                                      DxbcShader* ps_generic, uint64_t pixel_mod,
+                                      uint64_t generic_pixel_mod, const ShaderDrawRegs& sdr,
+                                      xenos::PrimitiveType prim);
+  // What BindTextures reads besides the shader, and where it writes the texture signs.
+  struct TextureBindContext {
+    const DrawState& s;
+    const RegisterFile& regs;
+    ID3D12GraphicsCommandList* list;
+    TextureCache& texture_cache;
+    uint64_t frame_fence;
+    uint64_t captured;  // TextureCache::MarkCapture stamp
+    uint8_t* signs;     // [32], by fetch constant: the bound textures' swizzled signs
+  };
+  // The shader's descriptor table into `indices`; returns its entry count.
+  uint32_t BindTextures(const TextureBindContext& ctx, const DxbcShader& shader, uint32_t* indices);
+  void FillSystemConstants(const DrawState& s, const RegisterFile& regs, xenos::PrimitiveType prim,
+                           bool polygonal, xenos::Endian index_endian, const ViewportInfo& vp,
+                           uint32_t used_textures, const uint8_t* signs,
+                           DxbcShaderTranslator::SystemConstants& sys);
   DxbcShader* LoadShader(ShaderMemo* table, ShaderMemo*& last, const ShaderRef& ref,
                          xenos::ShaderType type);
   // Copies go to the end of `out`.
-  bool RequestVertices(const DrawState& s, const DxbcShader& vs, std::vector<PendingCopy>& out);
+  bool RequestVertices(const DrawState& s, const DxbcShader& vs, std::vector<VertexCopy>& out);
   void Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep, std::vector<VertexCopy>* out);
   // A triangle fan as a host triangle list (v1, v2, v0), (v2, v3, v0)... like the plugin's
   // primitive processor; guest indices are copied raw (the VS still swaps them). The guest
@@ -1042,10 +1096,30 @@ struct DrawRenderer::Impl {
   // and Draw run VZEROUPPER before their calls (build.sh).
   [[gnu::noinline]] void WriteFanIndices(const DrawState& s, uint32_t count, bool wide,
                                          uint8_t* out) const;
+  struct FanIndices {
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    uint32_t count = 0;  // host indices, 0: none (out of upload memory)
+    bool wide = false;   // 32-bit
+  };
+  // The host indices of the triangle fan `s` (s.count >= 3) in upload memory tagged `tag`.
+  FanIndices UploadFanIndices(const DrawState& s, uint64_t tag);
   void ResetListState();
   // Whether [start, start + length) lies in guest physical memory (logged once if not).
   bool InSharedMemory(uint32_t start, uint32_t length);
-  bool RequestRange(uint32_t start, uint32_t length, bool watch, std::vector<PendingCopy>& out);
+  bool RequestRange(uint32_t start, uint32_t length, bool watch, std::vector<VertexCopy>& out);
+  // Sets (or clears) the valid bits of pages [first, end).
+  void SetValid(uint32_t first, uint32_t end, bool set) {
+    for (uint32_t q = first; q < end;) {
+      const uint32_t word_end = std::min(end, (q | 63) + 1);
+      const uint32_t n = word_end - q;
+      const uint64_t mask = (n == 64 ? ~0ull : ((1ull << n) - 1)) << (q & 63);
+      if (set)
+        valid[q >> 6].fetch_or(mask, std::memory_order_relaxed);
+      else
+        valid[q >> 6].fetch_and(~mask, std::memory_order_relaxed);
+      q = word_end;
+    }
+  }
   // Gives the shared buffer memory under [start, start + length) if it is reserved. Any thread;
   // the tile mappings are queued ahead of the copies the caller records afterwards.
   bool MapShared(uint32_t start, uint32_t length);
@@ -1092,8 +1166,8 @@ struct DrawRenderer::Impl {
   // A watched page may be unwatched once its valid bit is clear: the next request copies it
   // again and re-arms the watch. Unless the range must be exact, the pages around it that hold
   // no valid copy are offered for unwatching too (InvalidRunAround). Valid neighbours stay
-  // watched: unwatching them too (one fault per 256 KB block instead of per 4 KB page) tripled
-  // the bytes re-copied per frame.
+  // watched: unwatching them too (one fault per kPluginUnwatchBlock instead of per 4 KB page)
+  // tripled the bytes re-copied per frame.
   static std::pair<uint32_t, uint32_t> InvalidationThunk(void* context, uint32_t start,
                                                          uint32_t length, bool exact) {
     auto* self = static_cast<Impl*>(context);
@@ -1117,10 +1191,10 @@ struct DrawRenderer::Impl {
       quick.store(n, std::memory_order_relaxed);
       if (n == 2) self->hot[p >> 6].fetch_or(bit, std::memory_order_relaxed);
       // The page after one written since the previous frame: a buffer being filled in order.
-      // Its valid pages ahead, to the end of the 256 KB block (the widest range the Xenos
-      // plugin's callbacks let the memory unwatch), are invalidated with it, so the fill faults
-      // about once per block instead of once per page. In the race this cut the faults on valid
-      // pages 4x, and under 1 % of the pages invalidated ahead went unwritten.
+      // Its valid pages ahead, to the end of the kPluginUnwatchBlock (the valid word), are
+      // invalidated with it, so the fill faults about once per block instead of once per page. In
+      // the race this cut the faults on valid pages 4x, and under 1 % of the pages invalidated
+      // ahead went unwritten.
       const uint32_t previous = p ? self->write_frame[p - 1].load(std::memory_order_relaxed) : 0;
       self->write_frame[p].store(frame + 1, std::memory_order_relaxed);
       const uint32_t shift = (p & 63) + 1;
@@ -1222,7 +1296,6 @@ struct DrawRenderer::Impl {
     std::vector<std::pair<uint32_t, uint32_t>> segment_reads;
     uint8_t slot = 0xFF;           // vertex fetch constant being requested, 0xFF: indices
     uint64_t stale = 0, late = 0;  // pages, since the last Swap
-    uint32_t logged = 0, late_logged = 0;
     std::vector<std::pair<uint32_t, uint32_t>> frame_copies;  // (start, size) since the Swap
   };
   std::unique_ptr<Coherency> coherency;
@@ -1238,14 +1311,11 @@ struct DrawRenderer::Impl {
                            (kRegisterBlocks[i + 1] - kRegisterBlocks[i]) * 4) |
                1;
   }
-  uint32_t coherency_reg_logged = 0;
-  bool LogCoherency() { return coherency->logged < 200 && ++coherency->logged; }
   // The GPU half (render thread): jobs whose read back is recorded, waiting for their fence.
   static constexpr uint32_t kCoherencyReadback = 8u << 20;
   std::shared_ptr<CoherencyJob> coherency_next;
   std::deque<std::shared_ptr<CoherencyJob>> coherency_inflight;
   std::vector<ComPtr<ID3D12Resource>> coherency_readbacks;  // free, kCoherencyReadback each
-  uint32_t coherency_gpu_logged = 0;
   void CheckCoherencyJobs(uint64_t completed_fence);
 };
 
@@ -1279,7 +1349,7 @@ bool DrawRenderer::Impl::Initialize() {
   // 16 ms.
   vertex_upload.Reserve(4);
   constant_upload.Reserve(12);
-  root_signature = CreateBindlessRootSignature(device);
+  root_signature = CreateBindlessRootSignature(device, &root_signature_hash);
   if (!root_signature) return false;
 
   const D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
@@ -1290,16 +1360,15 @@ bool DrawRenderer::Impl::Initialize() {
   shared_tiled = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options,
                                                        sizeof(options))) &&
                  options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2 &&
-                 SUCCEEDED(device->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COPY_DEST,
-                                                          nullptr, IID_PPV_ARGS(&shared)));
+                 SUCCEEDED(device->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          IID_PPV_ARGS(&shared)));
   if (!shared_tiled) {
     if (Failed(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                IID_PPV_ARGS(&shared)),
                "shared memory buffer (512 MB)"))
       return false;
   }
-  shared_state = D3D12_RESOURCE_STATE_COPY_DEST;
   shared_gpu = shared->GetGPUVirtualAddress();
   // Zeroed: make_unique value-initializes, and std::atomic's default constructor value-initializes
   // its value (C++20).
@@ -1417,7 +1486,7 @@ bool DrawRenderer::Impl::Initialize() {
 }
 
 void DrawRenderer::Impl::PipelineWorker(bool saves, bool on_wait) {
-  std::call_once(library_open, [this] { library.Open(device, library_path); });
+  std::call_once(library_open, [this] { library.Open(device, library_path, root_signature_hash); });
   std::unique_lock<std::mutex> lock(pso_mutex);
   auto has_work = [this] { return pso_stopping || !pso_jobs.empty() || !prewarm_jobs.empty(); };
   for (;;) {
@@ -1443,21 +1512,16 @@ void DrawRenderer::Impl::PipelineWorker(bool saves, bool on_wait) {
     bool loaded;
     const auto t0 = std::chrono::steady_clock::now();
     const HRESULT hr = library.Create(job.desc, &pso, &loaded);
-    if (job.logged) {
-      static std::atomic<uint32_t> logged_times{0};
-      if (logged_times.fetch_add(1, std::memory_order_relaxed) < kNewPipelineLog)
-        REXLOG_INFO("PGR4 native pipelines: compiled in {:.1f} ms{}",
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                        .count(),
-                    loaded ? " (from the library)" : "");
-    }
+    if (job.logged)
+      PGR4_LOG_FIRST(
+          kNewPipelineLog, INFO, "PGR4 native pipelines: compiled in {:.1f} ms{}",
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+          loaded ? " (from the library)" : "");
     if (SUCCEEDED(hr)) {
       job.target->pso = std::move(pso);
       job.target->state.store(kReady, std::memory_order_release);
     } else {
-      static std::atomic<bool> logged{false};
-      if (!logged.exchange(true))
-        REXLOG_WARN("PGR4 native draw: CreateGraphicsPipelineState failed {:08X}", uint32_t(hr));
+      PGR4_WARN_ONCE("PGR4 native draw: CreateGraphicsPipelineState failed {:08X}", uint32_t(hr));
       job.target->state.store(kFailed, std::memory_order_release);
     }
     lock.lock();
@@ -1478,9 +1542,7 @@ void DrawRenderer::Impl::ResetListState() {
   bound_dsv.ptr = 0;
   bound_rt_count = UINT32_MAX;
   bound_ibv = {};
-  for (CachedCbv* cb :
-       {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop, &cb_fetch, &cb_desc_vs, &cb_desc_ps})
-    cb->bound = 0;
+  for (CachedCbv* cb : Cbvs()) cb->bound = 0;
 }
 
 void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
@@ -1493,18 +1555,18 @@ void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
 
 bool DrawRenderer::Impl::InSharedMemory(uint32_t start, uint32_t length) {
   if (start < kSharedMemorySize && kSharedMemorySize - start >= length) return true;
-  DRAW_LOG_ONCE(log_upload, "PGR4 native draw: range {:08X}+{:X} outside physical memory", start,
-                length);
+  PGR4_WARN_ONCE("PGR4 native draw: range {:08X}+{:X} outside physical memory", start, length);
   return false;
 }
 
 bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watch,
-                                      std::vector<PendingCopy>& out) {
+                                      std::vector<VertexCopy>& out) {
   if (!length) return true;
   if (!InSharedMemory(start, length)) return false;
   const bool exact = !watch || upload_every_draw.load(std::memory_order_relaxed);
   if (preparing) draw_reads.emplace_back(start, start + length, exact);
   const uint64_t fence = upload_fence;
+  PrepareDiag& pd = PrepDiag();
   auto copy = [&](uint32_t from, uint32_t size) {
     if (preparing && !segment_conflict) segment_conflict = SegmentReads(from, from + size);
     if (coherency && preparing) CheckSegmentCopy(from, size);
@@ -1530,20 +1592,24 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     return true;
   };
   if (exact) {
-    ++diag.unwatched;
+    ++pd.unwatched;
     return copy(start, length);
   }
-  ++diag.ranges;
+  ++pd.ranges;
   const uint32_t first = start >> kPageShift, last = (start + length - 1) >> kPageShift;
-  diag.range_pages += last - first + 1;
+  pd.range_pages += last - first + 1;
   const uint32_t trace_request =
       trace.file ? trace.request.fetch_add(1, std::memory_order_relaxed) : 0;
   const uint32_t frame = watch_frame.load(std::memory_order_relaxed);
   // Hot pages whose content changed, copied in runs of adjacent pages.
   uint32_t changed_first = 0, changed_end = 0;
   auto copy_changed = [&] {
-    return changed_first == changed_end ||
-           copy(changed_first << kPageShift, (changed_end - changed_first) << kPageShift);
+    if (changed_first == changed_end ||
+        copy(changed_first << kPageShift, (changed_end - changed_first) << kPageShift))
+      return true;
+    // Hashed as changed but not copied: the next request copies them.
+    for (uint32_t q = changed_first; q < changed_end; ++q) hot_hash[q] = 0;
+    return false;
   };
   uint64_t hashed = 0, changed = 0;
   uint32_t p = first;
@@ -1594,13 +1660,7 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
       ++run_end;
     }
     // Valid and watched before reading, so a write during the copy invalidates again.
-    for (uint32_t q = p; q < run_end;) {
-      const uint32_t word_end = std::min(run_end, (q | 63) + 1);
-      const uint32_t n = word_end - q;
-      const uint64_t mask = (n == 64 ? ~0ull : ((1ull << n) - 1)) << (q & 63);
-      valid[q >> 6].fetch_or(mask, std::memory_order_relaxed);
-      q = word_end;
-    }
+    SetValid(p, run_end, true);
     for (uint32_t q = p; q < run_end; ++q) armed_frame[q].store(frame, std::memory_order_relaxed);
     const uint32_t from = p << kPageShift, size = (run_end - p) << kPageShift;
     {
@@ -1610,8 +1670,12 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     watch_arms.fetch_add(1, std::memory_order_relaxed);
     watch_arm_pages.fetch_add(run_end - p, std::memory_order_relaxed);
     if (trace.file) trace.Add(WatchTrace::kArm, p, run_end - p, trace_request);
-    ++diag.range_runs;
-    if (!copy(from, size)) return false;
+    ++pd.range_runs;
+    if (!copy(from, size)) {
+      // Not copied: invalid again, so the next request copies them.
+      SetValid(p, run_end, false);
+      return false;
+    }
     p = run_end;
   }
   if (hashed) {
@@ -1653,14 +1717,13 @@ void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
         ++differ;
         first = std::min(first, i);
       }
-    if (LogCoherency())
-      REXLOG_WARN(
-          "PGR4 native coherency: frame {} stale page {:05X} (request {:08X}+{:X}, slot "
-          "{}): {} of {} bytes differ from {:08X}, {} armed at frame {}, last write fault "
-          "frame {}",
-          stamp - 1, p, start, length, c.slot, differ, hi - lo, first, is_hot ? "hot" : "valid",
-          armed_frame[p].load(std::memory_order_relaxed),
-          int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
+    PGR4_LOG_FIRST(200, WARN,
+                   "PGR4 native coherency: frame {} stale page {:05X} (request {:08X}+{:X}, slot "
+                   "{}): {} of {} bytes differ from {:08X}, {} armed at frame {}, last write fault "
+                   "frame {}",
+                   stamp - 1, p, start, length, c.slot, differ, hi - lo, first,
+                   is_hot ? "hot" : "valid", armed_frame[p].load(std::memory_order_relaxed),
+                   int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
   }
 }
 
@@ -1670,11 +1733,11 @@ void DrawRenderer::Impl::CheckSegmentCopy(uint32_t from, uint32_t size) {
   for (const auto& [b, e] : c.segment_reads) {
     if (!(b < end && from < e)) continue;
     if (segment_conflict) return;
-    if (LogCoherency())
-      REXLOG_WARN(
-          "PGR4 native coherency: frame {} copy {:08X}+{:X} overwrites {:08X}-{:08X}, read "
-          "earlier in its copy segment, without a new segment",
-          watch_frame.load(std::memory_order_relaxed), from, size, b, e);
+    PGR4_LOG_FIRST(
+        200, WARN,
+        "PGR4 native coherency: frame {} copy {:08X}+{:X} overwrites {:08X}-{:08X}, read "
+        "earlier in its copy segment, without a new segment",
+        watch_frame.load(std::memory_order_relaxed), from, size, b, e);
     return;
   }
 }
@@ -1737,14 +1800,11 @@ void DrawRenderer::Impl::CheckCoherencyJobs(uint64_t completed_fence) {
                 ++differ;
                 first = std::min(first, addr + i);
               }
-            if (coherency_gpu_logged < 200) {
-              ++coherency_gpu_logged;
-              REXLOG_WARN(
-                  "PGR4 native coherency: frame {} shared memory page {:05X} (copied run "
-                  "{:08X}+{:X}) differs from its copies after the frame: {} of {} bytes "
-                  "from {:08X}",
-                  job->frame, addr >> kPageShift, start, size, differ, n, first);
-            }
+            PGR4_LOG_FIRST(200, WARN,
+                           "PGR4 native coherency: frame {} shared memory page {:05X} (copied run "
+                           "{:08X}+{:X}) differs from its copies after the frame: {} of {} bytes "
+                           "from {:08X}",
+                           job->frame, addr >> kPageShift, start, size, differ, n, first);
           }
           off += n;
         }
@@ -1778,12 +1838,11 @@ void DrawRenderer::Impl::CheckLateWrites() {
           !(hot[p >> 6].load(std::memory_order_relaxed) & bit)) {
         // Valid and watched, yet guest memory differs: a write the watch missed.
         ++stale;
-        if (LogCoherency())
-          REXLOG_WARN(
-              "PGR4 native coherency: frame {} stale page {:05X} at the Swap (range "
-              "{:08X}+{:X}, slot {}), armed at frame {}",
-              stamp - 1, p, r.start, r.length, r.slot,
-              armed_frame[p].load(std::memory_order_relaxed));
+        PGR4_LOG_FIRST(200, WARN,
+                       "PGR4 native coherency: frame {} stale page {:05X} at the Swap (range "
+                       "{:08X}+{:X}, slot {}), armed at frame {}",
+                       stamp - 1, p, r.start, r.length, r.slot,
+                       armed_frame[p].load(std::memory_order_relaxed));
         continue;
       }
       ++late;
@@ -1797,15 +1856,17 @@ void DrawRenderer::Impl::CheckLateWrites() {
   }
   c.late += late;
   c.stale += stale;
-  if (late && c.late_logged < 400) {
-    ++c.late_logged;
-    std::string slots;
-    for (uint32_t s = 0; s < 256; ++s)
-      if (slot_pages[s]) slots += fmt::format(" {}:{}", s == 0xFF ? -1 : int(s), slot_pages[s]);
-    REXLOG_INFO(
-        "PGR4 native coherency: frame {} {} pages of {} ranges rewritten after a draw read "
-        "them (first {:08X}+{:X}); pages per slot{}",
-        stamp - 1, late, late_ranges, first_late->start, first_late->length, slots);
+  if (late) {
+    auto slots = [&] {
+      std::string list;
+      for (uint32_t s = 0; s < 256; ++s)
+        if (slot_pages[s]) list += fmt::format(" {}:{}", s == 0xFF ? -1 : int(s), slot_pages[s]);
+      return list;
+    };
+    PGR4_LOG_FIRST(400, INFO,
+                   "PGR4 native coherency: frame {} {} pages of {} ranges rewritten after a draw "
+                   "read them (first {:08X}+{:X}); pages per slot{}",
+                   stamp - 1, late, late_ranges, first_late->start, first_late->length, slots());
   }
   c.ranges.clear();
 }
@@ -1840,8 +1901,9 @@ bool DrawRenderer::Impl::MapShared(uint32_t start, uint32_t length) {
     size.NumTiles = UINT(hd.SizeInBytes / D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES);
     const D3D12_TILE_RANGE_FLAGS flags = D3D12_TILE_RANGE_FLAG_NONE;
     const UINT heap_offset = 0;
-    r.queue()->UpdateTileMappings(shared.Get(), 1, &coord, &size, heap.Get(), 1, &flags,
-                                  &heap_offset, &size.NumTiles, D3D12_TILE_MAPPING_FLAG_NONE);
+    r.command_queue()->UpdateTileMappings(shared.Get(), 1, &coord, &size, heap.Get(), 1, &flags,
+                                          &heap_offset, &size.NumTiles,
+                                          D3D12_TILE_MAPPING_FLAG_NONE);
     shared_heaps.push_back(std::move(heap));
     for (uint32_t m = c; m < end; ++m)
       shared_mapped[m >> 6].fetch_or(1ull << (m & 63), std::memory_order_release);
@@ -1864,7 +1926,7 @@ void DrawRenderer::Impl::FlushCopies(ID3D12GraphicsCommandList* list) {
   ++diag.flushes;
   ++stats.copy_batches;
   TransitionShared(list, D3D12_RESOURCE_STATE_COPY_DEST);
-  for (const PendingCopy& c : copies)
+  for (const VertexCopy& c : copies)
     list->CopyBufferRegion(shared.Get(), c.dst, c.src, c.src_offset, c.size);
   copies.clear();
   TransitionShared(list, kSharedReadState);
@@ -1901,26 +1963,28 @@ uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
   D3D12_SHADER_RESOURCE_VIEW_DESC desc = b.srv;
   // The translator's space for the binding: 2D array (1D/2D), cube, or 3D-or-stacked (either).
   const D3D12_SRV_DIMENSION dim = desc.ViewDimension;
+  bool fits;
   switch (tb.dimension) {
     case xenos::FetchOpDimension::kCube:
-      if (dim != D3D12_SRV_DIMENSION_TEXTURECUBE) return kNullCube;
+      fits = dim == D3D12_SRV_DIMENSION_TEXTURECUBE;
       break;
     case xenos::FetchOpDimension::k3DOrStacked:
-      if (dim != D3D12_SRV_DIMENSION_TEXTURE3D && dim != D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
-        return kNull3D;
+      fits = dim == D3D12_SRV_DIMENSION_TEXTURE3D || dim == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
       break;
     default:
-      if (dim != D3D12_SRV_DIMENSION_TEXTURE2DARRAY) return kNull2DArray;
+      fits = dim == D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
       break;
   }
+  if (!fits) return NullView(tb.dimension);
   if (tb.is_signed) {
     if (b.srv_signed_format == DXGI_FORMAT_UNKNOWN) return NullView(dim);
     desc.Format = b.srv_signed_format;
   }
   const uint64_t key = XXH3_64bits(&desc, sizeof(desc));
-  std::vector<std::pair<uint64_t, uint32_t>>& views = srv_views[b.resource];
-  for (const auto& [view_key, index] : views)
-    if (view_key == key) return index;
+  auto views = srv_views.find(b.resource);
+  if (views != srv_views.end())
+    for (const auto& [view_key, index] : views->second)
+      if (view_key == key) return index;
   uint32_t heap_index;
   if (!free_views.empty()) {
     heap_index = free_views.back();
@@ -1928,14 +1992,15 @@ uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
   } else if (views_allocated < kViewHeapSize) {
     heap_index = views_allocated++;
   } else {
-    DRAW_LOG_ONCE(log_heap, "PGR4 native draw: view heap full ({} descriptors)", kViewHeapSize);
+    PGR4_WARN_ONCE("PGR4 native draw: view heap full ({} descriptors)", kViewHeapSize);
     return NullView(dim);
   }
   D3D12_CPU_DESCRIPTOR_HANDLE h = view_cpu;
   h.ptr += size_t(heap_index) * view_stride;
   device->CreateShaderResourceView(b.resource, &desc, h);
   const uint32_t index = heap_index - kViewTableStart;
-  views.emplace_back(key, index);
+  if (views == srv_views.end()) views = srv_views.try_emplace(b.resource).first;
+  views->second.emplace_back(key, index);
   ++stats.srv_created;
   return index;
 }
@@ -1960,7 +2025,7 @@ uint32_t DrawRenderer::Impl::SamplerDescriptor(const SamplerKey& k) {
   auto it = sampler_indices.find(key);
   if (it != sampler_indices.end()) return it->second;
   if (samplers_allocated >= kSamplerHeapSize) {
-    DRAW_LOG_ONCE(log_heap, "PGR4 native draw: sampler heap full");
+    PGR4_WARN_ONCE("PGR4 native draw: sampler heap full");
     return 0;
   }
   const uint32_t index = samplers_allocated++;
@@ -2011,7 +2076,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash, con
       }
       store.RecordPipeline(vss.ucode_data_hash(), vs.modification(),
                            ps ? ps->shader().ucode_data_hash() : 0, ps ? ps->modification() : 0,
-                           &stored, sizeof(stored));
+                           &stored);
     }
   }
   return p;
@@ -2123,8 +2188,10 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
     b.RenderTargetWriteMask = rt.mask;
   }
   Pipeline* p = pipelines.emplace(hash, std::make_unique<Pipeline>()).first->second.get();
-  ++pipeline_states[StateDigest(key)];
-  ++pipeline_pairs[PairDigest(key)];
+  if (new_pipelines_logged < kNewPipelineLog) {
+    ++pipeline_states[StateDigest(key)];
+    ++pipeline_pairs[PairDigest(key)];
+  }
   if (!pso_threads.empty()) {
     p->prewarm = prewarm;
     {
@@ -2136,8 +2203,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
   }
   HRESULT hr = device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&p->pso));
   if (FAILED(hr)) {
-    DRAW_LOG_ONCE(log_pso, "PGR4 native draw: CreateGraphicsPipelineState failed {:08X}",
-                  uint32_t(hr));
+    PGR4_WARN_ONCE("PGR4 native draw: CreateGraphicsPipelineState failed {:08X}", uint32_t(hr));
     p->state.store(kFailed, std::memory_order_relaxed);
     return p;
   }
@@ -2212,6 +2278,16 @@ void DrawRenderer::Impl::WriteFanIndices(const DrawState& s, uint32_t count, boo
     FanAsList(guest, count, reinterpret_cast<uint16_t*>(out));
 }
 
+DrawRenderer::Impl::FanIndices DrawRenderer::Impl::UploadFanIndices(const DrawState& s,
+                                                                    uint64_t tag) {
+  const uint32_t host_count = (s.count - 2) * 3;
+  const bool wide = s.indexed ? s.index_32bit : s.count > 0xFFFF;
+  UploadPool::Alloc a;
+  if (!vertex_upload.Allocate(uint64_t(host_count) * (wide ? 4 : 2), 16, tag, &a)) return {};
+  WriteFanIndices(s, s.count, wide, a.cpu);
+  return {a.gpu, host_count, wide};
+}
+
 DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
                                            const ShaderRef& ref, xenos::ShaderType type) {
   if (!ref.ucode || !ref.dwords) return nullptr;
@@ -2233,17 +2309,18 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
       memo.immediate_seq == ref.immediate_seq &&
       std::memcmp(memo.sample, sample, sizeof(sample)) == 0) {
     if (memo.binding == ref.binding) return memo.shader;
-    if (++vs_repatches <= 8)
-      REXLOG_INFO("PGR4 native draw: vertex shader {:08X} ({} dwords) rebound in place at frame {}",
-                  ref.ucode, ref.dwords, r.frame_index());
+    PGR4_LOG_FIRST(
+        8, INFO, "PGR4 native draw: vertex shader {:08X} ({} dwords) rebound in place at frame {}",
+        ref.ucode, ref.dwords, r.frame_index());
   }
   memo.ucode = ref.ucode;
   memo.dwords = ref.dwords;
   memo.immediate_seq = ref.immediate_seq;
   memo.binding = ref.binding;
   std::memcpy(memo.sample, sample, sizeof(sample));
-  ++diag.shader_loads;
-  if (ref.immediate) ++diag.shader_loads_immediate;
+  PrepareDiag& pd = PrepDiag();
+  ++pd.shader_loads;
+  if (ref.immediate) ++pd.shader_loads_immediate;
   memo.shader = shaders.Load(type, ucode, ref.dwords);
   return memo.shader;
 }
@@ -2251,7 +2328,7 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
 // Vertex ranges the VS fetches and the index range into `out`. Fan indices are only checked:
 // WriteFanIndices reads them from guest memory.
 bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& vs,
-                                         std::vector<PendingCopy>& out) {
+                                         std::vector<VertexCopy>& out) {
   const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
   const Shader::ConstantRegisterMap& vmap = vs.constant_register_map();
   for (uint32_t w = 0; w < 3; ++w) {
@@ -2262,8 +2339,8 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
       const uint32_t index = w * 32 + b;
       xenos::xe_gpu_vertex_fetch_t f = regs.GetVertexFetch(index);
       if (f.type != xenos::FetchConstantType::kVertex) {
-        DRAW_LOG_ONCE(log_vfetch, "PGR4 native draw: vertex fetch {} has type {} ({:08X} {:08X})",
-                      index, uint32_t(f.type), f.dword_0, f.dword_1);
+        PGR4_WARN_ONCE("PGR4 native draw: vertex fetch {} has type {} ({:08X} {:08X})", index,
+                       uint32_t(f.type), f.dword_0, f.dword_1);
         if (f.type != xenos::FetchConstantType::kInvalidVertex) return false;
       }
       const uint32_t start = f.address << 2, size = f.size << 2;
@@ -2282,7 +2359,6 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
 
 void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep,
                                  std::vector<VertexCopy>* out) {
-  *prep = DrawPrep{};
   prep->captured = r.textures().MarkCapture();
   if (!s.vs.ucode || !s.vs.dwords) return;
   prep->vs = LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
@@ -2307,18 +2383,12 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
   if (coherency)
     for (const Read& read : draw_reads) coherency->segment_reads.push_back({read.begin, read.end});
   // Triangle fans: host indices from the guest's now (Draw reads them from here).
-  const uint32_t count = s.count;
   if (prep->upload_ok && xenos::PrimitiveType(s.primitive) == xenos::PrimitiveType::kTriangleFan &&
-      count >= 3) {
-    const uint32_t host_count = (count - 2) * 3;
-    const bool wide = s.indexed ? s.index_32bit : count > 0xFFFF;
-    UploadPool::Alloc a;
-    if (vertex_upload.Allocate(uint64_t(host_count) * (wide ? 4 : 2), 16, tag, &a)) {
-      WriteFanIndices(s, count, wide, a.cpu);
-      prep->fan_indices = a.gpu;
-      prep->fan_count = host_count;
-      prep->fan_wide = wide;
-    }
+      s.count >= 3) {
+    const FanIndices fan = UploadFanIndices(s, tag);
+    prep->fan_indices = fan.gpu;
+    prep->fan_count = fan.count;
+    prep->fan_wide = fan.wide;
   }
   profile::Mark(profile::kCapVertices);
 }
@@ -2343,265 +2413,42 @@ void DrawRenderer::Impl::ShaderSlots::Assign(const DxbcShader& s) {
   last = nullptr;
 }
 
-void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
-  ID3D12GraphicsCommandList* list = r.command_list();
-  if (list_frame != r.frame_index()) {
-    // A new frame's list: nothing is bound, cached constants of older frames may be reused.
-    list_frame = r.frame_index();
-    ResetListState();
-    for (CachedCbv* cb : {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop, &cb_fetch,
-                          &cb_desc_vs, &cb_desc_ps})
-      cb->Reset();
-  }
-  if (prep && prep->regs_hash[0]) {
-    uint64_t now[5];
-    HashRegisterBlocks(s.regs, now);
-    if (std::memcmp(now, prep->regs_hash, sizeof(now))) {
-      ++stats.reg_mismatches;
-      if (coherency_reg_logged < 100) {
-        ++coherency_reg_logged;
-        REXLOG_WARN(
-            "PGR4 native coherency: frame {} draw {} registers differ from Prepare's in "
-            "blocks{}{}{}{}{}",
-            r.frame_index(), frame_draws, now[0] != prep->regs_hash[0] ? " state" : "",
-            now[1] != prep->regs_hash[1] ? " vs-float" : "",
-            now[2] != prep->regs_hash[2] ? " ps-float" : "",
-            now[3] != prep->regs_hash[3] ? " fetch" : "",
-            now[4] != prep->regs_hash[4] ? " bool-loop" : "");
-      }
-    }
-  }
-  if (prep) {
-    // The guest thread copied the ranges (and marked their pages valid): they go into shared
-    // memory whether or not the draw is issued.
-    if (prep->copy_count) {
-      ++stats.copy_batches;
-      TransitionShared(list, D3D12_RESOURCE_STATE_COPY_DEST);
-      for (uint32_t i = 0; i < prep->copy_count; ++i) {
-        const VertexCopy& c = prep->copies[i];
-        list->CopyBufferRegion(shared.Get(), c.dst, c.src, c.src_offset, c.size);
-      }
-    }
-    if (!prep->upload_ok) {
-      ++stats.failed;
-      return;
-    }
-  }
-  const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
-  const xenos::PrimitiveType prim = xenos::PrimitiveType(s.primitive);
+void DrawRenderer::Impl::SyncListFrame() {
+  if (list_frame == r.frame_index()) return;
+  // A new frame's list: nothing is bound, and shared memory decayed to the common state when the
+  // previous frame's lists completed. Every CBV is uploaded again: the upload memory holding older
+  // frames' constants may have been recycled.
+  list_frame = r.frame_index();
+  ResetListState();
+  shared_state = D3D12_RESOURCE_STATE_COMMON;
+  for (CachedCbv* cb : Cbvs()) cb->Reset();
+}
 
-  // Shaders.
-  if (!s.vs.ucode || !s.vs.dwords) {
-    ++stats.skipped;
-    return;
+DxbcShader::Translation* DrawRenderer::Impl::Translated(DxbcShader& shader, uint64_t modification) {
+  TranslationMemo& m = translation_memo[(reinterpret_cast<uintptr_t>(&shader) >> 6) & 255];
+  if (m.shader == &shader && m.modification == modification) {
+    ++diag.translation_hits;
+    return m.translation;
   }
-  DxbcShader* vs = prep ? prep->vs : LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
-  DxbcShader* ps = prep ? prep->ps : LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
-  if (!vs) {
-    ++stats.failed;
-    return;
-  }
-  DxbcShader* const vs_generic = vs;
-  DxbcShader* const ps_generic = ps;
-  if (bool_specialize) {
-    const uint32_t* bools = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
-    vs = vs_bools.Get(vs, bools);
-    ps = ps_bools.Get(ps, bools);
-  }
+  DxbcShader::Translation* t = shaders.Translate(shader, modification);
+  if (t) m = {&shader, modification, t};
+  return t;
+}
 
-  // SelectModifications reads only prim_type; the index count would defeat mods_memo.
-  reg::VGT_DRAW_INITIATOR initiator;
-  initiator.value = 0;
-  initiator.prim_type = prim;
-
-  ShaderDrawRegs sdr;
-  sdr.sq_program_cntl = regs[XE_GPU_REG_SQ_PROGRAM_CNTL];
-  sdr.sq_context_misc = regs[XE_GPU_REG_SQ_CONTEXT_MISC];
-  sdr.sq_interpolator_cntl = regs[XE_GPU_REG_SQ_INTERPOLATOR_CNTL];
-  sdr.pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
-  sdr.vgt_draw_initiator = initiator.value;
-  sdr.vgt_output_path_cntl = regs[XE_GPU_REG_VGT_OUTPUT_PATH_CNTL];
-  sdr.pa_su_sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
-  sdr.rb_modecontrol = regs[XE_GPU_REG_RB_MODECONTROL];
-  sdr.rb_surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
-  sdr.rb_colorcontrol = regs[XE_GPU_REG_RB_COLORCONTROL];
-  sdr.rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
-  for (uint32_t i = 0; i < 4; ++i) sdr.rb_color_info[i] = regs[kColorInfoRegs[i]];
-  if (mods_memo.vs == vs && mods_memo.ps == ps &&
-      std::memcmp(&mods_memo.sdr, &sdr, sizeof(sdr)) == 0) {
-    ++diag.mods_hits;
-  } else {
-    mods_memo.vs = vs;
-    mods_memo.ps = ps;
-    mods_memo.sdr = sdr;
-    mods_memo.mods = SelectModifications(shaders.translator(), *vs, ps, sdr);
-    mods_memo.ps_textures = 0;
-    if (mods_memo.mods.pixel_shader_used)
-      for (const auto& tb : ps->texture_bindings())
-        mods_memo.ps_textures |= 1u << tb.fetch_constant;
-  }
-  ShaderModifications mods = mods_memo.mods;
-  const uint64_t generic_pixel_mod = mods.pixel;
-  mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
-                                       signed_is_unsigned_formats);
-
-  if (!mods.draw) {
-    ++stats.skipped;
-    return;
-  }
-  if (!mods.pixel_shader_used) ps = nullptr;
-  if (vs->memexport_eM_written() || (ps && ps->memexport_eM_written())) {
-    DRAW_LOG_ONCE(log_memexport, "PGR4 native draw: memexport unsupported (draw skipped)");
-    ++stats.unsupported;
-    return;
-  }
-  const bool tess = xenos::IsMajorModeExplicit(initiator.major_mode, initiator.prim_type) &&
-                    regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
-                        xenos::VGTOutputPath::kTessellationEnable;
-  if (tess) {
-    DRAW_LOG_ONCE(log_tess, "PGR4 native draw: tessellation unsupported");
-    ++stats.unsupported;
-    return;
-  }
-  profile::Mark(profile::kShaders);
-  const bool polygonal = rex::graphics::draw_util::IsPrimitivePolygonal(false, prim);
-  const bool rasterization = IsRasterizationPotentiallyDone(regs, polygonal);
-
-  // Host primitive (the plugin's primitive processor on D3D12: points, rectangles and quads go
-  // through a geometry shader, triangle fans through converted indices).
-  D3D_PRIMITIVE_TOPOLOGY topology;
-  switch (prim) {
-    case xenos::PrimitiveType::kPointList:
-      topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-      break;
-    case xenos::PrimitiveType::kLineList:
-      topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-      break;
-    case xenos::PrimitiveType::kLineStrip:
-      topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-      break;
-    case xenos::PrimitiveType::kTriangleList:
-    case xenos::PrimitiveType::kRectangleList:
-      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-      break;
-    case xenos::PrimitiveType::kTriangleStrip:
-      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-      break;
-    case xenos::PrimitiveType::kQuadList:
-      topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
-      break;
-    case xenos::PrimitiveType::kTriangleFan:
-      // As a triangle list with host indices (v1, v2, v0), (v2, v3, v0)... like the plugin's
-      // primitive processor; guest indices are copied raw (the VS still swaps them).
-      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-      break;
-    default:
-      DRAW_LOG_ONCE(log_prim, "PGR4 native draw: primitive type {} unsupported", s.primitive);
-      ++stats.unsupported;
-      return;
-  }
-  uint32_t count = s.count;
-  if (!count) {
-    ++stats.skipped;
-    return;
-  }
-
-  // Index buffer (kGuestDMA) and primitive reset.
-  xenos::Endian index_endian = xenos::Endian::kNone;
-  uint8_t strip_cut = 0;
-  if (s.indexed) {
-    index_endian = xenos::Endian(s.index_endian);
-    if (!s.index_32bit && index_endian != xenos::Endian::kNone &&
-        index_endian != xenos::Endian::k8in16)
-      index_endian =
-          index_endian == xenos::Endian::k8in32 ? xenos::Endian::k8in16 : xenos::Endian::kNone;
-    if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
-        (prim == xenos::PrimitiveType::kLineStrip ||
-         prim == xenos::PrimitiveType::kTriangleStrip)) {
-      uint32_t reset =
-          xenos::GpuSwap(regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx, index_endian);
-      if (!s.index_32bit) {
-        if (reset <= 0xFFFF) {
-          if (reset != 0xFFFF) {
-            DRAW_LOG_ONCE(log_reset, "PGR4 native draw: primitive reset index {:X} unsupported",
-                          reset);
-            ++stats.unsupported;
-            return;
-          }
-          strip_cut = 1;
-        }
-      } else {
-        // The host compares all 32 bits; the guest only the low 24. Fine when the guest uses
-        // 0xFFFFFFFF (or the index never appears).
-        strip_cut = 2;
-      }
-    }
-    if (!s.index_address) {
-      ++stats.failed;
-      return;
-    }
-  }
-
-  // Render targets.
-  const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
-  const uint32_t color_mask = ps ? GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
-  const bool depth_used = rasterization && (depth_control.z_enable || depth_control.stencil_enable);
-  uint32_t rt_mask = 0;
-  for (uint32_t i = 0; i < 4; ++i)
-    if ((color_mask >> (4 * i)) & 0xF) rt_mask |= 1u << i;
-  if (!rt_mask && !depth_used) {
-    ++stats.skipped;  // nothing to write (no occlusion query emulation yet)
-    return;
-  }
-  Scissor scissor;
-  HostScissor(regs, scissor);
-  ViewportInfo vp;
-  HostViewportInfo(regs, ps && ps->writes_depth(), vp);
-  const uint32_t height = std::clamp(scissor.offset[1] + scissor.extent[1], 1u, 2048u);
-  profile::Mark(profile::kSetup);
-  BoundTargets targets;
-  if (!r.render_targets().Bind(list, SurfaceRegsFromRegisters(s.regs), rt_mask, depth_used, height,
-                               &targets)) {
-    DRAW_LOG_ONCE(log_rt, "PGR4 native draw: RenderTargets::Bind failed (surface {:08X})",
-                  regs[XE_GPU_REG_RB_SURFACE_INFO]);
-    ++stats.failed;
-    return;
-  }
-  profile::Mark(profile::kRtBind);
-
-  // Translations.
-  auto translate = [&](DxbcShader& shader, uint64_t modification) -> DxbcShader::Translation* {
-    TranslationMemo& m = translation_memo[(reinterpret_cast<uintptr_t>(&shader) >> 6) & 255];
-    if (m.shader == &shader && m.modification == modification) {
-      ++diag.translation_hits;
-      return m.translation;
-    }
-    DxbcShader::Translation* t = shaders.Translate(shader, modification);
-    if (t) m = {&shader, modification, t};
-    return t;
-  };
-  DxbcShader::Translation* vst = translate(*vs, mods.vertex);
-  DxbcShader::Translation* pst = ps ? translate(*ps, mods.pixel) : nullptr;
-  if (!vst || (ps && !pst)) {
-    DRAW_LOG_ONCE(log_shader, "PGR4 native draw: shader translation failed");
-    ++stats.failed;
-    return;
-  }
-  profile::Mark(profile::kTranslate);
-
-  // Pipeline description (GetCurrentStateDescription, host render targets).
+// GetCurrentStateDescription, host render targets.
+PipelineKey DrawRenderer::Impl::BuildPipelineKey(
+    const RegisterFile& regs, xenos::PrimitiveType prim, const ShaderModifications& mods,
+    const DxbcShader::Translation* vst, const DxbcShader::Translation* pst, uint8_t strip_cut,
+    bool rasterization, bool polygonal, reg::PA_SU_SC_MODE_CNTL sc,
+    reg::RB_DEPTHCONTROL depth_control, uint32_t color_mask, const BoundTargets& targets) const {
   PipelineKey key;
   std::memset(&key, 0, sizeof(key));
   key.vs = vst;
   key.ps = pst;
-  GeometryShaderKey gs_key;
-  if (GetGeometryShaderKey(GeometryShaderForPrimitive(prim), mods.vertex, pst ? mods.pixel : 0,
-                           gs_key))
-    key.gs_key = gs_key.key;
+  key.gs_key = GeometryShaderKeyFor(prim, mods.vertex, pst ? mods.pixel : 0);
   key.topology_type = uint8_t(TopologyTypeForPrimitive(prim));
   key.strip_cut = strip_cut;
   key.samples = 1;
-  auto sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   if (!rasterization) {
     key.disable_raster = 1;
     key.cull = uint8_t(D3D12_CULL_MODE_NONE);
@@ -2705,6 +2552,646 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     key.depth_bias = 0;
     key.slope_scaled_depth_bias = 0;
   }
+  return key;
+}
+
+void DrawRenderer::Impl::LogDraw(const DrawState& s, const RegisterFile& regs, uint32_t draw_index,
+                                 uint32_t count, const DxbcShader& vs, const DxbcShader* ps,
+                                 const ShaderModifications& mods, const PipelineKey& key,
+                                 const ViewportInfo& vp, const Scissor& scissor) {
+  std::fprintf(
+      draw_log,
+      "%u fn=%08X prim=%u n=%u idx=%u vs=%016llX:%llX ps=%016llX:%llX rt=%u:%d,%d dsv=%d "
+      "z=%u/%u/%u st=%u cull=%u blend=%u:%u/%u/%u,%u/%u/%u mask=%X bc=%08X cc=%08X "
+      "f=%.2f,%.2f,%.2f,%.2f samples=%u vp=%u,%u,%u,%u z=%.3f-%.3f sc=%u,%u,%u,%u "
+      "tex=%zu ci=%08X si=%08X di=%08X su=%08X dc=%08X po=%g/%g,%g/%g bias=%d/%g\n",
+      draw_index, uint32_t(s.fn), s.primitive, count, uint32_t(s.indexed),
+      (unsigned long long)vs.ucode_data_hash(), (unsigned long long)mods.vertex,
+      ps ? (unsigned long long)ps->ucode_data_hash() : 0ull, (unsigned long long)mods.pixel,
+      key.num_rts, int(key.rtv[0]), int(key.rtv[1]), int(key.dsv), key.depth_enable,
+      key.depth_write, key.depth_func, key.stencil_enable, key.cull, key.rt[0].blend, key.rt[0].src,
+      key.rt[0].dst, key.rt[0].op, key.rt[0].src_a, key.rt[0].dst_a, key.rt[0].op_a, key.rt[0].mask,
+      regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_COLORCONTROL],
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+      regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA),
+      key.samples, vp.xy_offset[0], vp.xy_offset[1], vp.xy_extent[0], vp.xy_extent[1], vp.z_min,
+      vp.z_max, scissor.offset[0], scissor.offset[1], scissor.extent[0], scissor.extent[1],
+      ps ? ps->GetTextureBindingsAfterTranslation().size() : size_t(0),
+      regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
+      regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+      regs[XE_GPU_REG_RB_DEPTHCONTROL], regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+      regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+      regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
+      regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
+      key.slope_scaled_depth_bias);
+  // Where the draw's data comes from and the float constants each shader reads (hashed).
+  std::fprintf(draw_log, "  ia=%08X", s.indexed ? s.index_address : 0u);
+  const Shader::ConstantRegisterMap& vmap = vs.constant_register_map();
+  for (uint32_t w = 0; w < 3; ++w)
+    for (uint32_t bits = vmap.vertex_fetch_bitmap[w]; bits; bits &= bits - 1) {
+      const uint32_t index = w * 32 + uint32_t(std::countr_zero(bits));
+      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(index);
+      std::fprintf(draw_log, " vf%u=%08X+%X", index, vf.address << 2, vf.size << 2);
+    }
+  auto float_hash = [&](const Shader* shader, uint32_t base) {
+    uint64_t h = 0;
+    if (!shader) return h;
+    const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+    for (uint32_t w = 0; w < 4; ++w)
+      for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1)
+        h = XXH3_64bits_withSeed(&regs[base + (w * 64 + uint32_t(std::countr_zero(bits))) * 4], 16,
+                                 h);
+    return h;
+  };
+  std::fprintf(draw_log, " cvs=%016llX cps=%016llX\n",
+               (unsigned long long)float_hash(&vs, XE_GPU_REG_SHADER_CONSTANT_000_X),
+               (unsigned long long)float_hash(ps, XE_GPU_REG_SHADER_CONSTANT_256_X));
+  if (ps) {
+    std::fprintf(draw_log, "  pc");
+    const Shader::ConstantRegisterMap& map = ps->constant_register_map();
+    for (uint32_t w = 0; w < 4; ++w)
+      for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1) {
+        const uint32_t c = w * 64 + uint32_t(std::countr_zero(bits));
+        const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4;
+        std::fprintf(draw_log, " %u=%g,%g,%g,%g", c, regs.Get<float>(r), regs.Get<float>(r + 1),
+                     regs.Get<float>(r + 2), regs.Get<float>(r + 3));
+      }
+    std::fputc('\n', draw_log);
+  }
+}
+
+ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
+    const PipelineKey& key, const DxbcShader::Translation& vst, const DxbcShader::Translation* pst,
+    DxbcShader*& vs, DxbcShader*& ps, DxbcShader* vs_generic, DxbcShader* ps_generic,
+    uint64_t pixel_mod, uint64_t generic_pixel_mod, const ShaderDrawRegs& sdr,
+    xenos::PrimitiveType prim) {
+  const uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
+  PsoMemo& pso_slot = pso_memo[key_hash & 1023];
+  if (pso_slot.pso && pso_slot.hash == key_hash) {
+    ++diag.pso_hits;
+    return pso_slot.pso;
+  }
+  const uint32_t variant = (vs != vs_generic ? 1u : 0u) | (ps && ps != ps_generic ? 2u : 0u) |
+                           (pst && pixel_mod != generic_pixel_mod ? 4u : 0u);
+  const auto found = pipelines.find(key_hash);
+  Pipeline* p = found != pipelines.end() ? found->second.get() : nullptr;
+  // A new specialization (bool constants, texture signs) of shaders and state whose
+  // unspecialized pipeline is ready compiles in the background while its draws use that
+  // pipeline: the same image for a little more GPU time. A race keeps bringing new
+  // combinations of known shaders for minutes, and each would otherwise hold a frame for its
+  // compile. The first draw of the shaders and state waits for its specialization, which has
+  // less code and compiles faster, and queues the unspecialized pipeline behind it.
+  Pipeline* use = nullptr;
+  DxbcShader* generic_ps = nullptr;
+  if (variant && generic_pipelines &&
+      (!p || (p->behind_generic && p->state.load(std::memory_order_acquire) == kCompiling))) {
+    const ShaderModifications gm =
+        SelectModifications(shaders.translator(), *vs_generic, ps_generic, sdr);
+    DxbcShader* gps = gm.pixel_shader_used ? ps_generic : nullptr;
+    // The draw's setup so far read the specialized pixel shader's depth output.
+    if (gm.draw && !gps == !ps && (!gps || gps->writes_depth() == ps->writes_depth())) {
+      DxbcShader::Translation* gvst = Translated(*vs_generic, gm.vertex);
+      DxbcShader::Translation* gpst = gps ? Translated(*gps, gm.pixel) : nullptr;
+      if (gvst && (!gps || gpst)) {
+        PipelineKey gkey = key;
+        gkey.vs = gvst;
+        gkey.ps = gpst;
+        gkey.gs_key = GeometryShaderKeyFor(prim, gm.vertex, gpst ? gm.pixel : 0);
+        const uint64_t ghash = XXH3_64bits(&gkey, sizeof(gkey));
+        const auto gf = pipelines.find(ghash);
+        if (gf == pipelines.end()) {
+          GetPipeline(ghash, gkey, *gvst, gpst, 0, /*background=*/true);
+        } else if (gf->second->state.load(std::memory_order_acquire) == kReady) {
+          use = gf->second.get();
+          generic_ps = gps;
+          if (!p) {
+            p = GetPipeline(key_hash, key, vst, pst, variant, /*background=*/true);
+            p->behind_generic = true;
+          }
+        }
+      }
+    }
+  }
+  if (!use) use = p ? p : GetPipeline(key_hash, key, vst, pst, variant);
+  const uint8_t state = use->state.load(std::memory_order_acquire);
+  if (state == kCompiling) {
+    if (use->prewarm) PromotePipeline(use);
+    if (use->pending_frame != r.frame_index()) {
+      use->pending_frame = r.frame_index();
+      frame_pending.push_back(use);
+    }
+  }
+  if (state != kReady) {
+    if (state == kCompiling) {
+      ++stats.pso_pending;
+    } else {
+      ++stats.failed;
+    }
+    return nullptr;
+  }
+  ID3D12PipelineState* const pso = use->pso.Get();
+  if (use == p) {
+    pso_slot = {key_hash, pso};
+  } else {
+    // Bindings and constants follow the shaders the pipeline was built from.
+    vs = vs_generic;
+    ps = generic_ps;
+    ++stats.pso_generic;
+  }
+  return pso;
+}
+
+uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const DxbcShader& shader,
+                                          uint32_t* indices) {
+  const DrawState& s = ctx.s;
+  const RegisterFile& regs = ctx.regs;
+  TextureCache& texture_cache = ctx.texture_cache;
+  const uint64_t frame_fence = ctx.frame_fence;
+  uint8_t* const signs = ctx.signs;
+  const auto& tex = shader.GetTextureBindingsAfterTranslation();
+  const auto& smp = shader.GetSamplerBindingsAfterTranslation();
+  ShaderSlots& ss = shader_slots[(reinterpret_cast<uintptr_t>(&shader) >> 6) & 511];
+  if (ss.shader != &shader) ss.Assign(shader);
+  const uint32_t n = ss.n;
+  // The memo entry for (shader, the fetch constants it reads); null if not memoizable.
+  BindMemo* bm = nullptr;
+  const uint64_t epoch = texture_cache.change_epoch();
+  // While the draw log records, every binding goes through Get so each one is logged.
+  if (!draw_log && ss.count <= BindMemo::kMaxSlots && tex.size() <= BindMemo::kMaxBound) {
+    auto same_fetch = [&](const BindMemo& e) {
+      if (e.shader != &shader) return false;
+      const uint32_t* stored = e.data;
+      for (uint32_t m = ss.mask; m; m &= m - 1, stored += 6)
+        if (std::memcmp(stored, s.fetch(uint32_t(std::countr_zero(m))), 24) != 0) return false;
+      return true;
+    };
+    profile::Counter miss_kind = profile::kBindMissEmpty;
+    bool found = false;
+    if (ss.last && same_fetch(*ss.last)) {
+      bm = ss.last;
+      found = true;
+      profile::Count(profile::kBindMru);
+    } else {
+      uint64_t h = uint64_t(reinterpret_cast<uintptr_t>(&shader)) * 0x9E3779B97F4A7C15ull;
+      for (uint32_t m = ss.mask; m; m &= m - 1) {
+        const uint32_t* f = s.fetch(uint32_t(std::countr_zero(m)));
+        uint64_t a, b, c;
+        std::memcpy(&a, f, 8);
+        std::memcpy(&b, f + 2, 8);
+        std::memcpy(&c, f + 4, 8);
+        h = (h ^ a ^ std::rotl(b, 21) ^ std::rotl(c, 42)) * 0x9E3779B97F4A7C15ull;
+      }
+      BindMemo* set = &bind_memo[size_t(h >> (64 - kBindMemoSetBits)) << 1];
+      for (uint32_t way = 0; way < 2 && !found; ++way) {
+        if (same_fetch(set[way])) {
+          bm = &set[way];
+          found = true;
+        } else if (set[way].shader == &shader) {
+          miss_kind = profile::kBindMissFetch;
+        }
+      }
+      // Not found: fill the least recently used way.
+      if (!found) bm = set[0].used <= set[1].used ? &set[0] : &set[1];
+      bm->used = ++bind_clock;
+      ss.last = bm;
+    }
+    if (found) {
+      bool same = true;
+      if (bm->epoch != epoch) {
+        for (uint32_t i = 0; i < bm->bound && same; ++i)
+          same = texture_cache.Unchanged(bm->entry[i]);
+        if (same) bm->epoch = epoch;
+      }
+      if (same) {
+        if (bm->touched != frame_fence) {
+          for (uint32_t i = 0; i < bm->bound; ++i) texture_cache.Touch(bm->entry[i], frame_fence);
+          bm->touched = frame_fence;
+        }
+        const uint32_t* stored = bm->data + ss.count * 6;
+        std::memcpy(indices, stored, n * sizeof(uint32_t));
+        stored += n;
+        for (uint32_t i = 0; i < bm->bound; ++i) signs[stored[i] & 0xFF] = uint8_t(stored[i] >> 8);
+        stats.textures += bm->textures;
+        ++stats.bind_memo_hits;
+        profile::Count(profile::kBindHit);
+        return n;
+      }
+      miss_kind = profile::kBindMissTexture;
+    }
+    profile::Count(miss_kind);
+  }
+  profile::Scope miss_scope(profile::kTexMiss);
+  ++stats.bind_memo_misses;
+  std::fill(indices, indices + n, 0u);
+  uint32_t bound = 0, textures = 0, missing = 0, stale = 0;
+  for (const auto& tb : tex) {
+    ++textures;
+    TextureBinding b;
+    uint32_t index;
+    const uint32_t* fetch = s.fetch(tb.fetch_constant);
+    bool got;
+    {
+      profile::Scope get_scope(profile::kTexGet);
+      got = texture_cache.Get(fetch, ctx.list, frame_fence, &b, ctx.captured) && b.resource;
+    }
+    if (draw_log)
+      std::fprintf(draw_log, "  tf%u %08X fmt=%u %ux%ux%u dim=%u tiled=%u mips=%u%s%s\n",
+                   tb.fetch_constant, b.key.base_page << 12, uint32_t(b.key.format), b.key.width,
+                   b.key.height, b.key.depth_or_array_size, uint32_t(b.key.dimension),
+                   uint32_t(b.key.tiled), b.key.mip_levels(), got ? "" : " missing",
+                   got && b.aliased ? " alias" : "");
+    if (got) {
+      profile::Scope srv_scope(profile::kTexSrv);
+      stale += b.stale;
+      const uint32_t mapping = b.srv.Shader4ComponentMapping;
+      const uint64_t sh =
+          (uint64_t(reinterpret_cast<uintptr_t>(b.resource)) ^ (uint64_t(mapping) << 32) ^
+           (uint64_t(tb.is_signed) << 3) ^ (uint64_t(tb.dimension) << 4)) *
+          0x9E3779B97F4A7C15ull;
+      SrvMemo& m = srv_memo[sh >> (64 - kSrvMemoBits)];
+      if (m.resource == b.resource && m.mapping == mapping &&
+          m.is_signed == uint8_t(tb.is_signed) && m.dimension == uint8_t(tb.dimension)) {
+        index = m.index;
+        profile::Count(profile::kSrvMemoHit);
+      } else {
+        index = TextureDescriptor(b, tb);
+        m.resource = b.resource;
+        m.mapping = mapping;
+        m.is_signed = uint8_t(tb.is_signed);
+        m.dimension = uint8_t(tb.dimension);
+        m.index = index;
+      }
+      signs[tb.fetch_constant] = b.swizzled_signs;
+      if (bm) {
+        bm->entry[bound] = b.entry;
+        bm->data[ss.count * 6 + n + bound] =
+            uint32_t(uint8_t(tb.fetch_constant)) | uint32_t(b.swizzled_signs) << 8;
+      }
+      ++bound;
+    } else {
+      ++missing;
+      index = NullView(tb.dimension);
+    }
+    if (tb.bindless_descriptor_index < 64) indices[tb.bindless_descriptor_index] = index;
+  }
+  for (const auto& sb : smp) {
+    const uint32_t* fetch = s.fetch(sb.fetch_constant);
+    const uint8_t filters[4] = {uint8_t(sb.mag_filter), uint8_t(sb.min_filter),
+                                uint8_t(sb.mip_filter), uint8_t(sb.aniso_filter)};
+    uint32_t sh = 0;
+    for (int i = 0; i < 6; ++i) sh = (sh ^ fetch[i]) * 0x9E3779B1u;
+    uint32_t fw;
+    std::memcpy(&fw, filters, 4);
+    sh = (sh ^ fw) * 0x9E3779B1u;
+    SamplerMemo& m = sampler_memo[sh >> (32 - kSamplerMemoBits)];
+    uint32_t index;
+    if (std::memcmp(m.filters, filters, 4) == 0 &&
+        std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0) {
+      index = m.index;
+    } else {
+      index = SamplerDescriptor(GetSamplerKey(regs, sb, min_aniso));
+      std::memcpy(m.filters, filters, 4);
+      std::memcpy(m.fetch, fetch, sizeof(m.fetch));
+      m.index = index;
+    }
+    if (sb.bindless_descriptor_index < 64) indices[sb.bindless_descriptor_index] = index;
+  }
+  stats.textures += textures;
+  stats.textures_missing += missing;
+  stats.textures_stale += stale;
+  if (bm && !missing && !stale) {
+    bm->shader = &shader;
+    bm->epoch = epoch;
+    bm->touched = frame_fence;  // Get marked them
+    uint32_t* stored = bm->data;
+    for (uint32_t m = ss.mask; m; m &= m - 1, stored += 6)
+      std::memcpy(stored, s.fetch(uint32_t(std::countr_zero(m))), 24);
+    std::memcpy(stored, indices, n * sizeof(uint32_t));
+    bm->bound = bound;
+    bm->textures = textures;
+  } else {
+    if (bm) bm->shader = nullptr;
+    profile::Count(profile::kBindNoMemo);
+  }
+  return n;
+}
+
+// UpdateSystemConstantValues, host render targets, no ROV.
+void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterFile& regs,
+                                             xenos::PrimitiveType prim, bool polygonal,
+                                             xenos::Endian index_endian, const ViewportInfo& vp,
+                                             uint32_t used_textures, const uint8_t* signs,
+                                             DxbcShaderTranslator::SystemConstants& sys) {
+  std::memset(&sys, 0, sizeof(sys));
+  auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+  auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  uint32_t flags = 0;
+  if (vte.vtx_xy_fmt) flags |= DxbcShaderTranslator::kSysFlag_XYDividedByW;
+  if (vte.vtx_z_fmt) flags |= DxbcShaderTranslator::kSysFlag_ZDividedByW;
+  if (vte.vtx_w0_fmt) flags |= DxbcShaderTranslator::kSysFlag_WNotReciprocal;
+  if (polygonal) flags |= DxbcShaderTranslator::kSysFlag_PrimitivePolygonal;
+  if (rex::graphics::draw_util::IsPrimitiveLine(false, prim))
+    flags |= DxbcShaderTranslator::kSysFlag_PrimitiveLine;
+  // No kSysFlag_DepthFloat24: without float24 conversion in the shader, its only effect is to
+  // scale oDepth into the plugin's host 0...0.5 float24 range, while viewports, clears and
+  // resolves here keep D24FS8 in 0...1 (HostViewportInfo). Setting it halves the depth that
+  // depth-restoring passes write.
+  const xenos::CompareFunction alpha_func =
+      colorcontrol.alpha_test_enable && !(debug_mask & kDebugNoAlphaTest)
+          ? colorcontrol.alpha_func
+          : xenos::CompareFunction::kAlways;
+  flags |= uint32_t(alpha_func) << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
+  // Gamma render targets are unorm16 on the host (the plugin's setting): no conversion flag.
+  sys.flags = flags;
+  sys.tessellation_factor_range_min = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
+  sys.tessellation_factor_range_max = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
+  sys.vertex_index_endian = index_endian;
+  sys.vertex_index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  sys.vertex_index_min = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  sys.vertex_index_max = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  if (!clip.clip_disable) {
+    float* ucp = sys.user_clip_planes[0];
+    uint32_t remaining = clip.ucp_ena;
+    while (remaining) {
+      uint32_t i = uint32_t(std::countr_zero(remaining));
+      remaining &= remaining - 1;
+      std::memcpy(ucp, &regs[XE_GPU_REG_PA_CL_UCP_0_X + i * 4], 4 * sizeof(float));
+      ucp += 4;
+    }
+  }
+  for (uint32_t i = 0; i < 3; ++i) {
+    sys.ndc_scale[i] = vp.ndc_scale[i];
+    sys.ndc_offset[i] = vp.ndc_offset[i];
+  }
+  if (prim == xenos::PrimitiveType::kPointList) {
+    auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
+    auto size = regs.Get<reg::PA_SU_POINT_SIZE>();
+    sys.point_vertex_diameter_min = float(minmax.min_size) * (2.0f / 16.0f);
+    sys.point_vertex_diameter_max = float(minmax.max_size) * (2.0f / 16.0f);
+    sys.point_constant_diameter[0] = float(size.width) * (2.0f / 16.0f);
+    sys.point_constant_diameter[1] = float(size.height) * (2.0f / 16.0f);
+    sys.point_screen_diameter_to_ndc_radius[0] = 1.0f / float(std::max(vp.xy_extent[0], 1u));
+    sys.point_screen_diameter_to_ndc_radius[1] = 1.0f / float(std::max(vp.xy_extent[1], 1u));
+  }
+  uint32_t remaining = used_textures;
+  while (remaining) {
+    uint32_t i = uint32_t(std::countr_zero(remaining));
+    remaining &= remaining - 1;
+    sys.texture_swizzled_signs[i >> 2] |= uint32_t(signs[i]) << ((i & 3) * 8);
+    if (profile::On()) {
+      const uint32_t* f = s.fetch(i);
+      const uint8_t sg = signs[i];
+      ++diag.fetch_classes[sg == 0 ? 0 : sg == 0x3F ? 1 : sg == 0xFF ? 2 : sg == 0x55 ? 3 : 4];
+      if ((f[3] >> 13) & 0x3F) ++diag.fetch_classes[5];
+      if ((f[4] >> 12) & 0x3FF) ++diag.fetch_classes[6];
+    }
+  }
+  sys.sample_count_log2[0] = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
+  sys.sample_count_log2[1] = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0;
+  sys.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+  sys.alpha_to_mask = colorcontrol.alpha_to_mask_enable ? (colorcontrol.value >> 24) | (1 << 8) : 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    auto ci = regs.Get<reg::RB_COLOR_INFO>(kColorInfoRegs[i]);
+    int32_t bias = ci.color_exp_bias;
+    // snorm16 render targets use the full -32...32 range (the plugin's default).
+    if (ci.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
+        ci.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16)
+      bias -= 5;
+    uint32_t bits = uint32_t(0x3F800000 + (bias << 23));
+    std::memcpy(&sys.color_exp_bias[i], &bits, 4);
+  }
+}
+
+void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
+  ID3D12GraphicsCommandList* list = r.command_list();
+  SyncListFrame();
+  if (prep && prep->regs_hash[0]) {
+    uint64_t now[5];
+    HashRegisterBlocks(s.regs, now);
+    if (std::memcmp(now, prep->regs_hash, sizeof(now))) {
+      ++stats.reg_mismatches;
+      PGR4_LOG_FIRST(100, WARN,
+                     "PGR4 native coherency: frame {} draw {} registers differ from Prepare's in "
+                     "blocks{}{}{}{}{}",
+                     r.frame_index(), frame_draws, now[0] != prep->regs_hash[0] ? " state" : "",
+                     now[1] != prep->regs_hash[1] ? " vs-float" : "",
+                     now[2] != prep->regs_hash[2] ? " ps-float" : "",
+                     now[3] != prep->regs_hash[3] ? " fetch" : "",
+                     now[4] != prep->regs_hash[4] ? " bool-loop" : "");
+    }
+  }
+  if (prep) {
+    // The guest thread copied the ranges (and marked their pages valid): they go into shared
+    // memory whether or not the draw is issued.
+    if (prep->copy_count) {
+      ++stats.copy_batches;
+      TransitionShared(list, D3D12_RESOURCE_STATE_COPY_DEST);
+      for (uint32_t i = 0; i < prep->copy_count; ++i) {
+        const VertexCopy& c = prep->copies[i];
+        list->CopyBufferRegion(shared.Get(), c.dst, c.src, c.src_offset, c.size);
+      }
+    }
+    if (!prep->upload_ok) {
+      ++stats.failed;
+      return;
+    }
+  }
+  const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
+  const xenos::PrimitiveType prim = xenos::PrimitiveType(s.primitive);
+
+  // Shaders.
+  if (!s.vs.ucode || !s.vs.dwords) {
+    ++stats.skipped;
+    return;
+  }
+  DxbcShader* vs = prep ? prep->vs : LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
+  DxbcShader* ps = prep ? prep->ps : LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
+  if (!vs) {
+    ++stats.failed;
+    return;
+  }
+  DxbcShader* const vs_generic = vs;
+  DxbcShader* const ps_generic = ps;
+  if (bool_specialize) {
+    const uint32_t* bools = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
+    vs = vs_bools.Get(vs, bools);
+    ps = ps_bools.Get(ps, bools);
+  }
+
+  // SelectModifications reads only prim_type; the index count would defeat mods_memo.
+  reg::VGT_DRAW_INITIATOR initiator;
+  initiator.value = 0;
+  initiator.prim_type = prim;
+
+  ShaderDrawRegs sdr;
+  sdr.sq_program_cntl = regs[XE_GPU_REG_SQ_PROGRAM_CNTL];
+  sdr.sq_context_misc = regs[XE_GPU_REG_SQ_CONTEXT_MISC];
+  sdr.sq_interpolator_cntl = regs[XE_GPU_REG_SQ_INTERPOLATOR_CNTL];
+  sdr.pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL];
+  sdr.vgt_draw_initiator = initiator.value;
+  sdr.vgt_output_path_cntl = regs[XE_GPU_REG_VGT_OUTPUT_PATH_CNTL];
+  sdr.pa_su_sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+  sdr.rb_modecontrol = regs[XE_GPU_REG_RB_MODECONTROL];
+  sdr.rb_surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  sdr.rb_colorcontrol = regs[XE_GPU_REG_RB_COLORCONTROL];
+  sdr.rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+  for (uint32_t i = 0; i < 4; ++i) sdr.rb_color_info[i] = regs[kColorInfoRegs[i]];
+  if (mods_memo.vs == vs && mods_memo.ps == ps &&
+      std::memcmp(&mods_memo.sdr, &sdr, sizeof(sdr)) == 0) {
+    ++diag.mods_hits;
+  } else {
+    mods_memo.vs = vs;
+    mods_memo.ps = ps;
+    mods_memo.sdr = sdr;
+    mods_memo.mods = SelectModifications(shaders.translator(), *vs, ps, sdr);
+    mods_memo.ps_textures = 0;
+    if (mods_memo.mods.pixel_shader_used)
+      for (const auto& tb : ps->texture_bindings())
+        mods_memo.ps_textures |= 1u << tb.fetch_constant;
+  }
+  ShaderModifications mods = mods_memo.mods;
+  const uint64_t generic_pixel_mod = mods.pixel;
+  mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
+                                       signed_is_unsigned_formats);
+
+  if (!mods.draw) {
+    ++stats.skipped;
+    return;
+  }
+  if (!mods.pixel_shader_used) ps = nullptr;
+  if (vs->memexport_eM_written() || (ps && ps->memexport_eM_written())) {
+    PGR4_WARN_ONCE("PGR4 native draw: memexport unsupported (draw skipped)");
+    ++stats.unsupported;
+    return;
+  }
+  const bool tess = xenos::IsMajorModeExplicit(initiator.major_mode, initiator.prim_type) &&
+                    regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+                        xenos::VGTOutputPath::kTessellationEnable;
+  if (tess) {
+    PGR4_WARN_ONCE("PGR4 native draw: tessellation unsupported");
+    ++stats.unsupported;
+    return;
+  }
+  profile::Mark(profile::kShaders);
+  const bool polygonal = rex::graphics::draw_util::IsPrimitivePolygonal(false, prim);
+  const bool rasterization = IsRasterizationPotentiallyDone(regs, polygonal);
+
+  // Host primitive (the plugin's primitive processor on D3D12: points, rectangles and quads go
+  // through a geometry shader, triangle fans through converted indices).
+  D3D_PRIMITIVE_TOPOLOGY topology;
+  switch (prim) {
+    case xenos::PrimitiveType::kPointList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+      break;
+    case xenos::PrimitiveType::kLineList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+      break;
+    case xenos::PrimitiveType::kLineStrip:
+      topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+      break;
+    case xenos::PrimitiveType::kTriangleList:
+    case xenos::PrimitiveType::kRectangleList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      break;
+    case xenos::PrimitiveType::kTriangleStrip:
+      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+      break;
+    case xenos::PrimitiveType::kQuadList:
+      topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+      break;
+    case xenos::PrimitiveType::kTriangleFan:
+      // As a triangle list with host indices (v1, v2, v0), (v2, v3, v0)... like the plugin's
+      // primitive processor; guest indices are copied raw (the VS still swaps them).
+      topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+      break;
+    default:
+      PGR4_WARN_ONCE("PGR4 native draw: primitive type {} unsupported", s.primitive);
+      ++stats.unsupported;
+      return;
+  }
+  uint32_t count = s.count;
+  if (!count) {
+    ++stats.skipped;
+    return;
+  }
+
+  // Index buffer (kGuestDMA) and primitive reset.
+  xenos::Endian index_endian = xenos::Endian::kNone;
+  uint8_t strip_cut = 0;
+  if (s.indexed) {
+    index_endian = xenos::Endian(s.index_endian);
+    if (!s.index_32bit && index_endian != xenos::Endian::kNone &&
+        index_endian != xenos::Endian::k8in16)
+      index_endian =
+          index_endian == xenos::Endian::k8in32 ? xenos::Endian::k8in16 : xenos::Endian::kNone;
+    if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena &&
+        (prim == xenos::PrimitiveType::kLineStrip ||
+         prim == xenos::PrimitiveType::kTriangleStrip)) {
+      uint32_t reset =
+          xenos::GpuSwap(regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx, index_endian);
+      if (!s.index_32bit) {
+        if (reset <= 0xFFFF) {
+          if (reset != 0xFFFF) {
+            PGR4_WARN_ONCE("PGR4 native draw: primitive reset index {:X} unsupported", reset);
+            ++stats.unsupported;
+            return;
+          }
+          strip_cut = 1;
+        }
+      } else {
+        // The host compares all 32 bits; the guest only the low 24. Fine when the guest uses
+        // 0xFFFFFFFF (or the index never appears).
+        strip_cut = 2;
+      }
+    }
+    if (!s.index_address) {
+      ++stats.failed;
+      return;
+    }
+  }
+
+  // Render targets.
+  const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
+  const uint32_t color_mask = ps ? GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
+  const bool depth_used = rasterization && (depth_control.z_enable || depth_control.stencil_enable);
+  uint32_t rt_mask = 0;
+  for (uint32_t i = 0; i < 4; ++i)
+    if ((color_mask >> (4 * i)) & 0xF) rt_mask |= 1u << i;
+  if (!rt_mask && !depth_used) {
+    ++stats.skipped;  // nothing to write (no occlusion query emulation yet)
+    return;
+  }
+  Scissor scissor;
+  HostScissor(regs, scissor);
+  ViewportInfo vp;
+  HostViewportInfo(regs, ps && ps->writes_depth(), vp);
+  const uint32_t height = std::clamp(scissor.offset[1] + scissor.extent[1], 1u, 2048u);
+  profile::Mark(profile::kSetup);
+  BoundTargets targets;
+  if (!r.render_targets().Bind(list, SurfaceRegsFromRegisters(s.regs), rt_mask, depth_used, height,
+                               &targets)) {
+    PGR4_WARN_ONCE("PGR4 native draw: RenderTargets::Bind failed (surface {:08X})",
+                   regs[XE_GPU_REG_RB_SURFACE_INFO]);
+    ++stats.failed;
+    return;
+  }
+  profile::Mark(profile::kRtBind);
+
+  // Translations.
+  DxbcShader::Translation* vst = Translated(*vs, mods.vertex);
+  DxbcShader::Translation* pst = ps ? Translated(*ps, mods.pixel) : nullptr;
+  if (!vst || (ps && !pst)) {
+    PGR4_WARN_ONCE("PGR4 native draw: shader translation failed");
+    ++stats.failed;
+    return;
+  }
+  profile::Mark(profile::kTranslate);
+
+  const auto sc = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  PipelineKey key = BuildPipelineKey(regs, prim, mods, vst, pst, strip_cut, rasterization,
+                                     polygonal, sc, depth_control, color_mask, targets);
   const uint32_t draw_index = frame_draws++;
   bool debug_skip = (debug_max_draws && draw_index >= debug_max_draws) ||
                     (draw_index >= debug_skip_from && draw_index < debug_skip_to);
@@ -2725,68 +3212,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     ++stats.skipped;
     return;
   }
-  if (draw_log) {
-    std::fprintf(
-        draw_log,
-        "%u fn=%08X prim=%u n=%u idx=%u vs=%016llX:%llX ps=%016llX:%llX rt=%u:%d,%d dsv=%d "
-        "z=%u/%u/%u st=%u cull=%u blend=%u:%u/%u/%u,%u/%u/%u mask=%X bc=%08X cc=%08X "
-        "f=%.2f,%.2f,%.2f,%.2f samples=%u vp=%u,%u,%u,%u z=%.3f-%.3f sc=%u,%u,%u,%u "
-        "tex=%zu ci=%08X si=%08X di=%08X su=%08X dc=%08X po=%g/%g,%g/%g bias=%d/%g\n",
-        draw_index, uint32_t(s.fn), s.primitive, count, uint32_t(s.indexed),
-        (unsigned long long)vs->ucode_data_hash(), (unsigned long long)mods.vertex,
-        ps ? (unsigned long long)ps->ucode_data_hash() : 0ull, (unsigned long long)mods.pixel,
-        key.num_rts, int(key.rtv[0]), int(key.rtv[1]), int(key.dsv), key.depth_enable,
-        key.depth_write, key.depth_func, key.stencil_enable, key.cull, key.rt[0].blend,
-        key.rt[0].src, key.rt[0].dst, key.rt[0].op, key.rt[0].src_a, key.rt[0].dst_a,
-        key.rt[0].op_a, key.rt[0].mask, regs[XE_GPU_REG_RB_BLENDCONTROL0],
-        regs[XE_GPU_REG_RB_COLORCONTROL], regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
-        regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN), regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
-        regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA), key.samples, vp.xy_offset[0], vp.xy_offset[1],
-        vp.xy_extent[0], vp.xy_extent[1], vp.z_min, vp.z_max, scissor.offset[0], scissor.offset[1],
-        scissor.extent[0], scissor.extent[1],
-        ps ? ps->GetTextureBindingsAfterTranslation().size() : size_t(0),
-        regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
-        regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
-        regs[XE_GPU_REG_RB_DEPTHCONTROL], regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
-        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
-        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
-        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
-        key.slope_scaled_depth_bias);
-    // Where the draw's data comes from and the float constants each shader reads (hashed).
-    std::fprintf(draw_log, "  ia=%08X", s.indexed ? s.index_address : 0u);
-    const Shader::ConstantRegisterMap& vmap = vs->constant_register_map();
-    for (uint32_t w = 0; w < 3; ++w)
-      for (uint32_t bits = vmap.vertex_fetch_bitmap[w]; bits; bits &= bits - 1) {
-        const uint32_t index = w * 32 + uint32_t(std::countr_zero(bits));
-        const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(index);
-        std::fprintf(draw_log, " vf%u=%08X+%X", index, vf.address << 2, vf.size << 2);
-      }
-    auto float_hash = [&](const Shader* shader, uint32_t base) {
-      uint64_t h = 0;
-      if (!shader) return h;
-      const Shader::ConstantRegisterMap& map = shader->constant_register_map();
-      for (uint32_t w = 0; w < 4; ++w)
-        for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1)
-          h = XXH3_64bits_withSeed(&regs[base + (w * 64 + uint32_t(std::countr_zero(bits))) * 4],
-                                   16, h);
-      return h;
-    };
-    std::fprintf(draw_log, " cvs=%016llX cps=%016llX\n",
-                 (unsigned long long)float_hash(vs, XE_GPU_REG_SHADER_CONSTANT_000_X),
-                 (unsigned long long)float_hash(ps, XE_GPU_REG_SHADER_CONSTANT_256_X));
-    if (ps) {
-      std::fprintf(draw_log, "  pc");
-      const Shader::ConstantRegisterMap& map = ps->constant_register_map();
-      for (uint32_t w = 0; w < 4; ++w)
-        for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1) {
-          const uint32_t c = w * 64 + uint32_t(std::countr_zero(bits));
-          const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4;
-          std::fprintf(draw_log, " %u=%g,%g,%g,%g", c, regs.Get<float>(r), regs.Get<float>(r + 1),
-                       regs.Get<float>(r + 2), regs.Get<float>(r + 3));
-        }
-      std::fputc('\n', draw_log);
-    }
-  }
+  if (draw_log) LogDraw(s, regs, draw_index, count, *vs, ps, mods, key, vp, scissor);
   // With dynamic depth bias the polygon offset is not part of the pipeline.
   const float depth_bias = float(key.depth_bias);
   const float slope_bias = key.slope_scaled_depth_bias;
@@ -2794,358 +3220,30 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     key.depth_bias = 0;
     key.slope_scaled_depth_bias = 0;
   }
-  const uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
-  PsoMemo& pso_slot = pso_memo[key_hash & 1023];
-  ID3D12PipelineState* pso = nullptr;
-  if (pso_slot.pso && pso_slot.hash == key_hash) {
-    pso = pso_slot.pso;
-    ++diag.pso_hits;
-  } else {
-    const uint32_t variant = (vs != vs_generic ? 1u : 0u) | (ps && ps != ps_generic ? 2u : 0u) |
-                             (pst && mods.pixel != generic_pixel_mod ? 4u : 0u);
-    const auto found = pipelines.find(key_hash);
-    Pipeline* p = found != pipelines.end() ? found->second.get() : nullptr;
-    // A new specialization (bool constants, texture signs) of shaders and state whose
-    // unspecialized pipeline is ready compiles in the background while its draws use that
-    // pipeline: the same image for a little more GPU time. A race keeps bringing new
-    // combinations of known shaders for minutes, and each would otherwise hold a frame for its
-    // compile. The first draw of the shaders and state waits for its specialization, which has
-    // less code and compiles faster, and queues the unspecialized pipeline behind it.
-    Pipeline* use = nullptr;
-    DxbcShader* generic_ps = nullptr;
-    if (variant && generic_pipelines &&
-        (!p || (p->behind_generic && p->state.load(std::memory_order_acquire) == kCompiling))) {
-      const ShaderModifications gm =
-          SelectModifications(shaders.translator(), *vs_generic, ps_generic, sdr);
-      DxbcShader* gps = gm.pixel_shader_used ? ps_generic : nullptr;
-      // The draw's setup so far read the specialized pixel shader's depth output.
-      if (gm.draw && !gps == !ps && (!gps || gps->writes_depth() == ps->writes_depth())) {
-        DxbcShader::Translation* gvst = translate(*vs_generic, gm.vertex);
-        DxbcShader::Translation* gpst = gps ? translate(*gps, gm.pixel) : nullptr;
-        if (gvst && (!gps || gpst)) {
-          PipelineKey gkey = key;
-          gkey.vs = gvst;
-          gkey.ps = gpst;
-          GeometryShaderKey ggs;
-          gkey.gs_key = GetGeometryShaderKey(GeometryShaderForPrimitive(prim), gm.vertex,
-                                             gpst ? gm.pixel : 0, ggs)
-                            ? ggs.key
-                            : 0;
-          const uint64_t ghash = XXH3_64bits(&gkey, sizeof(gkey));
-          const auto gf = pipelines.find(ghash);
-          if (gf == pipelines.end()) {
-            GetPipeline(ghash, gkey, *gvst, gpst, 0, /*background=*/true);
-          } else if (gf->second->state.load(std::memory_order_acquire) == kReady) {
-            use = gf->second.get();
-            generic_ps = gps;
-            if (!p) {
-              p = GetPipeline(key_hash, key, *vst, pst, variant, /*background=*/true);
-              p->behind_generic = true;
-            }
-          }
-        }
-      }
-    }
-    if (!use) use = p ? p : GetPipeline(key_hash, key, *vst, pst, variant);
-    const uint8_t state = use->state.load(std::memory_order_acquire);
-    if (state == kCompiling) {
-      if (use->prewarm) PromotePipeline(use);
-      if (use->pending_frame != r.frame_index()) {
-        use->pending_frame = r.frame_index();
-        frame_pending.push_back(use);
-      }
-    }
-    if (state != kReady) {
-      if (state == kCompiling) {
-        ++stats.pso_pending;
-      } else {
-        ++stats.failed;
-      }
-      return;
-    }
-    pso = use->pso.Get();
-    if (use == p) {
-      pso_slot = {key_hash, pso};
-    } else {
-      // Bindings and constants below follow the shaders the pipeline was built from.
-      vs = vs_generic;
-      ps = generic_ps;
-      ++stats.pso_generic;
-    }
-  }
+  ID3D12PipelineState* const pso = SelectPipeline(key, *vst, pst, vs, ps, vs_generic, ps_generic,
+                                                  mods.pixel, generic_pixel_mod, sdr, prim);
+  if (!pso) return;
   profile::Mark(profile::kPipeline);
 
   // Textures and samplers (bindless descriptor indices, b4).
   const uint32_t used_textures = vs->GetUsedTextureMaskAfterTranslation() |
                                  (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0);
-  DxbcShaderTranslator::SystemConstants sys;
-  std::memset(&sys, 0, sizeof(sys));
   uint32_t desc_vs[64], desc_ps[64];
   uint8_t signs[32] = {};
-  TextureCache& texture_cache = r.textures();
-  const uint64_t frame_fence = r.frame_fence();
-  const uint64_t captured = prep ? prep->captured : TextureCache::kCapturedNow;
-  auto bind_textures = [&](const DxbcShader& shader, uint32_t* indices) -> uint32_t {
-    const auto& tex = shader.GetTextureBindingsAfterTranslation();
-    const auto& smp = shader.GetSamplerBindingsAfterTranslation();
-    ShaderSlots& ss = shader_slots[(reinterpret_cast<uintptr_t>(&shader) >> 6) & 511];
-    if (ss.shader != &shader) ss.Assign(shader);
-    const uint32_t n = ss.n;
-    // The memo entry for (shader, the fetch constants it reads); null if not memoizable.
-    BindMemo* bm = nullptr;
-    const uint64_t epoch = texture_cache.change_epoch();
-    // While the draw log records, every binding goes through Get so each one is logged.
-    if (!draw_log && ss.count <= BindMemo::kMaxSlots && tex.size() <= BindMemo::kMaxBound) {
-      auto same_fetch = [&](const BindMemo& e) {
-        if (e.shader != &shader) return false;
-        const uint32_t* stored = e.data;
-        for (uint32_t m = ss.mask; m; m &= m - 1, stored += 6)
-          if (std::memcmp(stored, s.fetch(uint32_t(std::countr_zero(m))), 24) != 0) return false;
-        return true;
-      };
-      profile::Counter miss_kind = profile::kBindMissEmpty;
-      bool found = false;
-      if (ss.last && same_fetch(*ss.last)) {
-        bm = ss.last;
-        found = true;
-        profile::Count(profile::kBindMru);
-      } else {
-        uint64_t h = uint64_t(reinterpret_cast<uintptr_t>(&shader)) * 0x9E3779B97F4A7C15ull;
-        for (uint32_t m = ss.mask; m; m &= m - 1) {
-          const uint32_t* f = s.fetch(uint32_t(std::countr_zero(m)));
-          uint64_t a, b, c;
-          std::memcpy(&a, f, 8);
-          std::memcpy(&b, f + 2, 8);
-          std::memcpy(&c, f + 4, 8);
-          h = (h ^ a ^ std::rotl(b, 21) ^ std::rotl(c, 42)) * 0x9E3779B97F4A7C15ull;
-        }
-        BindMemo* set = &bind_memo[size_t(h >> (64 - kBindMemoSetBits)) << 1];
-        for (uint32_t way = 0; way < 2 && !found; ++way) {
-          if (same_fetch(set[way])) {
-            bm = &set[way];
-            found = true;
-          } else if (set[way].shader == &shader) {
-            miss_kind = profile::kBindMissFetch;
-          }
-        }
-        // Not found: fill the least recently used way.
-        if (!found) bm = set[0].used <= set[1].used ? &set[0] : &set[1];
-        bm->used = ++bind_clock;
-        ss.last = bm;
-      }
-      if (found) {
-        bool same = true;
-        if (bm->epoch != epoch) {
-          for (uint32_t i = 0; i < bm->bound && same; ++i)
-            same = texture_cache.Unchanged(bm->entry[i]);
-          if (same) bm->epoch = epoch;
-        }
-        if (same) {
-          if (bm->touched != frame_fence) {
-            for (uint32_t i = 0; i < bm->bound; ++i) texture_cache.Touch(bm->entry[i], frame_fence);
-            bm->touched = frame_fence;
-          }
-          const uint32_t* stored = bm->data + ss.count * 6;
-          std::memcpy(indices, stored, n * sizeof(uint32_t));
-          stored += n;
-          for (uint32_t i = 0; i < bm->bound; ++i)
-            signs[stored[i] & 0xFF] = uint8_t(stored[i] >> 8);
-          stats.textures += bm->textures;
-          ++stats.bind_memo_hits;
-          profile::Count(profile::kBindHit);
-          return n;
-        }
-        miss_kind = profile::kBindMissTexture;
-      }
-      profile::Count(miss_kind);
-    }
-    profile::Scope miss_scope(profile::kTexMiss);
-    ++stats.bind_memo_misses;
-    std::fill(indices, indices + n, 0u);
-    uint32_t bound = 0, textures = 0, missing = 0, stale = 0;
-    for (const auto& tb : tex) {
-      ++textures;
-      TextureBinding b;
-      uint32_t index;
-      const uint32_t* fetch = s.fetch(tb.fetch_constant);
-      bool got;
-      {
-        profile::Scope get_scope(profile::kTexGet);
-        got = texture_cache.Get(fetch, list, frame_fence, &b, captured) && b.resource;
-      }
-      if (draw_log)
-        std::fprintf(draw_log, "  tf%u %08X fmt=%u %ux%ux%u dim=%u tiled=%u mips=%u%s%s\n",
-                     tb.fetch_constant, b.key.base_page << 12, uint32_t(b.key.format), b.key.width,
-                     b.key.height, b.key.depth_or_array_size, uint32_t(b.key.dimension),
-                     uint32_t(b.key.tiled), b.key.mip_levels(), got ? "" : " missing",
-                     got && b.aliased ? " alias" : "");
-      if (got) {
-        profile::Scope srv_scope(profile::kTexSrv);
-        stale += b.stale;
-        const uint32_t mapping = b.srv.Shader4ComponentMapping;
-        const uint64_t sh =
-            (uint64_t(reinterpret_cast<uintptr_t>(b.resource)) ^ (uint64_t(mapping) << 32) ^
-             (uint64_t(tb.is_signed) << 3) ^ (uint64_t(tb.dimension) << 4)) *
-            0x9E3779B97F4A7C15ull;
-        SrvMemo& m = srv_memo[sh >> (64 - kSrvMemoBits)];
-        if (m.resource == b.resource && m.mapping == mapping &&
-            m.is_signed == uint8_t(tb.is_signed) && m.dimension == uint8_t(tb.dimension)) {
-          index = m.index;
-          profile::Count(profile::kSrvMemoHit);
-        } else {
-          index = TextureDescriptor(b, tb);
-          m.resource = b.resource;
-          m.mapping = mapping;
-          m.is_signed = uint8_t(tb.is_signed);
-          m.dimension = uint8_t(tb.dimension);
-          m.index = index;
-        }
-        signs[tb.fetch_constant] = b.swizzled_signs;
-        if (bm) {
-          bm->entry[bound] = b.entry;
-          bm->data[ss.count * 6 + n + bound] =
-              uint32_t(uint8_t(tb.fetch_constant)) | uint32_t(b.swizzled_signs) << 8;
-        }
-        ++bound;
-      } else {
-        ++missing;
-        index = tb.dimension == xenos::FetchOpDimension::kCube          ? kNullCube
-                : tb.dimension == xenos::FetchOpDimension::k3DOrStacked ? kNull3D
-                                                                        : kNull2DArray;
-      }
-      if (tb.bindless_descriptor_index < 64) indices[tb.bindless_descriptor_index] = index;
-    }
-    for (const auto& sb : smp) {
-      const uint32_t* fetch = s.fetch(sb.fetch_constant);
-      const uint8_t filters[4] = {uint8_t(sb.mag_filter), uint8_t(sb.min_filter),
-                                  uint8_t(sb.mip_filter), uint8_t(sb.aniso_filter)};
-      uint32_t sh = 0;
-      for (int i = 0; i < 6; ++i) sh = (sh ^ fetch[i]) * 0x9E3779B1u;
-      uint32_t fw;
-      std::memcpy(&fw, filters, 4);
-      sh = (sh ^ fw) * 0x9E3779B1u;
-      SamplerMemo& m = sampler_memo[sh >> (32 - kSamplerMemoBits)];
-      uint32_t index;
-      if (std::memcmp(m.filters, filters, 4) == 0 &&
-          std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0) {
-        index = m.index;
-      } else {
-        index = SamplerDescriptor(GetSamplerKey(regs, sb, min_aniso));
-        std::memcpy(m.filters, filters, 4);
-        std::memcpy(m.fetch, fetch, sizeof(m.fetch));
-        m.index = index;
-      }
-      if (sb.bindless_descriptor_index < 64) indices[sb.bindless_descriptor_index] = index;
-    }
-    stats.textures += textures;
-    stats.textures_missing += missing;
-    stats.textures_stale += stale;
-    if (bm && !missing && !stale) {
-      bm->shader = &shader;
-      bm->epoch = epoch;
-      bm->touched = frame_fence;  // Get marked them
-      uint32_t* stored = bm->data;
-      for (uint32_t m = ss.mask; m; m &= m - 1, stored += 6)
-        std::memcpy(stored, s.fetch(uint32_t(std::countr_zero(m))), 24);
-      std::memcpy(stored, indices, n * sizeof(uint32_t));
-      bm->bound = bound;
-      bm->textures = textures;
-    } else {
-      if (bm) bm->shader = nullptr;
-      profile::Count(profile::kBindNoMemo);
-    }
-    return n;
-  };
-  const uint32_t n_desc_vs = bind_textures(*vs, desc_vs);
-  const uint32_t n_desc_ps = ps ? bind_textures(*ps, desc_ps) : 1;
+  const TextureBindContext bind = {s,
+                                   regs,
+                                   list,
+                                   r.textures(),
+                                   r.frame_fence(),
+                                   prep ? prep->captured : TextureCache::kCapturedNow,
+                                   signs};
+  const uint32_t n_desc_vs = BindTextures(bind, *vs, desc_vs);
+  const uint32_t n_desc_ps = ps ? BindTextures(bind, *ps, desc_ps) : 1;
   if (!ps) desc_ps[0] = 0;
   profile::Mark(profile::kTextures);
 
-  // System constants (UpdateSystemConstantValues, host render targets, no ROV).
-  {
-    auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
-    auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
-    auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
-    auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
-    uint32_t flags = 0;
-    if (vte.vtx_xy_fmt) flags |= DxbcShaderTranslator::kSysFlag_XYDividedByW;
-    if (vte.vtx_z_fmt) flags |= DxbcShaderTranslator::kSysFlag_ZDividedByW;
-    if (vte.vtx_w0_fmt) flags |= DxbcShaderTranslator::kSysFlag_WNotReciprocal;
-    if (polygonal) flags |= DxbcShaderTranslator::kSysFlag_PrimitivePolygonal;
-    if (rex::graphics::draw_util::IsPrimitiveLine(false, prim))
-      flags |= DxbcShaderTranslator::kSysFlag_PrimitiveLine;
-    // No kSysFlag_DepthFloat24: without float24 conversion in the shader, its only effect is to
-    // scale oDepth into the plugin's host 0...0.5 float24 range, while viewports, clears and
-    // resolves here keep D24FS8 in 0...1 (HostViewportInfo). Setting it halves the depth that
-    // depth-restoring passes write.
-    const xenos::CompareFunction alpha_func =
-        colorcontrol.alpha_test_enable && !(debug_mask & kDebugNoAlphaTest)
-            ? colorcontrol.alpha_func
-            : xenos::CompareFunction::kAlways;
-    flags |= uint32_t(alpha_func) << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
-    // Gamma render targets are unorm16 on the host (the plugin's setting): no conversion flag.
-    sys.flags = flags;
-    sys.tessellation_factor_range_min = regs.Get<float>(XE_GPU_REG_VGT_HOS_MIN_TESS_LEVEL) + 1.0f;
-    sys.tessellation_factor_range_max = regs.Get<float>(XE_GPU_REG_VGT_HOS_MAX_TESS_LEVEL) + 1.0f;
-    sys.line_loop_closing_index = 0;
-    sys.vertex_index_endian = index_endian;
-    sys.vertex_index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
-    sys.vertex_index_min = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
-    sys.vertex_index_max = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
-    if (!clip.clip_disable) {
-      float* ucp = sys.user_clip_planes[0];
-      uint32_t remaining = clip.ucp_ena;
-      while (remaining) {
-        uint32_t i = uint32_t(std::countr_zero(remaining));
-        remaining &= remaining - 1;
-        std::memcpy(ucp, &regs[XE_GPU_REG_PA_CL_UCP_0_X + i * 4], 4 * sizeof(float));
-        ucp += 4;
-      }
-    }
-    for (uint32_t i = 0; i < 3; ++i) {
-      sys.ndc_scale[i] = vp.ndc_scale[i];
-      sys.ndc_offset[i] = vp.ndc_offset[i];
-    }
-    if (prim == xenos::PrimitiveType::kPointList) {
-      auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
-      auto size = regs.Get<reg::PA_SU_POINT_SIZE>();
-      sys.point_vertex_diameter_min = float(minmax.min_size) * (2.0f / 16.0f);
-      sys.point_vertex_diameter_max = float(minmax.max_size) * (2.0f / 16.0f);
-      sys.point_constant_diameter[0] = float(size.width) * (2.0f / 16.0f);
-      sys.point_constant_diameter[1] = float(size.height) * (2.0f / 16.0f);
-      sys.point_screen_diameter_to_ndc_radius[0] = 1.0f / float(std::max(vp.xy_extent[0], 1u));
-      sys.point_screen_diameter_to_ndc_radius[1] = 1.0f / float(std::max(vp.xy_extent[1], 1u));
-    }
-    uint32_t remaining = used_textures;
-    while (remaining) {
-      uint32_t i = uint32_t(std::countr_zero(remaining));
-      remaining &= remaining - 1;
-      sys.texture_swizzled_signs[i >> 2] |= uint32_t(signs[i]) << ((i & 3) * 8);
-      if (profile::On()) {
-        const uint32_t* f = s.fetch(i);
-        const uint8_t sg = signs[i];
-        ++diag.fetch_classes[sg == 0 ? 0 : sg == 0x3F ? 1 : sg == 0xFF ? 2 : sg == 0x55 ? 3 : 4];
-        if ((f[3] >> 13) & 0x3F) ++diag.fetch_classes[5];
-        if ((f[4] >> 12) & 0x3FF) ++diag.fetch_classes[6];
-      }
-    }
-    sys.textures_resolution_scaled = 0;
-    sys.sample_count_log2[0] = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
-    sys.sample_count_log2[1] = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0;
-    sys.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
-    sys.alpha_to_mask =
-        colorcontrol.alpha_to_mask_enable ? (colorcontrol.value >> 24) | (1 << 8) : 0;
-    for (uint32_t i = 0; i < 4; ++i) {
-      auto ci = regs.Get<reg::RB_COLOR_INFO>(kColorInfoRegs[i]);
-      int32_t bias = ci.color_exp_bias;
-      // snorm16 render targets use the full -32...32 range (the plugin's default).
-      if (ci.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
-          ci.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16)
-        bias -= 5;
-      uint32_t bits = uint32_t(0x3F800000 + (bias << 23));
-      std::memcpy(&sys.color_exp_bias[i], &bits, 4);
-    }
-  }
+  DxbcShaderTranslator::SystemConstants sys;
+  FillSystemConstants(s, regs, prim, polygonal, index_endian, vp, used_textures, signs, sys);
   profile::Mark(profile::kSysConst);
 
   // Float constants packed by the shaders' maps (UpdateBindings), compared and staged in place.
@@ -3159,7 +3257,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   if (!prep) {
     upload_fence = r.frame_fence();
     if (!RequestVertices(s, *vs, copies)) {
-      copies.clear();
+      // The copies made before the failed range go out: their pages are marked valid already.
+      FlushCopies(list);
       ++stats.failed;
       return;
     }
@@ -3271,33 +3370,19 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       ++stats.skipped;
       return;
     }
-    D3D12_INDEX_BUFFER_VIEW ibv;
-    uint32_t host_count;
-    bool wide;
-    if (prep) {
-      if (!prep->fan_count) {
-        ++stats.failed;
-        return;
-      }
-      host_count = prep->fan_count;
-      wide = prep->fan_wide;
-      ibv.BufferLocation = prep->fan_indices;
-    } else {
-      host_count = (count - 2) * 3;
-      wide = s.indexed ? s.index_32bit : count > 0xFFFF;
-      UploadPool::Alloc a;
-      if (!vertex_upload.Allocate(uint64_t(host_count) * (wide ? 4 : 2), 16, r.frame_fence(), &a)) {
-        ++stats.failed;
-        return;
-      }
-      WriteFanIndices(s, count, wide, a.cpu);
-      ibv.BufferLocation = a.gpu;
+    const FanIndices f = prep ? FanIndices{prep->fan_indices, prep->fan_count, prep->fan_wide}
+                              : UploadFanIndices(s, r.frame_fence());
+    if (!f.count) {
+      ++stats.failed;
+      return;
     }
-    ibv.SizeInBytes = host_count * (wide ? 4 : 2);
-    ibv.Format = wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    D3D12_INDEX_BUFFER_VIEW ibv;
+    ibv.BufferLocation = f.gpu;
+    ibv.SizeInBytes = f.count * (f.wide ? 4 : 2);
+    ibv.Format = f.wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     list->IASetIndexBuffer(&ibv);
     bound_ibv = ibv;
-    list->DrawIndexedInstanced(host_count, 1, 0, 0, 0);
+    list->DrawIndexedInstanced(f.count, 1, 0, 0, 0);
   } else if (s.indexed) {
     // The whole shared memory buffer is the index buffer and the draw starts at the guest
     // address, so consecutive draws only rebind it when the index format changes.
@@ -3418,6 +3503,7 @@ DrawRenderer::PrepareCounters DrawRenderer::EndFramePrepare(uint64_t done) {
   m.vertex_upload.EndFrame(done);
   c.upload_bytes = std::exchange(m.prep_upload_bytes, 0);
   c.uploads = std::exchange(m.prep_uploads, 0);
+  c.diag = std::exchange(m.prep_diag, {});
   return c;
 }
 
@@ -3426,6 +3512,13 @@ void DrawRenderer::AddPrepareCounters(const PrepareCounters& c) {
   stats_.uploads += c.uploads;
   stats_.stale_pages += c.stale_pages;
   stats_.late_pages += c.late_pages;
+  PrepareDiag& d = impl_->diag.prep;
+  d.shader_loads += c.diag.shader_loads;
+  d.shader_loads_immediate += c.diag.shader_loads_immediate;
+  d.ranges += c.diag.ranges;
+  d.range_pages += c.diag.range_pages;
+  d.range_runs += c.diag.range_runs;
+  d.unwatched += c.diag.unwatched;
   if (c.job) impl_->coherency_next = c.job;
 }
 
@@ -3442,6 +3535,7 @@ void DrawRenderer::BeforeSubmit() {
       return;
   }
   ID3D12GraphicsCommandList* list = m.r.command_list();
+  m.SyncListFrame();  // a frame without draws
   m.TransitionShared(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
   uint64_t offset = 0;
   for (const auto& [start, size] : job->runs) {
@@ -3452,10 +3546,15 @@ void DrawRenderer::BeforeSubmit() {
   m.coherency_inflight.push_back(std::move(job));
 }
 
-void DrawRenderer::InvalidateListState(const char* why) {
+void DrawRenderer::InvalidateListState(ListBreak why) {
   impl_->ResetListState();
+  // Recording goes on in a new list, and the submitted one left shared memory in the common
+  // state once it completed.
+  const bool submit = why == ListBreak::kSubmit;
+  if (submit) impl_->shared_state = D3D12_RESOURCE_STATE_COMMON;
   if (impl_->draw_log)
-    std::fprintf(impl_->draw_log, "%s (after draw %u)\n", why, impl_->frame_draws);
+    std::fprintf(impl_->draw_log, "%s (after draw %u)\n", submit ? "submit" : "resolve",
+                 impl_->frame_draws);
 }
 
 std::pair<uint64_t, uint64_t> DrawRenderer::ShaderHashes(const DrawPrep& prep) {
@@ -3534,9 +3633,9 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
         "PGR4 native draw diag: {} draws/frame; per draw: shader loads {:.3f} ({:.3f} immediate), "
         "mods hits {:.3f}, translation hits {:.3f}, pso hits {:.3f}, ranges {:.3f} (pages "
         "{:.1f}, copied runs {:.3f}), unwatched copies {:.3f}, copy flushes {:.3f}",
-        d.draws / d.frames, per(d.shader_loads), per(d.shader_loads_immediate), per(d.mods_hits),
-        per(d.translation_hits), per(d.pso_hits), per(d.ranges), per(d.range_pages),
-        per(d.range_runs), per(d.unwatched), per(d.flushes));
+        d.draws / d.frames, per(d.prep.shader_loads), per(d.prep.shader_loads_immediate),
+        per(d.mods_hits), per(d.translation_hits), per(d.pso_hits), per(d.prep.ranges),
+        per(d.prep.range_pages), per(d.prep.range_runs), per(d.prep.unwatched), per(d.flushes));
     std::string cbv;
     for (uint32_t i = 0; i < 16; ++i) {
       if (!d.cbv_uploads[i]) continue;
@@ -3602,8 +3701,8 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     impl_->draw_log = std::fopen(path.string().c_str(), "w");
     renderer_.render_targets().SetLog(impl_->draw_log);
   }
-  // The next frame's list starts with the shared buffer in whatever state this frame left it;
-  // D3D12 keeps resource states across command lists, so no reset of shared_state here.
+  // The next frame's list finds the shared buffer in the common state, to which buffers decay
+  // when ExecuteCommandLists completes: SyncListFrame resets shared_state at its first use.
 }
 
 }  // namespace pgr4::native

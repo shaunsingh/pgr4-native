@@ -117,7 +117,6 @@ class GpuTimer {
   uint32_t slot_ = 0;
   uint64_t current_ = 0;
   std::unordered_map<uint64_t, uint32_t> occurrences_;  // this frame's spans per key
-  bool overflow_logged_ = false;
 
   bool per_shader_ = false;
   std::vector<std::pair<uint64_t, uint64_t>> pairs_;  // (VS, PS) hashes by KeyDrawShaders id

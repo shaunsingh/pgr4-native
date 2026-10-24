@@ -12,7 +12,7 @@
 
 #include <algorithm>
 #include <condition_variable>
-#include <cstdio>
+#include <cwchar>
 #include <mutex>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize, false, "PGR4 native",
@@ -22,7 +22,6 @@ REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize, false, "PGR4 native",
 namespace pgr4::native {
 
 namespace {
-constexpr UINT kTitleMsg = WM_APP + 1;
 constexpr UINT_PTR kTitleTimer = 1;
 const wchar_t kClassName[] = L"pgr4_native_debug";
 }  // namespace
@@ -54,7 +53,7 @@ pD3DCompile D3DCompiler() {
 }
 
 D3D12Device::~D3D12Device() {
-  if (device_) WaitIdle();
+  WaitIdle();
   if (HWND h = hwnd_.load()) PostMessageW(h, WM_CLOSE, 1, 0);
   if (window_thread_.joinable()) window_thread_.join();
 }
@@ -116,11 +115,12 @@ bool D3D12Device::CreateWindowThread(const wchar_t* title) {
       SetTimer(hwnd, kTitleTimer, 500, nullptr);
     }
     {
+      // Notified under the lock: once it sees done, the waiter returns and destroys cv.
       std::lock_guard lock(m);
       hwnd_.store(hwnd);
       done = true;
+      cv.notify_one();
     }
-    cv.notify_one();
     if (!hwnd) return;
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -167,10 +167,14 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
     return false;
   queue_->SetName(L"pgr4 native queue");
   if (Failed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.GetAddressOf())),
-             "CreateFence"))
+             "CreateFence") ||
+      Failed(
+          device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(idle_fence_.GetAddressOf())),
+          "CreateFence(idle)"))
     return false;
   fence_event_ = CreateAutoResetEvent();
-  if (!fence_event_) {
+  idle_event_ = CreateAutoResetEvent();
+  if (!fence_event_ || !idle_event_) {
     REXLOG_ERROR("PGR4 native: CreateEvent failed: error {}", GetLastError());
     return false;
   }
@@ -296,8 +300,13 @@ void D3D12Device::WaitFence(uint64_t value) {
 }
 
 void D3D12Device::WaitIdle() {
-  uint64_t v = next_fence_++;
-  if (SUCCEEDED(queue_->Signal(fence_.Get(), v))) WaitFence(v);
+  // A fence of its own: the frame fence's next value belongs to the frame still being recorded,
+  // whose resources would count as done before it is submitted.
+  if (!queue_ || !idle_fence_ || !idle_event_) return;
+  const uint64_t v = ++idle_fence_value_;
+  if (FAILED(queue_->Signal(idle_fence_.Get(), v)) || idle_fence_->GetCompletedValue() >= v) return;
+  idle_fence_->SetEventOnCompletion(v, idle_event_.get());
+  WaitForSingleObject(idle_event_.get(), INFINITE);
 }
 
 bool D3D12Device::EnableGpuTimer() {

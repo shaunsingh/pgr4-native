@@ -6,12 +6,12 @@
 // thread's and the others are the render thread's; renderer.h).
 #pragma once
 
+#include "clock.h"
 #include "d3d12_device.h"
 
 #include <rex/logging.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -85,7 +85,7 @@ class UploadPool {
     uint64_t size = 0, used = 0, fence = 0;
   };
   std::unique_ptr<Block> CreateBlock(uint64_t size) {
-    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t t0 = NowNs();
     auto b = std::make_unique<Block>();
     D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
     if (cpu_cached_)
@@ -109,8 +109,7 @@ class UploadPool {
     b->gpu = b->resource->GetGPUVirtualAddress();
     b->size = size;
     ++created_;
-    const double ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double ms = (NowNs() - t0) / 1e6;
     if (created_ > reserved_ && created_ <= reserved_ + 32)
       REXLOG_INFO(
           "PGR4 native: upload block {} of {} MB created during play in {:.2f} ms (pool "

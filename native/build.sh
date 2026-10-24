@@ -127,7 +127,12 @@ native_src=$here/src/native
 # and render threads' samples (td-145). -mprefer-vector-width covers the vectorizers; struct
 # copies and fills follow allow-light-256-bit, a tuning feature of the Zen CPUs that lets them
 # use 256 bits regardless. Intrinsics keep their width.
-clang_cl_flags="/clang:-march=$march /clang:-mtune=$mtune /clang:-mprefer-vector-width=128 -Xclang -target-feature -Xclang -allow-light-256-bit /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-"
+#
+# -mprfchw: PREFETCHW, so that __builtin_prefetch(p, 1) prefetches for a write; x86-64-v3 leaves
+# it out, and clang then emits a read prefetch. Zen 2 has it; Intel CPUs before Broadwell, which
+# do not report it, run it as a NOP. These flags reach only the toolchain's AMD64 targets (the SDK
+# and the game); the host codegen tool and the profile runtime are compiled with their own.
+clang_cl_flags="/clang:-march=$march /clang:-mtune=$mtune /clang:-mprefer-vector-width=128 /clang:-mprfchw -Xclang -target-feature -Xclang -allow-light-256-bit /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-"
 export PATH=$HOME/recomp/tools/bin:$PATH
 
 IFS=, read -ra stage_list <<< "$stages"
@@ -227,7 +232,8 @@ prep() {
       echo "applied $(basename "$p")"
     fi
   done
-  cp -f "${sources[@]}" "$tree/src/"
+  # With their times: a new time would recompile pgr4_d3d_trace.cpp at every prep.
+  rsync -a "${sources[@]}" "$tree/src/"
   rsync -a --delete "$native_src/" "$tree/src/native/"
   NATIVE_CMAKE=$native_cmake python3 - "$tree/CMakeLists.txt" <<'PY'
 import os, re, sys

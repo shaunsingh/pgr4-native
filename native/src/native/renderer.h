@@ -26,6 +26,8 @@
 // waits for the render thread to finish the Swaps around a capture (present.h).
 #pragma once
 
+#include "hook_args.h"
+
 #include <rex/cvar.h>
 
 #include <atomic>
@@ -37,8 +39,6 @@ struct ID3D12Device;
 struct ID3D12CommandQueue;
 struct ID3D12GraphicsCommandList;
 
-REXCVAR_DECLARE(bool, pgr4_native);                // master switch, off by default
-REXCVAR_DECLARE(std::string, pgr4_native_csv);     // per-frame CSV of the native path ("" = off)
 REXCVAR_DECLARE(bool, pgr4_native_render_thread);  // record on a render thread (see above)
 
 namespace pgr4::native {
@@ -57,58 +57,14 @@ struct DrawState;
 struct ResolveParams;
 struct SwapCall;
 
-// Guest D3D entry points the native path receives (addresses in the base-disc default.xex;
-// names from native/src/d3d_surface.inc).
-enum class HookFn : uint32_t {
-  kBeginVertices = 0x826CFA60,        // draw; the game writes the vertices after it returns
-  kDrawVerticesUP = 0x826CFF10,       // draw
-  kDrawVertices = 0x826CFF58,         // draw
-  kDrawIndexedVertices = 0x826D0340,  // draw
-  kDrawIndx2Inline = 0x826D0798,      // draw, called only from inside the D3D library
-  kDrawIndx2Split = 0x826DC888,       // draw, called only from inside the D3D library
-  kClearF = 0x826D18E0,
-  kClear = 0x826D1A08,
-  kResolve = 0x826CBEE0,
-  kSwap = 0x826CB148,
-};
-
-// The guest D3D's predicated tiling calls a hooked call can be nested in. BeginTiling
-// (fn_826D1C38) clears through ClearF with the largest tile's extent at the EDRAM base, meaning
-// every tile; EndTiling (fn_826D20D0) resolves each tile, its rectangle in surface pixels and
-// the EDRAM holding the tile from its origin (the tile list at device+12740, render_targets.h).
-enum class TilingCall : uint8_t { kNone, kBegin, kEnd };
-
-// Raw PPC arguments of one hooked call. Integer arguments in r3..r10 and float arguments in
-// f1..f4 are captured at entry, before the guest function runs (it clobbers them).
-// Argument meaning follows the XDK D3DDevice_* signatures [INFERENCE, check against the
-// tap traces' `C` lines before relying on one]:
-//   DrawIndexedVertices(dev, prim, base_vertex, start_index, index_count)
-//   DrawVertices(dev, prim, start_vertex, vertex_count)
-//   DrawVerticesUP(dev, prim, vertex_count, data_ptr, stride)
-//   BeginVertices(dev, prim, vertex_count, stride) -> r3 = pointer the game writes into
-//   Clear(dev, count, rects_ptr, flags, color; z in f1, stencil in r9)
-//   ClearF(dev, flags, rect_ptr, color_ptr; z in f1, stencil in r8)
-//   (a float argument takes the next integer register's slot)
-//   Resolve(dev, flags, src_rect_ptr, dest_texture, dest_point_ptr, level, slice,
-//           clear_color_ptr; clear_z in f1, clear_stencil, params_ptr)
-//   Swap(dev, front_buffer_texture, scaler_params_ptr)
-struct HookArgs {
-  HookFn fn;
-  uint32_t device;  // r3 at entry: the guest D3D device (a guest virtual address)
-  uint32_t r[8];    // r3..r10 at entry; r[0] == device
-  uint32_t sp;      // r1 at entry: arguments past r10 are on the guest stack (Resolve's
-                    // ClearStencil and pParameters; offsets in resolve.h)
-  double f[4];      // f1..f4 at entry
-  uint64_t ret;     // r3 after the guest function returned
-  TilingCall tiling = TilingCall::kNone;  // the tiling call this one is nested in
-};
-
 // Per-frame counters of the native path (also the frame CSV's columns).
 struct FrameStats {
   uint64_t draws = 0, clears = 0, resolves = 0;
-  uint64_t state_fail = 0;                             // draws ReadDrawState rejected
-  uint64_t draw_ns = 0, clear_ns = 0, resolve_ns = 0;  // CPU time inside the On* calls
-  uint64_t swap_ns = 0;                                // OnSwap: record, submit, present
+  uint64_t state_fail = 0;  // draws ReadDrawState rejected
+  // CPU time inside ExecuteDraw, ExecuteClear and ExecuteResolve, summed in ticks and converted
+  // at the Swap: the render thread's time (the guest thread's without it).
+  uint64_t draw_ns = 0, clear_ns = 0, resolve_ns = 0;
+  uint64_t swap_ns = 0;  // ExecuteSwap: record, submit, present
   // Guest thread: time in the On* calls (render thread mode: capturing and queueing) and the
   // part of it spent waiting for the render thread.
   uint64_t hook_ns = 0, hook_wait_ns = 0;
@@ -128,13 +84,14 @@ struct FrameStats {
 
 class NativeRenderer {
  public:
-  // The renderer, created on first use when --pgr4_native is on; nullptr when it is off or
-  // when D3D12 initialization failed (logged once).
+  // The renderer, created on first use when --pgr4_native is on; nullptr when it is off, when
+  // D3D12 initialization failed (logged once) and from a failed frame on (Fail).
   static NativeRenderer* Get();
   // The renderer while it draws the game: Get(), except after the renderer switch handed the
-  // game to the Xenos plugin (primary mode, bind_renderer_switch) or a frame failed. The hooks
-  // use this one, a single load while the renderer draws; while it is null the guest D3D runs
-  // unchanged and nothing is tracked.
+  // game to the Xenos plugin (primary mode, bind_renderer_switch) or a frame failed (in primary
+  // mode from the guest thread's next Swap, which hands the game to the plugin as the switch
+  // does). The hooks use this one, a single load while the renderer draws; while it is null the
+  // guest D3D runs unchanged and nothing is tracked.
   static NativeRenderer* Live() {
     if (NativeRenderer* r = live_.load(std::memory_order_acquire)) [[likely]]
       return r;
@@ -160,7 +117,7 @@ class NativeRenderer {
   // For modules.
   D3D12Device& device() { return *device_; }
   ID3D12Device* d3d12() const;
-  ID3D12CommandQueue* queue() const;
+  ID3D12CommandQueue* command_queue() const;
   // The frame's direct command list: open from the previous Swap until OnSwap closes and
   // submits it. Record into it from the On* calls only (the render thread, in that mode).
   ID3D12GraphicsCommandList* command_list() const;
@@ -179,7 +136,17 @@ class NativeRenderer {
  private:
   NativeRenderer() = default;
   bool Initialize();
-  void WriteCsv(const FrameStats& s, uint64_t frame_ns);
+  // At the end of each frame's ExecuteSwap: its row of the frame CSV, its share of the stats
+  // log (every --pgr4_d3d_stats_frames frames), then the per-frame counters start over.
+  void WriteCsvRow(const FrameStats& s, uint64_t frame_ns);
+  // The frame CSV's columns, their names (header) or this frame's values: those of every frame,
+  // with --pgr4_native_profile the stage times and texture counters, with
+  // --pgr4_native_luma_probe the probe's.
+  void AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bool header, std::string* line);
+  void AppendCsvProfileColumns(bool header, std::string* line);
+  void AppendCsvLumaColumns(bool header, std::string* line);
+  void AddToStatsLog(const FrameStats& s, uint64_t frame_ns);
+  void ResetFrameCounters();
   // Starts a frame's module state (RenderTargets/Resolver BeginFrame) at its first On* call.
   void BeginFrame() {
     if (!frame_begun_) BeginFrameModules();
@@ -194,6 +161,9 @@ class NativeRenderer {
   // since the last submission.
   void SubmitEarly();
   // A failed submission or present: logs and turns the native path off for the rest of the run.
+  // In primary mode it also releases the game window to ReXGlue's presenter (on the thread that
+  // records, which owns the swapchain), and the guest thread hands the game to the Xenos plugin
+  // at its next Swap (HandOver).
   void Fail();
   // Primary mode, at a Swap before anything is recorded into the back buffer: who presents into
   // the game window. The renderer while it draws the game and no XAM dialog is up; ReXGlue's
@@ -202,6 +172,8 @@ class NativeRenderer {
   // surface is disconnected before ours is created, and ours released before it is connected
   // again. Returns false when the swapchain cannot be created (logged).
   bool OwnGameWindow(bool own);
+  // OwnGameWindow(false) from any state, including a half-done OwnGameWindow(true).
+  void ReleaseGameWindow();
   // Render thread mode.
   struct Queue;
   void QueueDraw(const uint8_t* base, const HookArgs& args);
@@ -212,7 +184,8 @@ class NativeRenderer {
   // Renderer switch. The key bind_renderer_switch (F9; a Steam Input binding can send it from a
   // back grip) requests it on the UI thread; the guest thread takes the request at its next
   // Swap. A key rather than a pad combination: the game reads every button of the pad.
-  // HandOver: the Xenos plugin draws from the next frame on; TakeBack: native again.
+  // HandOver: the Xenos plugin draws from the next frame on (also after a failed frame, Fail);
+  // TakeBack: native again.
   bool SwitchRequested() {
     return switch_requested_.load(std::memory_order_relaxed) &&
            switch_requested_.exchange(false, std::memory_order_relaxed);
@@ -228,7 +201,8 @@ class NativeRenderer {
   std::unique_ptr<Queue> queue_;  // render thread mode only
 
   std::unique_ptr<D3D12Device> device_;
-  bool primary_ = false;  // --pgr4_native_primary: presenting into the game window
+  bool primary_ = false;       // --pgr4_native_primary: presenting into the game window
+  bool window_taken_ = false;  // OwnGameWindow disconnected ReXGlue's presenter from the window
   std::unique_ptr<RenderTargets> rt_;
   std::unique_ptr<Resolver> resolver_;
   std::unique_ptr<TextureCache> textures_;

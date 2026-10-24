@@ -17,16 +17,18 @@
 // 8; NULL dest point = (0, 0); sample select from Flags bits 4-6 (0 = by the surface's MSAA:
 // 1x sample 0, 2x average of 2, 4x average of 4); exponent bias from Flags bits 26-31;
 // red/blue swap when the destination's swizzle X is not R; raw copies for depth, conversion
-// for color. The guest Resolve runs first, so DecodeResolve also compares the decoded copy
-// registers with the ones the D3D wrote into its register shadow and logs mismatches.
+// for color (the guest D3D never asks for a raw color copy). The guest Resolve runs first, so
+// DecodeResolve also compares the decoded copy registers with the ones the D3D wrote into its
+// register shadow and logs mismatches.
 //
-// Oracle dumps (--pgr4_native_resolve_dump=<dir>): creating <dir>\dump.request arms a dump of
-// the next frame's resolves: for each, the native texels (`f<F>-r<i>-native.bin`, tight rows),
-// the guest memory Xenos wrote at the same address in the same frame (`-guest.bin`, tiled,
-// big-endian; read in that frame's Swap with the guest thread held and the plugin on full
+// Oracle dumps (--pgr4_native_resolve_dump=<dir>, resolve_debug.cpp, with the self test):
+// creating <dir>\dump.request arms a dump of the next frame's resolves: for each, the native
+// texels (`f<F>-r<i>-native.bin`, tight rows), the guest memory Xenos wrote at the same address
+// in the same frame (`-guest.bin`, tiled, big-endian; read in AfterSwap with the plugin on full
 // readback, see HoldFullReadback), and one JSON line in `f<F>-resolves.jsonl`. When a frame
 // resolves twice into one address, every entry's guest copy is the last write.
-// tools/compare_resolves.py untiles and compares them.
+// tools/compare_resolves.py untiles and compares them. AfterSwap's wait holds the guest only
+// when frames are recorded on the guest thread, so dumps need --pgr4_native_render_thread off.
 //
 // Pipeline state: Resolve sets its own compute root signature, PSO and shader-visible
 // descriptor heap on the command list; callers that draw afterwards must set theirs again.
@@ -39,7 +41,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -66,7 +67,7 @@ struct ResolveParams {
   SurfaceRegs regs;                          // the source surfaces (register shadow at the call)
   uint32_t source = 0;                       // 0-3 color render target, 4 depth
   uint32_t sample_select = 0;                // xenos::CopySampleSelect
-  uint32_t copy_command = 1;                 // xenos::CopyCommand: 0 raw, 1 convert
+  uint32_t copy_command = 1;                 // xenos::CopyCommand: 0 raw (depth), 1 convert
   int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;    // source rectangle, surface pixels, exclusive end
   int32_t dest_x = 0, dest_y = 0;            // destination point
   uint32_t dest_base = 0;                    // physical address of the destination level/slice
@@ -80,7 +81,8 @@ struct ResolveParams {
   bool dest_tiled = false;
   uint32_t dest_pitch_blocks = 0;  // row pitch in texels (tiled: 32-aligned)
   uint32_t dest_extent_bytes = 0;  // guest memory the level/slice occupies
-  // Clears after the copy (Flags 0x100 color, 0x200 depth+stencil) over the source rect.
+  // Clears after the copy (Flags 0x100 color, 0x200 depth+stencil) over the source rect, all
+  // of it on the target even where the copy is clipped to the destination level.
   // Inside EndTiling the rect is one tile, which the guest rendered with its origin (edram_x,
   // edram_y) at the surface's EDRAM base, so that is where the clear lands in the EDRAM.
   uint32_t clear_flags = 0;
@@ -101,7 +103,8 @@ bool DecodeResolve(const uint8_t* base, const HookArgs& args, ResolveParams* out
 // guest just swapped. Oracles (captures, dumps) call HoldFullReadback(true) a frame ahead, which
 // switches the plugin to "full" (synchronous, exact) through the cvar registry, and
 // HoldFullReadback(false) after reading guest memory, which restores the previous value. Nested
-// holds are counted. Guest thread only.
+// holds are counted. On the frame-recording thread only (resolve dumps and Presenter captures
+// call it from Execute*: the render thread by default).
 void HoldFullReadback(bool hold);
 
 class Resolver {
@@ -113,10 +116,13 @@ class Resolver {
   bool Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12CommandQueue* queue);
 
   // Once per frame before recording it, like RenderTargets::BeginFrame (handles dumps too).
+  // On the frame-recording thread, as are AfterSwap and Resolve.
   void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
 
-  // In NativeRenderer::OnSwap after EndFrame: for a dumped frame, holds the guest thread for
-  // --pgr4_native_capture_hold_ms and copies the guest memory of its resolves.
+  // After the swap's EndFrame: for a dumped frame, sleeps --pgr4_native_capture_hold_ms so the
+  // Xenos plugin can execute the frame, then copies the guest memory of its resolves. That
+  // sleep holds the guest only when frames are recorded on the guest thread: with the render
+  // thread (the default) the guest runs on and the copies may hold a later frame.
   void AfterSwap();
 
   bool Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p);
@@ -149,11 +155,30 @@ class Resolver {
     Image* current = nullptr;  // the last one written (Find)
   };
   struct Dump;
+  struct DumpDeleter {
+    void operator()(Dump* dump) const;
+  };
   bool CreatePipelines();
-  Image* GetImage(const ResolveParams& p);
-  void DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, Image* img,
+  // The image at p.dest_base for p's format and size, created if missing; `*dest_out`: its
+  // destination.
+  Image* GetImage(const ResolveParams& p, Destination** dest_out);
+  // Copies the clipped rectangle `src` of rt to (dx, dy) in the destination image.
+  bool Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
+            const D3D12_RECT& src, int32_t dx, int32_t dy);
+
+  // Oracle dumps and the self test (resolve_debug.cpp), and what they use of resolve.cpp.
+  void InitializeOracles(ID3D12CommandQueue* queue);  // as their cvars ask
+  // While a dump records, reads back `img`'s texels from (0, 0) to (width, height).
+  void DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, const ResolvedImage& img,
                   uint32_t width, uint32_t height);
   void DumpBeginFrame(uint64_t completed_fence);
+  static DXGI_FORMAT DestResourceFormat(uint32_t dest_format);  // of the host image
+  static uint32_t DestBytesPerTexel(uint32_t dest_format);
+  static bool IsFloatDest(uint32_t dest_format);
+  // false: the generic copy pipelines only; true: each kind's specialized one, compiled on
+  // first use on the calling thread.
+  void SetSpecialization(bool sync);
+  void EraseDestination(uint32_t dest_base);  // and every image of it
 
   ID3D12Device* device_ = nullptr;
   RenderTargets* targets_ = nullptr;
@@ -168,7 +193,7 @@ class Resolver {
   uint64_t frame_ = 0, frame_fence_ = 0;
   uint64_t seq_ = 0;
   std::function<void(uint32_t)> changed_;
-  std::unique_ptr<Dump> dump_;
+  std::unique_ptr<Dump, DumpDeleter> dump_;
   GpuTimer* timer_ = nullptr;
 };
 

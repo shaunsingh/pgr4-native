@@ -28,7 +28,7 @@
 #include <memory>
 #include <vector>
 
-#include "renderer.h"
+#include "hook_args.h"
 
 namespace pgr4::native {
 
@@ -62,40 +62,37 @@ CallEntry ReadDirtyMasks(const uint8_t* base, uint32_t device);
 // ReadDrawState reads after the call (and the replaced draw, guest_d3d.h, does not read at all).
 void PrefetchIndexBuffer(const uint8_t* base, uint32_t device);
 
+// Mask +16 bits 17..20 make a draw call the shader load sub_826DEDC8 (bit 19 = vertex shader,
+// 20 = pixel shader). Besides the stream, it writes registers of the 0x2000, 0x2180 and 0x2200
+// blocks into the shadow (0x2001, 0x2180-0x2182 and, through sub_826DD6F8, 0x2203, 0x2208)
+// and the draw flushes them in the same call, so their dirty bits are not set at its entry.
+constexpr uint64_t kShaderLoadBits = 0x1E0000ull;
+
 // Sets the dirty bits of every state block the draws flush (float constants, register blocks,
 // fetch and bool/loop constants, clip planes) and the shader rebind bits, so the next draw
 // writes the whole shadow and both shaders into the stream.
 void MarkAllDirty(uint8_t* base, uint32_t device);
 
 // The D3D functions that flush the shadow (directly or through the internal draw builders):
-// the draws, DrawIndx2Inline/Split, Clear/ClearF, Resolve, Swap and fn_826D6610. The dispatch
-// calls ReadDirtyMasks before and GuestState().AfterCall after each of them, at every
-// nesting depth, whenever --pgr4_native or the trace tap is on.
-namespace guest_fn {
-constexpr uint32_t kBeginVertices = 0x826CFA60, kDrawVerticesUP = 0x826CFF10,
-                   kDrawVertices = 0x826CFF58, kDrawIndexed = 0x826D0340,
-                   kDrawIndx2Inline = 0x826D0798, kDrawIndx2Split = 0x826DC888,
-                   kClearF = 0x826D18E0, kClear = 0x826D1A08, kResolve = 0x826CBEE0,
-                   kSwap = 0x826CB148, k10A8 = 0x826D6610;
-}  // namespace guest_fn
-
+// every HookFn (hook_args.h). The dispatch calls ReadDirtyMasks before and
+// GuestState().AfterCall after each of them, at every nesting depth, whenever --pgr4_native or
+// the trace tap is on.
 constexpr bool IsStateFlushingFn(uint32_t addr) {
-  switch (addr) {
-    case guest_fn::kBeginVertices:
-    case guest_fn::kDrawVerticesUP:
-    case guest_fn::kDrawVertices:
-    case guest_fn::kDrawIndexed:
-    case guest_fn::kDrawIndx2Inline:
-    case guest_fn::kDrawIndx2Split:
-    case guest_fn::kClearF:
-    case guest_fn::kClear:
-    case guest_fn::kResolve:
-    case guest_fn::kSwap:
-    case guest_fn::k10A8:
+  switch (HookFn(addr)) {
+    case HookFn::kBeginVertices:
+    case HookFn::kDrawVerticesUP:
+    case HookFn::kDrawVertices:
+    case HookFn::kDrawIndexedVertices:
+    case HookFn::kDrawIndx2Inline:
+    case HookFn::kDrawIndx2Split:
+    case HookFn::kClearF:
+    case HookFn::kClear:
+    case HookFn::kResolve:
+    case HookFn::kSwap:
+    case HookFn::kRunCommandBuffer:
       return true;
-    default:
-      return false;
   }
+  return false;
 }
 // Registers the D3D writes into the stream outside any draw state (Resolve's
 // RB_COPY_DEST_BASE, the queries' RB_SAMPLE_COUNT_ADDR); CompareWithTap skips them.
@@ -129,7 +126,6 @@ struct DrawState {
   // entries (0x4000 VS constants, 0x4400 PS constants, 0x4800 fetch constants, 0x4900
   // bool/loop, 0x2000.. render/raster state). Valid until the next hooked D3D call.
   const uint32_t* regs = nullptr;
-  uint32_t reg(uint32_t r) const { return regs[r]; }
   // Fetch constant slot 0..31 (6 dwords; texture fetch) or vertex fetch 0..95 (2 dwords).
   const uint32_t* fetch(uint32_t slot) const { return regs + 0x4800 + slot * 6; }
 
@@ -189,7 +185,7 @@ class GuestStateTracker {
   // r5 vertex shader object, r10 variant). The copy is taken over by the draw that made it.
   void AfterImmediateVs(const uint8_t* base, const uint32_t r[8]);
   // State of the draw `args` describes; call after AfterCall for that draw (OnDraw).
-  bool ReadDrawState(const uint8_t* base, uint32_t device, const HookArgs& args, DrawState* out);
+  bool ReadDrawState(const uint8_t* base, const HookArgs& args, DrawState* out);
   const uint32_t* regs() const { return regs_; }
   uint32_t device() const { return device_; }
   // Shaders bound at the last draw (the IM_LOAD address the D3D uses for them).

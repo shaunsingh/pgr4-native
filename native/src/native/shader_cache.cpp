@@ -24,10 +24,14 @@ double Us(std::chrono::steady_clock::time_point since) {
 }
 }  // namespace
 
-ShaderCache::ShaderCache(const ShaderTranslatorConfig& config)
-    : translator_(rex::ui::GraphicsProvider::GpuVendorID(config.vendor_id), config.bindless,
-                  /*edram_rov_used=*/false, config.gamma_render_target_as_unorm8,
-                  config.msaa_2x_supported) {}
+// The Xenos plugin's settings on the RTX 3090 (bindless on, host render targets, gamma as
+// unorm16, 2x MSAA supported, no resolution scale), so a translation here is byte-identical to
+// the plugin's for the same modification. The vendor only changes code for Intel (no switch
+// statements).
+ShaderCache::ShaderCache()
+    : translator_(rex::ui::GraphicsProvider::GpuVendorID(0x10DE), /*bindless=*/true,
+                  /*edram_rov_used=*/false, /*gamma_render_target_as_unorm8=*/false,
+                  /*msaa_2x_supported=*/true) {}
 
 ShaderCache::~ShaderCache() = default;
 

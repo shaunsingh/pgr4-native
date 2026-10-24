@@ -66,11 +66,7 @@ constexpr Block kFlushBlocks[] = {
 // float constants' shadow may also hold values the game wrote without a dirty bit.
 constexpr std::span<const Block> kRegisterBlocks = std::span(kFlushBlocks).subspan<2>();
 
-// Mask +16 bits 17..20 make a draw call the shader load sub_826DEDC8 (bit 19 = vertex shader,
-// 20 = pixel shader). Besides the stream, it writes registers of the 0x2000, 0x2180 and 0x2200
-// blocks into the shadow (0x2001, 0x2180-0x2182 and, through sub_826DD6F8, 0x2203, 0x2208)
-// and the draw flushes them in the same call, so their dirty bits are not set at its entry.
-constexpr uint64_t kShaderLoadBits = 0x1E0000ull;
+// The blocks holding the registers the shader load (kShaderLoadBits) writes into the shadow.
 constexpr uint64_t kShaderLoadBlocks = (0xFFFFull << 42) | (0x1Full << 12) | 0xFFFull;  // mask +16
 // Vertex fetch constant 31 (mask +24 bit 0): BeginVertices' inline vertex buffer.
 constexpr uint64_t kFetch31 = 1ull;
@@ -277,7 +273,8 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   if (device != device_) Attach(base, device);
   // DrawVerticesUP is BeginVertices + a copy + RestorePush; the nested BeginVertices call
   // already reported its flush and its inline vertex buffer.
-  if (fn_addr == guest_fn::kDrawVerticesUP) return;
+  const HookFn fn = HookFn(fn_addr);
+  if (fn == HookFn::kDrawVerticesUP) return;
   // An immediate VS load belongs to the draw it was made in; one made by Clear/Resolve's own
   // draws (DrawIndx2Inline) never reaches a game draw (the D3D re-dirties the VS after them).
   const bool vs_imm_new = vs_imm_pending_valid_;
@@ -296,10 +293,10 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   uint64_t flushed[6];
   for (uint32_t m = 0; m < 2; ++m)
     flushed[m] = e.dirty[m] & ~Load64(base, device + dev::kDirtyMasks + m * 8);
-  const bool game_draw = fn_addr == guest_fn::kDrawIndexed || fn_addr == guest_fn::kDrawVertices ||
-                         fn_addr == guest_fn::kBeginVertices;
+  const bool game_draw = fn == HookFn::kDrawIndexedVertices || fn == HookFn::kDrawVertices ||
+                         fn == HookFn::kBeginVertices;
   const bool stride_changed =
-      fn_addr == guest_fn::kBeginVertices && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords;
+      fn == HookFn::kBeginVertices && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords;
   if (game_draw) {
     const bool shader_load = (e.dirty[2] & kShaderLoadBits) || stride_changed;
     flushed[2] = e.dirty[2] | (shader_load ? kShaderLoadBlocks : 0);
@@ -328,7 +325,7 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
     Put(0x2082, ((field(br >> 16) << 16) & 0x3FFF0000u) | (field(br) & 0x3FFFu));
   }
 
-  if (game_draw || fn_addr == guest_fn::k10A8) {
+  if (game_draw || fn == HookFn::kRunCommandBuffer) {
     // Bound shaders and the literal constants sub_826DEDC8 loads when they are rebound (after
     // the constant flush, so they win over the shadow). That load, under the mask +16 bits
     // 17..20, is the only place the D3D changes which ucode the GPU runs and patches a variant
@@ -369,16 +366,16 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   }
 
   // Registers the draw functions write straight into the stream (not into the shadow).
-  switch (fn_addr) {
-    case guest_fn::kDrawIndexed:   // VGT_INDX_OFFSET = BaseVertexIndex
-    case guest_fn::kDrawVertices:  // VGT_INDX_OFFSET = StartVertex
+  switch (fn) {
+    case HookFn::kDrawIndexedVertices:  // VGT_INDX_OFFSET = BaseVertexIndex
+    case HookFn::kDrawVertices:         // VGT_INDX_OFFSET = StartVertex
       Put(0x2102, r[2]);
       inline_vertices_ = 0;
       break;
-    case guest_fn::kDrawIndx2Split:  // Swap's internal draw
+    case HookFn::kDrawIndx2Split:  // Swap's internal draw
       Put(0x2102, 0);
       break;
-    case guest_fn::kBeginVertices: {
+    case HookFn::kBeginVertices: {
       Put(0x2102, 0);
       uint32_t p = uint32_t(ret);
       if (!p) break;  // no space: nothing was written
@@ -426,16 +423,23 @@ void GuestStateTracker::AfterImmediateVs(const uint8_t* base, const uint32_t r[8
   vs_imm_pending_valid_ = true;
 }
 
-bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, const HookArgs& a,
-                                      DrawState* s) {
+bool GuestStateTracker::ReadDrawState(const uint8_t* base, const HookArgs& a, DrawState* s) {
+  const uint32_t device = a.device;
   if (!device || device != device_) return false;
-  *s = DrawState{};
+  // Field by field rather than from a DrawState{}: the render thread's queue entries are
+  // value-initialized already, and this runs for every draw on the guest thread.
   s->regs = regs_;
   s->fn = a.fn;
   s->device = device;
+  s->primitive = a.r[1] & 0x3F;
+  s->indexed = false;
+  s->index_address = 0;
+  s->index_32bit = false;
+  s->index_endian = 0;
+  s->base_vertex = 0;
+  s->inline_vertices = 0;
   switch (a.fn) {
     case HookFn::kDrawIndexedVertices: {  // (dev, prim, base vertex, start index, index count)
-      s->primitive = a.r[1] & 0x3F;
       s->base_vertex = a.r[2];
       s->count = a.r[4];
       s->indexed = true;
@@ -448,13 +452,11 @@ bool GuestStateTracker::ReadDrawState(const uint8_t* base, uint32_t device, cons
       break;
     }
     case HookFn::kDrawVertices:  // (dev, prim, start vertex, vertex count)
-      s->primitive = a.r[1] & 0x3F;
       s->base_vertex = a.r[2];
       s->count = a.r[3];
       break;
     case HookFn::kBeginVertices:   // (dev, prim, vertex count, stride)
     case HookFn::kDrawVerticesUP:  // (dev, prim, vertex count, data, stride)
-      s->primitive = a.r[1] & 0x3F;
       s->count = a.r[2];
       s->inline_vertices = inline_vertices_;
       break;

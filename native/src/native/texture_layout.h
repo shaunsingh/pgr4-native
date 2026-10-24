@@ -14,6 +14,7 @@
 // info_formats.cpp are compiled into the game (build.ps1) and into the harness.
 #pragma once
 
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 
 #include <cstddef>
@@ -41,8 +42,7 @@ struct TextureKey {
   bool tiled = false;
   bool packed_mips = false;
 
-  bool operator==(const TextureKey& o) const;
-  bool operator!=(const TextureKey& o) const { return !(*this == o); }
+  bool operator==(const TextureKey&) const = default;
   size_t Hash() const;
   uint32_t mip_levels() const { return mip_max_level + 1; }
   bool is_3d() const { return dimension == rex::graphics::xenos::DataDimension::k3D; }
@@ -114,8 +114,14 @@ struct GuestTextureMemory {
   size_t mips_size = 0;
 };
 
-// Guest byte extents of the base level and the mips (texture_util::GetGuestTextureLayout):
-// the ranges a cache must watch and a dump must contain.
+// texture_util::GetGuestTextureLayout of the key's texture.
+rex::graphics::texture_util::TextureGuestLayout GetGuestLayout(const TextureKey& key);
+
+// Guest byte extents of the base level and the mips: the ranges a cache must watch and a dump
+// must contain. `layout`: GetGuestLayout(key), for callers that keep it.
+void GetGuestExtents(const TextureKey& key,
+                     const rex::graphics::texture_util::TextureGuestLayout& layout,
+                     uint32_t* base_bytes, uint32_t* mips_bytes);
 void GetGuestExtents(const TextureKey& key, uint32_t* base_bytes, uint32_t* mips_bytes);
 
 struct UntileStats {
@@ -126,7 +132,12 @@ struct UntileStats {
 // Endian-swaps (per 32-bit word, as the Xenos texture fetch does) and untiles every
 // subresource into dst (sized by GetHostFootprints with the same subresources), applying the
 // host format conversion. `scratch` is reused between calls to hold the swapped guest data.
-// Returns false for unsupported formats.
+// Returns false for unsupported formats. `layout`: GetGuestLayout(key).
+bool UntileTexture(const TextureKey& key,
+                   const rex::graphics::texture_util::TextureGuestLayout& layout,
+                   const GuestTextureMemory& memory,
+                   const std::vector<HostSubresource>& subresources, uint8_t* dst,
+                   std::vector<uint8_t>* scratch, UntileStats* stats = nullptr);
 bool UntileTexture(const TextureKey& key, const GuestTextureMemory& memory,
                    const std::vector<HostSubresource>& subresources, uint8_t* dst,
                    std::vector<uint8_t>* scratch, UntileStats* stats = nullptr);

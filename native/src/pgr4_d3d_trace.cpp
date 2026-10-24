@@ -3,9 +3,10 @@
 // Every function in d3d_surface.inc (the XDK D3D entry points PGR4's game code calls, plus the
 // internal draw builders and MakeSpace) is overridden with a REX_HOOK_RAW that forwards to the
 // original __imp__sub_X and counts the call (the pass-through ones only while the tap or the
-// profiler is on). Forwarding can be switched off per class at run time
-// (`skip draw|clear|resolve|none`), which is the switch a native backend will use to take draws
-// away from the Xenos plugin while it stays available as the A/B oracle.
+// profiler is on). For debugging and oracle comparisons, forwarding can be switched off per class
+// at run time (`skip draw|clear|resolve|none`). The native renderer as the presenter
+// (--pgr4_native_primary) does not use it: it keeps forwarding and stops the Xenos plugin's host
+// draws with the SDK's --gpu_skip_draws (rexglue-native-primary.patch).
 //
 // With --pgr4_d3d_tap the hooks also follow the D3D push buffer: the D3D device keeps its write
 // pointer at device+48 (last written dword) and its limit at device+56, and every packet the
@@ -17,9 +18,13 @@
 //
 // Control at run time: --pgr4_d3d_control=<file>. The file is read (then deleted) once per
 // frame, one command per line:
-//   trace <tag> [frames]   write the next N complete frames to --pgr4_d3d_trace_dir
+//   trace <tag> [frames]   write the next N complete frames to --pgr4_d3d_trace_dir (ignored
+//                          while the tap is off)
 //   skip <draw,clear,resolve|none>
-//   tap on|off             stop or resume decoding (hooks keep counting and forwarding)
+//   tap on|off             stop or resume decoding (hooks keep counting and forwarding); off
+//                          also drops the frames a trace has still to write
+// --pgr4_d3d_tap, --pgr4_d3d_tap_check and --pgr4_d3d_skip set the state at the first device the
+// game creates; the one it creates at the title screen keeps what the commands changed since.
 //
 // With --pgr4_native the draw, clear, resolve and Swap hooks also call the native D3D12
 // renderer (src/native/renderer.h) after the guest function returned.
@@ -30,6 +35,7 @@
 #include "native/d3d_state.h"
 #include "native/guest_d3d.h"
 #include "native/guest_memory.h"
+#include "native/log.h"
 #include "native/profile.h"
 #include "native/renderer.h"
 
@@ -41,6 +47,7 @@
 #include <rex/system/kernel_state.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
@@ -49,7 +56,6 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
-#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -74,7 +80,8 @@ REXCVAR_DEFINE_BOOL(pgr4_d3d_tap_check, false, "PGR4 native",
 
 namespace {
 
-using namespace rex::graphics;
+namespace ucode = rex::graphics::ucode;
+namespace xenos = rex::graphics::xenos;
 
 enum Cat : uint8_t {
   kDraw,
@@ -95,7 +102,6 @@ enum Cat : uint8_t {
   kDevice,
   kResource,
   kOther,
-  kCatCount
 };
 
 enum FnId : uint32_t {
@@ -304,7 +310,7 @@ struct ShaderInfo {
 
 void ScanUcode(const uint32_t* host_le, uint32_t dwords, ShaderInfo& info) {
   uint32_t first_exec = dwords / 3;
-  for (uint32_t pair = 0; pair * 3 + 3 <= dwords && pair * 3 < first_exec * 3; ++pair) {
+  for (uint32_t pair = 0; pair * 3 + 3 <= dwords && pair < first_exec; ++pair) {
     ucode::ControlFlowInstruction cf[2];
     ucode::UnpackControlFlowInstructions(host_le + pair * 3, cf);
     bool end = false;
@@ -342,11 +348,15 @@ struct FrameCounters {
   uint64_t checked = 0, differ = 0;  // --pgr4_d3d_tap_check: draws compared, draws that differ
 };
 
+// Belongs to the thread that drives the guest D3D device: the game uses the device from one
+// thread at a time (renderer.h), and only the hooked calls on that device and CreateDevice, which
+// runs before the calls on the device it creates, change this state. Hooked calls on other
+// threads (r3 not the device) read `device` and `enabled` only.
 struct Tap {
-  std::mutex mutex;  // device calls come from one thread at a time; this only guards the tap
   uint32_t device = 0;
   uint32_t cursor = 0;
   bool enabled = false;
+  bool configured = false;  // the cvars were read (at the first CreateDevice)
 
   // Decoder.
   uint32_t regs[kRegCount] = {};
@@ -372,7 +382,6 @@ struct Tap {
   bool state_pending = false;  // BeginVertices: compared when RestorePush publishes its packets
   bool check = false;          // --pgr4_d3d_tap_check
   std::string check_first;     // the frame's first differing draw
-  uint32_t check_logged = 0;
   std::vector<uint64_t> state_regs = std::vector<uint64_t>(kRegCount);
   std::map<uint32_t, uint64_t> op_counts;
   std::map<uint64_t, ShaderInfo> shaders;                      // key: type<<63 | addr<<20 ^ dwords
@@ -416,15 +425,6 @@ __attribute__((format(printf, 2, 3))) void Append(std::string& s, const char* f,
   va_end(args);
 }
 
-__attribute__((format(printf, 2, 3))) void Out(Tap& t, const char* f, ...) {
-  va_list args;
-  va_start(args, f);
-  AppendV(t.out, f, args);
-  va_end(args);
-}
-
-bool Tracing(const Tap& t) { return t.tracing; }
-
 FnId CurrentFn() { return t_depth ? t_stack[std::min<uint32_t>(t_depth, 64) - 1].id : kFnCount; }
 uint64_t CurrentSeq() { return t_depth ? t_stack[std::min<uint32_t>(t_depth, 64) - 1].seq : 0; }
 
@@ -435,7 +435,7 @@ void WriteReg(Tap& t, uint32_t reg, uint32_t v, uint8_t how = 1) {
   t.written[reg] = how;
 }
 
-const ShaderInfo* Shader(Tap& t, uint8_t* base, uint32_t type, uint32_t addr, uint32_t dwords) {
+const ShaderInfo* Shader(Tap& t, uint32_t type, uint32_t addr, uint32_t dwords) {
   if (!addr || !dwords) return nullptr;
   uint64_t key = (uint64_t(type) << 63) | ((uint64_t(addr) << 20) ^ dwords);
   auto it = t.shaders.find(key);
@@ -454,7 +454,6 @@ const ShaderInfo* Shader(Tap& t, uint8_t* base, uint32_t type, uint32_t addr, ui
   }
   info.hash = Fnv(le.data(), le.size());
   ScanUcode(le.data(), dwords, info);
-  (void)base;
   return &t.shaders.emplace(key, info).first->second;
 }
 
@@ -464,10 +463,10 @@ void CompareState(Tap& t, FnId id) {
   const auto& gs = pgr4::native::GuestState();
   if (gs.device() != t.device) {
     ++t.state_unchecked;
-    if (Tracing(t) && t.state_details < 64) {
+    if (t.tracing && t.state_details < 64) {
       ++t.state_details;
-      Out(t, "# state_unchecked d=%llu fn=%s tracker_device=%08X tap_device=%08X\n",
-          (unsigned long long)t.draw_seq, kFns[id].name, gs.device(), t.device);
+      Append(t.out, "# state_unchecked d=%llu fn=%s tracker_device=%08X tap_device=%08X\n",
+             (unsigned long long)t.draw_seq, kFns[id].name, gs.device(), t.device);
     }
     return;
   }
@@ -490,8 +489,8 @@ void CompareState(Tap& t, FnId id) {
   ++t.state_bad_draws;
   ++t.frame.differ;
   // Traced frames list 64 differing draws; --pgr4_d3d_tap_check keeps each frame's first.
-  const bool detail = Tracing(t) && t.state_details < 64;
-  if (!detail && (Tracing(t) || !t.check_first.empty())) return;
+  const bool detail = t.tracing && t.state_details < 64;
+  if (!detail && (t.tracing || !t.check_first.empty())) return;
   if (detail) ++t.state_details;
   std::string s;
   Append(s, "d=%llu fn=%s", (unsigned long long)t.draw_seq, kFns[id].name);
@@ -509,12 +508,12 @@ void CompareState(Tap& t, FnId id) {
     Append(s, " ps tap=%08X:%u state=%08X:%u", t.ps_addr, t.ps_dwords, gs.ps().ucode,
            gs.ps().dwords);
   if (detail)
-    Out(t, "# state_diff %s\n", s.c_str());
+    Append(t.out, "# state_diff %s\n", s.c_str());
   else
     t.check_first = std::move(s);
 }
 
-void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
+void OnDraw(Tap& t, uint32_t op, bool predicated) {
   // DRAW_INDX: viz, initiator, [index base, index size]; DRAW_INDX_2: initiator, indices.
   uint32_t initiator =
       op == 0x22 ? (t.pkt.size() > 1 ? t.pkt[1] : 0) : (t.pkt.empty() ? 0 : t.pkt[0]);
@@ -530,44 +529,44 @@ void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
     ++t.frame.tap_aux;
     g_tap_counts[1].fetch_add(1, std::memory_order_relaxed);
   }
-  if (!Tracing(t)) return;
+  if (!t.tracing) return;
 
   uint32_t prim = initiator & 0x3F, src = (initiator >> 6) & 3, count = initiator >> 16;
   FnId fn = CurrentFn();
-  Out(t, "D %llu c=%llu fn=%s op=%s pred=%d %s prim=%u src=%s idx32=%u count=%u",
-      (unsigned long long)t.draw_seq++, (unsigned long long)CurrentSeq(),
-      fn < kFnCount ? kFns[fn].name : "-", OpName(op), predicated ? 1 : 0,
-      resolve ? "RESOLVE" : "draw", prim,
-      src == 0   ? "dma"
-      : src == 2 ? "auto"
-                 : "imm",
-      (initiator >> 11) & 1, count);
+  Append(t.out, "D %llu c=%llu fn=%s op=%s pred=%d %s prim=%u src=%s idx32=%u count=%u",
+         (unsigned long long)t.draw_seq++, (unsigned long long)CurrentSeq(),
+         fn < kFnCount ? kFns[fn].name : "-", OpName(op), predicated ? 1 : 0,
+         resolve ? "RESOLVE" : "draw", prim,
+         src == 0   ? "dma"
+         : src == 2 ? "auto"
+                    : "imm",
+         (initiator >> 11) & 1, count);
   if (op == 0x22 && src == 0 && t.pkt.size() >= 4)
-    Out(t, " ib=%08X:%u", t.pkt[2], t.pkt[3] & 0xFFFFFF);
+    Append(t.out, " ib=%08X:%u", t.pkt[2], t.pkt[3] & 0xFFFFFF);
   if (resolve) {
-    Out(t, " copy_ctl=%08X dest=%08X pitch=%08X info=%08X surf=%08X c0=%08X d=%08X\n",
-        t.regs[0x2318], t.regs[0x2319], t.regs[0x231A], t.regs[0x231B], t.regs[0x2000],
-        t.regs[0x2001], t.regs[0x2002]);
+    Append(t.out, " copy_ctl=%08X dest=%08X pitch=%08X info=%08X surf=%08X c0=%08X d=%08X\n",
+           t.regs[0x2318], t.regs[0x2319], t.regs[0x231A], t.regs[0x231B], t.regs[0x2000],
+           t.regs[0x2001], t.regs[0x2002]);
     return;
   }
-  const ShaderInfo* vs = Shader(t, base, 0, t.vs_addr, t.vs_dwords);
-  const ShaderInfo* ps = Shader(t, base, 1, t.ps_addr, t.ps_dwords);
-  Out(t, " vs=%08X:%u:%016llX ps=%08X:%u:%016llX", t.vs_addr, t.vs_dwords,
-      (unsigned long long)(vs ? vs->hash : t.vs_imm_hash), t.ps_addr, t.ps_dwords,
-      (unsigned long long)(ps ? ps->hash : t.ps_imm_hash));
-  Out(t,
-      " mode=%08X surf=%08X c0=%08X c1=%08X c2=%08X c3=%08X d=%08X mask=%08X depth=%08X"
-      " blend0=%08X sc=%08X,%08X vgt_offs=%u",
-      t.regs[0x2208], t.regs[0x2000], t.regs[0x2001], t.regs[0x2003], t.regs[0x2004],
-      t.regs[0x2005], t.regs[0x2002], t.regs[0x2104], t.regs[0x2200], t.regs[0x2201],
-      t.regs[0x2081], t.regs[0x2082], t.regs[0x2102]);
+  const ShaderInfo* vs = Shader(t, 0, t.vs_addr, t.vs_dwords);
+  const ShaderInfo* ps = Shader(t, 1, t.ps_addr, t.ps_dwords);
+  Append(t.out, " vs=%08X:%u:%016llX ps=%08X:%u:%016llX", t.vs_addr, t.vs_dwords,
+         (unsigned long long)(vs ? vs->hash : t.vs_imm_hash), t.ps_addr, t.ps_dwords,
+         (unsigned long long)(ps ? ps->hash : t.ps_imm_hash));
+  Append(t.out,
+         " mode=%08X surf=%08X c0=%08X c1=%08X c2=%08X c3=%08X d=%08X mask=%08X depth=%08X"
+         " blend0=%08X sc=%08X,%08X vgt_offs=%u",
+         t.regs[0x2208], t.regs[0x2000], t.regs[0x2001], t.regs[0x2003], t.regs[0x2004],
+         t.regs[0x2005], t.regs[0x2002], t.regs[0x2104], t.regs[0x2200], t.regs[0x2201],
+         t.regs[0x2081], t.regs[0x2082], t.regs[0x2102]);
   uint32_t tmask = (vs ? vs->tfetch_mask : 0) | (ps ? ps->tfetch_mask : 0);
   for (uint32_t s = 0; s < 32; ++s) {
     if (!(tmask >> s & 1)) continue;
     const uint32_t* f = &t.regs[0x4800 + s * 6];
     uint32_t w = (f[2] & 0x1FFF) + 1, h = ((f[2] >> 13) & 0x1FFF) + 1;
-    Out(t, " t%u=%08X/fmt%u/%ux%u/%s/dim%u", s, f[1] & 0xFFFFF000u, f[1] & 0x3F, w, h,
-        (f[0] >> 31) ? "tiled" : "linear", (f[5] >> 9) & 3);
+    Append(t.out, " t%u=%08X/fmt%u/%ux%u/%s/dim%u", s, f[1] & 0xFFFFF000u, f[1] & 0x3F, w, h,
+           (f[0] >> 31) ? "tiled" : "linear", (f[5] >> 9) & 3);
     ++t.textures[{f[1], f[2]}];
   }
   if (vs) {
@@ -575,22 +574,22 @@ void OnDraw(Tap& t, uint8_t* base, uint32_t op, bool predicated) {
       bool used = v < 64 ? (vs->vfetch_lo >> v & 1) : (vs->vfetch_hi >> (v - 64) & 1);
       if (!used) continue;
       const uint32_t* f = &t.regs[0x4800 + v * 2];
-      Out(t, " v%u=%08X:%u", v, f[0] & 0xFFFFFFFCu, (f[1] >> 2) & 0xFFFFFF);
+      Append(t.out, " v%u=%08X:%u", v, f[0] & 0xFFFFFFFCu, (f[1] >> 2) & 0xFFFFFF);
     }
   }
-  Out(t, "\n");
+  Append(t.out, "\n");
 }
 
-void HandlePacket(Tap& t, uint8_t* base) {
+void HandlePacket(Tap& t) {
   uint32_t type = t.header >> 30;
   if (type == 0) {
     uint32_t reg = t.header & 0x7FFF;
     bool one = (t.header >> 15) & 1;
     for (size_t i = 0; i < t.pkt.size(); ++i) WriteReg(t, one ? reg : reg + uint32_t(i), t.pkt[i]);
-    if (Tracing(t)) {
-      Out(t, "W %04X", reg);
-      for (size_t i = 0; i < t.pkt.size() && i < 64; ++i) Out(t, " %08X", t.pkt[i]);
-      Out(t, "%s\n", t.pkt.size() > 64 ? " ..." : "");
+    if (t.tracing) {
+      Append(t.out, "W %04X", reg);
+      for (size_t i = 0; i < t.pkt.size() && i < 64; ++i) Append(t.out, " %08X", t.pkt[i]);
+      Append(t.out, "%s\n", t.pkt.size() > 64 ? " ..." : "");
     }
     return;
   }
@@ -601,21 +600,22 @@ void HandlePacket(Tap& t, uint8_t* base) {
   }
   uint32_t op = (t.header >> 8) & 0x7F;
   bool pred = t.header & 1;
-  if (Tracing(t)) ++t.op_counts[op];
+  if (t.tracing) ++t.op_counts[op];
   if (!OpName(op)) ++t.frame.unknown_ops;
   auto range = [&](uint32_t reg, size_t first) {
     const uint8_t how = pred ? pgr4::native::GuestStateTracker::kTapWrittenPredicated : 1;
     for (size_t i = first; i < t.pkt.size(); ++i)
       WriteReg(t, reg + uint32_t(i - first), t.pkt[i], how);
-    if (Tracing(t)) {
+    if (t.tracing) {
       size_t n = t.pkt.size() - first;
       if (reg >= 0x4000 && reg < 0x4800)
-        Out(t, "K %04X n=%zu h=%016llX\n", reg, n,
-            (unsigned long long)Fnv(t.pkt.data() + first, n));
+        Append(t.out, "K %04X n=%zu h=%016llX\n", reg, n,
+               (unsigned long long)Fnv(t.pkt.data() + first, n));
       else {
-        Out(t, "W %04X", reg);
-        for (size_t i = first; i < t.pkt.size() && i < first + 64; ++i) Out(t, " %08X", t.pkt[i]);
-        Out(t, "\n");
+        Append(t.out, "W %04X", reg);
+        for (size_t i = first; i < t.pkt.size() && i < first + 64; ++i)
+          Append(t.out, " %08X", t.pkt[i]);
+        Append(t.out, "\n");
       }
     }
   };
@@ -642,7 +642,7 @@ void HandlePacket(Tap& t, uint8_t* base) {
         std::memcpy(&v, p + i * 4, 4);
         WriteReg(t, kConstantBase[kind] + index + i, __builtin_bswap32(v));
       }
-      if (Tracing(t)) Out(t, "L %04X n=%u from=%08X\n", kConstantBase[kind] + index, n, addr);
+      if (t.tracing) Append(t.out, "L %04X n=%u from=%08X\n", kConstantBase[kind] + index, n, addr);
       break;
     }
     case 0x27:  // IM_LOAD
@@ -654,8 +654,9 @@ void HandlePacket(Tap& t, uint8_t* base) {
         t.ps_addr = t.pkt[0] & ~3u;
         t.ps_dwords = t.pkt[1] & 0xFFFF;
       }
-      if (Tracing(t))
-        Out(t, "S %s %08X %u\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[0] & ~3u, t.pkt[1] & 0xFFFF);
+      if (t.tracing)
+        Append(t.out, "S %s %08X %u\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[0] & ~3u,
+               t.pkt[1] & 0xFFFF);
       break;
     case 0x2B: {  // IM_LOAD_IMMEDIATE
       if (t.pkt.size() < 2) break;
@@ -669,36 +670,38 @@ void HandlePacket(Tap& t, uint8_t* base) {
         t.ps_dwords = t.pkt[1] & 0xFFFF;
         t.ps_imm_hash = h;
       }
-      if (Tracing(t))
-        Out(t, "S %s imm %u %016llX\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[1] & 0xFFFF,
-            (unsigned long long)h);
+      if (t.tracing)
+        Append(t.out, "S %s imm %u %016llX\n", (t.pkt[0] & 3) ? "ps" : "vs", t.pkt[1] & 0xFFFF,
+               (unsigned long long)h);
       break;
     }
     case 0x22:
     case 0x36:
     case 0x34:
     case 0x35:
-      OnDraw(t, base, op, pred);
+      OnDraw(t, op, pred);
       break;
     case 0x3F:
     case 0x37:
       ++t.frame.ibs;
-      if (Tracing(t) && t.pkt.size() >= 2) Out(t, "I %08X %u\n", t.pkt[0], t.pkt[1] & 0xFFFFF);
+      if (t.tracing && t.pkt.size() >= 2)
+        Append(t.out, "I %08X %u\n", t.pkt[0], t.pkt[1] & 0xFFFFF);
       break;
     case 0x10:  // NOP (also carries inline vertex data for the UP draws)
       break;
     default:
-      if (Tracing(t)) {
-        Out(t, "P %s%s n=%zu", OpName(op) ? OpName(op) : "op", pred ? " pred" : "", t.pkt.size());
-        if (!OpName(op)) Out(t, " opcode=%02X", op);
-        for (size_t i = 0; i < t.pkt.size() && i < 8; ++i) Out(t, " %08X", t.pkt[i]);
-        Out(t, "\n");
+      if (t.tracing) {
+        Append(t.out, "P %s%s n=%zu", OpName(op) ? OpName(op) : "op", pred ? " pred" : "",
+               t.pkt.size());
+        if (!OpName(op)) Append(t.out, " opcode=%02X", op);
+        for (size_t i = 0; i < t.pkt.size() && i < 8; ++i) Append(t.out, " %08X", t.pkt[i]);
+        Append(t.out, "\n");
       }
       break;
   }
 }
 
-void Feed(Tap& t, uint8_t* base, uint32_t dw) {
+void Feed(Tap& t, uint32_t dw) {
   if (!t.in_packet) {
     // MakeSpace leaves dwords it patches later as zeros; the D3D never writes register 0, so
     // a zero header is padding, not a one-register type-0 packet.
@@ -725,12 +728,11 @@ void Feed(Tap& t, uint8_t* base, uint32_t dw) {
   t.pkt.push_back(dw);
   if (--t.need == 0) {
     t.in_packet = false;
-    HandlePacket(t, base);
+    HandlePacket(t);
   }
 }
 
-// Decode everything the D3D wrote since the last sync. Called with the tap lock held, on the
-// thread that owns the device.
+// Decode everything the D3D wrote since the last sync.
 // `jump`: the call that just returned moved the push pointer to a new segment by assignment,
 // so the dwords up to the new pointer (reserved patch space, the unwritten segment start) were
 // not written in this lap and are skipped.
@@ -743,19 +745,19 @@ void Sync(Tap& t, uint8_t* base, bool segment_switch_expected, bool jump = false
     // misread a length); drop it rather than let a bad length swallow the following stream.
     if (t.in_packet) {
       ++t.frame.torn;
-      if (Tracing(t))
-        Out(t, "# torn packet header=%08X still needs %u dwords at window %08X\n", t.header, t.need,
-            t.cursor + 4);
+      if (t.tracing)
+        Append(t.out, "# torn packet header=%08X still needs %u dwords at window %08X\n", t.header,
+               t.need, t.cursor + 4);
       t.in_packet = false;
     }
-    if (Tracing(t)) {  // raw dwords, for checking the decoder against the stream
+    if (t.tracing) {  // raw dwords, for checking the decoder against the stream
       uint32_t n = (cur - t.cursor) / 4;
-      Out(t, "X %08X n=%u", t.cursor + 4, n);
+      Append(t.out, "X %08X n=%u", t.cursor + 4, n);
       for (uint32_t i = 0; i < n && i < 24; ++i)
-        Out(t, " %08X", Load32(base, t.cursor + 4 + i * 4));
-      Out(t, "%s\n", n > 24 ? " ..." : "");
+        Append(t.out, " %08X", Load32(base, t.cursor + 4 + i * 4));
+      Append(t.out, "%s\n", n > 24 ? " ..." : "");
     }
-    for (uint32_t a = t.cursor + 4; a <= cur; a += 4) Feed(t, base, Load32(base, a));
+    for (uint32_t a = t.cursor + 4; a <= cur; a += 4) Feed(t, Load32(base, a));
     t.frame.dwords += (cur - t.cursor) / 4;
   } else {
     // The pointer moved to another segment (MakeSpace, RestorePush). Packets end at segment
@@ -766,45 +768,45 @@ void Sync(Tap& t, uint8_t* base, bool segment_switch_expected, bool jump = false
       ++t.frame.resyncs;
     if (t.in_packet) ++t.frame.resyncs;
     t.in_packet = false;
-    if (Tracing(t))
-      Out(t, "# segment %08X -> %08X%s\n", t.cursor, cur,
-          segment_switch_expected ? "" : " (unexpected)");
+    if (t.tracing)
+      Append(t.out, "# segment %08X -> %08X%s\n", t.cursor, cur,
+             segment_switch_expected ? "" : " (unexpected)");
   }
   t.cursor = cur;
 }
 
 void FlushTrace(Tap& t) {
-  Out(t,
-      "# summary frame=%llu calls=%llu draw_calls=%llu tap_draws=%llu tap_aux=%llu"
-      " tap_resolves=%llu dwords=%llu segments=%llu resyncs=%llu torn=%llu unknown_ops=%llu"
-      " ibs=%llu zero_pad=%llu state_checked_draws=%llu state_mismatch_draws=%llu"
-      " state_shader_mismatch=%llu state_unchecked=%llu state_per_tile=%llu\n",
-      (unsigned long long)t.trace_frame, (unsigned long long)t.frame.calls,
-      (unsigned long long)t.frame.draw_calls, (unsigned long long)t.frame.tap_draws,
-      (unsigned long long)t.frame.tap_aux, (unsigned long long)t.frame.tap_resolves,
-      (unsigned long long)t.frame.dwords, (unsigned long long)t.frame.segments,
-      (unsigned long long)t.frame.resyncs, (unsigned long long)t.frame.torn,
-      (unsigned long long)t.frame.unknown_ops, (unsigned long long)t.frame.ibs,
-      (unsigned long long)t.frame.zero_pad, (unsigned long long)t.state_draws,
-      (unsigned long long)t.state_bad_draws, (unsigned long long)t.state_shader_bad,
-      (unsigned long long)t.state_unchecked, (unsigned long long)t.state_per_tile);
+  Append(t.out,
+         "# summary frame=%llu calls=%llu draw_calls=%llu tap_draws=%llu tap_aux=%llu"
+         " tap_resolves=%llu dwords=%llu segments=%llu resyncs=%llu torn=%llu unknown_ops=%llu"
+         " ibs=%llu zero_pad=%llu state_checked_draws=%llu state_mismatch_draws=%llu"
+         " state_shader_mismatch=%llu state_unchecked=%llu state_per_tile=%llu\n",
+         (unsigned long long)t.trace_frame, (unsigned long long)t.frame.calls,
+         (unsigned long long)t.frame.draw_calls, (unsigned long long)t.frame.tap_draws,
+         (unsigned long long)t.frame.tap_aux, (unsigned long long)t.frame.tap_resolves,
+         (unsigned long long)t.frame.dwords, (unsigned long long)t.frame.segments,
+         (unsigned long long)t.frame.resyncs, (unsigned long long)t.frame.torn,
+         (unsigned long long)t.frame.unknown_ops, (unsigned long long)t.frame.ibs,
+         (unsigned long long)t.frame.zero_pad, (unsigned long long)t.state_draws,
+         (unsigned long long)t.state_bad_draws, (unsigned long long)t.state_shader_bad,
+         (unsigned long long)t.state_unchecked, (unsigned long long)t.state_per_tile);
   for (uint32_t r = 0; r < kRegCount; ++r)
     if (t.state_regs[r])
-      Out(t, "# state_mismatch %04X %s draws=%llu\n", r, RegName(r) ? RegName(r) : "?",
-          (unsigned long long)t.state_regs[r]);
+      Append(t.out, "# state_mismatch %04X %s draws=%llu\n", r, RegName(r) ? RegName(r) : "?",
+             (unsigned long long)t.state_regs[r]);
   for (uint32_t i = 0; i < kFnCount; ++i)
     if (t.fn_calls[i])
-      Out(t, "# calls %08X %s %llu\n", kFns[i].addr, kFns[i].name,
-          (unsigned long long)t.fn_calls[i]);
+      Append(t.out, "# calls %08X %s %llu\n", kFns[i].addr, kFns[i].name,
+             (unsigned long long)t.fn_calls[i]);
   for (auto& [op, n] : t.op_counts)
-    Out(t, "# packets %s %llu\n", OpName(op) ? OpName(op) : "?", (unsigned long long)n);
+    Append(t.out, "# packets %s %llu\n", OpName(op) ? OpName(op) : "?", (unsigned long long)n);
   for (auto& [k, s] : t.shaders)
-    Out(t, "# shader %s %08X dwords=%u hash=%016llX tfetch=%08X vfetch=%08X%016llX\n",
-        s.type ? "ps" : "vs", s.addr, s.dwords, (unsigned long long)s.hash, s.tfetch_mask,
-        s.vfetch_hi, (unsigned long long)s.vfetch_lo);
+    Append(t.out, "# shader %s %08X dwords=%u hash=%016llX tfetch=%08X vfetch=%08X%016llX\n",
+           s.type ? "ps" : "vs", s.addr, s.dwords, (unsigned long long)s.hash, s.tfetch_mask,
+           s.vfetch_hi, (unsigned long long)s.vfetch_lo);
   for (auto& [k, n] : t.textures)
-    Out(t, "# texture %08X fmt%u %ux%u draws=%llu\n", k.first & 0xFFFFF000u, k.first & 0x3F,
-        (k.second & 0x1FFF) + 1, ((k.second >> 13) & 0x1FFF) + 1, (unsigned long long)n);
+    Append(t.out, "# texture %08X fmt%u %ux%u draws=%llu\n", k.first & 0xFFFFF000u, k.first & 0x3F,
+           (k.second & 0x1FFF) + 1, ((k.second >> 13) & 0x1FFF) + 1, (unsigned long long)n);
   std::filesystem::path dir = REXCVAR_GET(pgr4_d3d_trace_dir);
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
@@ -830,18 +832,18 @@ void BeginTrace(Tap& t) {
   t.textures.clear();
   std::memset(t.fn_calls, 0, sizeof(t.fn_calls));
   t.out.reserve(32u << 20);
-  Out(t, "# pgr4-d3d-trace v1 tag=%s frame=%llu device=%08X push=%08X\n", t.trace_tag.c_str(),
-      (unsigned long long)t.frame_index, t.device, t.cursor);
-  Out(t, "# state at frame start (registers the tap has seen written)\n");
+  Append(t.out, "# pgr4-d3d-trace v1 tag=%s frame=%llu device=%08X push=%08X\n",
+         t.trace_tag.c_str(), (unsigned long long)t.frame_index, t.device, t.cursor);
+  Append(t.out, "# state at frame start (registers the tap has seen written)\n");
   for (uint32_t r = 0; r < kRegCount; ++r) {
     if (!t.written[r]) continue;
     if (r >= 0x4000 && r < 0x4800) continue;  // float constants: hashed per block below
     const char* n = RegName(r);
-    Out(t, "R %04X %08X %s\n", r, t.regs[r], n ? n : "");
+    Append(t.out, "R %04X %08X %s\n", r, t.regs[r], n ? n : "");
   }
   for (uint32_t b = 0x4000; b < 0x4800; b += 256)
-    Out(t, "K %04X n=256 h=%016llX\n", b, (unsigned long long)Fnv(&t.regs[b], 256));
-  Out(t, "S vs %08X %u\nS ps %08X %u\n", t.vs_addr, t.vs_dwords, t.ps_addr, t.ps_dwords);
+    Append(t.out, "K %04X n=256 h=%016llX\n", b, (unsigned long long)Fnv(&t.regs[b], 256));
+  Append(t.out, "S vs %08X %u\nS ps %08X %u\n", t.vs_addr, t.vs_dwords, t.ps_addr, t.ps_dwords);
 }
 
 void PollControl(Tap& t, uint8_t* base) {
@@ -860,6 +862,10 @@ void PollControl(Tap& t, uint8_t* base) {
     std::string cmd, arg;
     ss >> cmd >> arg;
     if (cmd == "trace") {
+      if (!t.enabled) {
+        PGR4_WARN_ONCE("PGR4 D3D control: '{}' ignored: the tap is off", l);
+        continue;
+      }
       uint32_t frames = 1;
       ss >> frames;
       t.trace_tag = arg.empty() ? "frame" : arg;
@@ -873,6 +879,7 @@ void PollControl(Tap& t, uint8_t* base) {
         t.in_packet = false;
       }
       t.enabled = on;
+      if (!on) t.trace_left = 0;
       g_hook_all.store(on || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
     }
     REXLOG_INFO("PGR4 D3D control: {} (skip mask {})", l, g_skip.load());
@@ -936,10 +943,10 @@ void EndFrame(Tap& t, uint8_t* base) {
         w.unknown_ops, t.enabled ? "on" : "off", g_skip.load());
     w = Window{};
   }
-  if (t.check && c.differ && t.check_logged < 2000) {
-    ++t.check_logged;
+  if (t.check && c.differ) {
     const pgr4::native::NativeRenderer* r = pgr4::native::NativeRenderer::Get();
-    REXLOG_INFO(
+    PGR4_LOG_FIRST(
+        2000, INFO,
         "PGR4 D3D check: frame {} (native {}): {} of {} draws differ from the stream; first {}",
         t.frame_index, r ? r->frame_index() : 0, c.differ, c.checked, t.check_first);
   }
@@ -956,6 +963,16 @@ void EndFrame(Tap& t, uint8_t* base) {
     t.tracing = true;
     BeginTrace(t);
   }
+}
+
+// The game creates the device more than once (once more at the title screen); the device a Swap
+// or draw call runs on is the current one.
+[[gnu::noinline]] void FollowDevice(Tap& t, uint8_t* base, FnId id, uint32_t device) {
+  PGR4_LOG_FIRST(8, INFO, "PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it",
+                 kFns[id].name, device, t.device);
+  t.device = device;
+  t.cursor = Load32(base, t.device + dev::kPush);
+  t.in_packet = false;
 }
 
 // The tap's side of one hooked call: counts it, follows the device it runs on and, with the
@@ -976,31 +993,25 @@ inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
     else
       ctx.r3.u64 = 0;
   };
-  // The game creates the device more than once (once more at the title screen); the device a
-  // Swap or draw call runs on is the current one.
   if constexpr (kId == kFnSwap || kId == kFnDrawIndexed || kId == kFnDrawVertices) {
-    if (r3 && r3 != t.device && t.device) [[unlikely]] {
-      std::lock_guard lock(t.mutex);
-      static uint32_t switches = 0;
-      if (++switches <= 8)
-        REXLOG_INFO("PGR4 D3D: {} runs on device {:08X} (was {:08X}); following it", kFns[kId].name,
-                    r3, t.device);
-      t.device = r3;
-      t.cursor = Load32(base, t.device + dev::kPush);
-      t.in_packet = false;
-    }
+    if (r3 && r3 != t.device && t.device) [[unlikely]]
+      FollowDevice(t, base, kId, r3);
   }
   if (!(t.device && r3 == t.device)) {
     if constexpr (kId == kFnCreateDevice) {  // CreateDevice(..., ppDevice in r8)
       const uint32_t out = ctx.r8.u32;
       run(ctx, base);
-      std::lock_guard lock(t.mutex);
       t.device = Load32(base, out);
       t.cursor = t.device ? Load32(base, t.device + dev::kPush) : 0;
-      t.enabled = REXCVAR_GET(pgr4_d3d_tap);
-      t.check = t.enabled && REXCVAR_GET(pgr4_d3d_tap_check);
-      g_hook_all.store(t.enabled || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
-      g_skip.store(ParseSkip(REXCVAR_GET(pgr4_d3d_skip)));
+      t.in_packet = false;
+      // Only once: a later device would undo the control commands sent since.
+      if (!t.configured) {
+        t.configured = true;
+        t.enabled = REXCVAR_GET(pgr4_d3d_tap);
+        t.check = t.enabled && REXCVAR_GET(pgr4_d3d_tap_check);
+        g_hook_all.store(t.enabled || REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
+        g_skip.store(ParseSkip(REXCVAR_GET(pgr4_d3d_skip)));
+      }
       REXLOG_INFO("PGR4 D3D: device {:08X}, push {:08X}, tap {}{}, {} hooked functions", t.device,
                   t.cursor, t.enabled ? "on" : "off", t.check ? " (state check)" : "",
                   uint32_t(kFnCount));
@@ -1012,31 +1023,25 @@ inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
   if (!t.enabled) {  // the hooks only forward; Swap still polls the control file
     call();
     if constexpr (kId == kFnSwap) {
-      std::lock_guard lock(t.mutex);
       ++t.frame_index;
       PollControl(t, base);
     }
     return;
   }
 
-  std::unique_lock lock(t.mutex);
   Sync(t, base, false);
   const uint64_t seq = ++t.call_seq;
   ++t.frame.calls;
   if constexpr (IsDrawCounterFn(kId)) ++t.frame.draw_calls;
-  if (Tracing(t)) {
+  if (t.tracing) {
     ++t.fn_calls[kId];
-    Out(t, "C %llu %u %s r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s\n", (unsigned long long)seq,
-        t_depth, kFns[kId].name, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32,
-        forward ? "" : " SKIPPED");
+    Append(t.out, "C %llu %u %s r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X%s\n",
+           (unsigned long long)seq, t_depth, kFns[kId].name, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+           ctx.r7.u32, ctx.r8.u32, forward ? "" : " SKIPPED");
   }
   if (t_depth < 64) t_stack[t_depth] = {kId, seq};
   ++t_depth;
-  lock.unlock();
-
   call();
-
-  lock.lock();
   // These move the push pointer by assignment: MakeSpace and RestorePush stay in the written
   // stream; the segment functions leave a hole (reserved dwords, an unwritten new segment).
   constexpr bool kJump = kId == kFnSwitchSegment || kId == kFnStartSegment ||
@@ -1044,8 +1049,8 @@ inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
   Sync(t, base, kJump || kId == kFnMakeSpace || kId == kFnRestorePush || kId == kFnDrawVerticesUP,
        kJump);
   --t_depth;
-  if (Tracing(t)) Out(t, "R %llu r3=%08X\n", (unsigned long long)seq, ctx.r3.u32);
-  if (t_depth == 0 && (Tracing(t) || t.check)) {
+  if (t.tracing) Append(t.out, "R %llu r3=%08X\n", (unsigned long long)seq, ctx.r3.u32);
+  if (t_depth == 0 && (t.tracing || t.check)) {
     if (t.state_pending) {  // BeginVertices' packets are in the stream once RestorePush ran
       t.state_pending = false;
       if constexpr (kId == kFnRestorePush)
@@ -1151,9 +1156,9 @@ inline void RunOriginal(PPCContext& c, uint8_t* b) {
     return;
   }
   if (t_original_depth++ == 0) {
-    const uint64_t start = nat::profile::Now();
+    const uint64_t start = nat::Ticks();
     kFn(c, b);
-    const uint64_t ticks = nat::profile::Now() - start;
+    const uint64_t ticks = nat::Ticks() - start;
     nat::profile::g.ticks[nat::profile::kGuestD3d] += ticks;
     t_guest_d3d_times.ticks[kId] += ticks;
     ++t_guest_d3d_times.calls[kId];
@@ -1179,19 +1184,19 @@ inline void QueuePendingVertices(pgr4::native::NativeRenderer* r, const uint8_t*
   }
 }
 
+// r3..r10 at a hooked call's entry (HookArgs::r, the state tracker's `r`).
+inline std::array<uint32_t, 8> EntryRegs(const PPCContext& ctx) {
+  return {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+          ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
+}
+
 // A hooked call's arguments at its entry, before the guest function clobbers them.
 inline pgr4::native::HookArgs EntryArgs(uint32_t fn, const PPCContext& ctx) {
   pgr4::native::HookArgs a;
   a.fn = pgr4::native::HookFn(fn);
   a.device = ctx.r3.u32;
-  a.r[0] = ctx.r3.u32;
-  a.r[1] = ctx.r4.u32;
-  a.r[2] = ctx.r5.u32;
-  a.r[3] = ctx.r6.u32;
-  a.r[4] = ctx.r7.u32;
-  a.r[5] = ctx.r8.u32;
-  a.r[6] = ctx.r9.u32;
-  a.r[7] = ctx.r10.u32;
+  const std::array<uint32_t, 8> r = EntryRegs(ctx);
+  std::copy(r.begin(), r.end(), a.r);
   a.sp = ctx.r1.u32;
   a.f[0] = ctx.f1.f64;
   a.f[1] = ctx.f2.f64;
@@ -1200,6 +1205,12 @@ inline pgr4::native::HookArgs EntryArgs(uint32_t fn, const PPCContext& ctx) {
   a.ret = 0;
   a.tiling = t_tiling_call;
   return a;
+}
+
+// Whether the state tracker (native/d3d_state) follows the guest D3D: for the native renderer
+// `r` (NativeRenderer::Live) and for the tap's compare.
+inline bool TrackState(const pgr4::native::NativeRenderer* r) {
+  return r || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap);
 }
 
 // The state tracker (native/d3d_state) needs the dirty masks at the entry of every flushing
@@ -1221,12 +1232,11 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
     }
   }
   nat::NativeRenderer* const r = nat::NativeRenderer::Live();
-  const bool track = r || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap);
+  const bool track = TrackState(r);
   auto run = [&](PPCContext& c, uint8_t* b) {
     if constexpr (nat::IsStateFlushingFn(kAddr)) {
       if (track && c.r3.u32) {
-        const uint32_t rr[8] = {c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32,
-                                c.r7.u32, c.r8.u32, c.r9.u32, c.r10.u32};
+        const std::array<uint32_t, 8> rr = EntryRegs(c);
         nat::CallEntry e;
         {
           nat::profile::Scope scope(nat::profile::kTrack);
@@ -1236,7 +1246,7 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
         RunOriginal<kId, Body<kId, kOriginal>>(c, b);
         nat::profile::Scope scope(nat::profile::kTrack);
         ++nat::profile::g.track_calls;
-        nat::GuestState().AfterCall(b, kAddr, e, rr, c.r3.u64);
+        nat::GuestState().AfterCall(b, kAddr, e, rr.data(), c.r3.u64);
         return;
       }
     }
@@ -1294,17 +1304,21 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
 // starting with "draw" are summed into its api_total, as in DrawCounter's hooks.
 extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint64_t** values,
                                                                      const char* const** names) {
-  static const char* const kNames[] = {"draw_826CFA60", "draw_826CFF58", "draw_826D0340",
-                                       "draw_826D0798", "draw_826DC888", "aux_826CBEE0",
-                                       "tap_draws",     "tap_aux",       "tap_resolves"};
-  static uint64_t snapshot[9];
-  for (int i = 0; i < 5; ++i)
+  // kDrawCounterFns, then Resolve, then g_tap_counts.
+  static constexpr const char* kNames[] = {"draw_826CFA60", "draw_826CFF58", "draw_826D0340",
+                                           "draw_826D0798", "draw_826DC888", "aux_826CBEE0",
+                                           "tap_draws",     "tap_aux",       "tap_resolves"};
+  constexpr size_t kDraws = std::size(kDrawCounterFns), kCount = std::size(kNames);
+  static_assert(kCount == kDraws + 1 + std::size(g_tap_counts));
+  static uint64_t snapshot[kCount];
+  for (size_t i = 0; i < kDraws; ++i)
     snapshot[i] = g_calls[kDrawCounterFns[i]].load(std::memory_order_relaxed);
-  snapshot[5] = g_calls[kFnResolve].load(std::memory_order_relaxed);
-  for (int i = 0; i < 3; ++i) snapshot[6 + i] = g_tap_counts[i].load(std::memory_order_relaxed);
+  snapshot[kDraws] = g_calls[kFnResolve].load(std::memory_order_relaxed);
+  for (size_t i = 0; i < std::size(g_tap_counts); ++i)
+    snapshot[kDraws + 1 + i] = g_tap_counts[i].load(std::memory_order_relaxed);
   *values = snapshot;
   *names = kNames;
-  return 9;
+  return uint32_t(kCount);
 }
 
 bool Pgr4Enable60Fps();  // MTR's src/pgr4_patches.cpp
@@ -1355,11 +1369,10 @@ extern "C" float Pgr4MotionBlurStep(float step, uint8_t*) {
 // state tracker keeps the patched ucode for the native draws (d3d_state.h, ShaderRef).
 REX_EXTERN(__imp__sub_826DEA78);
 REX_HOOK_RAW(sub_826DEA78) {
-  const uint32_t r[8] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
-                         ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32};
+  const std::array<uint32_t, 8> r = EntryRegs(ctx);
   __imp__sub_826DEA78(ctx, base);
-  if (pgr4::native::NativeRenderer::Live() || g_tap.enabled || REXCVAR_GET(pgr4_d3d_tap)) {
+  if (TrackState(pgr4::native::NativeRenderer::Live())) {
     pgr4::native::profile::Scope scope(pgr4::native::profile::kImmediateVs);
-    pgr4::native::GuestState().AfterImmediateVs(base, r);
+    pgr4::native::GuestState().AfterImmediateVs(base, r.data());
   }
 }

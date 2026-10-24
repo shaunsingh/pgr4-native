@@ -19,13 +19,18 @@
 // are therefore also recorded as EDRAM fills that other surfaces over the same tiles take
 // over when they are next used (EdramFill below).
 //
-// The only format aliasing that must share storage is 2_10_10_10_FLOAT vs
-// 2_10_10_10_FLOAT_AS_16_16_16_16 (PGR4 flips between them inside one pass for blending
-// precision); both map to one R16G16B16A16_FLOAT target, as in ReXGlue's host RT path.
+// Targets are keyed by the host view format, not the guest format: guest formats with one host
+// format (2_10_10_10_FLOAT, its _AS_16_16_16_16 variant and 16_16_16_16_FLOAT, all
+// R16G16B16A16_FLOAT; 8_8_8_8 and its _GAMMA variant; 2_10_10_10 and its _AS_10_10_10_10
+// variant) share one target at the same base, pitch and MSAA, and so its contents. The pair
+// that must share storage is 2_10_10_10_FLOAT and 2_10_10_10_FLOAT_AS_16_16_16_16 (PGR4 flips
+// between them inside one pass for blending precision), as in ReXGlue's host RT path. It is the
+// only pair PGR4's traces show on one surface, so sharing the others' targets is harmless here.
 // The D3D's own clear quads at half pitch with 4x MSAA (inside Clear/ClearF) are not game
 // draws and never reach this module.
 //
-// Threading: called from the NativeRenderer's On* calls only (single guest thread).
+// Threading: DecodeClear runs on the guest thread; everything else on the thread that records
+// the frames (NativeRenderer::Execute*: the render thread by default, else the guest thread).
 #pragma once
 
 #include "d3d12_device.h"
@@ -52,9 +57,16 @@ SurfaceRegs SurfaceRegsFromRegisters(const uint32_t* regs);
 // From the guest device's register shadow (block 0x2000 at device+10368).
 SurfaceRegs SurfaceRegsFromDevice(const uint8_t* base, uint32_t device);
 
+// Samples per pixel of RB_SURFACE_INFO's msaa_samples (bits 16-17): 1, 2 or 4.
+inline uint32_t SurfaceSamples(uint32_t surface_info) {
+  const uint32_t msaa = (surface_info >> 16) & 3;
+  return msaa >= 2 ? 4 : msaa == 1 ? 2 : 1;
+}
+
 // Guest D3D device fields this module reads (tools/scan_d3d_surface.py, d3d_state.h).
 constexpr uint32_t kDevShadow2000 = 10368;     // registers 0x2000..0x2012
 constexpr uint32_t kDevShadow2100 = 10444;     // registers 0x2100..0x2114
+constexpr uint32_t kDevShadow2300 = 10680;     // registers from 0x2300 (the RB_COPY_* block)
 constexpr uint32_t kDevColorSurfaces = 12432;  // 4 x guest D3D surface object
 constexpr uint32_t kDevDepthSurface = 12448;
 // Predicated tiling, as BeginTiling (fn_826D1C38) stores it: the tile count, each tile's
@@ -67,7 +79,6 @@ constexpr uint32_t kMaxTiles = 15;
 
 // One host render target.
 struct RenderTarget {
-  uint64_t key = 0;
   bool depth = false;
   uint32_t edram_base = 0;  // tiles
   uint32_t pitch = 0;       // pixels (RB_SURFACE_INFO surface_pitch)
@@ -157,15 +168,17 @@ class RenderTargets {
   // is the fence the frame being recorded will signal, `completed_fence` the GPU's progress.
   // Frees replaced targets the GPU is done with and drops targets unused for kMaxAge frames.
   void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
-  static constexpr uint64_t kMaxAge = 120;
+
+  // Forgets every recorded EDRAM fill, for clears that are not guest content (the resolve self
+  // test), so no game surface over the same tiles takes them over.
+  void DropAllFills() { fills_.clear(); }
 
   // The draw log (DrawRenderer) while one is open: target creations and EDRAM fills applied.
   void SetLog(std::FILE* log) { log_ = log; }
 
-  // Host DXGI formats of a guest color / depth render target format (UNKNOWN if unsupported).
-  static DXGI_FORMAT ColorFormat(uint32_t color_format);
-
  private:
+  static constexpr uint64_t kMaxAge = 120;
+
   // EDRAM residue. A color clear leaves one value in the EDRAM tiles it covers, and another
   // surface of the same storage format over those tiles reads it until something renders
   // there. A fill is one cleared rectangle in EDRAM terms: dword columns and sample rows on the

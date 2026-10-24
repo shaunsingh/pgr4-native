@@ -1,11 +1,13 @@
 // pgr4-native PGR4 native renderer: GPU time per pass of the native frame.
 #include "gpu_timer.h"
 
+#include "log.h"
 #include "render_targets.h"
 #include "resolve.h"
 
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 
 #include <algorithm>
@@ -23,7 +25,8 @@ using enum rex::graphics::Register;  // XE_GPU_REG_*
 constexpr uint32_t kMaxQueries = GpuTimer::kMaxSpans + 1;
 
 // Key layout: kind in bits 0-2, the occurrence in the frame in bits 3-7 (set by Switch), then
-// the kind's fields from bit 8 in the order the Key* functions write them.
+// the kind's fields from bit 8 in the order the Key* functions write them. Sample counts (1, 2,
+// 4) take 3 bits.
 // kShaders: draws keyed by their shader pair (per_shader_); counted as draws in the totals.
 enum Kind : uint32_t { kStart, kDraw, kClear, kResolve, kPresent, kShaders, kSubmit, kKindCount };
 constexpr const char* kKindNames[kKindCount] = {"start",   "draws",   "clears", "resolves",
@@ -63,28 +66,26 @@ class KeyReader {
 
 Kind KindOf(uint64_t key) { return Kind(key & kKindMask); }
 
-const char* ColorFormatName(uint32_t f) {
-  static constexpr const char* kNames[16] = {"k_8_8_8_8",
-                                             "k_8_8_8_8_GAMMA",
-                                             "k_2_10_10_10",
-                                             "k_2_10_10_10_FLOAT",
-                                             "k_16_16",
-                                             "k_16_16_16_16",
-                                             "k_16_16_FLOAT",
-                                             "k_16_16_16_16_FLOAT",
-                                             "fmt8",
-                                             "fmt9",
-                                             "k_2_10_10_10_AS_10_10_10_10",
-                                             "fmt11",
-                                             "k_2_10_10_10_FLOAT_AS_16_16_16_16",
-                                             "fmt13",
-                                             "k_32_FLOAT",
-                                             "k_32_32_FLOAT"};
-  return kNames[f & 15];
+// The key without its occurrence: the pass, whichever run of it in the frame.
+uint64_t WithoutOccurrence(uint64_t key) {
+  return key & ~(uint64_t(kOccurrenceMax) << kOccurrenceShift);
 }
-const char* DepthFormatName(uint32_t f) { return f ? "D24FS8" : "D24S8"; }
 
-uint32_t Samples(uint32_t msaa) { return 1u << msaa; }
+// The fields of a kShaders key (KeyDrawShaders).
+struct ShadersKey {
+  uint32_t pitch, samples, id;
+};
+ShadersKey ReadShadersKey(uint64_t key) {
+  KeyReader r(key);
+  return {r.Get(14), r.Get(3), r.Get(24)};
+}
+
+const char* ColorFormatName(uint32_t f) {
+  return xenos::GetColorRenderTargetFormatName(xenos::ColorRenderTargetFormat(f));
+}
+const char* DepthFormatName(uint32_t f) {
+  return xenos::GetDepthRenderTargetFormatName(xenos::DepthRenderTargetFormat(f));
+}
 
 }  // namespace
 
@@ -95,10 +96,10 @@ std::string GpuTimer::Describe(uint64_t key) const {
     case kStart:
       return "list start (before the first pass)";
     case kDraw: {
-      const uint32_t pitch = r.Get(14), msaa = r.Get(2), writes = r.Get(4), c0_format = r.Get(4),
+      const uint32_t pitch = r.Get(14), samples = r.Get(3), writes = r.Get(4), c0_format = r.Get(4),
                      c0_base = r.Get(12), depth_used = r.Get(1), depth_format = r.Get(1),
                      depth_base = r.Get(12);
-      int n = std::snprintf(s, sizeof(s), "draws   pitch %u %ux", pitch, Samples(msaa));
+      int n = std::snprintf(s, sizeof(s), "draws   pitch %u %ux", pitch, samples);
       if (writes)
         n += std::snprintf(s + n, sizeof(s) - n, ", color rt0 %s@%u (writes %X)",
                            ColorFormatName(c0_format), c0_base, writes);
@@ -108,21 +109,21 @@ std::string GpuTimer::Describe(uint64_t key) const {
       return s;
     }
     case kClear: {
-      const uint32_t flags = r.Get(6), pitch = r.Get(14), msaa = r.Get(2), c0_format = r.Get(4),
+      const uint32_t flags = r.Get(6), pitch = r.Get(14), samples = r.Get(3), c0_format = r.Get(4),
                      c0_base = r.Get(12), depth_base = r.Get(12);
       std::snprintf(s, sizeof(s), "clear   pitch %u %ux, flags %02X, rt0 %s@%u, depth @%u", pitch,
-                    Samples(msaa), flags, ColorFormatName(c0_format), c0_base, depth_base);
+                    samples, flags, ColorFormatName(c0_format), c0_base, depth_base);
       return s;
     }
     case kResolve: {
-      const uint32_t source = r.Get(3), msaa = r.Get(2), source_format = r.Get(4),
+      const uint32_t source = r.Get(3), samples = r.Get(3), source_format = r.Get(4),
                      width = r.Get(13), height = r.Get(13), dest_format = r.Get(6),
                      clears = r.Get(2), phase = r.Get(2);
       static constexpr const char* kPhaseNames[4] = {"source", "copy", "release", "clear"};
       const auto* info = rex::graphics::FormatInfo::Get(dest_format);
       std::snprintf(s, sizeof(s), "resolve %s %ux%u %ux -> %s%s%s [%s]",
                     source == 4 ? DepthFormatName(source_format) : ColorFormatName(source_format),
-                    width, height, Samples(msaa), info ? info->name : "?",
+                    width, height, samples, info ? info->name : "?",
                     clears & 1 ? ", clears color" : "", clears & 2 ? ", clears depth" : "",
                     kPhaseNames[phase]);
       return s;
@@ -132,10 +133,10 @@ std::string GpuTimer::Describe(uint64_t key) const {
     case kSubmit:
       return "submit  (the GPU waiting for the frame's next command list)";
     case kShaders: {
-      const uint32_t pitch = r.Get(14), msaa = r.Get(2), id = r.Get(24);
-      const auto [vs, ps] = id < pairs_.size() ? pairs_[id] : std::pair<uint64_t, uint64_t>{};
+      const ShadersKey k = ReadShadersKey(key);
+      const auto [vs, ps] = k.id < pairs_.size() ? pairs_[k.id] : std::pair<uint64_t, uint64_t>{};
       std::snprintf(s, sizeof(s), "shaders VS %016llX PS %016llX, pitch %u %ux",
-                    (unsigned long long)vs, (unsigned long long)ps, pitch, Samples(msaa));
+                    (unsigned long long)vs, (unsigned long long)ps, k.pitch, k.samples);
       return s;
     }
     default:
@@ -184,13 +185,10 @@ void GpuTimer::Switch(ID3D12GraphicsCommandList* list, uint64_t key) {
   Frame& f = frames_[slot_];
   current_ = key;
   if (f.spans.size() >= kMaxSpans) {
-    if (!overflow_logged_) {
-      overflow_logged_ = true;
-      REXLOG_WARN(
-          "PGR4 native: GPU timing: more than {} passes in a frame; the rest are charged "
-          "to the last one",
-          kMaxSpans);
-    }
+    PGR4_WARN_ONCE(
+        "PGR4 native: GPU timing: more than {} passes in a frame; the rest are charged to the "
+        "last one",
+        kMaxSpans);
     return;
   }
   Stamp(list);
@@ -277,7 +275,7 @@ void GpuTimer::LogSpike(const Frame& f, uint64_t ticks) {
     std::snprintf(item, sizeof(item), "%s%.2f ms (mean %.2f) span %u: %s", i ? " | " : "",
                   double(s.ticks) * ms_per_tick,
                   g.spans ? double(g.ticks) * ms_per_tick / double(g.spans) : 0.0, s.index,
-                  Describe(key & ~(uint64_t(kOccurrenceMax) << kOccurrenceShift)).c_str());
+                  Describe(WithoutOccurrence(key)).c_str());
     spans += item;
   }
   REXLOG_INFO("PGR4 native GPU spike: frame {} {:.2f} ms (typical {:.2f}), {} spans: {}", f.number,
@@ -286,7 +284,8 @@ void GpuTimer::LogSpike(const Frame& f, uint64_t ticks) {
 }
 
 uint64_t GpuTimer::KeyDraw(const uint32_t* regs) {
-  const reg::RB_SURFACE_INFO surface{.value = regs[XE_GPU_REG_RB_SURFACE_INFO]};
+  const uint32_t surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  const reg::RB_SURFACE_INFO surface{.value = surface_info};
   const reg::RB_COLOR_INFO color0{.value = regs[XE_GPU_REG_RB_COLOR_INFO]};
   const reg::RB_DEPTH_INFO depth{.value = regs[XE_GPU_REG_RB_DEPTH_INFO]};
   const reg::RB_DEPTHCONTROL depth_control{.value = regs[XE_GPU_REG_RB_DEPTHCONTROL]};
@@ -296,7 +295,7 @@ uint64_t GpuTimer::KeyDraw(const uint32_t* regs) {
     if ((mask >> (4 * i)) & 15) writes |= 1u << i;
   return KeyWriter(kDraw)
       .Put(surface.surface_pitch, 14)
-      .Put(uint32_t(surface.msaa_samples), 2)
+      .Put(SurfaceSamples(surface_info), 3)
       .Put(writes, 4)
       .Put(uint32_t(color0.color_format), 4)
       .Put(color0.value & 0xFFF, 12)
@@ -312,7 +311,7 @@ uint64_t GpuTimer::KeyClear(const ClearCall& c) {
   return KeyWriter(kClear)
       .Put(c.p.flags, 6)
       .Put(surface.surface_pitch, 14)
-      .Put(uint32_t(surface.msaa_samples), 2)
+      .Put(SurfaceSamples(c.regs.surface_info), 3)
       .Put(uint32_t(color0.color_format), 4)
       .Put(color0.value & 0xFFF, 12)
       .Put(c.regs.depth_info & 0xFFF, 12)
@@ -320,14 +319,13 @@ uint64_t GpuTimer::KeyClear(const ClearCall& c) {
 }
 
 uint64_t GpuTimer::KeyResolve(const ResolveParams& p, ResolvePhase phase) {
-  const reg::RB_SURFACE_INFO surface{.value = p.regs.surface_info};
   const uint32_t source_format =
       p.source == 4
           ? uint32_t(reg::RB_DEPTH_INFO{.value = p.regs.depth_info}.depth_format)
           : uint32_t(reg::RB_COLOR_INFO{.value = p.regs.color_info[p.source & 3]}.color_format);
   return KeyWriter(kResolve)
       .Put(p.source, 3)
-      .Put(uint32_t(surface.msaa_samples), 2)
+      .Put(SurfaceSamples(p.regs.surface_info), 3)
       .Put(source_format, 4)
       .Put(uint32_t(std::clamp(p.x1 - p.x0, 0, 8191)), 13)
       .Put(uint32_t(std::clamp(p.y1 - p.y0, 0, 8191)), 13)
@@ -342,13 +340,14 @@ uint64_t GpuTimer::KeyPresent() { return KeyWriter(kPresent).key(); }
 uint64_t GpuTimer::KeySubmit() { return KeyWriter(kSubmit).key(); }
 
 uint64_t GpuTimer::KeyDrawShaders(const uint32_t* regs, uint64_t vs_hash, uint64_t ps_hash) {
-  const reg::RB_SURFACE_INFO surface{.value = regs[XE_GPU_REG_RB_SURFACE_INFO]};
+  const uint32_t surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];
+  const reg::RB_SURFACE_INFO surface{.value = surface_info};
   const auto [it, added] =
       pair_ids_.try_emplace(vs_hash ^ (ps_hash * 0x9E3779B97F4A7C15ull), uint32_t(pairs_.size()));
   if (added) pairs_.emplace_back(vs_hash, ps_hash);
   return KeyWriter(kShaders)
       .Put(surface.surface_pitch, 14)
-      .Put(uint32_t(surface.msaa_samples), 2)
+      .Put(SurfaceSamples(surface_info), 3)
       .Put(it->second, 24)
       .key();
 }
@@ -391,9 +390,9 @@ void GpuTimer::Log() {
         "PGR4 native GPU: {:6.3f} ms {:5.1f} %  span {:4.0f}  #{:<2} x{:.2f}  {:5.0f} cmds  {}",
         ms(g->ticks), frame_ms > 0 ? 100.0 * ms(g->ticks) / frame_ms : 0.0,
         double(g->position) / double(g->spans), occurrence, double(g->spans) / n,
-        double(g->commands) / n, Describe(key & ~(uint64_t(kOccurrenceMax) << kOccurrenceShift)));
+        double(g->commands) / n, Describe(WithoutOccurrence(key)));
     if (KindOf(key) != kShaders) continue;
-    const uint32_t id = uint32_t(key >> (kFieldShift + 16)) & 0xFFFFFF;
+    const uint32_t id = ReadShadersKey(key).id;
     if (id >= pairs_.size()) continue;
     for (uint64_t hash : {pairs_[id].first, pairs_[id].second})
       if (hash && shaders_reported_.insert(hash).second) new_top_shaders_.push_back(hash);

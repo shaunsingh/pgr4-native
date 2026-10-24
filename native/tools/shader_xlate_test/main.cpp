@@ -86,18 +86,27 @@ static_assert(sizeof(StoredPipeline) == 72);
 DXGI_FORMAT ColorFormat(uint32_t f) {  // D3D12RenderTargetCache::GetColorResourceDXGIFormat
   using F = xenos::ColorRenderTargetFormat;
   switch (F(f)) {
-    case F::k_8_8_8_8: return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case F::k_8_8_8_8_GAMMA: return DXGI_FORMAT_R16G16B16A16_UNORM;  // gamma as unorm16
+    case F::k_8_8_8_8:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case F::k_8_8_8_8_GAMMA:
+      return DXGI_FORMAT_R16G16B16A16_UNORM;  // gamma as unorm16
     case F::k_2_10_10_10:
-    case F::k_2_10_10_10_AS_10_10_10_10: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case F::k_2_10_10_10_AS_10_10_10_10:
+      return DXGI_FORMAT_R10G10B10A2_UNORM;
     case F::k_2_10_10_10_FLOAT:
     case F::k_2_10_10_10_FLOAT_AS_16_16_16_16:
-    case F::k_16_16_16_16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case F::k_16_16: return DXGI_FORMAT_R16G16_SNORM;
-    case F::k_16_16_16_16: return DXGI_FORMAT_R16G16B16A16_SNORM;
-    case F::k_16_16_FLOAT: return DXGI_FORMAT_R16G16_FLOAT;
-    case F::k_32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
-    case F::k_32_32_FLOAT: return DXGI_FORMAT_R32G32_FLOAT;
+    case F::k_16_16_16_16_FLOAT:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case F::k_16_16:
+      return DXGI_FORMAT_R16G16_SNORM;
+    case F::k_16_16_16_16:
+      return DXGI_FORMAT_R16G16B16A16_SNORM;
+    case F::k_16_16_FLOAT:
+      return DXGI_FORMAT_R16G16_FLOAT;
+    case F::k_32_FLOAT:
+      return DXGI_FORMAT_R32_FLOAT;
+    case F::k_32_32_FLOAT:
+      return DXGI_FORMAT_R32G32_FLOAT;
   }
   return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
@@ -122,17 +131,30 @@ int main(int argc, char** argv) {
   bool debug = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    auto next = [&]() { return i + 1 < argc ? std::filesystem::path(argv[++i]) : std::filesystem::path(); };
-    if (a == "--xsh") xsh = next();
-    else if (a == "--xpso") xpso = next();
-    else if (a == "--trace") traces.push_back(next());
-    else if (a == "--dump") dump = next();
-    else if (a == "--csv") csv = next();
-    else if (a == "--debug") debug = true;
-    else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
+    auto next = [&]() {
+      return i + 1 < argc ? std::filesystem::path(argv[++i]) : std::filesystem::path();
+    };
+    if (a == "--xsh")
+      xsh = next();
+    else if (a == "--xpso")
+      xpso = next();
+    else if (a == "--trace")
+      traces.push_back(next());
+    else if (a == "--dump")
+      dump = next();
+    else if (a == "--csv")
+      csv = next();
+    else if (a == "--debug")
+      debug = true;
+    else {
+      std::fprintf(stderr, "unknown argument %s\n", a.c_str());
+      return 2;
+    }
   }
   if (xsh.empty() || xpso.empty() || traces.empty()) {
-    std::fprintf(stderr, "usage: shader_xlate_test --xsh F --xpso F --trace F [--trace F] [--dump DIR] [--csv F] [--debug]\n");
+    std::fprintf(stderr,
+                 "usage: shader_xlate_test --xsh F --xpso F --trace F [--trace F] [--dump DIR] "
+                 "[--csv F] [--debug]\n");
     return 2;
   }
 
@@ -173,14 +195,16 @@ int main(int argc, char** argv) {
       char type[4];
       unsigned addr, dwords;
       unsigned long long fnv;
-      if (std::sscanf(line.c_str(), "# shader %2s %x dwords=%u hash=%llx", type, &addr, &dwords, &fnv) == 4) {
+      if (std::sscanf(line.c_str(), "# shader %2s %x dwords=%u hash=%llx", type, &addr, &dwords,
+                      &fnv) == 4) {
         results[{std::strcmp(type, "ps") == 0 ? 1 : 0, fnv}].traces.insert(tag);
         continue;
       }
       if (line.rfind("D ", 0) != 0) continue;
       for (int t = 0; t < 2; ++t) {
         auto at = line.find(t ? " ps=" : " vs=");
-        if (at != std::string::npos && std::sscanf(line.c_str() + at + 4, "%x:%u:%llx", &addr, &dwords, &fnv) == 3 && dwords)
+        if (at != std::string::npos &&
+            std::sscanf(line.c_str() + at + 4, "%x:%u:%llx", &addr, &dwords, &fnv) == 3 && dwords)
           results[{t, fnv}].traces.insert(tag);
       }
     }
@@ -204,17 +228,20 @@ int main(int argc, char** argv) {
   std::vector<std::unique_ptr<Result>> partners;  // results of untraced partner shaders
   {
     auto bytes = Slurp(xpso);
-    for (size_t at = 12; at + sizeof(StoredPipeline) <= bytes.size(); at += sizeof(StoredPipeline)) {
+    for (size_t at = 12; at + sizeof(StoredPipeline) <= bytes.size();
+         at += sizeof(StoredPipeline)) {
       StoredPipeline p;
       std::memcpy(&p, &bytes[at], sizeof(p));
-      if (by_hash.count(p.vs_hash) || (p.ps_hash && by_hash.count(p.ps_hash))) pipelines.push_back(p);
+      if (by_hash.count(p.vs_hash) || (p.ps_hash && by_hash.count(p.ps_hash)))
+        pipelines.push_back(p);
     }
     for (auto& p : pipelines) {
       for (uint64_t h : {p.vs_hash, p.ps_hash}) {
         if (!h || by_hash.count(h) || !stored_by_hash.count(h)) continue;
         const StoredShader& s = *stored_by_hash[h];
         partners.push_back(std::make_unique<Result>());
-        by_hash[h] = {cache.Load(s.type, s.guest.data(), uint32_t(s.guest.size())), partners.back().get()};
+        by_hash[h] = {cache.Load(s.type, s.guest.data(), uint32_t(s.guest.size())),
+                      partners.back().get()};
       }
     }
   }
@@ -233,7 +260,10 @@ int main(int argc, char** argv) {
   if (!root) return 1;
 
   FILE* out = csv.empty() ? nullptr : _wfopen(csv.c_str(), L"w");
-  if (out) std::fprintf(out, "stage,ucode_hash,modification,dwords,dxbc_bytes,translate_us,textures,samplers,float_consts,traces,dump\n");
+  if (out)
+    std::fprintf(out,
+                 "stage,ucode_hash,modification,dwords,dxbc_bytes,translate_us,textures,samplers,"
+                 "float_consts,traces,dump\n");
 
   // Translate (vs, mod) / (ps, mod) once each, compare with the plugin's dump.
   std::map<std::pair<uint64_t, uint64_t>, DxbcShader::Translation*> translated;
@@ -251,26 +281,37 @@ int main(int argc, char** argv) {
     const char* dump_state = "";
     if (tr && !dump.empty()) {
       char name[96];
-      std::snprintf(name, sizeof(name), "shader_%016llX_%016llX.d3d12", (unsigned long long)hash, (unsigned long long)mod);
+      std::snprintf(name, sizeof(name), "shader_%016llX_%016llX.d3d12", (unsigned long long)hash,
+                    (unsigned long long)mod);
       std::filesystem::path match;
       for (const char* suffix : {"", "_rtv"}) {
         auto p = dump / (std::string(name) + suffix + ".bin." + ext);
         if (std::filesystem::exists(p)) match = p;
       }
-      if (match.empty()) { ++r->dump_missing; dump_state = "missing"; }
-      else if (Slurp(match) == tr->translated_binary()) { ++r->dump_same; dump_state = "same"; }
-      else { ++r->dump_diff; dump_state = "different"; }
+      if (match.empty()) {
+        ++r->dump_missing;
+        dump_state = "missing";
+      } else if (Slurp(match) == tr->translated_binary()) {
+        ++r->dump_same;
+        dump_state = "same";
+      } else {
+        ++r->dump_diff;
+        dump_state = "different";
+      }
     }
     if (out) {
       std::string tags;
       for (auto& s : r->traces) tags += (tags.empty() ? "" : "+") + s;
       uint32_t floats = 0;
-      for (uint64_t w : shader->constant_register_map().float_bitmap) floats += uint32_t(std::popcount(w));
-      std::fprintf(out, "%s,%016llX,%016llX,%zu,%zu,%.1f,%zu,%zu,%u,%s,%s\n", shader->type() == xenos::ShaderType::kVertex ? "vs" : "ps",
+      for (uint64_t w : shader->constant_register_map().float_bitmap)
+        floats += uint32_t(std::popcount(w));
+      std::fprintf(out, "%s,%016llX,%016llX,%zu,%zu,%.1f,%zu,%zu,%u,%s,%s\n",
+                   shader->type() == xenos::ShaderType::kVertex ? "vs" : "ps",
                    (unsigned long long)hash, (unsigned long long)mod, shader->ucode_dword_count(),
                    tr ? tr->translated_binary().size() : 0, us,
-                   shader->GetTextureBindingsAfterTranslation().size(), shader->GetSamplerBindingsAfterTranslation().size(),
-                   floats, tags.c_str(), dump_state);
+                   shader->GetTextureBindingsAfterTranslation().size(),
+                   shader->GetSamplerBindingsAfterTranslation().size(), floats, tags.c_str(),
+                   dump_state);
     }
     translated.emplace(key, tr);
     return tr;
@@ -281,7 +322,8 @@ int main(int argc, char** argv) {
   double pso_ms_total = 0, pso_ms_max = 0;
   uint32_t pso_ok = 0, pso_failed = 0, pso_skipped = 0, pso_with_gs = 0;
   std::map<uint32_t, std::vector<uint32_t>> geometry_shaders;
-  auto compile = [&](const StoredPipeline& p, DxbcShader::Translation* vs, DxbcShader::Translation* ps) {
+  auto compile = [&](const StoredPipeline& p, DxbcShader::Translation* vs,
+                     DxbcShader::Translation* ps) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
     d.pRootSignature = root.Get();
     d.VS = {vs->translated_binary().data(), vs->translated_binary().size()};
@@ -294,9 +336,14 @@ int main(int argc, char** argv) {
     d.PrimitiveTopologyType = topology == 0   ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
                               : topology == 1 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                               : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    // A stored key holds the geometry shader type; any primitive needing that type rebuilds it.
+    static constexpr xenos::PrimitiveType kPrimitiveForType[] = {
+        xenos::PrimitiveType::kTriangleList, xenos::PrimitiveType::kPointList,
+        xenos::PrimitiveType::kRectangleList, xenos::PrimitiveType::kQuadList};
     pgr4::native::GeometryShaderKey gs_key;
-    if (pgr4::native::GetGeometryShaderKey(pgr4::native::GeometryShaderType(gs), vs->modification(),
-                                           ps ? ps->modification() : 0, gs_key)) {
+    gs_key.key = pgr4::native::GeometryShaderKeyFor(kPrimitiveForType[gs], vs->modification(),
+                                                    ps ? ps->modification() : 0);
+    if (gs_key.key) {
       auto it = geometry_shaders.find(gs_key.key);
       if (it == geometry_shaders.end())
         it = geometry_shaders.emplace(gs_key.key, pgr4::native::CreateGeometryShader(gs_key)).first;
@@ -305,7 +352,8 @@ int main(int argc, char** argv) {
     }
     uint32_t msaa = (p.bits0 >> 11) & 3;
     d.SampleDesc.Count = 1u << msaa;
-    d.DSVFormat = ((p.bits0 >> 13) & 1) ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT;
+    d.DSVFormat =
+        ((p.bits0 >> 13) & 1) ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT;
     for (uint32_t i = 0; i < 4; ++i) {
       if (!(p.rt[i] & 1)) continue;
       d.NumRenderTargets = i + 1;
@@ -320,31 +368,37 @@ int main(int argc, char** argv) {
     pso_ms_max = std::max(pso_ms_max, ms);
     bool ok = SUCCEEDED(hr);
     (ok ? pso_ok : pso_failed)++;
-    if (!ok) std::printf("PSO failed %08X: vs %016llX/%016llX ps %016llX/%016llX gs=%u topo=%u msaa=%u\n", unsigned(hr),
-                         (unsigned long long)vs->shader().ucode_data_hash(), (unsigned long long)vs->modification(),
-                         ps ? (unsigned long long)ps->shader().ucode_data_hash() : 0ull,
-                         ps ? (unsigned long long)ps->modification() : 0ull, gs, topology, msaa);
+    if (!ok)
+      std::printf("PSO failed %08X: vs %016llX/%016llX ps %016llX/%016llX gs=%u topo=%u msaa=%u\n",
+                  unsigned(hr), (unsigned long long)vs->shader().ucode_data_hash(),
+                  (unsigned long long)vs->modification(),
+                  ps ? (unsigned long long)ps->shader().ucode_data_hash() : 0ull,
+                  ps ? (unsigned long long)ps->modification() : 0ull, gs, topology, msaa);
     return ok;
   };
 
   // Every pipeline the plugin created with a traced shader, with its modifications.
   for (auto& p : pipelines) {
-    if (!by_hash.count(p.vs_hash) || (p.ps_hash && !by_hash.count(p.ps_hash))) { ++pso_skipped; continue; }
+    if (!by_hash.count(p.vs_hash) || (p.ps_hash && !by_hash.count(p.ps_hash))) {
+      ++pso_skipped;
+      continue;
+    }
     DxbcShader::Translation* vs = translate(p.vs_hash, p.vs_mod);
     DxbcShader::Translation* ps = p.ps_hash ? translate(p.ps_hash, p.ps_mod) : nullptr;
     Result* rv = by_hash.at(p.vs_hash).second;
     Result* rp = p.ps_hash ? by_hash.at(p.ps_hash).second : nullptr;
     bool ok = vs && (!p.ps_hash || ps) && compile(p, vs, ps);
     if (!vs || (p.ps_hash && !ps)) ++pso_failed;
-    for (Result* r : {rv, rp}) if (r) (ok ? r->pso_ok : r->pso_failed)++;
+    for (Result* r : {rv, rp})
+      if (r) (ok ? r->pso_ok : r->pso_failed)++;
   }
 
   // Traced shaders the plugin never built a pipeline with (it drops a pixel shader that cannot
   // affect the frame, e.g. no color write in a depth-only pass): default modification, no
   // interpolators; a pixel shader is paired with a traced vertex shader translated the same way.
   StoredPipeline plain = {};
-  plain.bits0 = 2u << 2;                     // triangles, no GS, 1x MSAA, D24S8
-  plain.rt[0] = 1u | (15u << 27);            // RT0 k_8_8_8_8, all channels
+  plain.bits0 = 2u << 2;           // triangles, no GS, 1x MSAA, D24S8
+  plain.rt[0] = 1u | (15u << 27);  // RT0 k_8_8_8_8, all channels
   DxbcShader::Translation* default_vs = nullptr;
   for (auto& [hash, sr] : by_hash) {
     if (sr.first->type() != xenos::ShaderType::kVertex || sr.second->traces.empty()) continue;
@@ -362,7 +416,8 @@ int main(int argc, char** argv) {
     DxbcShader::Translation* tr =
         translate(hash, vertex ? cache.translator().GetDefaultVertexShaderModification(regs)
                                : cache.translator().GetDefaultPixelShaderModification(regs));
-    bool ok = tr && (vertex ? compile(plain, tr, nullptr) : default_vs && compile(plain, default_vs, tr));
+    bool ok =
+        tr && (vertex ? compile(plain, tr, nullptr) : default_vs && compile(plain, default_vs, tr));
     (ok ? r->pso_ok : r->pso_failed)++;
   }
   if (out) std::fclose(out);
@@ -398,13 +453,21 @@ int main(int argc, char** argv) {
       unsigned prim = 0;
       unsigned long long vs_fnv = 0, ps_fnv = 0;
       unsigned a, n;
-      if (auto at = line.find(" prim="); at != std::string::npos) std::sscanf(line.c_str() + at, " prim=%u", &prim);
-      if (auto at = line.find(" vs="); at != std::string::npos) std::sscanf(line.c_str() + at, " vs=%x:%u:%llx", &a, &n, &vs_fnv);
-      if (auto at = line.find(" ps="); at != std::string::npos) std::sscanf(line.c_str() + at, " ps=%x:%u:%llx", &a, &n, &ps_fnv);
+      if (auto at = line.find(" prim="); at != std::string::npos)
+        std::sscanf(line.c_str() + at, " prim=%u", &prim);
+      if (auto at = line.find(" vs="); at != std::string::npos)
+        std::sscanf(line.c_str() + at, " vs=%x:%u:%llx", &a, &n, &vs_fnv);
+      if (auto at = line.find(" ps="); at != std::string::npos)
+        std::sscanf(line.c_str() + at, " ps=%x:%u:%llx", &a, &n, &ps_fnv);
       auto vs_it = by_fnv.find({0, vs_fnv});
       auto ps_it = by_fnv.find({1, ps_fnv});
-      if (vs_it == by_fnv.end() || ps_it == by_fnv.end()) { ++unknown; continue; }
-      auto load = [&](const StoredShader& s) { return cache.Load(s.type, s.guest.data(), uint32_t(s.guest.size())); };
+      if (vs_it == by_fnv.end() || ps_it == by_fnv.end()) {
+        ++unknown;
+        continue;
+      }
+      auto load = [&](const StoredShader& s) {
+        return cache.Load(s.type, s.guest.data(), uint32_t(s.guest.size()));
+      };
       DxbcShader* vs = load(*vs_it->second);
       DxbcShader* ps = load(*ps_it->second);
       using namespace rex::graphics;
@@ -425,26 +488,37 @@ int main(int argc, char** argv) {
       r.rb_color_info[2] = regs[XE_GPU_REG_RB_COLOR2_INFO];
       r.rb_color_info[3] = regs[XE_GPU_REG_RB_COLOR3_INFO];
       auto m = pgr4::native::SelectModifications(cache.translator(), *vs, ps, r);
-      if (!m.draw) { ++dropped; continue; }
-      auto key = std::make_tuple(vs->ucode_data_hash(), m.vertex, m.pixel_shader_used ? ps->ucode_data_hash() : 0ull,
+      if (!m.draw) {
+        ++dropped;
+        continue;
+      }
+      auto key = std::make_tuple(vs->ucode_data_hash(), m.vertex,
+                                 m.pixel_shader_used ? ps->ucode_data_hash() : 0ull,
                                  m.pixel_shader_used ? m.pixel : 0ull);
-      if (plugin_pipelines.count(key)) { ++matched; continue; }
+      if (plugin_pipelines.count(key)) {
+        ++matched;
+        continue;
+      }
       ++unmatched;
       if (shown++ < 8) {
-        std::printf("draw %s: vs %016llX/%016llX ps %016llX/%016llX not among the plugin's pipelines"
-                    " (modecontrol %08X surface %08X ctx_misc %08X program %08X prim %u); plugin has:",
-                    line.substr(2, line.find(' ', 2) - 2).c_str(), (unsigned long long)std::get<0>(key),
-                    (unsigned long long)std::get<1>(key), (unsigned long long)std::get<2>(key),
-                    (unsigned long long)std::get<3>(key), r.rb_modecontrol, r.rb_surface_info, r.sq_context_misc,
-                    r.sq_program_cntl, prim);
+        std::printf(
+            "draw %s: vs %016llX/%016llX ps %016llX/%016llX not among the plugin's pipelines"
+            " (modecontrol %08X surface %08X ctx_misc %08X program %08X prim %u); plugin has:",
+            line.substr(2, line.find(' ', 2) - 2).c_str(), (unsigned long long)std::get<0>(key),
+            (unsigned long long)std::get<1>(key), (unsigned long long)std::get<2>(key),
+            (unsigned long long)std::get<3>(key), r.rb_modecontrol, r.rb_surface_info,
+            r.sq_context_misc, r.sq_program_cntl, prim);
         for (auto& [pv, pvm, pp, ppm] : plugin_pipelines)
           if (pv == vs->ucode_data_hash())
-            std::printf(" %016llX/%016llX/%016llX", (unsigned long long)pvm, (unsigned long long)pp, (unsigned long long)ppm);
+            std::printf(" %016llX/%016llX/%016llX", (unsigned long long)pvm, (unsigned long long)pp,
+                        (unsigned long long)ppm);
         std::printf("\n");
       }
     }
-    std::printf("replay %s: %u draws, %u dropped as the plugin does, %u with the plugin's modifications, %u without, %u unknown shader\n",
-                path.stem().string().c_str(), draws, dropped, matched, unmatched, unknown);
+    std::printf(
+        "replay %s: %u draws, %u dropped as the plugin does, %u with the plugin's modifications, "
+        "%u without, %u unknown shader\n",
+        path.stem().string().c_str(), draws, dropped, matched, unmatched, unknown);
   }
 
   // Report.
@@ -454,30 +528,51 @@ int main(int argc, char** argv) {
   for (auto& [key, r] : results) {
     ++traced;
     bool ok = r.found && r.translations && !r.translate_failures && r.pso_ok && !r.pso_failed;
-    if (!r.found) ++missing;
-    else if (!r.translations) ++not_translated;
-    else if (r.translate_failures || r.pso_failed) ++failed;
-    else if (!r.pso_ok) ++no_pso;
-    for (auto& t : r.traces) { per_trace[t].second++; if (ok) per_trace[t].first++; }
-    if (!ok) std::printf("NOT OK %s %016llX: found=%d translations=%u failures=%u pso ok=%u failed=%u\n",
-                         key.first ? "ps" : "vs", (unsigned long long)key.second, r.found, r.translations,
-                         r.translate_failures, r.pso_ok, r.pso_failed);
-    dump_same += r.dump_same; dump_diff += r.dump_diff; dump_missing += r.dump_missing;
+    if (!r.found)
+      ++missing;
+    else if (!r.translations)
+      ++not_translated;
+    else if (r.translate_failures || r.pso_failed)
+      ++failed;
+    else if (!r.pso_ok)
+      ++no_pso;
+    for (auto& t : r.traces) {
+      per_trace[t].second++;
+      if (ok) per_trace[t].first++;
+    }
+    if (!ok)
+      std::printf("NOT OK %s %016llX: found=%d translations=%u failures=%u pso ok=%u failed=%u\n",
+                  key.first ? "ps" : "vs", (unsigned long long)key.second, r.found, r.translations,
+                  r.translate_failures, r.pso_ok, r.pso_failed);
+    dump_same += r.dump_same;
+    dump_diff += r.dump_diff;
+    dump_missing += r.dump_missing;
   }
   const auto& st = cache.stats();
-  std::printf("storage: %zu shaders in xsh, %zu pipelines use traced shaders\n", stored.size(), pipelines.size());
-  for (auto& [t, n] : per_trace) std::printf("trace %s: %u/%u shaders ok\n", t.c_str(), n.first, n.second);
-  std::printf("traced shaders: %u; not in storage %u, never translated %u, failed %u, translated but no pipeline %u;"
-              " %u had no plugin pipeline (default modification)\n",
-              traced, missing, not_translated, failed, no_pso, default_mod_shaders);
+  std::printf("storage: %zu shaders in xsh, %zu pipelines use traced shaders\n", stored.size(),
+              pipelines.size());
+  for (auto& [t, n] : per_trace)
+    std::printf("trace %s: %u/%u shaders ok\n", t.c_str(), n.first, n.second);
+  std::printf(
+      "traced shaders: %u; not in storage %u, never translated %u, failed %u, translated but no "
+      "pipeline %u;"
+      " %u had no plugin pipeline (default modification)\n",
+      traced, missing, not_translated, failed, no_pso, default_mod_shaders);
   std::printf("untraced partner shaders loaded from storage: %zu\n", partners.size());
-  std::printf("translations: %llu (%llu failed), analyze %.1f ms total, translate %.1f ms total, %.1f us mean, %.1f us max\n",
-              (unsigned long long)st.translations, (unsigned long long)st.failures, st.analyze_us / 1000.0,
-              st.translate_us / 1000.0, st.translations ? st.translate_us / double(st.translations) : 0.0, st.max_translate_us);
-  std::printf("pipelines: %u compiled, %u failed, %u skipped (a shader not in storage), %u with a geometry shader (%zu keys);"
-              " create %.1f ms total, %.2f ms mean, %.1f ms max\n",
-              pso_ok, pso_failed, pso_skipped, pso_with_gs, geometry_shaders.size(), pso_ms_total,
-              pso_ok + pso_failed ? pso_ms_total / (pso_ok + pso_failed) : 0.0, pso_ms_max);
-  if (!dump.empty()) std::printf("xenos dump compare: %u identical, %u different, %u not in dump\n", dump_same, dump_diff, dump_missing);
+  std::printf(
+      "translations: %llu (%llu failed), analyze %.1f ms total, translate %.1f ms total, %.1f us "
+      "mean, %.1f us max\n",
+      (unsigned long long)st.translations, (unsigned long long)st.failures, st.analyze_us / 1000.0,
+      st.translate_us / 1000.0, st.translations ? st.translate_us / double(st.translations) : 0.0,
+      st.max_translate_us);
+  std::printf(
+      "pipelines: %u compiled, %u failed, %u skipped (a shader not in storage), %u with a geometry "
+      "shader (%zu keys);"
+      " create %.1f ms total, %.2f ms mean, %.1f ms max\n",
+      pso_ok, pso_failed, pso_skipped, pso_with_gs, geometry_shaders.size(), pso_ms_total,
+      pso_ok + pso_failed ? pso_ms_total / (pso_ok + pso_failed) : 0.0, pso_ms_max);
+  if (!dump.empty())
+    std::printf("xenos dump compare: %u identical, %u different, %u not in dump\n", dump_same,
+                dump_diff, dump_missing);
   return (missing || not_translated || failed || no_pso || pso_failed) ? 1 : 0;
 }

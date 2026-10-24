@@ -1,13 +1,14 @@
 #include "shader_specialize.h"
 
-#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include <rex/graphics/format/ucode.h>
-#include <rex/logging.h>
+#include <rex/types.h>
 
 #include <simde/x86/sse2.h>
+
+#include "log.h"
 
 namespace pgr4::native {
 
@@ -16,6 +17,8 @@ namespace {
 namespace ucode = rex::graphics::ucode;
 using ucode::ControlFlowInstruction;
 using Op = ucode::ControlFlowOpcode;
+
+constexpr uint32_t kLogged = 64;
 
 void PackControlFlowInstructions(const ControlFlowInstruction* ab, uint32_t* dwords) {
   dwords[0] = ab[0].dword_0;
@@ -34,7 +37,6 @@ constexpr uint32_t kOpcodeShift = 12;
 constexpr uint32_t kExecKeepDword1 = 0x0803u;  // vertex cache bits and addressing mode
 constexpr uint32_t kExecAddressMask = 0xFFFu;
 constexpr uint32_t kJumpUnconditional = 1u << 13;
-constexpr uint32_t kJumpPredicated = 1u << 14;
 constexpr uint32_t kJumpConditionBits = 0x7FCu;  // bool address and condition
 
 void SetExec(ControlFlowInstruction& cf, bool end) {
@@ -198,7 +200,7 @@ DxbcShader* BoolSpecializer::Create(DxbcShader& shader, const uint32_t* bools) {
   std::vector<uint32_t> ucode = shader.ucode_data();
   if (!SpecializeBoolControlFlow(ucode.data(), shader.cf_pair_index_bound(), bools)) return &shader;
   // ShaderCache::Load takes guest (big-endian) ucode, which its hash is of.
-  for (uint32_t& d : ucode) d = _byteswap_ulong(d);
+  for (uint32_t& d : ucode) d = rex::byte_swap(d);
   DxbcShader* s = cache_.Load(shader.type(), ucode.data(), uint32_t(ucode.size()));
   // The draw's pipeline, color mask and host vertex shader type follow from what a shader
   // writes. An export only on a path the bools exclude would change them, so such a shader
@@ -210,21 +212,18 @@ DxbcShader* BoolSpecializer::Create(DxbcShader& shader, const uint32_t* bools) {
                                 shader.writes_point_size_edge_flag_kill_vertex() &&
                             s->memexport_eM_written() == shader.memexport_eM_written();
   if (!same_outputs) {
-    ++kept_generic_;
-    REXLOG_INFO(
-        "PGR4 native: shader {:016X} stays generic for bools {:08X}{:08X}{:08X}{:08X} "
-        "{:08X}{:08X}{:08X}{:08X} (outputs differ)",
-        shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4], bools[5],
-        bools[6], bools[7]);
+    PGR4_LOG_FIRST(kLogged, INFO,
+                   "PGR4 native: shader {:016X} stays generic for bools {:08X}{:08X}{:08X}{:08X} "
+                   "{:08X}{:08X}{:08X}{:08X} (outputs differ)",
+                   shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4],
+                   bools[5], bools[6], bools[7]);
     return &shader;
   }
-  ++created_;
-  if (created_ <= kLogged)
-    REXLOG_INFO(
-        "PGR4 native: shader {:016X} for bools {:08X}{:08X}{:08X}{:08X} "
-        "{:08X}{:08X}{:08X}{:08X} is {:016X}",
-        shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4], bools[5],
-        bools[6], bools[7], s->ucode_data_hash());
+  PGR4_LOG_FIRST(kLogged, INFO,
+                 "PGR4 native: shader {:016X} for bools {:08X}{:08X}{:08X}{:08X} "
+                 "{:08X}{:08X}{:08X}{:08X} is {:016X}",
+                 shader.ucode_data_hash(), bools[0], bools[1], bools[2], bools[3], bools[4],
+                 bools[5], bools[6], bools[7], s->ucode_data_hash());
   return s;
 }
 

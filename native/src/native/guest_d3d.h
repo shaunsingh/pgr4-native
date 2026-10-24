@@ -19,7 +19,7 @@ REXCVAR_DECLARE(bool, pgr4_native_replace_draws);
 namespace pgr4::native::guest_d3d {
 
 // sub_826D0340 (DrawIndexedVertices): runs the replacement and returns true, or returns false
-// when the original must run (flag off, not primary, no native renderer, predicated tiling).
+// when the original must run (flag off, not primary, no native renderer drawing).
 bool DrawIndexed(PPCContext& ctx, uint8_t* base);
 
 }  // namespace pgr4::native::guest_d3d

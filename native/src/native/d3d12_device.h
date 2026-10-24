@@ -72,7 +72,7 @@ class D3D12Device {
   bool has_swapchain() const { return swapchain_ != nullptr; }
 
   ID3D12Device* device() const { return device_.Get(); }
-  ID3D12CommandQueue* queue() const { return queue_.Get(); }
+  ID3D12CommandQueue* command_queue() const { return queue_.Get(); }
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
 
   // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV.
@@ -112,9 +112,12 @@ class D3D12Device {
   };
   const EndFrameTimes& end_frame_times() const { return end_frame_times_; }
 
-  // Shows a frame counter in the window title (posted to the window thread).
+  // Shows a frame counter in the debug window's title (a 500 ms timer on the window thread
+  // reads it).
   void SetTitleFrame(uint64_t frame) { title_frame_.store(frame, std::memory_order_relaxed); }
 
+  // Waits for the GPU to finish everything submitted so far, mid-frame Submits included; the
+  // frame being recorded keeps its frame_fence.
   void WaitIdle();
 
   // Timestamps per pass in every frame from now on (gpu_timer.h), starting with the open list.
@@ -139,6 +142,9 @@ class D3D12Device {
   ComPtr<ID3D12Fence> fence_;
   UniqueHandle fence_event_;
   uint64_t next_fence_ = 1;
+  ComPtr<ID3D12Fence> idle_fence_;  // WaitIdle's
+  UniqueHandle idle_event_;
+  uint64_t idle_fence_value_ = 0;
   ComPtr<ID3D12CommandAllocator> allocators_[kFramesInFlight];
   uint64_t slot_fence_[kFramesInFlight] = {};
   uint32_t slot_ = 0;
