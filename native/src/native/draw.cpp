@@ -95,6 +95,9 @@ REXCVAR_DEFINE_INT32(pgr4_native_draw_log_from, -1, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_draw_log_frames, 1, "PGR4 native",
                      "Frames one draw log trigger (--pgr4_native_draw_log_from or draw-debug.txt "
                      "bit 16) covers");
+REXCVAR_DEFINE_INT32(pgr4_native_anisotropy, 1, "PGR4 native",
+                     "Anisotropic filtering of the game's linearly filtered textures with mips, "
+                     "at least this many samples per pixel (2, 4, 8 or 16; 1: the game's own)");
 REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);
 
 namespace pgr4::native {
@@ -488,7 +491,14 @@ SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBind
   auto aniso = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst ? fetch.aniso_filter
                                                                           : binding.aniso_filter;
   aniso = std::min(aniso, xenos::AnisoFilter::kMax_16_1);
-  k.aniso = uint8_t(aniso);
+  // Linearly filtered textures with mips get at least the configured anisotropy; render
+  // targets, lookup tables and other point-sampled or single-level textures keep the game's
+  // filtering. kMax_N_1 is log2(N) + 1.
+  if (const uint32_t samples = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_anisotropy), 1, 16));
+      samples > 1 && mag == xenos::TextureFilter::kLinear && min == xenos::TextureFilter::kLinear &&
+      mip != xenos::TextureFilter::kBaseMap && mip_max_level > mip_min_level)
+    aniso = std::max(aniso, xenos::AnisoFilter(std::bit_width(samples)));
+  k.aniso = uint32_t(aniso);
   if (aniso != xenos::AnisoFilter::kDisabled) {
     k.mag_linear = k.min_linear = k.mip_linear = 1;
   } else {
