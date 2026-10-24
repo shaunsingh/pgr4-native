@@ -379,7 +379,9 @@ if new != text:
     os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
 PY
   case_links
-  local flags=$clang_cl_flags ldflags="" sum
+  # The MSVC CRT deprecates fopen, fscanf and friends in favor of its _s variants; the native
+  # code uses the standard functions.
+  local flags="$clang_cl_flags /D_CRT_SECURE_NO_WARNINGS" ldflags="" sum
   case $pgo in
     off) ;;
     gen)
