@@ -572,7 +572,39 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   textures keep the game's filtering. Off by default, so the image matches the console's. At 16
   (td-141 against td-140): race 88.9 against 89.4 fps, 1 % low 59.7 against 59.6, game GPU time
   86 % of the window against 84 % (fdinfo).
-
+- The state tracker walks one table of flushed blocks (the float constants and the register
+  blocks) once per call and compares and records each group inline, 128 bits at a time (SSE2
+  through simde), with the register log reserved once per flush. AfterCall shrinks from 15 KB to
+  4.9 KB of code. td-142 and td-146 each compared 33.5 million draws with the guest's register
+  shadow: none differed. The tracker went from 6.7 % of the game thread's perf samples (td-145)
+  to 5.4 % (td-147).
+- No 256-bit vector code on the hot threads. The Deck's microcode (0x8901007) has no Zenbleed
+  fix, so the kernel sets the DE_CFG chicken bit, and VZEROUPPER, which the compiler runs before
+  every call and return of a function that wrote a 256-bit register, gets slow: the instruction
+  after one took 4.2 % of the game thread's samples and 4.3 % of the render thread's (td-145).
+  `native/build.sh` builds with -mprefer-vector-width=128 and without the Zen tuning that copies
+  and fills with 256-bit moves (allow-light-256-bit), and the constant packing, the fan index
+  writer, the shader slot fill and the bool specializer no longer make 256-bit code. td-150:
+  0.00 % of the render thread's samples after a VZEROUPPER, 1.2 % of the game thread's. td-148
+  checked 33.5 million draws against the register shadow: none differed.
+- `--pgr4_native_profile` also times each hooked guest D3D function's outermost call, logged
+  per frame for the twelve that take longest. td-144: about 1 ms of guest D3D in a normal frame
+  and 1.4 ms in a heavy one, at 25-50 ns per call, spread over SetStreamSource, SetTexture,
+  DrawIndexed and the constant setters, so no single setter is worth replacing natively.
+- The hooks' check for a live renderer is one atomic load (it was a function-local static guard
+  and two settings reads per call), and the profiler's switch is one process-wide atomic flag.
+  The draw debug mask has named bits; settings such as the anisotropy and the texture trace
+  address are parsed once. The game builds with no warnings.
+- The PGO profile is taken again from the current code (td-152). Race against td-140, before
+  the tracker and vector changes (td-153): 89.2 against 89.4 fps, 1 % low 54.6 against 59.6;
+  hook time 258 against 241 ns per draw, render thread 2004 against 1947 ns per draw; game
+  thread 9.48 against 9.47 ms in the median and 13.6 against 13.8 ms at p99. That is within the
+  spread between runs (td-140 and td-141, one build with anisotropic filtering on in the
+  second, differ by 6 % in draw time), so these changes show in the perf samples, not yet in
+  the frame times. Of td-153's nine frames over 20 ms, six waited a whole interval in Present
+  (the GPU finished late), two created about 80 textures each, and one is the frame CSV: the
+  render thread stalled 27 ms between writing a row and finishing the frame (the row is flushed
+  on that thread).
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
@@ -848,11 +880,17 @@ keeps the sampled modules in `<log>-perf-modules/` for `perf_symbols.py`.
   with the pad column to tell them from look-backs.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
-  work per frame. Most frames shown late at 90 Hz now come in one stretch of the route (frames
-  19735-20074 of td-138) where the game thread takes 12.5-15.4 ms a frame under the power limit,
-  the rest from single GPU spikes. On the game thread the D3D state tracker's AfterCall (6.6 % of
-  its samples), the draw's Prepare (4.0 %) and the game's own SetTexture and SetStreamSource
-  (1.8 % each) lead (td-137).
+  work per frame. Most frames shown late at 90 Hz waited a whole interval in Present for the GPU
+  (td-153). Of the game thread's perf samples outside the game's own code, the state tracker's
+  CopyFlushed takes 3.9 %, OnDraw 1.5 %, Prepare 1.2 % and the guest heap's AllocRange 1.1 %
+  (td-150). On the render thread the drivers take about 40 % (RADV 28 %, vkd3d-proton 11 %) and
+  Draw 30 %. Ideas: fewer D3D12 calls per draw; resolves that share the draws' descriptor heaps,
+  so a resolve no longer resets the list's state.
+- Steam Deck: one instrumented run (td-151) lost the device at 116 s. RADV's submission was
+  rejected with ENOENT (`The CS has been rejected (-2)`) and the kernel logged nothing, which
+  rules out a missing synchronization object (that path logs) and leaves a buffer handle the
+  kernel no longer knew. vkd3d-proton issue 2881 reports the same failure in another game. The
+  rerun (td-152) and the ~150 runs before had none; watch for it.
 - Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
   pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
   compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
