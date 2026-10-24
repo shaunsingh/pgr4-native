@@ -1,0 +1,195 @@
+From 5b73b59da6b2c40964aa2b2406600ded21f0e544 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:40:07 -0400
+Subject: [PATCH 22/32] gpu: add a pixel shader modification for textures known
+ to be unsigned
+
+Each texture fetch in a translated shader reads the swizzled signs of
+its fetch constant from the system constants, samples the unsigned
+and/or the signed SRV behind dynamic branches on those signs, then
+applies the signed bias, gamma and the exponent adjustment of the fetch
+constant per component. A renderer that knows when it creates a pipeline
+that every fetch constant the pixel shader uses is unsigned after the
+swizzle, with no exponent adjustment, pays for all of this on every
+sample.
+
+Add Modification::pixel.textures_unsigned. When it is set, texture
+fetches in the pixel shader sample the unsigned SRV unconditionally and
+skip the sign extraction, the signed SRV branch, the bias and gamma
+conversion and the exponent bias. The signed bindings are still
+declared: DxbcShader takes its bindings from the first translation that
+completes, so every modification of a shader must declare the same set.
+The bit defaults to 0, and nothing in the SDK sets it, so existing
+pipelines and shader storage keys are unchanged.
+
+In PGR4 with a renderer that sets the bit per pipeline, the motion blur
+pass went from 1.6 to 1.0 ms and the GPU time per race frame from 13.7
+to 10.8 ms on the measured route.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ .../pipeline/shader/dxbc_translator.h         |  5 ++
+ .../pipeline/shader/dxbc_translator_fetch.cpp | 60 ++++++++++++-------
+ 2 files changed, 43 insertions(+), 22 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 3b0fd61..9c112af 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -176,6 +176,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       uint32_t dynamic_addressable_register_count : 8;
+       // Non-ROV - depth / stencil output mode.
+       DepthStencilMode depth_stencil_mode : 2;
++      // Every texture fetch constant the shader uses has only unsigned components after the
++      // swizzle (texture_util::SwizzleSigns is 0) and no exponent adjustment, so texture
++      // fetches sample the unsigned SRV unconditionally and skip the sign, gamma and exponent
++      // conversions.
++      uint32_t textures_unsigned : 1;
+     } pixel;
+ 
+     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index 62b44a1..bdce483 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -672,6 +672,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+ 
+   uint32_t tfetch_index = instr.operands[1].storage_index;
+ 
++  // The fetch constant is unsigned without an exponent bias, known when the pipeline is created.
++  const bool textures_unsigned = instr.opcode == FetchOpcode::kTextureFetch && is_pixel_shader() &&
++                                 GetDxbcShaderModification().pixel.textures_unsigned;
++
+   // Whether to use gradients (implicit or explicit) for LOD calculation.
+   bool use_computed_lod = instr.attributes.use_computed_lod &&
+                           (is_pixel_shader() || instr.attributes.use_register_gradients);
+@@ -979,7 +983,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+         dxbc::Src::kXXXX));
+     uint32_t signs_shift = (tfetch_index & 3) * 8;
+     uint32_t signs_temp = UINT32_MAX;
+-    if (instr.opcode == FetchOpcode::kTextureFetch) {
++    if (instr.opcode == FetchOpcode::kTextureFetch && !textures_unsigned) {
+       signs_temp = PushSystemTemp();
+       MarkSystemConstantUsed(SystemConstants::Index::kTextureSwizzledSigns);
+       a_.OpUBFE(dxbc::Dest::R(signs_temp, used_result_nonzero_components), dxbc::Src::LU(2),
+@@ -1564,15 +1568,18 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+         sampler = dxbc::Src::S(0, dxbc::Index(coord_and_sampler_temp, 3));
+       }
+ 
+-      // Break result register dependencies because textures will be sampled
+-      // conditionally, including the primary signs.
+-      a_.OpMov(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+-               dxbc::Src::LF(0.0f));
+-
+-      // Extract whether each component is signed.
+-      uint32_t is_signed_temp = PushSystemTemp();
+-      a_.OpIEq(dxbc::Dest::R(is_signed_temp, used_result_nonzero_components),
+-               dxbc::Src::R(signs_temp), dxbc::Src::LU(uint32_t(xenos::TextureSign::kSigned)));
++      uint32_t is_signed_temp = UINT32_MAX;
++      if (!textures_unsigned) {
++        // Break result register dependencies because textures will be sampled
++        // conditionally, including the primary signs.
++        a_.OpMov(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
++                 dxbc::Src::LF(0.0f));
++
++        // Extract whether each component is signed.
++        is_signed_temp = PushSystemTemp();
++        a_.OpIEq(dxbc::Dest::R(is_signed_temp, used_result_nonzero_components),
++                 dxbc::Src::R(signs_temp), dxbc::Src::LU(uint32_t(xenos::TextureSign::kSigned)));
++      }
+ 
+       // Calculate the lerp factor between stacked texture layers if needed (or
+       // 0 if point-sampled), and check which signedness SRVs need to be
+@@ -1716,9 +1723,13 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+       // Check if any component is not signed, and if any component is signed.
+       uint32_t result_first_component;
+       rex::bit_scan_forward(used_result_nonzero_components, &result_first_component);
+-      dxbc::Src is_all_signed_src(dxbc::Src::R(is_signed_temp).Select(result_first_component));
+-      dxbc::Src is_any_signed_src(dxbc::Src::R(is_signed_temp).Select(result_first_component));
+-      if (used_result_nonzero_components != (1 << result_first_component)) {
++      dxbc::Src is_all_signed_src(dxbc::Src::LU(0));
++      dxbc::Src is_any_signed_src(dxbc::Src::LU(0));
++      if (!textures_unsigned) {
++        is_all_signed_src = dxbc::Src::R(is_signed_temp).Select(result_first_component);
++        is_any_signed_src = is_all_signed_src;
++      }
++      if (!textures_unsigned && used_result_nonzero_components != (1 << result_first_component)) {
+         // Multiple components fetched - need to merge.
+         if (srv_selection_temp == UINT32_MAX) {
+           srv_selection_temp = PushSystemTemp();
+@@ -1771,6 +1782,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+         }
+         uint32_t texture_binding_index_unsigned =
+             FindOrAddTextureBinding(tfetch_index, srv_dimension, false);
++        // Added even when not sampled: the shader keeps the bindings of its first translation,
++        // so every modification must declare the same ones.
+         uint32_t texture_binding_index_signed =
+             FindOrAddTextureBinding(tfetch_index, srv_dimension, true);
+         const TextureBinding& texture_binding_unsigned =
+@@ -1822,7 +1835,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+           }
+           // Always 3 coordinate components (1D and 2D are padded to 2D arrays,
+           // 3D and cube have 3 coordinate dimensions).
+-          a_.OpIf(false, is_all_signed_src);
++          if (!textures_unsigned) {
++            a_.OpIf(false, is_all_signed_src);
++          }
+           {
+             // Sample the unsigned texture.
+             if (bindless_resources_used_) {
+@@ -1853,9 +1868,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler, lod_src);
+             }
+           }
+-          a_.OpEndIf();
+-          a_.OpIf(true, is_any_signed_src);
+-          {
++          if (!textures_unsigned) {
++            a_.OpEndIf();
++            a_.OpIf(true, is_any_signed_src);
+             // Sample the signed texture.
+             uint32_t signed_temp = PushSystemTemp();
+             if (bindless_resources_used_) {
+@@ -1890,8 +1905,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+                       dxbc::Src::R(layer_value_temp));
+             // Release signed_temp.
+             PopSystemTemp();
++            a_.OpEndIf();
+           }
+-          a_.OpEndIf();
+           if (layer) {
+             assert_true(layer_value_temp != system_temp_result_);
+             // Interpolate between the two layers.
+@@ -1915,8 +1930,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+       if (srv_selection_temp != UINT32_MAX) {
+         PopSystemTemp();
+       }
+-      // Release is_signed_temp.
+-      PopSystemTemp();
++      if (is_signed_temp != UINT32_MAX) {
++        PopSystemTemp();
++      }
+ 
+       // Release grad_h_lod_temp and grad_v_temp.
+       if (grad_v_temp != UINT32_MAX) {
+@@ -1933,7 +1949,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+     // Apply the bias and gamma correction (gamma is after filtering here,
+     // likely should be before, but it's outside Xenia's control for host
+     // sampler filtering).
+-    if (instr.opcode == FetchOpcode::kTextureFetch) {
++    if (instr.opcode == FetchOpcode::kTextureFetch && !textures_unsigned) {
+       assert_true(signs_temp != UINT32_MAX);
+       for (uint32_t i = 0; i < 4; ++i) {
+         if (!(used_result_nonzero_components & (1 << i))) {
+@@ -1965,7 +1981,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+     PopSystemTemp();
+   }
+ 
+-  if (instr.opcode == FetchOpcode::kTextureFetch) {
++  if (instr.opcode == FetchOpcode::kTextureFetch && !textures_unsigned) {
+     // Apply the result exponent bias.
+     uint32_t exp_adjust_temp = PushSystemTemp();
+     a_.OpIBFE(dxbc::Dest::R(exp_adjust_temp, 0b0001), dxbc::Src::LU(6), dxbc::Src::LU(13),
+-- 
+2.50.1
+

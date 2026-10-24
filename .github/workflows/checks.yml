@@ -1,0 +1,53 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No game data in the repository
+        run: |
+          if git ls-files | grep -Ei '\.(xex|xexp|iso|xcp|stfs)$|(^|/)Pgr4TitleUpdate\.bin$'; then
+            echo "game data is tracked" >&2; exit 1
+          fi
+
+      - name: Shell syntax
+        run: git ls-files '*.sh' | xargs -r -n1 bash -n
+
+      - name: Python syntax
+        run: git ls-files '*.py' | xargs -r python3 -m py_compile
+
+      - name: TOML
+        run: |
+          git ls-files '*.toml' | python3 -c '
+          import sys, tomllib
+          for path in sys.stdin.read().split():
+              tomllib.load(open(path, "rb"))
+              print("ok", path)'
+
+      - name: SDK series applies to the pinned ReXGlue
+        run: |
+          source sdk/rexglue.lock
+          git clone -q --no-checkout --filter=blob:none "$REXGLUE_URL" "$RUNNER_TEMP/rexglue"
+          cd "$RUNNER_TEMP/rexglue"
+          git checkout -q "$REXGLUE_COMMIT"
+          # Only the submodules a patch touches.
+          subs=$(git config -f .gitmodules --get-regexp 'submodule\..*\.path' | cut -d' ' -f2)
+          for sub in $subs; do
+            if grep -qh "^+++ b/$sub/" "$GITHUB_WORKSPACE"/sdk/patches/*.patch; then
+              git submodule update -q --init --depth 1 "$sub"
+            fi
+          done
+          for p in "$GITHUB_WORKSPACE"/sdk/patches/*.patch; do
+            git apply --whitespace=nowarn "$p"
+            echo "applied $(basename "$p")"
+          done

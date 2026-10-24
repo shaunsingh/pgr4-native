@@ -1,0 +1,37 @@
+From 88f6b75a49fe80acdbd76c72e3ea01d8fb0f23e3 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:33:06 -0400
+Subject: [PATCH 19/32] ui: run a key bind once per press, not on every
+ auto-repeat
+
+Binds such as F3 (debug overlay) and F4 (settings) toggle their overlay
+on each key down event. SDL sends a key down again for every auto-repeat
+of a held key (event.key.repeat, reported as KeyEvent::prev_state), so
+holding the key flips the overlay on and off at the repeat rate.
+
+Run the callback only for the first key down. Repeats of the bound key
+are still marked handled, so they do not reach the game.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/ui/keybinds.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/keybinds.cpp b/src/ui/keybinds.cpp
+index 9822f3b..de5a355 100644
+--- a/src/ui/keybinds.cpp
++++ b/src/ui/keybinds.cpp
+@@ -215,7 +215,9 @@ bool ProcessKeyEvent(KeyEvent& e) {
+       continue;
+     VirtualKey vk = ParseVirtualKey(entry.current_key);
+     if (vk != VirtualKey::kNone && e.virtual_key() == vk) {
+-      entry.callback();
++      if (!e.prev_state()) {
++        entry.callback();
++      }
+       e.set_handled(true);
+       return true;
+     }
+-- 
+2.50.1
+

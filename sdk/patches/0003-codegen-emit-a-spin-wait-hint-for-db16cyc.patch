@@ -1,0 +1,43 @@
+From ccbcec58c29d19d4879025fabdeb0c829faf3131 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:03:46 -0400
+Subject: [PATCH 03/32] codegen: emit a spin-wait hint for db16cyc
+
+db16cyc (or r31,r31,r31, a Xenon 16-cycle delay hint) sits in guest
+spin-wait loops and was dropped, so those loops spun at full speed. Emit
+simde_mm_pause() instead: PAUSE on x86, YIELD/ISB on ARM. A spinning
+thread draws less power and leaves its core to the SMT sibling.
+
+Xenia Canary does the same: ppc_emit_alu.cc InstrEmit_orx turns
+0x7FFFFB78 into DelayExecution, which x64_sequences.cc DELAY_EXECUTION
+emits as pause (its comment: "heavily used in spinlocks. since we do not
+emit any code for this we end up wasting a ton of power").
+
+Measured in Project Gotham Racing 4 on a Steam Deck OLED under Proton
+(pgr4-native README, scripted St Petersburg race,
+td-81 against td-79): race 84.8 fps (83.4), 1 % low 55.7 (55.5).
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/codegen/builders/system.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index f560429..04f3292 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -61,8 +61,9 @@ bool build_eieio(BuilderContext& ctx) {
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // Xenon's 16-cycle delay hint sits in spin-wait loops. PAUSE is the host's spin-wait hint: the
++  // loop draws less power and leaves the core to its SMT sibling.
++  ctx.println("\tsimde_mm_pause();");
+   return true;
+ }
+ 
+-- 
+2.50.1
+

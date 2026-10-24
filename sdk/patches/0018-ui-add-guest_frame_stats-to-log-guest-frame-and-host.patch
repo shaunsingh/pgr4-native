@@ -1,0 +1,143 @@
+From 2e3b9d29d4edb9b723d681e1df0eeb6c55e38d99 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:32:33 -0400
+Subject: [PATCH 18/32] ui: add guest_frame_stats to log guest frame and host
+ present pacing
+
+Frame pacing on a handheld is judged by the rate of frames and the
+stalls between them, and the guest's frame rate is not the host's when
+presentation is decoupled from guest swaps. With guest_frame_stats
+(default off) the presenter logs, every five seconds, the rate of guest
+frames (refreshes of the guest output with an image) and of successful
+host presents, the number of gaps over 25 ms between them and the
+largest gap:
+
+  Guest frames: <N>/s, gaps >25 ms: <count>, largest gap: <ms> ms
+  Host presents: <N>/s, gaps >25 ms: <count>, largest gap: <ms> ms
+
+The format is MTR-PGR4's, which its users and pgr4-native's frame-time
+tools parse. Each counter is touched by one thread only, refreshing or
+painting, and costs a cvar read per frame while off.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/ui/presenter.h | 21 +++++++++++++++++++++
+ src/ui/presenter.cpp       | 33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+)
+
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..7c2aa06 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <climits>
+ #include <cmath>
+ #include <condition_variable>
+@@ -977,6 +978,26 @@ class Presenter {
+   // rather than being blank.
+   bool guest_output_active_last_refresh_ = false;
+ 
++  // With guest_frame_stats, counts the frames reported to Frame() and the gaps between them
++  // over 25 ms, and logs them as "<label>: N/s, ..." every five seconds. Not thread-safe.
++  class FrameRateLog {
++   public:
++    explicit FrameRateLog(const char* label) : label_(label) {}
++    void Frame();
++
++   private:
++    const char* label_;
++    std::chrono::steady_clock::time_point window_start_{};
++    std::chrono::steady_clock::time_point last_frame_{};
++    uint32_t frame_count_ = 0;
++    uint32_t long_gap_count_ = 0;
++    double max_gap_ms_ = 0.0;
++  };
++  // Accessible only by refreshing.
++  FrameRateLog guest_frame_log_{"Guest frames"};
++  // Accessible only by painting.
++  FrameRateLog host_present_log_{"Host presents"};
++
+   // Ordered by the Z order, and then by the time of addition.
+   // Note: All the iteration logic involving this Z ordering must be the same as
+   // in input handling (in the input listeners in the Window), but in reverse.
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..ad0b781 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cctype>
++#include <chrono>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -28,6 +29,9 @@
+ 
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
++REXCVAR_DEFINE_BOOL(guest_frame_stats, false, "UI/Presenter",
++                    "Log the rate of guest frames and host presents, and the gaps over 25 ms "
++                    "between them, every five seconds");
+ 
+ REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
+                     "Enable letterboxing for non-native aspect ratios");
+@@ -567,6 +571,7 @@ bool Presenter::RefreshGuestOutput(
+       return false;
+     }
+     guest_output_active_last_refresh_ = true;
++    guest_frame_log_.Frame();
+   } else {
+     // Request presenting a blank image if there was a true image previously,
+     // but not now.
+@@ -1494,6 +1499,32 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
+ #endif  // XE_PLATFORM
+ }
+ 
++void Presenter::FrameRateLog::Frame() {
++  if (!REXCVAR_GET(guest_frame_stats)) {
++    return;
++  }
++  auto now = std::chrono::steady_clock::now();
++  if (window_start_ == std::chrono::steady_clock::time_point{}) {
++    window_start_ = now;
++  }
++  if (last_frame_ != std::chrono::steady_clock::time_point{}) {
++    double gap_ms = std::chrono::duration<double, std::milli>(now - last_frame_).count();
++    max_gap_ms_ = std::max(max_gap_ms_, gap_ms);
++    long_gap_count_ += gap_ms > 25.0;
++  }
++  last_frame_ = now;
++  ++frame_count_;
++  double seconds = std::chrono::duration<double>(now - window_start_).count();
++  if (seconds >= 5.0) {
++    REXLOG_INFO("{}: {:.1f}/s, gaps >25 ms: {}, largest gap: {:.1f} ms", label_,
++                frame_count_ / seconds, long_gap_count_, max_gap_ms_);
++    window_start_ = now;
++    frame_count_ = 0;
++    long_gap_count_ = 0;
++    max_gap_ms_ = 0.0;
++  }
++}
++
+ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
+   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+@@ -1501,8 +1532,10 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+   switch (result) {
+     case PaintResult::kPresented:
+       surface_paint_connection_was_optimal_at_successful_paint_ = true;
++      host_present_log_.Frame();
+       break;
+     case PaintResult::kPresentedSuboptimal:
++      host_present_log_.Frame();
+       // Make outdated if previously optimal, now suboptimal, but don't cause
+       // the connection to become outdated if it has been suboptimal from the
+       // very beginning.
+-- 
+2.50.1
+

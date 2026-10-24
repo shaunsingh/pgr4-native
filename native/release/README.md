@@ -3,7 +3,8 @@
 Project Gotham Racing 4 (Title Update #2), recompiled for 64-bit Windows from the Xbox 360
 executable, with a native Direct3D 12 renderer. It is tuned for the Steam Deck OLED: 1280x800
 at 90 fps, MSAA and motion blur on. It runs on Windows and, through Proton, on SteamOS and Linux.
-It builds on MTR-PGR4 (github.com/MissingThePixel/MTR-PGR4) and the ReXGlue SDK.
+It is built with the ReXGlue SDK and fixes from Xenia Canary; its frame rate unlock and game
+fixes follow those MTR-PGR4 (github.com/MissingThePixel/MTR-PGR4) found.
 
 This package holds no game data. You need your own copy of the game.
 
@@ -59,6 +60,7 @@ command line overrides it: in Steam's launch options, `%command% --fullscreen=fa
 
 ## Licenses
 
-`LICENSE.txt` is this project's license. `LICENSES/` holds those of MTR-PGR4, PGR4-Recomp, the
-ReXGlue SDK and the libraries built into the program. Project Gotham Racing 4 and its content
-belong to their owners; these licenses grant no rights to the game.
+`LICENSE.txt` is this project's license. `LICENSES/` holds those of the ReXGlue SDK, Xenia,
+PGR4-Recomp, MTR-PGR4 and the libraries built into the program, and the sources it was built
+from (`SOURCE.txt`). Project Gotham Racing 4 and its content belong to their owners; these
+licenses grant no rights to the game.

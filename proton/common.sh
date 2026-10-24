@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# The parts of deck-run.sh, play.sh and run.sh that must not drift apart; each sources this
+# The parts of deck-run.sh and play.sh that must not drift apart; each sources this
 # file. Expects `set -euo pipefail`.
 
 # A Linux path as the game sees it: Proton maps Z: to /.
@@ -52,16 +52,15 @@ signal_prefix_games() {
 # A fresh save: user data directory $1 emptied but for cache/ (the shader caches).
 fresh_save() { find "$1" -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} +; }
 
-# Sets args to MTR's launcher arguments (launcher/Launcher.cs) for the game files in $1 and the
-# user data in $2; with $3 = 60fps, those of its "60 FPS" option.
-mtr_args() {
+# Sets args to the runtime settings of the release (native/release/pgr4_recompiled.toml) for the
+# game files in $1 and the user data in $2; with $3 = 60fps, the frame rate unlocked.
+game_args() {
   # shellcheck disable=SC2034  # read by the sourcing script
   args=(--game_data_root "$(win "$1")" --user_data_root "$(win "$2")"
-    --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync --xmp_music_gain 0.35
-    --d3d12_texture_shared_heaps --gpu_vblank_deadline_timer --gpu_wait_reg_mem_high_res
-    --no-clear_memory_page_state --gpu_ring_wake_fast --texture_resource_reuse
-    --texture_reuse_pool_limit_mib=256 --texture_cache_memory_limit_soft_lifetime=30)
-  if [[ ${3:-} == 60fps ]]; then args+=(--pgr4_60fps --pgr4_garage_walk_fix); fi
+    --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync
+    --gpu_vblank_deadline_timer --gpu_wait_reg_mem_high_res --no-clear_memory_page_state
+    --gpu_ring_wake_fast --texture_cache_memory_limit_soft_lifetime=30)
+  if [[ ${3:-} == 60fps ]]; then args+=(--pgr4_60fps); fi
 }
 
 # Bash runs the EXIT trap after a signal only if the signal is handled: make TERM and INT exits.

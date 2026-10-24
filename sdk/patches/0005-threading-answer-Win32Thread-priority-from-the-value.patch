@@ -1,0 +1,73 @@
+From bed9c8d96a7ffd15bc713d413e642e12d1966239 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:05:57 -0400
+Subject: [PATCH 05/32] threading: answer Win32Thread::priority() from the
+ value last set
+
+Win32Thread::priority() called GetThreadPriority on every query, and
+guest priority queries (KeQueryBasePriorityThread, XThread::QueryPriority)
+reach it directly. Under Wine each GetThreadPriority is a wineserver
+round trip. In Project Gotham Racing 4 on a Steam Deck under Proton
+(pgr4-native README, wineserver request trace td-60), the game thread
+made 1,100 wineserver requests a second, 77 of them GetThreadPriority
+queries and 380 ResumeThread calls (see the XThread::Resume change).
+
+Read the priority once when the thread object is created and remember
+the value each successful SetThreadPriority sets. The runtime changes a
+thread's priority only through set_priority, so the cached value is the
+thread's priority.
+
+Measured together with the XThread::Resume change (td-61): the game
+thread made 167 requests a second (1,103), and the race ran at 78.0 fps
+(77.1).
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/core/threading_win.cpp | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 896dfec..36567d7 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -364,7 +364,8 @@ std::unique_ptr<Timer> Timer::CreateSynchronizationTimer() {
+ 
+ class Win32Thread : public Win32Handle<Thread> {
+  public:
+-  explicit Win32Thread(HANDLE handle) : Win32Handle(handle) {}
++  explicit Win32Thread(HANDLE handle)
++      : Win32Handle(handle), priority_(GetThreadPriority(handle)) {}
+   ~Win32Thread() = default;
+ 
+   void set_name(std::string name) override {
+@@ -372,10 +373,16 @@ class Win32Thread : public Win32Handle<Thread> {
+     Thread::set_name(name);
+   }
+ 
+-  int32_t priority() override { return GetThreadPriority(handle_); }
++  // The priority last set through this object, not GetThreadPriority: some titles query their
++  // priority every frame, and each query is a kernel call (a wineserver round trip under Wine).
++  int32_t priority() override { return priority_.load(std::memory_order_relaxed); }
+   uint32_t system_id() const override { return GetThreadId(handle_); }
+ 
+-  void set_priority(int32_t new_priority) override { SetThreadPriority(handle_, new_priority); }
++  void set_priority(int32_t new_priority) override {
++    if (SetThreadPriority(handle_, new_priority)) {
++      priority_.store(new_priority, std::memory_order_relaxed);
++    }
++  }
+ 
+   uint64_t affinity_mask() override {
+     DWORD_PTR prev = SetThreadAffinityMask(handle_, 1);
+@@ -435,6 +442,8 @@ class Win32Thread : public Win32Handle<Thread> {
+ 
+  private:
+   void AssertCallingThread() { assert_true(GetCurrentThreadId() == GetThreadId(handle_)); }
++
++  std::atomic<int32_t> priority_;
+ };
+ 
+ thread_local std::unique_ptr<Win32Thread> current_thread_ = nullptr;
+-- 
+2.50.1
+

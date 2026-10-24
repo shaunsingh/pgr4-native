@@ -1,0 +1,218 @@
+From d535692773e4ba0b9080defec0719c12f78ff830 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:29:11 -0400
+Subject: [PATCH 15/32] gpu: add gpu_wait_reg_mem_high_res for sub-millisecond
+ WAIT_REG_MEM polling
+
+While a WAIT_REG_MEM condition is unmet and vsync is on, the command
+processor sleeps wait / 0x100 ms between polls, which with a 1 ms timer
+period is 1 to 2 ms, and the guest's progress (often a vblank or a
+fence it waits on) is seen that much later.
+
+With gpu_wait_reg_mem_high_res (default off) it polls every 0.5 ms
+instead, on a new PreciseSleep helper private to the GPU module. On
+Windows that is a CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer. Under
+Wine a waitable timer is a wineserver object, so each sleep was a
+set_timer request plus a server wakeup, 987 a second in a measured
+Proton run on the Steam Deck; Wine's NtDelayExecution sleeps in the
+process, so under Wine (detected by ntdll's wine_get_version) that is
+used instead. A wineserver trace afterwards showed no requests from the
+GPU command thread. Elsewhere it is std::this_thread::sleep_for. When no
+precise sleep is available the old sleep is kept.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/graphics/CMakeLists.txt         |  1 +
+ src/graphics/command_processor.cpp  | 14 +++++-
+ src/graphics/util/precise_sleep.cpp | 75 +++++++++++++++++++++++++++++
+ src/graphics/util/precise_sleep.h   | 39 +++++++++++++++
+ 4 files changed, 128 insertions(+), 1 deletion(-)
+ create mode 100644 src/graphics/util/precise_sleep.cpp
+ create mode 100644 src/graphics/util/precise_sleep.h
+
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index da7ae1a..731a3a8 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -20,6 +20,7 @@ set(REXGPU_XENOS_SOURCES
+     command_processor.cpp
+     util/draw_extent_estimator.cpp
+     util/draw.cpp
++    util/precise_sleep.cpp
+     packet_disassembler.cpp
+     primitive_processor.cpp
+     pipeline/render_target/cache.cpp
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 0658aa7..5c86ade 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -37,6 +37,8 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
+ 
++#include "util/precise_sleep.h"
++
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+@@ -87,12 +89,22 @@ REXCVAR_DEFINE_BOOL(gpu_ring_wake_fast, false, "GPU",
+                     "and poll its empty ring every 2 ms instead of 5 ms, as Xenia does")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(gpu_wait_reg_mem_high_res, false, "GPU",
++                    "Poll unmet WAIT_REG_MEM conditions every 0.5 ms with a high-resolution "
++                    "sleep instead of sleeping for the packet's wait interval")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+ 
+ namespace {
+ 
++bool SleepForWaitRegMemPoll() {
++  static thread_local PreciseSleep precise_sleep;
++  return precise_sleep.SleepFor(std::chrono::microseconds(500));
++}
++
+ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+   if (value == "fast") {
+     return ReadbackResolveMode::kFast;
+@@ -1076,7 +1088,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+           rex::thread::MaybeYield();
+-        } else {
++        } else if (!REXCVAR_GET(gpu_wait_reg_mem_high_res) || !SleepForWaitRegMemPoll()) {
+           rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+         }
+         rex::thread::SyncMemory();
+diff --git a/src/graphics/util/precise_sleep.cpp b/src/graphics/util/precise_sleep.cpp
+new file mode 100644
+index 0000000..23ae286
+--- /dev/null
++++ b/src/graphics/util/precise_sleep.cpp
+@@ -0,0 +1,75 @@
++/**
++ * @file        graphics/util/precise_sleep.cpp
++ * @brief       Sleeps shorter than the system timer period for the GPU threads
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include "precise_sleep.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <thread>
++
++#if REX_PLATFORM_WIN32
++#include <windows.h>
++#endif
++
++namespace rex::graphics {
++
++#if REX_PLATFORM_WIN32
++
++namespace {
++using NtDelayExecutionFn = LONG(WINAPI*)(BOOLEAN alertable, const LARGE_INTEGER* timeout);
++}  // namespace
++
++PreciseSleep::PreciseSleep() {
++  // Under Wine a waitable timer is a wineserver object: arming it is a request to the server and
++  // its expiry a wakeup from it. Wine runs NtDelayExecution in the process instead, as a poll
++  // with a microsecond timeout. On Windows NtDelayExecution is rounded up to the timer period,
++  // so Windows gets a high-resolution waitable timer.
++  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++  if (ntdll && GetProcAddress(ntdll, "wine_get_version")) {
++    delay_execution_ = reinterpret_cast<void*>(GetProcAddress(ntdll, "NtDelayExecution"));
++  }
++  if (!delay_execution_) {
++    timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                    TIMER_ALL_ACCESS);
++  }
++}
++
++PreciseSleep::~PreciseSleep() {
++  if (timer_) {
++    CloseHandle(timer_);
++  }
++}
++
++bool PreciseSleep::SleepFor(std::chrono::nanoseconds duration) {
++  LARGE_INTEGER due_time;
++  // Negative: relative to now, in 100 ns units.
++  due_time.QuadPart = -std::max<int64_t>(1, duration.count() / 100);
++  if (delay_execution_) {
++    return reinterpret_cast<NtDelayExecutionFn>(delay_execution_)(FALSE, &due_time) >= 0;
++  }
++  if (!timer_) {
++    return false;
++  }
++  return SetWaitableTimer(timer_, &due_time, 0, nullptr, nullptr, FALSE) &&
++         WaitForSingleObject(timer_, INFINITE) == WAIT_OBJECT_0;
++}
++
++#else
++
++PreciseSleep::PreciseSleep() = default;
++
++PreciseSleep::~PreciseSleep() = default;
++
++bool PreciseSleep::SleepFor(std::chrono::nanoseconds duration) {
++  std::this_thread::sleep_for(duration);
++  return true;
++}
++
++#endif
++
++}  // namespace rex::graphics
+diff --git a/src/graphics/util/precise_sleep.h b/src/graphics/util/precise_sleep.h
+new file mode 100644
+index 0000000..b64e7cc
+--- /dev/null
++++ b/src/graphics/util/precise_sleep.h
+@@ -0,0 +1,39 @@
++/**
++ * @file        graphics/util/precise_sleep.h
++ * @brief       Sleeps shorter than the system timer period for the GPU threads
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#pragma once
++
++#include <chrono>
++
++#include <rex/platform.h>
++
++namespace rex::graphics {
++
++// A sleep that is not rounded up to the system timer period, for the GPU threads that poll for
++// guest progress or wait for a deadline. Owned and used by one thread.
++class PreciseSleep {
++ public:
++  PreciseSleep();
++  ~PreciseSleep();
++  PreciseSleep(const PreciseSleep&) = delete;
++  PreciseSleep& operator=(const PreciseSleep&) = delete;
++
++  // Returns false without sleeping if no precise sleep is available, so that the caller can
++  // fall back to its ordinary sleep.
++  bool SleepFor(std::chrono::nanoseconds duration);
++
++ private:
++#if REX_PLATFORM_WIN32
++  // NtDelayExecution, found only under Wine.
++  void* delay_execution_ = nullptr;
++  // A high-resolution waitable timer, used otherwise.
++  void* timer_ = nullptr;
++#endif
++};
++
++}  // namespace rex::graphics
+-- 
+2.50.1
+

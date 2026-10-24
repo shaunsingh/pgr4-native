@@ -6,7 +6,7 @@
 // profiler is on). For debugging and oracle comparisons, forwarding can be switched off per class
 // at run time (`skip draw|clear|resolve|none`). The native renderer as the presenter
 // (--pgr4_native_primary) does not use it: it keeps forwarding and stops the Xenos plugin's host
-// draws with the SDK's --gpu_skip_draws (rexglue-native-primary.patch).
+// draws with the SDK's --gpu_skip_draws (sdk/patches/0031).
 //
 // With --pgr4_d3d_tap the hooks also follow the D3D push buffer: the D3D device keeps its write
 // pointer at device+48 (last written dword) and its limit at device+56, and every packet the
@@ -29,7 +29,7 @@
 // With --pgr4_native the draw, clear, resolve and Swap hooks also call the native D3D12
 // renderer (src/native/renderer.h) after the guest function returned.
 //
-// Built only into the pgr4-native native checkout (native/build.sh, native/build.ps1).
+// Built only into the PGR4 game project (game/pgr4, native/build.sh).
 
 #include "native/clock.h"
 #include "native/d3d_state.h"
@@ -1321,17 +1321,22 @@ extern "C" __declspec(dllexport) uint32_t rex_drawcount_api_counters(const uint6
   return uint32_t(kCount);
 }
 
-bool Pgr4Enable60Fps();  // MTR's src/pgr4_patches.cpp
+bool Pgr4Enable60Fps();  // game/pgr4/src/pgr4_hooks.cpp
 
 // The presentation interval KickOffEx (sub_826CACA0) hands to the GPU, read from the device
-// (title-update/apply_game_patches.patch). While the native renderer paces the frames on the
-// display the guest presents at once: waiting for a vblank as well would pace the game on
-// ReXGlue's vblank timer a second time (frame_pacer.h). Otherwise the game's own interval, or
-// ONE with MTR's 60 FPS option.
-extern "C" uint32_t Pgr4PresentationInterval(uint32_t guest) {
+// (Pgr4PresentationIntervalHook). While the native renderer paces the frames on the display the
+// guest presents at once: waiting for a vblank as well would pace the game on ReXGlue's vblank
+// timer a second time (frame_pacer.h). Otherwise the game's own interval, or ONE with the 60 FPS
+// option.
+uint32_t Pgr4PresentationInterval(uint32_t guest) {
   constexpr uint32_t kOne = 1, kImmediate = 0x80000000;  // D3DPRESENT_INTERVAL_*
   if (pgr4::native::NativeRenderer::PacesFrames()) return kImmediate;
   return Pgr4Enable60Fps() ? kOne : guest;
+}
+
+// Whether the game runs faster than the console's 30 FPS.
+bool Pgr4FrameRateUnlocked() {
+  return pgr4::native::NativeRenderer::PacesFrames() || Pgr4Enable60Fps();
 }
 
 // The motion blur pass (sub_82859FC0) smears each pixel along its reprojection to the previous
@@ -1340,8 +1345,8 @@ extern "C" uint32_t Pgr4PresentationInterval(uint32_t guest) {
 // 90 fps the blur was a third as long. Scaled by the steps per 1/30 s, it is the blur of a 30 FPS
 // frame at any frame rate: in the same race at 30 and 90 fps the reprojection moved 2.95 times as
 // far per frame at 30, and its product with the step matched within 2 % (td-127, td-128).
-// title-update/apply_game_patches.patch calls this.
-extern "C" float Pgr4MotionBlurStep(float step, uint8_t*) {
+// Pgr4MotionBlurStepHook calls this.
+float Pgr4MotionBlurStep(float step) {
   constexpr double kConsoleFrameNs = 1e9 / 30;
   constexpr int64_t kMinStepNs = 1'000'000, kMaxStepNs = 100'000'000;
   // Not measured yet (the first frames): the console's step. Clamped: steps under 1 ms are frames

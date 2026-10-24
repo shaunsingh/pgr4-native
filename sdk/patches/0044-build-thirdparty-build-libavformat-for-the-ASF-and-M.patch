@@ -1,0 +1,133 @@
+From 8705b7405bd2b6ad7fae7bcaaffef6e2abcc1ec7 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:10:31 -0400
+Subject: [PATCH 44/48] build(thirdparty): build libavformat for the ASF and
+ MP3 demuxers
+
+The Xbox Music Player plays a title's own soundtrack: WMA files in ASF
+containers (or MP3) that the title names by path. Decoding them needs a
+demuxer as well as the WMA decoder libavcodec already has.
+
+Add a libavformat static library built from the FFmpeg submodule. The
+file list is the fork's own generated libavformat/premake5.lua, the one
+Xenia Canary built before it moved to a newer FFmpeg (Canary's
+third_party/CMakeLists.txt libavformat target at 451f915 lists the same
+demuxers on its newer tree). The fork's config headers enable only the
+ASF and MP3 demuxers, no muxers, and the file protocol, and its
+libavformat/demuxer_list.c, muxer_list.c and protocol_list.c already
+select exactly those, so no overlay is needed. Network support and zlib
+stay off.
+
+Link it into rexaudio and export it with the other FFmpeg targets.
+
+Checked on a host build of these sources: an in-memory AVIOContext over
+one of Project Gotham Racing 4's 160 kbit/s soundtrack files opens as
+asf/wmav2 44.1 kHz stereo and decodes to within 0.0019 of FFmpeg 7.1's
+output.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ cmake/rexglue_export_targets.cmake |  2 +-
+ src/audio/CMakeLists.txt           |  2 +-
+ thirdparty/CMakeLists.txt          | 51 ++++++++++++++++++++++++++++--
+ 3 files changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/cmake/rexglue_export_targets.cmake b/cmake/rexglue_export_targets.cmake
+index 2d40e1f..3505aa2 100644
+--- a/cmake/rexglue_export_targets.cmake
++++ b/cmake/rexglue_export_targets.cmake
+@@ -11,7 +11,7 @@ set(REXGLUE_INSTALL_TARGETS
+     rexgpu-xenos
+     disruptorplus renderdoc simde tomlplusplus
+     aes128 mspack o1heap disasm xxhash
+-    libavcodec libavutil
++    libavformat libavcodec libavutil
+ )
+ 
+ if(REXGLUE_USE_VULKAN)
+diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
+index d55f16a..98dfced 100644
+--- a/src/audio/CMakeLists.txt
++++ b/src/audio/CMakeLists.txt
+@@ -37,5 +37,5 @@ target_include_directories(rexaudio PUBLIC
+ 
+ target_link_libraries(rexaudio
+     PUBLIC rexcore SDL3::SDL3
+-    PRIVATE libavcodec libavutil
++    PRIVATE libavformat libavcodec libavutil
+ )
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 1be07e3..7c98e53 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -405,7 +405,8 @@ endif()
+ 
+ #=============================================================================
+ # FFmpeg - Audio/video codec library (for XMA decoding)
+-# Only builds libavutil and libavcodec needed for WMA Pro decoding
++# Builds libavutil and libavcodec for WMA Pro (XMA) and WMA decoding, and
++# libavformat for the Xbox Music Player's WMA files
+ #=============================================================================
+ 
+ set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
+@@ -695,10 +696,56 @@ if(WIN32)
+     target_link_libraries(libavcodec PRIVATE bcrypt)
+ endif()
+ 
++# libavformat - FFmpeg demuxer library (depends on libavcodec)
++# Only the ASF and MP3 demuxers and the file protocol, for the Xbox Music
++# Player's title playlists. The demuxer, muxer and protocol lists are the
++# fork's own libavformat/*_list.c, which select exactly these.
++add_library(libavformat STATIC
++    ${FFMPEG_DIR}/libavformat/allformats.c
++    ${FFMPEG_DIR}/libavformat/avio.c
++    ${FFMPEG_DIR}/libavformat/aviobuf.c
++    ${FFMPEG_DIR}/libavformat/dump.c
++    ${FFMPEG_DIR}/libavformat/format.c
++    ${FFMPEG_DIR}/libavformat/id3v1.c
++    ${FFMPEG_DIR}/libavformat/id3v2.c
++    ${FFMPEG_DIR}/libavformat/metadata.c
++    ${FFMPEG_DIR}/libavformat/mux.c
++    ${FFMPEG_DIR}/libavformat/options.c
++    ${FFMPEG_DIR}/libavformat/os_support.c
++    ${FFMPEG_DIR}/libavformat/protocols.c
++    ${FFMPEG_DIR}/libavformat/riff.c
++    ${FFMPEG_DIR}/libavformat/sdp.c
++    ${FFMPEG_DIR}/libavformat/url.c
++    ${FFMPEG_DIR}/libavformat/utils.c
++    ${FFMPEG_DIR}/libavformat/riffdec.c
++    ${FFMPEG_DIR}/libavformat/asfdec_f.c
++    ${FFMPEG_DIR}/libavformat/asf.c
++    ${FFMPEG_DIR}/libavformat/asfcrypt.c
++    ${FFMPEG_DIR}/libavformat/avlanguage.c
++    ${FFMPEG_DIR}/libavformat/mp3dec.c
++    ${FFMPEG_DIR}/libavformat/replaygain.c
++    ${FFMPEG_DIR}/libavformat/file.c
++)
++
++if(WIN32)
++    target_sources(libavformat PRIVATE
++        ${FFMPEG_DIR}/libavformat/file_open.c
++    )
++endif()
++
++target_include_directories(libavformat
++    PUBLIC
++        $<BUILD_INTERFACE:${FFMPEG_DIR}>
++        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
++    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
++)
++target_compile_definitions(libavformat PRIVATE ${FFMPEG_COMMON_DEFINES})
++target_compile_options(libavformat PRIVATE -w)  # Suppress warnings in third-party code
++target_link_libraries(libavformat PUBLIC libavcodec libavutil)
+ # Hidden visibility is required on aarch64. The NEON .S files use ADRP/ADD
+ # PC-relative addressing (movrel) for symbols like ff_cos_*, which the linker
+ # only accepts against locally bound symbols when emitting a shared object.
+-set_target_properties(libavutil libavcodec PROPERTIES
++set_target_properties(libavutil libavcodec libavformat PROPERTIES
+     C_VISIBILITY_PRESET hidden
+     VISIBILITY_INLINES_HIDDEN ON
+     FOLDER "FFmpeg")
+-- 
+2.50.1
+

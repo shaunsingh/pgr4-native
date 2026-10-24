@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One PGR4 race run under Proton on a Steam Deck (or any Linux machine with gamescope), the local
-# counterpart of run.sh. Builds come from native/build.sh, the game files from
+# One PGR4 race run under Proton on a Steam Deck (or any Linux machine with gamescope). Builds
+# come from native/build.sh, the game files from
 # ~/recomp/dumps/pgr4/game. Keeps its own prefix and user data under
 # ~/pgr4-proton (a fresh save every run; vkd3d, Mesa and pipeline caches kept), drives the
 # St Petersburg route with route_player.py, holds HOLD seconds after the race mark, stops the game
@@ -60,10 +60,9 @@
 # so such a run's frame rate is not a measurement.
 #
 # <tree> names $PGR4_BUILDS/native-<tree>/run/runtime (PGR4_BUILDS defaults to
-# ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is, so the released
-# MTR-PGR4 runtime runs too (--mode none: it has no native renderer).
+# ~/recomp/builds/pgr4); a directory holding pgr4_recompiled.exe is used as is.
 # --mode none runs Xenos alone; primary runs the native renderer as the presenter; oracle runs
-# both and captures their front buffers 5, 10 and 15 s after the race mark (see run.sh), or at
+# both and captures their front buffers 5, 10 and 15 s after the race mark, or at
 # the seconds after the mark that --captures lists (ascending, fractions allowed).
 # --mode release runs an unpacked release (native/tools/package_release.py) as a player starts
 # it: its own pgr4_recompiled.toml, and game/, title-update/ and userdata/ beside the exe (a
@@ -149,12 +148,13 @@ base=$top/logs/pgr4-proton-$tag-$stamp
 ilog=$top/logs/pgr4-co-input-$tag.log
 rm -f "$ilog"
 
-# MTR's launcher arguments for 60 fps, then the measurement flags.
+# A release brings its own settings; other trees get the game's with the frame rate unlocked.
+# Then the measurement flags.
 if [[ $mode == release ]]; then
   # The reports read the renderer's frame lines, logged at info.
   args=(--log_level=info)
 else
-  mtr_args "$game" "$userdata" 60fps
+  game_args "$game" "$userdata" 60fps
   args+=("--window_width=$width" "--window_height=$height" "--video_mode_refresh_rate=$refresh")
   if [[ $fullscreen == 1 ]]; then args+=(--fullscreen); else args+=(--fullscreen=false); fi
 fi

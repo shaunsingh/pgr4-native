@@ -1,0 +1,131 @@
+From 7549658ba54f7cd17732521d9cf4848ddd0727b4 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:56:39 -0400
+Subject: [PATCH 25/32] input: record the guest's pad reads between two host
+ frames
+
+A host renderer that logs per-frame data (PGR4's native renderer writes
+one CSV row per guest Swap) has no way to tell which inputs the title
+saw during a frame: the title polls XamInputGetState at its own rate,
+and sampling the pads from the host side would see a different state
+than the title read.
+
+InputSystem::GetState now folds every successful read for user 0 into
+one atomic word, after the dialog blocking and the masking of consumed
+buttons, so it holds what the title actually received. Between two
+calls of TakeGuestPadSummary(), which returns and clears it, the
+buttons are OR'd over the reads, the triggers keep their highest value
+and each stick axis its largest deflection (the signed high byte), so a
+press shorter than the caller's period still shows. The bit layout is
+documented at the method. extern "C" rex_xam_take_frame_pad() returns
+the same for code without access to the runtime's input system. The
+cost to the title is one relaxed compare-exchange per pad read.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/input/input_system.h | 11 +++++++++++
+ src/input/input_system.cpp       | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 0c27eed..10ad642 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -66,6 +66,15 @@ class InputSystem : public system::IInputSystem {
+   /// Guest user whose device most recently produced a button press.
+   uint32_t GetLastUsedUser() const { return last_used_user_; }
+ 
++  /// Returns and clears what the guest's GetState reads for user 0 returned since the previous
++  /// call: the buttons OR'd over the reads, each trigger at its highest and each stick axis at
++  /// its largest deflection, so a press shorter than the caller's period still shows. Bits 0-15
++  /// are the buttons, 16-23 LT, 24-31 RT, then LX, LY, RX and RY as the signed high bytes of the
++  /// axes, 8 bits each.
++  uint64_t TakeGuestPadSummary() {
++    return guest_pad_summary_.exchange(0, std::memory_order_relaxed);
++  }
++
+  private:
+   using JoystickValue = std::pair<uint16_t, uint16_t>;
+   /// Re-enumerates every driver and notifies the assignment when the set
+@@ -80,6 +89,7 @@ class InputSystem : public system::IInputSystem {
+   void UpdateConnectedUser(uint32_t user_index, bool connected);
+   void AdjustDeadzoneLevels(uint32_t user_index, X_INPUT_GAMEPAD* gamepad) const;
+   X_INPUT_VIBRATION ModifyVibrationLevel(const X_INPUT_VIBRATION* vibration) const;
++  void NoteGuestPad(const X_INPUT_GAMEPAD& gamepad);
+ 
+   rex::ui::Window* window_ = nullptr;
+ 
+@@ -101,6 +111,7 @@ class InputSystem : public system::IInputSystem {
+   std::atomic<int> ui_input_blockers_{0};
+   // Masked out per user until the guest sees them released.
+   std::array<uint16_t, kMaxGuestUsers> consumed_buttons_ = {};
++  std::atomic<uint64_t> guest_pad_summary_{0};
+ };
+ 
+ /// Create a default InputSystem with SDL + MnK + NOP drivers.
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 40740ee..c0d389e 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <rex/dbg.h>
+@@ -24,6 +25,7 @@
+ #include <rex/input/state_merge.h>
+ #include <rex/input/xinput/xinput_input_driver.h>
+ #include <rex/logging.h>
++#include <rex/runtime.h>
+ #include <rex/system/kernel_state.h>
+ 
+ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
+@@ -290,9 +292,29 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+     out_state->gamepad.buttons = static_cast<uint16_t>(buttons & ~consumed_buttons_[user_index]);
+   }
+ 
++  if (result == X_ERROR_SUCCESS && out_state && user_index == 0) {
++    NoteGuestPad(out_state->gamepad);
++  }
++
+   return result;
+ }
+ 
++void InputSystem::NoteGuestPad(const X_INPUT_GAMEPAD& g) {
++  const int8_t axes[4] = {int8_t(int16_t(g.thumb_lx) >> 8), int8_t(int16_t(g.thumb_ly) >> 8),
++                          int8_t(int16_t(g.thumb_rx) >> 8), int8_t(int16_t(g.thumb_ry) >> 8)};
++  uint64_t old = guest_pad_summary_.load(std::memory_order_relaxed), next;
++  do {
++    next = (old | uint16_t(g.buttons)) & 0xFFFF;
++    next |= uint64_t(std::max(uint8_t(old >> 16), uint8_t(g.left_trigger))) << 16;
++    next |= uint64_t(std::max(uint8_t(old >> 24), uint8_t(g.right_trigger))) << 24;
++    for (int i = 0; i < 4; ++i) {
++      const int8_t was = int8_t(old >> (32 + 8 * i));
++      const int8_t now = std::abs(axes[i]) > std::abs(was) ? axes[i] : was;
++      next |= uint64_t(uint8_t(now)) << (32 + 8 * i);
++    }
++  } while (!guest_pad_summary_.compare_exchange_weak(old, next, std::memory_order_relaxed));
++}
++
+ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+@@ -523,3 +545,12 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+ }
+ 
+ }  // namespace rex::input
++
++// InputSystem::TakeGuestPadSummary for a host component without access to the runtime's input
++// system object, such as a renderer recording the title's pad reads per frame.
++extern "C" uint64_t rex_xam_take_frame_pad() {
++  auto* kernel_state = REX_KERNEL_STATE();
++  auto* runtime = kernel_state ? kernel_state->emulator() : nullptr;
++  auto* input = runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
++  return input ? input->TakeGuestPadSummary() : 0;
++}
+-- 
+2.50.1
+

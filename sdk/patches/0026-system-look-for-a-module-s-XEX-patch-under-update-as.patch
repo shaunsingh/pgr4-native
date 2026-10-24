@@ -1,0 +1,62 @@
+From ed5ca251c9cd0a79cf62ec76bb2b7779f518482d Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:45:02 -0400
+Subject: [PATCH 26/32] system: look for a module's XEX patch under update: as
+ well
+
+UserModule::LoadFromFile applies an XEX patch only from beside the XEX
+(path + "p"). The runtime mounts update_data_root as update:, which is
+where the console and Xenia keep a title update, but nothing looked for
+the patch there, so a title update kept apart from the game files was
+not applied at run time.
+
+When no sibling patch exists, resolve the module's path within game:
+under update: with the "p" suffix, as Xenia's
+KernelState::LoadTitleUpdate builds it (the module path with the game
+mount stripped, joined to the update mount, plus 'p'). The sibling
+patch keeps precedence, and modules outside game: are not looked up.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/system/user_module.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 171546f..523ac0c 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -15,6 +15,7 @@
+ #include <rex/logging.h>
+ #include <rex/runtime.h>
+ #include <rex/stream.h>
++#include <rex/string/utf8.h>
+ #include <rex/system/elf_module.h>
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/kernel_state.h>
+@@ -102,8 +103,21 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+     return result;
+   }
+ 
+-  // Search for sibling XEX patch file
+-  auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
++  // Search for sibling XEX patch file, then, as Xenia loads title updates, for the module's path
++  // within game: under update:.
++  auto* file_system = kernel_state_->file_system();
++  auto patch_entry = file_system->ResolvePath(path_ + "p");
++  std::string game_mount, update_mount;
++  if (!patch_entry && file_system->FindSymbolicLink("game:", game_mount) &&
++      file_system->FindSymbolicLink("update:", update_mount) &&
++      rex::string::utf8_starts_with_case(path_, game_mount)) {
++    std::string_view relative_path = std::string_view(path_).substr(game_mount.size());
++    while (!relative_path.empty() && relative_path.front() == '\\') {
++      relative_path.remove_prefix(1);
++    }
++    patch_entry = file_system->ResolvePath(
++        rex::string::utf8_join_guest_paths(update_mount, std::string(relative_path) + "p"));
++  }
+   if (patch_entry) {
+     auto patch_path = patch_entry->absolute_path();
+ 
+-- 
+2.50.1
+

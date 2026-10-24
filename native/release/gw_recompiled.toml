@@ -1,0 +1,10 @@
+# Settings for gw_recompiled.exe, the garage's Geometry Wars cabinet, read from beside it at every
+# start. pgr4_recompiled.exe starts it with its own command line, so flags given there (Steam's
+# launch options) reach this title too.
+
+window_width = 1280
+window_height = 800
+fullscreen = true
+
+# Errors only, in logs/ beside the executable ("warn" or "info" for a bug report).
+log_level = "error"

@@ -86,9 +86,9 @@ for ((i = 0; i + keep_sessions <= ${#sessions[@]}; i++)); do
   rm -f "$old".* "$old"-*
 done
 
-# MTR's launcher arguments for 60 fps with the guest's vblank at the Deck OLED panel's 90 Hz
-# (PGR4_REFRESH=60 for an LCD Deck) and the native renderer as the presenter.
-mtr_args "$game" "$top/userdata" 60fps
+# The release's runtime settings with the frame rate unlocked, the guest's vblank at the Deck OLED
+# panel's 90 Hz (PGR4_REFRESH=60 for an LCD Deck) and the native renderer as the presenter.
+game_args "$game" "$top/userdata" 60fps
 args+=(--window_width=1280 --window_height=800 "--video_mode_refresh_rate=${PGR4_REFRESH:-90}"
   --pgr4_native --pgr4_native_primary --log_file "$(win "$base.log")")
 # Game Mode (and any gamescope session): fullscreen; a desktop: a 1280x800 window.

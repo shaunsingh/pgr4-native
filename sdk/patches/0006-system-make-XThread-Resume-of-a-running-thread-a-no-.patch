@@ -1,0 +1,63 @@
+From 6729c984112c93f37ca53e0ec0a8fe76d9087046 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:06:21 -0400
+Subject: [PATCH 06/32] system: make XThread::Resume of a running thread a
+ no-op on Windows
+
+On Windows, XThread::Resume decremented the guest suspend count with
+fetch_sub and called ResumeThread unconditionally. Resuming a thread
+that is not suspended wrapped the 8-bit count to 255, so the thread's
+next suspend only brought it back to 0 and was lost (Suspend treats a
+count that wraps to 0 as not suspended). The Linux and macOS paths
+already stop at zero, as the console does.
+
+Decrement only a nonzero count, and return without the host call when
+the thread was not suspended. Besides the wrap, that call is a kernel
+round trip, a wineserver request under Wine: Project Gotham Racing 4
+resumes its running worker threads every frame, 380 ResumeThread calls
+a second from the game thread in a Steam Deck wineserver trace
+(pgr4-native README, td-60). With the Win32Thread priority change, the
+game thread made 167 requests a second (1,103) and the race ran at
+78.0 fps (77.1) in td-61.
+
+Xenia Canary's Win32 path (src/xenia/kernel/xthread.cc,
+XThread::Resume) has the same fetch_sub; its non-Windows path stops at
+zero like this one.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/system/xthread.cpp | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..dfe173d 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -932,11 +932,22 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
+   uint32_t unused_host_suspend_count = 0;
+ 
+ #if REX_PLATFORM_WIN32
+-  uint8_t previous_suspend_count =
+-      reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count)->fetch_sub(1);
++  // Resuming a thread that is not suspended changes nothing, as on the console: the count does
++  // not wrap (a later suspend would be lost), and the host is not asked (some titles resume
++  // their running workers every frame, and each ResumeThread is a kernel call, a wineserver
++  // round trip under Wine).
++  auto& suspend_count = *reinterpret_cast<std::atomic_uint8_t*>(&guest_thread->suspend_count);
++  uint8_t previous_suspend_count = suspend_count.load(std::memory_order_relaxed);
++  while (previous_suspend_count &&
++         !suspend_count.compare_exchange_weak(previous_suspend_count,
++                                              uint8_t(previous_suspend_count - 1))) {
++  }
+   if (out_suspend_count) {
+     *out_suspend_count = previous_suspend_count;
+   }
++  if (!previous_suspend_count) {
++    return X_STATUS_SUCCESS;
++  }
+   return thread_->Resume(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   bool should_resume_host = false;
+-- 
+2.50.1
+

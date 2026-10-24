@@ -1,0 +1,113 @@
+From 89fb90b0027f225b5337086bb748ca8973dd15f5 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:41:28 -0400
+Subject: [PATCH 48/48] feat(xam): name placeholder XMP songs after their file
+ names
+
+PGR4 registers each of its 115 soundtrack songs with the literal strings
+"Title" and "Artist" (as MTR-PGR4 found) and names the files Artist-Title.wma
+(Audio\Music0\BlocParty-Prayer.wma). The WMA files carry no title or
+artist tags either, so XMPGetCurrentSong, which the game sends, reports
+"Title" by "Artist".
+
+When a title passes an empty or placeholder title or artist,
+XMPCreateTitlePlaylist now fills it from an Artist-Title file name,
+splitting the compact words ("BlocParty" -> "Bloc Party", "120Days" ->
+"120 Days"). Songs with real metadata and files without a dash are left
+alone. All 115 PGR4 names fit the 39-character SONGINFO fields; the
+longest is "Come Out Come Down Fade Out Be Gone" (35).
+
+The idea comes from MTR-PGR4 (MIT, Copyright (c) 2026 MissingThePixel and
+MTR-PGR4 contributors), whose RestoreMusicMetadataFromFilename does the
+same. Its 19-character cap is not carried over: the SONGINFO strings are
+40 UTF-16 units, not 40 bytes. Xenia Canary passes the placeholders
+through.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/kernel/xam/apps/xmp_app.cpp | 55 +++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index 92cfaf8..5016045 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -8,6 +8,8 @@
+  *
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  * @modified    2026 - Message layer ported from Xenia Canary 451f915
++ * @modified    2026 - Placeholder song names from file names, after MTR-PGR4
++ *              (MIT, Copyright (c) 2026 MissingThePixel and MTR-PGR4 contributors)
+  */
+ 
+ #include <algorithm>
+@@ -44,6 +46,58 @@ void StoreSongInfoString(rex::be<char16_t>* field, const std::u16string& value)
+   memory::store_and_swap<std::u16string_view>(field, std::u16string_view(value).substr(0, length));
+ }
+ 
++// Splits a compact file-name part such as "BlocParty" or "120Days" into
++// words before a capital that follows a lowercase letter or digit, and before
++// a digit that follows a letter.
++std::u16string WordsFromFileNamePart(std::u16string_view part) {
++  auto is_lower = [](char16_t c) { return c >= u'a' && c <= u'z'; };
++  auto is_upper = [](char16_t c) { return c >= u'A' && c <= u'Z'; };
++  auto is_digit = [](char16_t c) { return c >= u'0' && c <= u'9'; };
++  std::u16string words;
++  words.reserve(part.size() + 8);
++  for (size_t i = 0; i < part.size(); ++i) {
++    const char16_t c = part[i];
++    if (i) {
++      const char16_t prev = part[i - 1];
++      if ((is_upper(c) && (is_lower(prev) || is_digit(prev))) ||
++          (is_digit(c) && (is_lower(prev) || is_upper(prev)))) {
++        words += u' ';
++      }
++    }
++    words += c == u'_' ? u' ' : c;
++  }
++  return words;
++}
++
++// Some titles register every song with "Title" and "Artist" placeholders and
++// name the files Artist-Title.ext instead (PGR4 does this for all 115 of its
++// tracks, which carry no tags either). Fill the placeholders from the name.
++void FillPlaceholderMetadataFromPath(std::u16string_view path, std::u16string& title,
++                                     std::u16string& artist) {
++  const bool title_missing = title.empty() || title == u"Title";
++  const bool artist_missing = artist.empty() || artist == u"Artist";
++  if (!title_missing && !artist_missing) {
++    return;
++  }
++  const size_t slash = path.find_last_of(u"\\/");
++  const size_t start = slash == std::u16string_view::npos ? 0 : slash + 1;
++  const size_t dash = path.find(u'-', start);
++  if (dash == std::u16string_view::npos || dash == start) {
++    return;
++  }
++  const size_t dot = path.find_last_of(u'.');
++  const size_t end = dot == std::u16string_view::npos || dot < dash ? path.size() : dot;
++  if (end <= dash + 1) {
++    return;
++  }
++  if (artist_missing) {
++    artist = WordsFromFileNamePart(path.substr(start, dash - start));
++  }
++  if (title_missing) {
++    title = WordsFromFileNamePart(path.substr(dash + 1, end - dash - 1));
++  }
++}
++
+ }  // namespace
+ 
+ XmpApp::XmpApp(KernelState* kernel_state) : App(kernel_state, 0xFA) {}
+@@ -95,6 +149,7 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
+       song->file_path = ReadGuestString(memory_, song_descriptor[i].file_path_ptr);
+       song->name = ReadGuestString(memory_, song_descriptor[i].title_ptr);
+       song->artist = ReadGuestString(memory_, song_descriptor[i].artist_ptr);
++      FillPlaceholderMetadataFromPath(song->file_path, song->name, song->artist);
+       song->album = ReadGuestString(memory_, song_descriptor[i].album_ptr);
+       song->album_artist = ReadGuestString(memory_, song_descriptor[i].album_artist_ptr);
+       song->genre = ReadGuestString(memory_, song_descriptor[i].genre_ptr);
+-- 
+2.50.1
+

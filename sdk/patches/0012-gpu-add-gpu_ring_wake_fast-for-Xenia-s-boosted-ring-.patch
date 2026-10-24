@@ -1,0 +1,116 @@
+From 1829b484abeabb6d707488b479028348aaf2dfda Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:13:32 -0400
+Subject: [PATCH 12/32] gpu: add gpu_ring_wake_fast for Xenia's boosted ring
+ wake
+
+Xenia Canary wakes its command processor with
+write_ptr_index_event_->SetBoostPriority() (src/xenia/gpu/
+command_processor.cc, UpdateWritePointer) and polls an empty ring every
+2 ms (WorkerThreadMain). Add the same as an option, off by default:
+with gpu_ring_wake_fast, UpdateWritePointer wakes a blocked worker with
+a priority boost and the worker's safety-net timeout is 2 ms instead of
+5 ms.
+
+The boost needs a new Event::SetBoostPriority, which sets the event like
+Set() and on Windows calls NtSetEventBoostPriority, as Canary's
+threading_win.cc does. Wine does not implement that call, and a failed
+call falls back to Set(), so under Wine the option changes only the
+timeout. Elsewhere SetBoostPriority is Set().
+
+MTR-PGR4's launcher and pgr4-native's release settings enable it for
+Project Gotham Racing 4.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/thread.h               |  4 ++++
+ src/core/threading_win.cpp         | 13 +++++++++++++
+ src/graphics/command_processor.cpp | 14 ++++++++++++--
+ 3 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207d..0fac341 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -275,6 +275,10 @@ class Event : public WaitHandle {
+   // called. If this is an auto reset event until exactly one wait is satisfied.
+   virtual void Set() = 0;
+ 
++  // Sets the event like Set(), and where the host can, boosts the priority of the thread the
++  // wait releases so that it runs soon (NtSetEventBoostPriority on Windows).
++  virtual void SetBoostPriority() { Set(); }
++
+   // Sets the specified event object to the nonsignaled state.
+   // Resetting an event that is already reset has no effect.
+   virtual void Reset() = 0;
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 36567d7..3a91d69 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -209,6 +209,19 @@ class Win32Event : public Win32Handle<Event> {
+   explicit Win32Event(HANDLE handle) : Win32Handle(handle) {}
+   ~Win32Event() override = default;
+   void Set() override { SetEvent(handle_); }
++  void SetBoostPriority() override {
++    using NtSetEventBoostPriorityFn = LONG(NTAPI*)(HANDLE event_handle);
++    static const auto set_event_boost_priority = []() -> NtSetEventBoostPriorityFn {
++      HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++      return ntdll ? reinterpret_cast<NtSetEventBoostPriorityFn>(
++                         GetProcAddress(ntdll, "NtSetEventBoostPriority"))
++                   : nullptr;
++    }();
++    // Wine does not implement it: a failed call has not set the event.
++    if (!set_event_boost_priority || set_event_boost_priority(handle_) < 0) {
++      Set();
++    }
++  }
+   void Reset() override { ResetEvent(handle_); }
+   void Pulse() override { PulseEvent(handle_); }
+ };
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 301b3f0..0658aa7 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -82,6 +82,11 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_ring_wake_fast, false, "GPU",
++                    "Wake the command processor for new ring buffer work with a priority boost "
++                    "and poll its empty ring every 2 ms instead of 5 ms, as Xenia does")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -234,12 +239,13 @@ void CommandProcessor::WorkerThreadMain() {
+           break;
+         }
+       }
++      const auto wait_time = std::chrono::milliseconds(REXCVAR_GET(gpu_ring_wake_fast) ? 2 : 5);
+       while (idle()) {
+         // Sequentially consistent, like the write pointer's store and load: either idle() below
+         // sees the new write pointer, or UpdateWritePointer sees the flag and sets the event.
+         worker_waiting_.store(true);
+         if (idle()) {
+-          rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
++          rex::thread::Wait(write_ptr_index_event_.get(), true, wait_time);
+         }
+         worker_waiting_.store(false);
+       }
+@@ -343,7 +349,11 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
+   write_ptr_index_ = value;
+   // The worker reads the write pointer itself unless it is blocked (WorkerThreadMain).
+   if (worker_waiting_.load()) {
+-    write_ptr_index_event_->Set();
++    if (REXCVAR_GET(gpu_ring_wake_fast)) {
++      write_ptr_index_event_->SetBoostPriority();
++    } else {
++      write_ptr_index_event_->Set();
++    }
+   }
+ }
+ 
+-- 
+2.50.1
+

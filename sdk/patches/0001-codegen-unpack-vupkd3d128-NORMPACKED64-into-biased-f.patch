@@ -1,0 +1,121 @@
+From 44c43a510d23f2605dd9dd8e8cd2ba2a021ec534 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:01:46 -0400
+Subject: [PATCH 01/32] codegen: unpack vupkd3d128 NORMPACKED64 into biased
+ float bit patterns
+
+vupkd3d128 type 6 (D3DFMT 4:20:20:20) read the packed value from the
+guest high doubleword (host u64[1]), converted every field numerically
+with float(), wrote the results to the wrong host lanes and sign-extended
+through a 32-bit shift, which drops the field.
+
+Xenos unpacks the same way as NORMPACKED32: each signed 20-bit field is
+added to the bit pattern of 3.0f and the 4-bit w field to the bit
+pattern of 1.0f, the packed value comes from guest elements 2-3 (host
+u64[0]), and the most negative field value is replaced with a QNaN.
+This matches Xenia Canary's PACK_TYPE_ULONG_4202020 unpack
+(src/xenia/cpu/backend/x64/x64_seq_vector.cc, EmitULONG_4202020, with
+XMMUnpackULONG_4202020_Overflow = 0x40380000; the a64 backend does the
+same in a64_seq_vector.cc).
+
+The test vectors are the ones Canary's unpack_test.cc uses for
+UNPACK_ULONG_4202020, expressed in guest element order.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/codegen/builders/vector.cpp  | 35 ++++++++++++++++++--------------
+ tests/ppc/asm/instr_vupkd3d128.s | 26 ++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 15 deletions(-)
+
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index 2e0070a..b2112cb 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -1501,23 +1501,28 @@ bool build_vupkd3d128(BuilderContext& ctx) {
+     {
+       auto vSrc = ctx.v(ctx.insn.operands[1]);
+       auto vDst = ctx.v(ctx.insn.operands[0]);
+-      // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in 64 bits
+-      // x, y, z --> floats, w --> float
+-      ctx.println("\t{}.u64[0] = {}.u64[1];", ctx.v_temp(), vSrc);
+-      // x (bits 0-19) - sign extend from 20 bits
+-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 44) >> 44);", ctx.temp(), ctx.v_temp());
+-      ctx.println("\t{}.f32[0] = float({}.s32);", vDst, ctx.temp());
+-      // y (bits 20-39) - sign extend from 20 bits
+-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 24) >> 44);", ctx.temp(), ctx.v_temp());
+-      ctx.println("\t{}.f32[1] = float({}.s32);", vDst, ctx.temp());
+-      // z (bits 40-59) - sign extend from 20 bits
+-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 4) >> 44);", ctx.temp(), ctx.v_temp());
+-      ctx.println("\t{}.f32[2] = float({}.s32);", vDst, ctx.temp());
+-      // w (bits 60-63) - 4 bits
+-      ctx.println("\t{}.f32[3] = float({}.u64[0] >> 60);", vDst, ctx.v_temp());
++      // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in the guest low doubleword
++      // (Guest elements 2-3, host u64[0]).
++      // x, y, z --> 3.0+X form (signed 20-bit), w --> 1.0+w form, like NORMPACKED32: the
++      // fields are added to the bit patterns of 3.0f and 1.0f, not converted to float. The
++      // most negative 20-bit value (3.0f bits - 0x80000) is replaced by a QNaN.
++      // Output: x --> Guest element 0 (host u32[3]), y --> Guest element 1 (host u32[2]),
++      //         z --> Guest element 2 (host u32[1]), w --> Guest element 3 (host u32[0])
++      ctx.println("\t{}.u64[0] = {}.u64[0];", ctx.v_temp(), vSrc);
++      constexpr struct {
++        int shift;
++        int dst;
++      } fields[] = {{44, 3}, {24, 2}, {4, 1}};
++      for (const auto& field : fields) {
++        ctx.println("\t{}.s32 = int32_t(int64_t({}.u64[0] << {}) >> 44);", ctx.temp(),
++                    ctx.v_temp(), field.shift);
++        ctx.println(
++            "\t{}.u32[{}] = {}.s32 == -0x80000 ? 0x7FC00000u : uint32_t({}.s32 + 0x40400000);",
++            vDst, field.dst, ctx.temp(), ctx.temp());
++      }
++      ctx.println("\t{}.u32[0] = 0x3F800000u + uint32_t({}.u64[0] >> 60);", vDst, ctx.v_temp());
+       break;
+     }
+-
+     default:
+       ctx.println("\t__builtin_debugtrap();");
+       break;
+diff --git a/tests/ppc/asm/instr_vupkd3d128.s b/tests/ppc/asm/instr_vupkd3d128.s
+index b16b299..3ab494f 100644
+--- a/tests/ppc/asm/instr_vupkd3d128.s
++++ b/tests/ppc/asm/instr_vupkd3d128.s
+@@ -4,6 +4,7 @@
+ #   1 = PACK_TYPE_SHORT_2
+ #   3 = PACK_TYPE_FLOAT16_2
+ #   5 = PACK_TYPE_FLOAT16_4
++#   6 = PACK_TYPE_NORMPACKED64
+ 
+ # vupkd3d128 is broken in binutils, so these are hand coded
+ 
+@@ -78,3 +79,28 @@ test_vupkd3d128_uint_2101010_2:
+   .long 0x18681FF0
+   blr
+   #_ REGISTER_OUT v3 [7FC00000, 40400000, 40400000, 3F800001]
++
++test_vupkd3d128_normpacked64_0:
++  #_ REGISTER_IN v3 [CDCDCDCD, CDCDCDCD, 00000000, 00000000]
++  # vupkd3d128 v3, v3, 6
++  .long 0x18781FF0
++  blr
++  #_ REGISTER_OUT v3 [40400000, 40400000, 40400000, 3F800000]
++test_vupkd3d128_normpacked64_1:
++  #_ REGISTER_IN v3 [CDCDCDCD, CDCDCDCD, 50006400, 7D0003E8]
++  # vupkd3d128 v3, v3, 6
++  .long 0x18781FF0
++  blr
++  #_ REGISTER_OUT v3 [404003E8, 404007D0, 40400064, 3F800005]
++test_vupkd3d128_normpacked64_2:
++  #_ REGISTER_IN v3 [CDCDCDCD, CDCDCDCD, AFFFFF00, 032FFF9C]
++  # vupkd3d128 v3, v3, 6
++  .long 0x18781FF0
++  blr
++  #_ REGISTER_OUT v3 [403FFF9C, 40400032, 403FFFFF, 3F80000A]
++test_vupkd3d128_normpacked64_3:
++  #_ REGISTER_IN v3 [CDCDCDCD, CDCDCDCD, 00000000, 00080000]
++  # vupkd3d128 v3, v3, 6
++  .long 0x18781FF0
++  blr
++  #_ REGISTER_OUT v3 [7FC00000, 40400000, 40400000, 3F800000]
+-- 
+2.50.1
+

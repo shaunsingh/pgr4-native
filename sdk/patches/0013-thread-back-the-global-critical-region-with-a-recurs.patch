@@ -1,0 +1,419 @@
+From aab34e05aa67a44fe6c21c9dc0cba422e6276150 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:19:09 -0400
+Subject: [PATCH 13/32] thread: back the global critical region with a
+ recursive SRW lock on Windows
+
+Generated code enters the global critical region around every guest
+critical section (REX_ENTER_GLOBAL_LOCK in pch_h.inja), and the kernel
+takes it for every object table lookup and shared memory request, so it
+is one of the most frequently acquired locks in the runtime. On Windows
+it was a std::recursive_mutex, whose lock and unlock go through the C++
+runtime DLL (msvcp140, which under Wine may be Wine's own build).
+
+Xenia Canary replaced its global std::recursive_mutex on Windows with
+xe_global_mutex (src/xenia/base/mutex.h, mutex.cc): an exclusive SRW
+lock plus an owner thread id and a recursion count. Port it as
+global_mutex_type. The SRWLOCK is stored as its one pointer-sized field
+so the public header needs no windows.h, and the owner id is a relaxed
+atomic: another thread reading it races with the owner's store, but can
+only ever see its own id while it holds the lock. Other platforms keep
+std::recursive_mutex.
+
+The lock type of global_critical_region::Acquire*() becomes
+global_unique_lock_type, and the watch and access violation callbacks
+that receive the held lock take that type.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/graphics/pipeline/texture/cache.h | 14 +++---
+ include/rex/graphics/shared_memory.h          |  4 +-
+ include/rex/system/mmio_handler.h             |  2 +-
+ include/rex/system/xmemory.h                  | 12 ++---
+ include/rex/thread/mutex.h                    | 45 +++++++++++++++----
+ src/core/mutex.cpp                            | 44 +++++++++++++++++-
+ src/graphics/pipeline/texture/cache.cpp       | 10 ++---
+ src/system/xmemory.cpp                        | 12 ++---
+ 8 files changed, 105 insertions(+), 38 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d26cd4f..fbcc95b 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -220,15 +220,15 @@ class TextureCache {
+     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
+     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
+ 
+-    bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
++    bool base_outdated(const rex::thread::global_unique_lock_type& global_lock) const {
+       return base_outdated_;
+     }
+-    bool mips_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
++    bool mips_outdated(const rex::thread::global_unique_lock_type& global_lock) const {
+       return mips_outdated_;
+     }
+-    void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
++    void MakeUpToDateAndWatch(const rex::thread::global_unique_lock_type& global_lock);
+ 
+-    void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
++    void WatchCallback(const rex::thread::global_unique_lock_type& global_lock, bool is_mip);
+ 
+     // For LRU caching - updates the last usage frame and moves the texture to
+     // the end of the usage queue. Must be called any time the texture is
+@@ -565,7 +565,7 @@ class TextureCache {
+   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
+ 
+   // Shared memory callback for texture data invalidation.
+-  static void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
++  static void WatchCallback(const rex::thread::global_unique_lock_type& global_lock,
+                             void* context, void* data, uint64_t argument, bool invalidated_by_gpu);
+ 
+   // Checks if there are any pages that contain scaled resolve data within the
+@@ -574,9 +574,9 @@ class TextureCache {
+   // Global shared memory invalidation callback for invalidating scaled resolved
+   // texture data.
+   static void ScaledResolveGlobalWatchCallbackThunk(
+-      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
++      const rex::thread::global_unique_lock_type& global_lock, void* context,
+       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+-  void ScaledResolveGlobalWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
++  void ScaledResolveGlobalWatchCallback(const rex::thread::global_unique_lock_type& global_lock,
+                                         uint32_t address_first, uint32_t address_last,
+                                         bool invalidated_by_gpu);
+ 
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..81f5a79 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -34,7 +34,7 @@ class SharedMemory {
+   void SetSystemPageBlocksValidWithGpuDataWritten();
+   void InvalidateAllPages();
+ 
+-  typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
++  typedef void (*GlobalWatchCallback)(const rex::thread::global_unique_lock_type& global_lock,
+                                       void* context, uint32_t address_first, uint32_t address_last,
+                                       bool invalidated_by_gpu);
+   typedef void* GlobalWatchHandle;
+@@ -48,7 +48,7 @@ class SharedMemory {
+   // The callback is called within the global critical region.
+   GlobalWatchHandle RegisterGlobalWatch(GlobalWatchCallback callback, void* callback_context);
+   void UnregisterGlobalWatch(GlobalWatchHandle handle);
+-  typedef void (*WatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
++  typedef void (*WatchCallback)(const rex::thread::global_unique_lock_type& global_lock,
+                                 void* context, void* data, uint64_t argument,
+                                 bool invalidated_by_gpu);
+   typedef void* WatchHandle;
+diff --git a/include/rex/system/mmio_handler.h b/include/rex/system/mmio_handler.h
+index 7ae42a8..18e3633 100644
+--- a/include/rex/system/mmio_handler.h
++++ b/include/rex/system/mmio_handler.h
+@@ -45,7 +45,7 @@ class MMIOHandler {
+ 
+   typedef uint32_t (*HostToGuestVirtual)(const void* context, const void* host_address);
+   typedef bool (*AccessViolationCallback)(
+-      std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
++      rex::thread::global_unique_lock_type global_lock_locked_once, void* context,
+       void* host_address, bool is_write);
+ 
+   // access_violation_callback is called with global_critical_region locked once
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 6a34e78..d0fb02e 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -246,7 +246,7 @@ class BaseHeap {
+   //
+   // Returns an empty (unlocked) guard when guest pages are at least host page
+   // sized, since no reconcile happens then and the lock would be pure cost.
+-  virtual std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const;
++  virtual rex::thread::global_unique_lock_type AcquireHostPageReconcileLock() const;
+ 
+   // Whether a host page is currently write-watched for guest invalidation.
+   // SyncHostPageAccess must not restore write access to such a page: the watch
+@@ -321,7 +321,7 @@ class PhysicalHeap : public BaseHeap {
+   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
+                              bool enable_invalidation_notifications, bool enable_data_providers);
+   // Returns true if any page in the range was watched.
+-  bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
++  bool TriggerCallbacks(rex::thread::global_unique_lock_type global_lock_locked_once,
+                         uint32_t virtual_address, uint32_t length, bool is_write,
+                         bool unwatch_exact_range, bool unprotect = true);
+ 
+@@ -334,7 +334,7 @@ class PhysicalHeap : public BaseHeap {
+   // pass takes the global critical region. Acquire whenever this heap or its
+   // parent will need it, so the ordering holds even for a heap whose own guest
+   // pages are large enough to skip reconciling but whose parent's are not.
+-  std::unique_lock<std::recursive_mutex> AcquireHostPageReconcileLock() const override;
++  rex::thread::global_unique_lock_type AcquireHostPageReconcileLock() const override;
+ 
+   VirtualHeap* parent_heap_;
+ 
+@@ -512,7 +512,7 @@ class Memory {
+   // TODO(Triang3l): Implement data providers - this is why locking depth of 1
+   // will be required in the future.
+   bool TriggerPhysicalMemoryCallbacks(
+-      std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
++      rex::thread::global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
+       uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true);
+ 
+   // Allocates virtual memory from the 'system' heap.
+@@ -573,10 +573,10 @@ class Memory {
+ 
+   static uint32_t HostToGuestVirtualThunk(const void* context, const void* host_address);
+ 
+-  bool AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
++  bool AccessViolationCallback(rex::thread::global_unique_lock_type global_lock_locked_once,
+                                void* host_address, bool is_write);
+   static bool AccessViolationCallbackThunk(
+-      std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
++      rex::thread::global_unique_lock_type global_lock_locked_once, void* context,
+       void* host_address, bool is_write);
+ 
+   std::filesystem::path file_name_;
+diff --git a/include/rex/thread/mutex.h b/include/rex/thread/mutex.h
+index 6e5755a..f885616 100644
+--- a/include/rex/thread/mutex.h
++++ b/include/rex/thread/mutex.h
+@@ -11,10 +11,37 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <cstdint>
+ #include <mutex>
+ 
+ namespace rex::thread {
+ 
++#if defined(_WIN32)
++// A recursive lock over an SRW lock, as Xenia uses for its global mutex on Windows.
++class alignas(64) global_mutex_type {
++ public:
++  global_mutex_type() = default;
++  global_mutex_type(const global_mutex_type&) = delete;
++  global_mutex_type& operator=(const global_mutex_type&) = delete;
++
++  void lock();
++  void unlock();
++  bool try_lock();
++
++ private:
++  // An SRWLOCK, kept as its single pointer-sized field so this header needs no windows.h.
++  void* srwlock_ = nullptr;
++  // Only the owner stores its own id here, so another thread can never read its own id
++  // unless it holds the lock.
++  std::atomic<uint32_t> owner_thread_{0};
++  uint32_t recursion_count_ = 0;
++};
++#else
++using global_mutex_type = std::recursive_mutex;
++#endif
++using global_unique_lock_type = std::unique_lock<global_mutex_type>;
++
+ // The global critical region mutex singleton.
+ // This must guard any operation that may suspend threads or be sensitive to
+ // being suspended such as global table locks and such.
+@@ -55,30 +82,30 @@ namespace rex::thread {
+ // };
+ class global_critical_region {
+  public:
+-  static std::recursive_mutex& mutex();
++  static global_mutex_type& mutex();
+ 
+   // Acquires a lock on the global critical section.
+   // Use this when keeping an instance is not possible. Otherwise, prefer
+   // to keep an instance of global_critical_region near the members requiring
+   // it to keep things readable.
+-  static std::unique_lock<std::recursive_mutex> AcquireDirect() {
+-    return std::unique_lock<std::recursive_mutex>(mutex());
++  static global_unique_lock_type AcquireDirect() {
++    return global_unique_lock_type(mutex());
+   }
+ 
+   // Acquires a lock on the global critical section.
+-  inline std::unique_lock<std::recursive_mutex> Acquire() {
+-    return std::unique_lock<std::recursive_mutex>(mutex());
++  inline global_unique_lock_type Acquire() {
++    return global_unique_lock_type(mutex());
+   }
+ 
+   // Acquires a deferred lock on the global critical section.
+-  inline std::unique_lock<std::recursive_mutex> AcquireDeferred() {
+-    return std::unique_lock<std::recursive_mutex>(mutex(), std::defer_lock);
++  inline global_unique_lock_type AcquireDeferred() {
++    return global_unique_lock_type(mutex(), std::defer_lock);
+   }
+ 
+   // Tries to acquire a lock on the glboal critical section.
+   // Check owns_lock() to see if the lock was successfully acquired.
+-  inline std::unique_lock<std::recursive_mutex> TryAcquire() {
+-    return std::unique_lock<std::recursive_mutex>(mutex(), std::try_to_lock);
++  inline global_unique_lock_type TryAcquire() {
++    return global_unique_lock_type(mutex(), std::try_to_lock);
+   }
+ };
+ 
+diff --git a/src/core/mutex.cpp b/src/core/mutex.cpp
+index d639924..31c6ac4 100644
+--- a/src/core/mutex.cpp
++++ b/src/core/mutex.cpp
+@@ -11,10 +11,50 @@
+ 
+ #include <rex/thread/mutex.h>
+ 
++#if defined(_WIN32)
++#include "platform_win.h"
++#endif
++
+ namespace rex::thread {
+ 
+-std::recursive_mutex& global_critical_region::mutex() {
+-  static std::recursive_mutex global_mutex;
++#if defined(_WIN32)
++static_assert(sizeof(void*) == sizeof(SRWLOCK));
++
++void global_mutex_type::lock() {
++  uint32_t self = GetCurrentThreadId();
++  if (owner_thread_.load(std::memory_order_relaxed) == self) {
++    ++recursion_count_;
++    return;
++  }
++  AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srwlock_));
++  owner_thread_.store(self, std::memory_order_relaxed);
++  recursion_count_ = 1;
++}
++
++void global_mutex_type::unlock() {
++  if (--recursion_count_ == 0) {
++    owner_thread_.store(0, std::memory_order_relaxed);
++    ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srwlock_));
++  }
++}
++
++bool global_mutex_type::try_lock() {
++  uint32_t self = GetCurrentThreadId();
++  if (owner_thread_.load(std::memory_order_relaxed) == self) {
++    ++recursion_count_;
++    return true;
++  }
++  if (!TryAcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srwlock_))) {
++    return false;
++  }
++  owner_thread_.store(self, std::memory_order_relaxed);
++  recursion_count_ = 1;
++  return true;
++}
++#endif
++
++global_mutex_type& global_critical_region::mutex() {
++  static global_mutex_type global_mutex;
+   return global_mutex;
+ }
+ 
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..788c617 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -687,7 +687,7 @@ TextureCache::Texture::~Texture() {
+ }
+ 
+ void TextureCache::Texture::MakeUpToDateAndWatch(
+-    const std::unique_lock<std::recursive_mutex>& global_lock) {
++    const rex::thread::global_unique_lock_type& global_lock) {
+   SharedMemory& shared_memory = texture_cache().shared_memory();
+   if (base_outdated_) {
+     assert_not_zero(GetGuestBaseSize());
+@@ -733,7 +733,7 @@ void TextureCache::Texture::MarkAsUsed() {
+ }
+ 
+ void TextureCache::Texture::WatchCallback(
+-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
++    [[maybe_unused]] const rex::thread::global_unique_lock_type& global_lock, bool is_mip) {
+   if (is_mip) {
+     assert_not_zero(GetGuestMipsSize());
+     mips_outdated_ = true;
+@@ -747,7 +747,7 @@ void TextureCache::Texture::WatchCallback(
+   }
+ }
+ 
+-void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
++void TextureCache::WatchCallback(const rex::thread::global_unique_lock_type& global_lock,
+                                  void* context, void* data, uint64_t argument,
+                                  bool invalidated_by_gpu) {
+   Texture& texture = *static_cast<Texture*>(context);
+@@ -1064,7 +1064,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
+ }
+ 
+ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
+-    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
++    const rex::thread::global_unique_lock_type& global_lock, void* context,
+     uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+   TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
+   texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
+@@ -1072,7 +1072,7 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
+ }
+ 
+ void TextureCache::ScaledResolveGlobalWatchCallback(
+-    const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
++    const rex::thread::global_unique_lock_type& global_lock, uint32_t address_first,
+     uint32_t address_last, bool invalidated_by_gpu) {
+   assert_true(IsDrawResolutionScaled());
+   if (invalidated_by_gpu) {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 187d1f8..745b81f 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -589,7 +589,7 @@ static bool HostPageAllowsAccess(void* host_address, bool is_write) {
+          (!is_write || access != rex::memory::PageAccess::kReadOnly);
+ }
+ 
+-bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
++bool Memory::AccessViolationCallback(rex::thread::global_unique_lock_type global_lock_locked_once,
+                                      void* host_address, bool is_write) {
+   // Access via physical_membase_ is special, when need to bypass everything
+   // (for instance, for a data provider to actually write the data) so only
+@@ -702,14 +702,14 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+ }
+ 
+ bool Memory::AccessViolationCallbackThunk(
+-    std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
++    rex::thread::global_unique_lock_type global_lock_locked_once, void* context,
+     void* host_address, bool is_write) {
+   return reinterpret_cast<memory::Memory*>(context)->AccessViolationCallback(
+       std::move(global_lock_locked_once), host_address, is_write);
+ }
+ 
+ bool Memory::TriggerPhysicalMemoryCallbacks(
+-    std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
++    rex::thread::global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
+     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect) {
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap) {
+@@ -974,7 +974,7 @@ BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_siz
+ 
+ BaseHeap::~BaseHeap() = default;
+ 
+-std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
++rex::thread::global_unique_lock_type BaseHeap::AcquireHostPageReconcileLock() const {
+   if (page_size_ >= memory_->system_page_size_) {
+     return {};
+   }
+@@ -2243,7 +2243,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+   }
+ }
+ 
+-bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
++bool PhysicalHeap::TriggerCallbacks(rex::thread::global_unique_lock_type global_lock_locked_once,
+                                     uint32_t virtual_address, uint32_t length, bool is_write,
+                                     bool unwatch_exact_range, bool unprotect) {
+   // TODO(Triang3l): Support read watches.
+@@ -2400,7 +2400,7 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
+   return true;
+ }
+ 
+-std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {
++rex::thread::global_unique_lock_type PhysicalHeap::AcquireHostPageReconcileLock() const {
+   auto lock = BaseHeap::AcquireHostPageReconcileLock();
+   if (!lock.owns_lock() && parent_heap_ && parent_heap_->page_size() < memory_->system_page_size_) {
+     lock = rex::thread::global_critical_region::AcquireDirect();
+-- 
+2.50.1
+

@@ -1,0 +1,161 @@
+From 7eb1e4442c58b1de822b420067c410eab2834348 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:07:00 -0400
+Subject: [PATCH 43/48] perf(audio): flush the xmaframes decoder instead of
+ reopening it
+
+When a context is released or cleared, ResetDecoderState zeroed the
+cached sample rate and channel count so that the next decode would free
+the FFmpeg context and open a new one (f96d31a). That drops the previous
+wave's overlap-add tail, but each reopen zeroes the ~450 KB decoder
+context and rebuilds the MDCT tables for seven block sizes, up to 8192
+points. Project Gotham Racing 4 recycles contexts about 55 times a second
+in a race; ff_mdct_init and split_radix_permutation were 2.5 % of its
+audio thread.
+
+avcodec_flush_buffers could not do the job because ff_xmaframes_decoder
+in the FFmpeg submodule declares no flush callback. Build wmaprodec.c
+through thirdparty/ffmpeg-overlay/wmaprodec_xmaframes.c, which includes
+the submodule's file unchanged, renames its xmaframes decoder out of the
+way and defines ff_xmaframes_decoder again with a flush. The flush runs
+the decoder's own flush() (clears the output tail, sets packet_loss as
+decode_init does) and puts each channel's per-stream state ahead of the
+output buffer back to what decode_init leaves: zero, and a previous
+block length of one whole frame. ResetDecoderState now calls
+avcodec_flush_buffers on an open context.
+
+Checked by decoding the first 64 frames of every new stream through both
+a flushed and a reopened decoder over menus and a race: 105,000 frames
+from 3,128 streams, no sample differed. The overlay keeps the submodule
+untouched; the flush belongs in the FFmpeg fork, and the overlay can go
+once the fork has it.
+
+Xenia Canary does not reset the decoder when a context is recycled
+(src/xenia/apu/xma_context_new.cc at 451f915), so this has no Canary
+counterpart.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/audio/xma_context.cpp                     | 12 ++--
+ thirdparty/CMakeLists.txt                     |  2 +-
+ .../ffmpeg-overlay/wmaprodec_xmaframes.c      | 72 +++++++++++++++++++
+ 3 files changed, 78 insertions(+), 8 deletions(-)
+ create mode 100644 thirdparty/ffmpeg-overlay/wmaprodec_xmaframes.c
+
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index fa80672..a8c5072 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -192,13 +192,11 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
+ void XmaContext::ResetDecoderState() {
+   // A freed or re-initialized context is a new logical stream, so the previous
+   // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
+-  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
+-  // flush callback, so the call never reaches the code clearing channel[].out.
+-  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
+-  // next decode, which does discard the history.
+-  if (av_context_) {
+-    av_context_->sample_rate = 0;
+-    av_context_->channels = 0;
++  // The xmaframes flush (thirdparty/ffmpeg-overlay/wmaprodec_xmaframes.c)
++  // returns the decoder to its just-opened state without the reopen's table
++  // rebuild.
++  if (av_context_ && avcodec_is_open(av_context_)) {
++    avcodec_flush_buffers(av_context_);
+   }
+   raw_frame_.fill(0);
+   decoded_frame_.fill(0);
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..1be07e3 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -611,7 +611,7 @@ add_library(libavcodec STATIC
+     ${FFMPEG_DIR}/libavcodec/mdct_fixed_32.c
+     ${FFMPEG_DIR}/libavcodec/sinewin.c
+     ${FFMPEG_DIR}/libavcodec/wma_freqs.c
+-    ${FFMPEG_DIR}/libavcodec/wmaprodec.c
++    ${FFMPEG_OVERLAY_SRC_DIR}/wmaprodec_xmaframes.c
+     ${FFMPEG_DIR}/libavcodec/wmadec.c
+     ${FFMPEG_DIR}/libavcodec/wma.c
+     ${FFMPEG_DIR}/libavcodec/wma_common.c
+diff --git a/thirdparty/ffmpeg-overlay/wmaprodec_xmaframes.c b/thirdparty/ffmpeg-overlay/wmaprodec_xmaframes.c
+new file mode 100644
+index 0000000..9248afb
+--- /dev/null
++++ b/thirdparty/ffmpeg-overlay/wmaprodec_xmaframes.c
+@@ -0,0 +1,72 @@
++/*
++ * Wmapro compatible decoder, with a flush callback for the xmaframes decoder
++ * Copyright (c) 2007 Baptiste Coudurier, Benjamin Larsson, Ulion
++ * Copyright (c) 2008 - 2011 Sascha Sommer, Benjamin Larsson
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Builds libavcodec/wmaprodec.c in place of the submodule's copy and replaces
++ * its ff_xmaframes_decoder with one that has a flush callback. The submodule's
++ * xmaframes decoder declares none, so avcodec_flush_buffers() cannot clear the
++ * overlap-add tail and per-channel history it keeps between frames, and the
++ * only way to start a new stream was to reopen the codec.
++ */
++
++#include <stddef.h>
++
++#define ff_xmaframes_decoder ff_xmaframes_decoder_without_flush
++#include "libavcodec/wmaprodec.c"
++#undef ff_xmaframes_decoder
++
++/**
++ *@brief Start a new stream: the next frame decodes as the first one after
++ *       xmaframes_decode_init would, without rebuilding the MDCT tables.
++ *@param avctx codec context
++ */
++static void xmaframes_flush(AVCodecContext *avctx)
++{
++    WMAProDecodeCtx *s = avctx->priv_data;
++    int i;
++
++    flush(s);
++    /** everything ahead of out is per-stream state that decode_init leaves
++        zeroed, except the previous block length, which starts at a whole
++        frame */
++    for (i = 0; i < s->nb_channels; i++) {
++        memset(&s->channel[i], 0, offsetof(WMAProChannelCtx, out));
++        s->channel[i].prev_block_len = s->samples_per_frame;
++    }
++}
++
++AVCodec ff_xmaframes_decoder = {
++    .name           = "xmaframes",
++    .long_name      = NULL_IF_CONFIG_SMALL("Xbox Media Audio raw frames"),
++    .type           = AVMEDIA_TYPE_AUDIO,
++    .id             = AV_CODEC_ID_XMAFRAMES,
++    .priv_data_size = sizeof(WMAProDecodeCtx),
++    .init           = xmaframes_decode_init,
++    .close          = xmaframes_decode_end,
++    .decode         = xmaframes_decode_packet,
++    .flush          = xmaframes_flush,
++    .capabilities   = AV_CODEC_CAP_DR1,
++    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
++    .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,
++                                                      AV_SAMPLE_FMT_NONE },
++};
+-- 
+2.50.1
+

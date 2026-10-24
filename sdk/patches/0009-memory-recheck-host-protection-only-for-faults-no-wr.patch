@@ -1,0 +1,119 @@
+From a702a9b385ea80f635129921c2ffcd70f39de938 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:09:26 -0400
+Subject: [PATCH 09/32] memory: recheck host protection only for faults no
+ write watch covers
+
+MMIOHandler::ExceptionCallback queried the faulting page's host
+protection (QueryProtect, VirtualQuery on Windows) on every fault outside
+an MMIO range, before the access violation callback ran, to catch a
+watch another thread had cleared after the fault. Nearly all of these
+faults are GPU write watches on guest physical memory, which the
+callback handles anyway, and under Wine VirtualQuery walks the whole
+view.
+
+Move the recheck into Memory::AccessViolationCallback, after the paths
+that can handle the fault: when PhysicalHeap::TriggerCallbacks finds no
+watch on the page, and for faults outside guest physical memory, the
+page's protection is queried under the global critical region, and an
+access the page now allows is retried as before. A fault on a watched
+page goes straight to its callbacks without the query.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/system/mmio_handler.cpp | 22 +++++++---------------
+ src/system/xmemory.cpp      | 25 ++++++++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..b6d7859 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -402,23 +402,15 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     }
+   }
+   if (!range) {
+-    // Recheck if the pages are still protected (race condition - another thread
+-    // clears the watch we just hit).
+-    // Do this under the lock so we don't introduce another race condition.
+-    auto lock = global_critical_region_.Acquire();
+-    memory::PageAccess cur_access;
+-    size_t page_length = memory::page_size();
+-    memory::QueryProtect(fault_host_address, page_length, cur_access);
+-    if (cur_access != memory::PageAccess::kNoAccess &&
+-        (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
+-      // Another thread has cleared this watch. Abort.
+-      return true;
+-    }
+     // The address is not found within any range, so either a write watch or an
+-    // actual access violation.
++    // actual access violation. The callback handles the race where another
++    // thread clears the watch we just hit: querying host protection here, on
++    // every write-watch fault, is expensive (VirtualQuery walks the whole view
++    // under Wine).
+     if (access_violation_callback_) {
+-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+-                                        fault_host_address, is_write);
++      return access_violation_callback_(global_critical_region_.Acquire(),
++                                        access_violation_callback_context_, fault_host_address,
++                                        is_write);
+     }
+     return false;
+   }
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 7819bc5..187d1f8 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -575,6 +575,20 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
+   return mmio_handler_->LookupRange(virtual_address);
+ }
+ 
++// True if the host page now permits the access, meaning another thread changed
++// its protection (usually by handling the same write watch) after the fault and
++// the faulting instruction can simply be retried. Must be called with the
++// global critical region locked.
++static bool HostPageAllowsAccess(void* host_address, bool is_write) {
++  rex::memory::PageAccess access;
++  size_t length = rex::memory::page_size();
++  if (!rex::memory::QueryProtect(host_address, length, access)) {
++    return false;
++  }
++  return access != rex::memory::PageAccess::kNoAccess &&
++         (!is_write || access != rex::memory::PageAccess::kReadOnly);
++}
++
+ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+                                      void* host_address, bool is_write) {
+   // Access via physical_membase_ is special, when need to bypass everything
+@@ -582,11 +596,14 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+   // triggering callbacks on virtual memory regions.
+   if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(virtual_membase_) ||
+       reinterpret_cast<size_t>(host_address) >= reinterpret_cast<size_t>(physical_membase_)) {
+-    return false;
++    return HostPageAllowsAccess(host_address, is_write);
+   }
+   uint32_t virtual_address = HostToGuestVirtual(host_address);
+   BaseHeap* heap = LookupHeap(virtual_address);
+   if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    if (HostPageAllowsAccess(host_address, is_write)) {
++      return true;
++    }
+     REXSYS_ERROR(
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+@@ -605,6 +622,12 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+     return true;
+   }
+ 
++  // No watch covers the page. TriggerCallbacks released the global lock.
++  auto global_lock = global_critical_region_.Acquire();
++  if (HostPageAllowsAccess(host_address, is_write)) {
++    return true;
++  }
++
+   // Recovery path for stale host protection state in physical memory:
+   // if guest metadata says the page is writable but host protection is still
+   // read-only / no-access, restore write access and resume execution.
+-- 
+2.50.1
+

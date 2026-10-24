@@ -1,0 +1,117 @@
+From e2829db8e62193bb4b4b3bac487071fda08fd11e Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:48:03 -0400
+Subject: [PATCH 29/32] app: add content_root to install a title's content
+ packages at startup
+
+ContentManager::InstallContent extracts an STFS content package into
+the content folder the title enumerates, but nothing in ReXApp calls it,
+so downloadable content a player copied off a console needs a separate
+tool before the title can see it.
+
+At startup, after the XEX loads and the title ID is known, go over the
+packages in content_root (default: <game_data_root>/Content) and install
+each marketplace package (content type 2) of this title that is not
+installed yet. A package counts as installed once its .header file
+exists, which InstallContent writes as its last step, so an interrupted
+install is redone on the next start. Other files and other titles'
+packages are skipped. Each install and failure is logged.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/ui/rex_app.cpp | 58 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index ea3f29a..a212087 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -32,11 +32,14 @@
+ #include <rex/input/input_system.h>
+ #include <rex/kernel/init.h>
+ #include <rex/string/numeric.h>
++#include <rex/string/utf8.h>
+ #include <rex/system.h>
++#include <rex/filesystem/devices/stfs_container_device.h>
+ #include <rex/system/achievement_manager.h>
+ #include <rex/system/gpu_plugin.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
++#include <rex/system/xam/content_manager.h>
+ #include <rex/system/xex_module.h>
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
+@@ -55,8 +58,61 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_STRING(content_root, "", "Content",
++                      "Folder of content packages (DLC as copied off a console) installed for the "
++                      "title at startup; default: <game_data_root>/Content")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex {
+ 
++namespace {
++
++// Installs the title's marketplace packages (DLC) found in content_root that are not installed
++// yet. A package counts as installed once its .header is written, the last step of
++// InstallContent, so an interrupted install is redone.
++void InstallContentPackages(system::KernelState& kernel_state,
++                            const std::filesystem::path& game_data_root) {
++  const std::string root_cvar = REXCVAR_GET(content_root);
++  const std::filesystem::path root =
++      root_cvar.empty() ? game_data_root / "Content" : std::filesystem::path(root_cvar);
++  std::error_code ec;
++  if (!std::filesystem::is_directory(root, ec)) {
++    return;
++  }
++  auto* content = kernel_state.content_manager();
++  const uint32_t title_id = kernel_state.title_id();
++  for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
++    if (!entry.is_regular_file(ec)) {
++      continue;
++    }
++    filesystem::StfsContainerDevice package("", entry.path());
++    if (!package.Initialize()) {
++      continue;
++    }
++    const auto& metadata = package.header().metadata;
++    if (metadata.content_type != system::XContentType::kMarketplaceContent ||
++        metadata.execution_info.title_id != title_id) {
++      continue;
++    }
++    const auto file_name = path_to_utf8(entry.path().filename());
++    system::xam::XCONTENT_AGGREGATE_DATA installed;
++    if (content->ReadContentHeaderFile(file_name, 0, title_id,
++                                       system::XContentType::kMarketplaceContent,
++                                       installed) == X_ERROR_SUCCESS) {
++      continue;
++    }
++    const auto result = content->InstallContent(entry.path());
++    if (result == X_ERROR_SUCCESS) {
++      REXLOG_INFO("Installed content package {} ({})", file_name,
++                  string::to_utf8(metadata.display_name(system::XLanguage::kEnglish)));
++    } else {
++      REXLOG_ERROR("Installing content package {} failed: {:08X}", entry.path().string(), result);
++    }
++  }
++}
++
++}  // namespace
++
+ // --- ReXApp ---
+ 
+ ReXApp::~ReXApp() = default;
+@@ -319,6 +375,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     return false;
+   }
+ 
++  InstallContentPackages(*runtime_->kernel_state(), paths.game_data_root);
++
+   OnPostLoadXexImage();
+ 
+   if (ppc_info_.rexcrt_heap) {
+-- 
+2.50.1
+

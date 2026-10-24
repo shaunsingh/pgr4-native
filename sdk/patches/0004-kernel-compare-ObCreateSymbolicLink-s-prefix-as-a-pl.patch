@@ -1,0 +1,37 @@
+From 937883739e523ea9ef8d1b32d93d1e4833756095 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:04:35 -0400
+Subject: [PATCH 04/32] kernel: compare ObCreateSymbolicLink's prefix as a
+ plain string literal
+
+ObCreateSymbolicLink passed u8"\\??\\" to utf8_starts_with, which takes
+std::string_view. In C++20 a u8 literal is const char8_t[], which does
+not convert to std::string_view, so the call only compiles where char8_t
+is disabled. The root CMakeLists.txt disables it with -fno-char8_t, but
+clang-cl does not know that option ("unknown argument ignored in
+clang-cl: '-fno-char8_t'"), so a clang-cl build fails here unless the
+caller adds /Zc:char8_t- itself. It is the only u8 literal in the SDK.
+
+The prefix is ASCII, so a plain literal compares the same bytes.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/kernel/xboxkrnl/xboxkrnl_ob.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
+index 5709e6d..0b94c3f 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
+@@ -177,7 +177,7 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
+   auto target = rex::string::utf8_canonicalize_guest_path(
+       util::TranslateAnsiPath(REX_KERNEL_MEMORY(), target_ptr));
+ 
+-  if (rex::string::utf8_starts_with(path, u8"\\??\\")) {
++  if (rex::string::utf8_starts_with(path, "\\??\\")) {
+     path = path.substr(4);  // Strip the full qualifier
+   }
+ 
+-- 
+2.50.1
+

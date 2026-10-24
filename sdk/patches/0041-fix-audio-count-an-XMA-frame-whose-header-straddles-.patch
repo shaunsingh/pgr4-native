@@ -1,0 +1,56 @@
+From d2a087b85d5e0a26e56d9291f47dc1465024eebc Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:05:35 -0400
+Subject: [PATCH 41/48] fix(audio): count an XMA frame whose header straddles
+ the packet end
+
+GetPacketInfo walks the frames that begin in a packet. When fewer than
+15 bits are left, the next frame's header continues in the following
+packet and the walk stopped without counting that frame. The caller then
+took the frame before it for the packet's last one, and when the read
+offset sat on the straddling frame it saw frame 0 with size 0 of a packet
+whose frame count did not include it, so it skipped the frame instead of
+assembling its header from both packets. The XMA2 header count covers
+part of this, but not packets whose header count matches the frames
+found before the straddling one, and not XMA1 packets, which carry no
+count.
+
+Port Xenia Canary's handling (src/xenia/apu/xma_context_new.cc,
+XmaContextNew::GetPacketInfo, at 451f915): when bits remain, count the
+frame and, if the read offset is on it, report it as the current frame
+with size 0. Decode already reads a size-0 frame's header from the two
+packets combined.
+
+Project Gotham Racing 4's menu music streams contain such frames; the
+MTR-PGR4 port carries the same change as its menu split-frame fix.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/audio/xma_context.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..fa80672 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -359,6 +359,17 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
+ 
+   while (true) {
+     if (stream.BitsRemaining() < kBitsPerFrameHeader) {
++      // This frame's 15-bit header runs into the next packet, so its size
++      // isn't readable yet. Count it anyway, or the caller takes the previous
++      // frame for the packet's last and skips straight past this one. Size 0
++      // sends it to the split-header path.
++      if (stream.BitsRemaining() > 0) {
++        if (stream.offset_bits() == frame_offset) {
++          packet_info.current_frame_ = packet_info.frame_count_;
++          packet_info.current_frame_size_ = 0;
++        }
++        packet_info.frame_count_++;
++      }
+       break;
+     }
+ 
+-- 
+2.50.1
+

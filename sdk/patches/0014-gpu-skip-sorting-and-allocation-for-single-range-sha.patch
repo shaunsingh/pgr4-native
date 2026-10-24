@@ -1,0 +1,131 @@
+From d0db2b02f41f0c706a336616855b627c00a3e3fd Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:26:21 -0400
+Subject: [PATCH 14/32] gpu: skip sorting and allocation for single-range
+ shared memory requests
+
+RequestRange, which every vertex fetch, index buffer, memexport and
+resolve destination goes through, forwards to RequestRanges with a
+count of one. RequestRanges then allocates a vector, copies the range
+into it, sorts and merges it before scanning the valid-page bitmap, on
+every draw for every vertex buffer, including the usual case where all
+pages are already valid and nothing is uploaded.
+
+Use a single range in place: validate it and scan it directly, keeping
+the vector, sort and merge for the texture cache's batched requests.
+Xenia Canary's RequestRange (src/xenia/gpu/shared_memory.cc) likewise
+scans a lone range without building a list. The order of the steps is
+unchanged: host GPU memory is still ensured for the range before the
+scan, as in Canary.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/graphics/shared_memory.cpp | 76 ++++++++++++++++++++--------------
+ 1 file changed, 46 insertions(+), 30 deletions(-)
+
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..eea0212 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <span>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -343,45 +344,60 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   }
+ 
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+-  merged_ranges.reserve(count);
+-  for (size_t i = 0; i < count; ++i) {
+-    uint32_t start = ranges[i].first;
+-    uint32_t length = ranges[i].second;
++  // A single range (RequestRange: vertex and index buffers, memexport, resolve destinations)
++  // needs no sorting or merging, and is used in place rather than copied into a new vector.
++  std::span<const std::pair<uint32_t, uint32_t>> merged_ranges;
++  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges_storage;
++  if (count == 1) {
++    uint32_t start = ranges[0].first;
++    uint32_t length = ranges[0].second;
+     if (!length) {
+-      continue;
++      return true;
+     }
+     if (start > kBufferSize || (kBufferSize - start) < length) {
+       return false;
+     }
+-    merged_ranges.emplace_back(start, length);
+-  }
+-  if (merged_ranges.empty()) {
+-    return true;
+-  }
+-
+-  SCOPE_profile_cpu_f("gpu");
++    merged_ranges = std::span(ranges, 1);
++  } else {
++    merged_ranges_storage.reserve(count);
++    for (size_t i = 0; i < count; ++i) {
++      uint32_t start = ranges[i].first;
++      uint32_t length = ranges[i].second;
++      if (!length) {
++        continue;
++      }
++      if (start > kBufferSize || (kBufferSize - start) < length) {
++        return false;
++      }
++      merged_ranges_storage.emplace_back(start, length);
++    }
++    if (merged_ranges_storage.empty()) {
++      return true;
++    }
+ 
+-  std::sort(merged_ranges.begin(), merged_ranges.end(),
+-            [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+-              return a.first < b.first;
+-            });
+-  size_t merged_write = 0;
+-  for (size_t i = 1; i < merged_ranges.size(); ++i) {
+-    std::pair<uint32_t, uint32_t>& range_previous = merged_ranges[merged_write];
+-    const std::pair<uint32_t, uint32_t>& range_current = merged_ranges[i];
+-    uint64_t previous_end = uint64_t(range_previous.first) + uint64_t(range_previous.second);
+-    uint64_t current_start = uint64_t(range_current.first);
+-    if (current_start <= previous_end) {
+-      uint64_t current_end = current_start + uint64_t(range_current.second);
+-      if (current_end > previous_end) {
+-        range_previous.second = uint32_t(current_end - uint64_t(range_previous.first));
++    std::sort(merged_ranges_storage.begin(), merged_ranges_storage.end(),
++              [](const std::pair<uint32_t, uint32_t>& a,
++                 const std::pair<uint32_t, uint32_t>& b) { return a.first < b.first; });
++    size_t merged_write = 0;
++    for (size_t i = 1; i < merged_ranges_storage.size(); ++i) {
++      std::pair<uint32_t, uint32_t>& range_previous = merged_ranges_storage[merged_write];
++      const std::pair<uint32_t, uint32_t>& range_current = merged_ranges_storage[i];
++      uint64_t previous_end = uint64_t(range_previous.first) + uint64_t(range_previous.second);
++      uint64_t current_start = uint64_t(range_current.first);
++      if (current_start <= previous_end) {
++        uint64_t current_end = current_start + uint64_t(range_current.second);
++        if (current_end > previous_end) {
++          range_previous.second = uint32_t(current_end - uint64_t(range_previous.first));
++        }
++      } else {
++        merged_ranges_storage[++merged_write] = range_current;
+       }
+-    } else {
+-      merged_ranges[++merged_write] = range_current;
+     }
++    merged_ranges_storage.resize(merged_write + 1);
++    merged_ranges = merged_ranges_storage;
+   }
+-  merged_ranges.resize(merged_write + 1);
++
++  SCOPE_profile_cpu_f("gpu");
+ 
+   for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
+-- 
+2.50.1
+

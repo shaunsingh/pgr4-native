@@ -1,0 +1,133 @@
+From 2dcb9455d317637d0ed8b7f39fab999f9d4b29c6 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:50:54 -0400
+Subject: [PATCH 31/32] gpu: add gpu_skip_draws for a host renderer that draws
+ the frames itself
+
+A host renderer that draws the guest's frames itself (PGR4's native
+D3D12 renderer, for one) still needs the command
+processor: the title waits on its fences, on register and memory
+write-backs and on the vblank and swap interrupts. The Xenos backend's
+own draws, resolves, shader loads and presents are then duplicate GPU
+and CPU work on every frame.
+
+With gpu_skip_draws set, the command processor keeps executing every
+packet but does no host work for:
+- draws and resolves (IssueDraw is not called);
+- IM_LOAD and IM_LOAD_IMMEDIATE (no shader lookup or creation; the
+  active shaders stay as they were, so after the cvar is cleared draws
+  use them until the title loads the next shader of each type);
+- EVENT_WRITE_ZPD: the D3D12 backend takes the base path, which writes
+  query_occlusion_fake_sample_count, or 1000 when that is disabled,
+  since nothing is drawn to count;
+- XE_SWAP in the D3D12 backend: the submission is ended as a swap
+  without presenting, so per-frame resources are still released.
+The cvar is hot-reloadable, so a renderer can switch between its own
+output and the backend's at run time. It defaults to false.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/graphics/command_processor.cpp       | 23 ++++++++++++++++++++++-
+ src/graphics/d3d12/command_processor.cpp | 10 +++++++++-
+ 2 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 5c86ade..7bfa92c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -94,6 +94,12 @@ REXCVAR_DEFINE_BOOL(gpu_wait_reg_mem_high_res, false, "GPU",
+                     "sleep instead of sleeping for the packet's wait interval")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(gpu_skip_draws, false, "GPU",
++                    "Skip all host GPU work for draws, resolves, shader loads and swaps, for a "
++                    "host renderer that draws the guest's frames itself; fences, register and "
++                    "memory write-backs and interrupts still run")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -1311,6 +1317,11 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
+   // This command is send on query begin and end.
+   // As a workaround report some fixed amount of passed samples.
+   auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
++  // Nothing is drawn to count samples of: report passed samples even when the fake count is
++  // disabled, so the title does not treat everything as occluded.
++  if (REXCVAR_GET(gpu_skip_draws) && fake_sample_count < 0) {
++    fake_sample_count = 1000;
++  }
+   if (fake_sample_count >= 0) {
+     auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
+         register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+@@ -1422,7 +1433,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+ 
+   if (draw_succeeded) {
+     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
++    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z) &&
++        !REXCVAR_GET(gpu_skip_draws)) {
+       // TODO(Triang3l): Don't drop the draw call completely if the vertex
+       // shader has memexport.
+       // TODO(Triang3l || JoelLinn): Handle this properly in the render
+@@ -1576,6 +1588,11 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+ 
++  // With gpu_skip_draws the active shaders stay as they were; after it is turned off, draws use
++  // them until the title loads the next shader of each type.
++  if (REXCVAR_GET(gpu_skip_draws)) {
++    return true;
++  }
+   auto shader =
+       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+   switch (shader_type) {
+@@ -1606,6 +1623,10 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer*
+   assert_true(start == 0);
+   assert_true(reader->read_count() >= size_dwords * 4);
+   assert_true(count - 2 >= size_dwords);
++  if (REXCVAR_GET(gpu_skip_draws)) {
++    reader->AdvanceRead(size_dwords * sizeof(uint32_t));
++    return true;
++  }
+   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
+                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+   switch (shader_type) {
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 3c443c2..225125b 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -47,6 +47,8 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DECLARE(bool, gpu_skip_draws);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -152,7 +154,8 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
+ 
+ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                uint32_t packet, uint32_t count) {
+-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
++  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
++      REXCVAR_GET(gpu_skip_draws)) {
+     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+   }
+ 
+@@ -1941,6 +1944,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+     return;
+   }
++  // Nothing to present, but the frame still ends here so its per-frame resources are released.
++  if (REXCVAR_GET(gpu_skip_draws)) {
++    EndSubmission(true);
++    return;
++  }
+ 
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+-- 
+2.50.1
+

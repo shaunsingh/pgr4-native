@@ -1,0 +1,80 @@
+From 293a0ee01f4dfd5a1e02b87fcca8b8bbb75ea564 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:41:16 -0400
+Subject: [PATCH 23/32] xam: copy the default text into a headless keyboard
+ prompt's buffer as is
+
+With headless set, or without an ImGui drawer to show the dialog,
+XamShowKeyboardUI completes at once with the default text in the result
+buffer. Xenia reads the default text through StringPointerParam::value(),
+which loads and swaps it to host order, and copy_and_swap_truncating
+swaps it back to big-endian on the way into the guest buffer. ReXGlue's
+MappedPtr<char16_t>::value() is a view of the guest string as it is in
+memory, already big-endian, so the same copy_and_swap_truncating call
+wrote the text byte-swapped. Both strings are guest memory: copy the
+characters unchanged, truncated to buffer_length - 1 and terminated, as
+copy_and_swap_truncating does, in one callback that both paths share.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/kernel/xam/xam_ui.cpp | 35 ++++++++++++++++-------------------
+ 1 file changed, 16 insertions(+), 19 deletions(-)
+
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index e38cd25..9431d70 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -465,18 +465,23 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+ 
+   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
+ 
++  // Redirect default_text back into the buffer.
++  auto return_default_text = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
++    if (!default_text) {
++      std::memset(buffer, 0, buffer_size);
++    } else if (buffer_length) {
++      // Both strings are in guest memory, so the text is already big-endian.
++      const std::u16string_view text = default_text.value();
++      const size_t length = std::min<size_t>(text.size(), buffer_length - 1);
++      std::memcpy(buffer, text.data(), length * sizeof(char16_t));
++      buffer[length] = 0;
++    }
++    return X_ERROR_SUCCESS;
++  };
++
+   X_RESULT result;
+   if (REXCVAR_GET(headless)) {
+-    auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+-      // Redirect default_text back into the buffer.
+-      if (!default_text) {
+-        std::memset(buffer, 0, buffer_size);
+-      } else {
+-        rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+-      }
+-      return X_ERROR_SUCCESS;
+-    };
+-    result = xeXamDispatchHeadless(run, overlapped.guest_address());
++    result = xeXamDispatchHeadless(return_default_text, overlapped.guest_address());
+   } else {
+     auto close = [buffer, buffer_length](KeyboardInputDialog* dialog, uint32_t& extended_error,
+                                          uint32_t& length) -> X_RESULT {
+@@ -518,15 +523,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+           close, overlapped.guest_address());
+     } else {
+       // Fallback to headless
+-      auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+-        if (!default_text) {
+-          std::memset(buffer, 0, buffer_size);
+-        } else {
+-          rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
+-        }
+-        return X_ERROR_SUCCESS;
+-      };
+-      result = xeXamDispatchHeadless(run, overlapped.guest_address());
++      result = xeXamDispatchHeadless(return_default_text, overlapped.guest_address());
+     }
+   }
+   return result;
+-- 
+2.50.1
+

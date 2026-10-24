@@ -1,0 +1,53 @@
+From 8ff45f7ed761f65ec523c516378c68d9bfc2ad28 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:42:03 -0400
+Subject: [PATCH 24/32] xam: add xam_keyboard_accept_default to complete
+ keyboard prompts unshown
+
+A host renderer that draws its own fullscreen window over the
+emulator's covers the ImGui dialogs XamShowKeyboardUI opens, and a
+handheld has no keyboard to type into them anyway. PGR4 opens one to
+name a saved replay and offers a default name.
+
+With xam_keyboard_accept_default set, a keyboard prompt that comes with
+non-empty default text completes at once, through the same callback as
+headless, with that text in the buffer, as if the player confirmed it
+unchanged. Prompts without default text still show the dialog. The
+accepted text is logged. The cvar defaults to false.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/kernel/xam/xam_ui.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 9431d70..76eddcc 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -19,6 +19,9 @@
+ 
+ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+                     "Don't display any UI, using defaults for prompts as needed");
++REXCVAR_DEFINE_BOOL(xam_keyboard_accept_default, false, "Kernel",
++                    "Complete keyboard prompts that come with default text with that text, "
++                    "without showing the dialog");
+ #include <rex/kernel/xam/private.h>
+ #include <rex/hook.h>
+ #include <rex/input/input_system.h>
+@@ -480,7 +483,12 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
+   };
+ 
+   X_RESULT result;
+-  if (REXCVAR_GET(headless)) {
++  if (REXCVAR_GET(xam_keyboard_accept_default) && default_text && default_text[0]) {
++    REXKRNL_INFO("XamShowKeyboardUI: accepted the default text \"{}\"",
++                 rex::string::to_utf8(
++                     rex::memory::load_and_swap<std::u16string>(default_text.host_address())));
++    result = xeXamDispatchHeadless(return_default_text, overlapped.guest_address());
++  } else if (REXCVAR_GET(headless)) {
+     result = xeXamDispatchHeadless(return_default_text, overlapped.guest_address());
+   } else {
+     auto close = [buffer, buffer_length](KeyboardInputDialog* dialog, uint32_t& extended_error,
+-- 
+2.50.1
+

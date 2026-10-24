@@ -1,0 +1,303 @@
+From f73e94f1e7d068fa7edaa953e6e46e9f97d93eae Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:09:18 -0400
+Subject: [PATCH 08/32] memory: give guest physical memory a section committed
+ when it is created
+
+Guest virtual and physical memory shared one page file-backed section
+created with SEC_RESERVE, and Memory::Initialize committed the 512 MB
+physical range afterwards (AllocFixed over the physical heap, from
+xenia-canary 5f5be0668). The heaps then committed physical pages again on
+every allocation, and the GPU's write watches change the protection of
+physical pages thousands of times a second. Under Wine, a protection
+change on a view of a section that commits on demand goes through
+wineserver, 5-7 times the cost of the same call on a committed section.
+
+Map guest physical memory from a section of its own, created with
+SEC_COMMIT; guest virtual memory keeps the reserve-only section. The
+map_info entries whose target lies above 4 GB (the physical views) map
+from the new section at target - 4 GB (ViewSource), on Windows, Linux
+and macOS. Heaps of guest physical memory set the protection where they
+used to commit (BaseHeap::AllocHostPages), and AddVirtualMappedRange
+protects instead of committing the MMIO windows at 0x7F000000, which
+sit in physical memory. The heaps never decommit host pages
+(BaseHeap::Decommit only updates the page table), so the physical
+section stays committed for its lifetime.
+
+Part of the runtime changes that took Project Gotham Racing 4 on a Steam
+Deck under Proton from 78.7 to 89.4 fps (pgr4-native README, "Steam
+Deck (OLED)": "a page protection change no longer costs a commit
+through wineserver"); no run measures it on its own.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/system/xmemory.h |   9 +++
+ src/system/xmemory.cpp       | 118 ++++++++++++++++++++++++-----------
+ 2 files changed, 92 insertions(+), 35 deletions(-)
+
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..6a34e78 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -258,6 +258,11 @@ class BaseHeap {
+   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
+                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
+ 
++  // rex::memory::AllocFixed for the heap's host pages. Guest physical memory is committed with
++  // its section (see Memory::Initialize), so there a commit only sets the protection.
++  bool AllocHostPages(void* host_address, size_t length, rex::memory::AllocationType type,
++                      rex::memory::PageAccess access);
++
+   memory::Memory* memory_;
+   uint8_t* membase_;
+   HeapType heap_type_;
+@@ -563,6 +568,8 @@ class Memory {
+ #endif
+   int MapViews(uint8_t* mapping_base);
+   void UnmapViews();
++  // The section and offset map_info entry n maps.
++  std::pair<rex::memory::FileMappingHandle, uint64_t> ViewSource(size_t n) const;
+ 
+   static uint32_t HostToGuestVirtualThunk(const void* context, const void* host_address);
+ 
+@@ -588,6 +595,8 @@ class Memory {
+   mutable std::mutex function_tables_mutex_;
+ 
+   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
++  std::filesystem::path physical_file_name_;
++  rex::memory::FileMappingHandle physical_mapping_ = rex::memory::kFileMappingHandleInvalid;
+   uint8_t* mapping_base_ = nullptr;
+   union {
+     struct {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..7819bc5 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -119,28 +119,37 @@ Memory::~Memory() {
+   heaps_.vE0000000.Dispose();
+   heaps_.physical.Dispose();
+ 
+-  // Unmap all views and close mapping.
++  // Unmap all views and close the mappings.
+   if (mapping_ != rex::memory::kFileMappingHandleInvalid) {
+     UnmapViews();
+     rex::memory::CloseFileMappingHandle(mapping_, file_name_);
+     mapping_base_ = nullptr;
+     mapping_ = rex::memory::kFileMappingHandleInvalid;
+   }
++  if (physical_mapping_ != rex::memory::kFileMappingHandleInvalid) {
++    rex::memory::CloseFileMappingHandle(physical_mapping_, physical_file_name_);
++    physical_mapping_ = rex::memory::kFileMappingHandleInvalid;
++  }
+ 
+   virtual_membase_ = nullptr;
+   physical_membase_ = nullptr;
+ }
+ 
++// Where guest physical memory starts in map_info's target addresses. It has a section of its
++// own, physical_mapping_, which is committed when it is created: the heaps never decommit it,
++// and on a section that commits on demand every protection change on a view costs a wineserver
++// round trip under Wine (5-7 times the cost of the call otherwise), which the GPU's write
++// watches on physical memory make thousands of times a second.
++constexpr uint64_t kPhysicalTargetBase = 0x100000000ull;
++
+ bool Memory::Initialize() {
+-  file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
++  const uint64_t tick = chrono::Clock::QueryHostTickCount();
++  file_name_ = fmt::format("xenia_memory_{}", tick);
++  physical_file_name_ = fmt::format("xenia_memory_{}_physical", tick);
+ 
+-  // Create main page file-backed mapping. This is all reserved but
+-  // uncommitted (so it shouldn't expand page file).
+-  // Round up to allocation granularity to accommodate platforms with large pages.
+-  const size_t mapping_size =
+-      rex::round_up(static_cast<size_t>(0x120000000ull) + system_allocation_granularity_,
+-                    static_cast<size_t>(system_allocation_granularity_));
+-  mapping_ = rex::memory::CreateFileMappingHandle(file_name_, mapping_size,
++  // Guest virtual memory: page file-backed, reserved but uncommitted (so it shouldn't expand
++  // the page file). The heaps commit it on demand.
++  mapping_ = rex::memory::CreateFileMappingHandle(file_name_, kPhysicalTargetBase,
+                                                   rex::memory::PageAccess::kReadWrite, false);
+   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
+     REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
+@@ -148,6 +157,20 @@ bool Memory::Initialize() {
+     return false;
+   }
+ 
++  // Guest physical memory, committed up front so the GPU can access it without page faults
++  // (reference: xenia-canary 5f5be0668). Rounded up to the allocation granularity for the
++  // 0xE0000000 view's 4 KB offset on platforms with large pages.
++  const size_t physical_mapping_size =
++      rex::round_up(static_cast<size_t>(0x20000000) + system_allocation_granularity_,
++                    static_cast<size_t>(system_allocation_granularity_));
++  physical_mapping_ = rex::memory::CreateFileMappingHandle(
++      physical_file_name_, physical_mapping_size, rex::memory::PageAccess::kReadWrite, true);
++  if (physical_mapping_ == rex::memory::kFileMappingHandleInvalid) {
++    REXSYS_ERROR("Unable to commit the 512mb guest physical memory.");
++    assert_always();
++    return false;
++  }
++
+ #if REX_PLATFORM_MAC
+   // On macOS, reserve a contiguous host range first, then carve guest views
+   // into it with MAP_SHARED|MAP_FIXED so all views share the same backing fd.
+@@ -216,12 +239,6 @@ bool Memory::Initialize() {
+                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                               memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
+ 
+-  // Pre-commit the physical memory range so the GPU can access it
+-  // without page faults. Reference: xenia-canary 5f5be0668.
+-  rex::memory::AllocFixed(heaps_.physical.TranslateRelative(0), heaps_.physical.heap_size(),
+-                          rex::memory::AllocationType::kCommit,
+-                          rex::memory::PageAccess::kReadWrite);
+-
+   // Install MMIO handler for physical address translation and MMIO ranges
+   mmio_handler_ = runtime::MMIOHandler::Install(
+       virtual_membase_, physical_membase_, physical_membase_ + 0x1FFFFFFF, HostToGuestVirtualThunk,
+@@ -335,10 +352,11 @@ int Memory::MapViewsMac() {
+   for (size_t n = 0; n < rex::countof(map_info); n++) {
+     size_t view_size = static_cast<size_t>(map_info[n].virtual_address_end -
+                                            map_info[n].virtual_address_start + 1);
+-    size_t file_offset = static_cast<size_t>(map_info[n].target_address & granularity_mask);
++    const auto [mapping, offset] = ViewSource(n);
++    size_t file_offset = static_cast<size_t>(offset & granularity_mask);
+     void* target_address = mapping_base + map_info[n].virtual_address_start;
+     void* result = mmap(target_address, view_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+-                        mapping_, file_offset);
++                        mapping, file_offset);
+     if (result == MAP_FAILED || result != target_address) {
+       int err = errno;
+       REXSYS_ERROR(
+@@ -358,16 +376,36 @@ int Memory::MapViewsMac() {
+ }
+ #endif  // REX_PLATFORM_MAC
+ 
++std::pair<rex::memory::FileMappingHandle, uint64_t> Memory::ViewSource(size_t n) const {
++  const uint64_t target = map_info[n].target_address;
++  if (target >= kPhysicalTargetBase) {
++    return {physical_mapping_, target - kPhysicalTargetBase};
++  }
++  return {mapping_, target};
++}
++
++// Whether the view holding a guest virtual address maps guest physical memory.
++static bool MapsPhysicalMemory(uint32_t virtual_address) {
++  for (const auto& view : map_info) {
++    if (virtual_address >= view.virtual_address_start &&
++        virtual_address <= view.virtual_address_end) {
++      return view.target_address >= kPhysicalTargetBase;
++    }
++  }
++  return false;
++}
++
+ int Memory::MapViews(uint8_t* mapping_base) {
+   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
+   // side if system allocation granularity is bigger than 4 KB.
+   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+   for (size_t n = 0; n < rex::countof(map_info); n++) {
++    const auto [mapping, offset] = ViewSource(n);
+     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
+-        mapping_, mapping_base + map_info[n].virtual_address_start,
++        mapping, mapping_base + map_info[n].virtual_address_start,
+         map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1,
+-        rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
++        rex::memory::PageAccess::kReadWrite, offset & granularity_mask));
+     if (!views_.all_views[n]) {
+       // Failed, so bail and try again.
+       UnmapViews();
+@@ -381,7 +419,7 @@ void Memory::UnmapViews() {
+   for (size_t n = 0; n < rex::countof(views_.all_views); n++) {
+     if (views_.all_views[n]) {
+       size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
+-      rex::memory::UnmapFileView(mapping_, views_.all_views[n], length);
++      rex::memory::UnmapFileView(ViewSource(n).first, views_.all_views[n], length);
+     }
+   }
+ }
+@@ -516,8 +554,14 @@ bool Memory::AddVirtualMappedRange(uint32_t virtual_address, uint32_t mask, uint
+       reinterpret_cast<uintptr_t>(range_start) & ~(uintptr_t(host_page_size) - 1));
+   const size_t aligned_length =
+       rex::round_up(size_t(range_start - aligned_start) + size, host_page_size);
+-  if (!rex::memory::AllocFixed(aligned_start, aligned_length, rex::memory::AllocationType::kCommit,
+-                               rex::memory::PageAccess::kNoAccess)) {
++  // Guest physical memory, which holds the windows at 0x7F000000, is committed already.
++  const bool mapped =
++      MapsPhysicalMemory(virtual_address)
++          ? rex::memory::Protect(aligned_start, aligned_length, rex::memory::PageAccess::kNoAccess)
++          : rex::memory::AllocFixed(aligned_start, aligned_length,
++                                    rex::memory::AllocationType::kCommit,
++                                    rex::memory::PageAccess::kNoAccess) != nullptr;
++  if (!mapped) {
+     REXSYS_ERROR("Unable to map range; commit/protect failed");
+     return false;
+   }
+@@ -1056,6 +1100,15 @@ void BaseHeap::Dispose() {
+   }
+ }
+ 
++bool BaseHeap::AllocHostPages(void* host_address, size_t length, rex::memory::AllocationType type,
++                              rex::memory::PageAccess access) {
++  if (heap_type_ != memory::HeapType::kGuestPhysical) {
++    return rex::memory::AllocFixed(host_address, length, type, access) != nullptr;
++  }
++  return type == rex::memory::AllocationType::kReserve ||
++         rex::memory::Protect(host_address, length, access, nullptr);
++}
++
+ void BaseHeap::DumpMap() {
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
+   REXSYS_ERROR("------------------------------------------------------------------");
+@@ -1198,8 +1251,8 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
+     if (!reconcile_host_pages) {
+       // Commit the memory if it isn't already. We do not need to reserve any
+       // memory, as the mapping has already taken care of that.
+-      rex::memory::AllocFixed(addr, page_size_, memory::AllocationType::kCommit,
+-                              memory::PageAccess::kReadWrite);
++      AllocHostPages(addr, page_size_, memory::AllocationType::kCommit,
++                     memory::PageAccess::kReadWrite);
+       // Read into memory with R/W protection, then restore the saved
+       // protection.
+       // TODO(DrChat): read compressed with snappy.
+@@ -1220,9 +1273,8 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
+         uint32_t(((uint64_t(i) << page_size_shift_) + host_address_offset_) / host_page_size);
+     if (host_page != writable_host_page) {
+       uint8_t* host_page_pointer = membase_ + heap_base_ + size_t(host_page) * host_page_size;
+-      if (!rex::memory::AllocFixed(host_page_pointer, host_page_size,
+-                                   memory::AllocationType::kCommit,
+-                                   memory::PageAccess::kReadWrite)) {
++      if (!AllocHostPages(host_page_pointer, host_page_size, memory::AllocationType::kCommit,
++                          memory::PageAccess::kReadWrite)) {
+         REXSYS_ERROR("BaseHeap::Restore failed to make host page {} writable", host_page);
+         return false;
+       }
+@@ -1347,10 +1399,8 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
+     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
+                           ? rex::memory::AllocationType::kCommit
+                           : rex::memory::AllocationType::kReserve;
+-    void* result =
+-        rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
+-                                page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
+-    if (!result) {
++    if (!AllocHostPages(TranslateRelative(start_page_number << page_size_shift_),
++                        page_count << page_size_shift_, alloc_type, ToPageAccess(protect))) {
+       REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
+       return false;
+     }
+@@ -1510,10 +1560,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
+                           ? rex::memory::AllocationType::kCommit
+                           : rex::memory::AllocationType::kReserve;
+-    void* result =
+-        rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
+-                                page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
+-    if (!result) {
++    if (!AllocHostPages(TranslateRelative(start_page_number << page_size_shift_),
++                        page_count << page_size_shift_, alloc_type, ToPageAccess(protect))) {
+       REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
+       return false;
+     }
+-- 
+2.50.1
+

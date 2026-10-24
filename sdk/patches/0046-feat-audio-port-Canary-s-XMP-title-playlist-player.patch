@@ -1,0 +1,2556 @@
+From 0ba3e932b1f7b612ed38e20e1e4f2e004adcf04e Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:37:08 -0400
+Subject: [PATCH 46/48] feat(audio): port Canary's XMP title-playlist player
+
+Titles that ship their own soundtrack hand it to the XMP (Xbox Music
+Player) as a title playlist and ask the system to play it: PGR4 registers
+115 WMA tracks with XMPCreateTitlePlaylist and then drives them with
+XMPPlayTitlePlaylist, XMPNext, XMPPause and XMPContinue. The ReXGlue XmpApp
+stored the playlists and reported a playing state but decoded nothing
+("Playlist playback not supported"), so those titles had no music.
+
+This ports the player from Xenia Canary 451f915:
+
+- src/xenia/apu/audio_media_player.{h,cc} -> rex/audio/audio_media_player
+  (AudioMediaPlayer: playlists, play/pause/next/previous, repeat and
+  shuffle, per-controller settings, state-change notifications).
+- src/xenia/kernel/xam/apps/xmp_app.{h,cc} -> the XmpApp message layer
+  (0x70002-0x70053, XMPAccessCheck, the XMP_* argument structures and the
+  XMP notification IDs).
+
+AudioSystem owns the player, creates it in Setup and shuts it down before
+its own drivers go. Songs are opened through the guest file system, decoded
+with libavformat/libavcodec (wmav2, wmapro, mp3) and fed to a host-format
+driver from AudioSystem::CreateDriver at the song's own rate and channel
+count; the pacing driver stands in when no device opens.
+
+Where the port differs from Canary:
+
+- The worker handshake is a mutex, a condition variable and a stop serial
+  instead of Canary's busy fences, so a stopped or idle player sleeps.
+- The demuxer reads the song through AVIO callbacks over one buffer, and
+  decoded samples go through one reusable vector; nothing is allocated per
+  frame. The decoder is drained at end of file and the last partial frame
+  is zero-padded rather than dropped.
+- The end of a song waits until the driver has returned every queued
+  frame (with a stall timeout unless paused), so a track is not cut short
+  before the next one starts.
+- XMP_SONGINFO.handle is big-endian (Canary stores a native X_HANDLE), the
+  song format is read once through rex::be (Canary swaps it twice), and
+  XMPGetCurrentSong writes at most 39 characters per string so the
+  terminator survives and a long tag cannot run into the next field.
+- With audio disabled there is no player; XmpApp answers X_E_FAIL and
+  warns once instead of dereferencing null.
+- The XMPCaptureOutput callback stays disabled, as in Canary.
+
+New cvars: enable_xmp (Canary's) and xmp_default_volume, which stands in
+for the dashboard music volume Canary reads from XCONFIG (default 0.7)
+until the title sets one.
+
+xtypes.h gains X_ERROR_NOT_SUPPORTED, X_E_ACCESS_DENIED and
+X_E_NOT_SUPPORTED from Canary's xbox.h for the message layer.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/audio/audio_media_player.h | 215 +++++++
+ include/rex/audio/audio_system.h       |   4 +
+ include/rex/kernel/xam/apps/xmp_app.h  | 308 ++++++++--
+ include/rex/system/xtypes.h            |   3 +
+ src/audio/CMakeLists.txt               |   1 +
+ src/audio/audio_media_player.cpp       | 818 +++++++++++++++++++++++++
+ src/audio/audio_system.cpp             |   9 +
+ src/kernel/xam/apps/xmp_app.cpp        | 815 +++++++++++++++---------
+ 8 files changed, 1834 insertions(+), 339 deletions(-)
+ create mode 100644 include/rex/audio/audio_media_player.h
+ create mode 100644 src/audio/audio_media_player.cpp
+
+diff --git a/include/rex/audio/audio_media_player.h b/include/rex/audio/audio_media_player.h
+new file mode 100644
+index 0000000..bed4820
+--- /dev/null
++++ b/include/rex/audio/audio_media_player.h
+@@ -0,0 +1,215 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2024 Xenia Canary. All rights reserved.                          *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    2026 - Ported to the ReXGlue runtime from Xenia Canary 451f915
++ */
++
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <span>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <rex/audio/audio_driver.h>
++#include <rex/kernel/xam/apps/xmp_app.h>
++#include <rex/thread.h>
++
++struct AVCodecContext;
++struct AVFormatContext;
++struct AVFrame;
++
++namespace rex::system {
++class KernelState;
++}  // namespace rex::system
++
++namespace rex::audio {
++
++class AudioSystem;
++
++using XmpApp = kernel::xam::apps::XmpApp;
++
++// Plays XMP title playlists: decodes the WMA or MP3 files a title registers and
++// feeds the PCM to a host-format driver, outside the guest audio clients.
++class AudioMediaPlayer {
++ public:
++  AudioMediaPlayer(AudioSystem* audio_system, system::KernelState* kernel_state);
++  ~AudioMediaPlayer();
++
++  void Setup();
++  // Stops playback and joins the worker. The player stays usable as a state
++  // holder, but plays nothing more.
++  void Shutdown();
++
++  X_STATUS Play(uint32_t playlist_handle, uint32_t song_handle, bool force);
++  X_STATUS Next();
++  X_STATUS Previous();
++
++  void Stop(bool change_state = false, bool force = true);
++  void Pause();
++  void Continue();
++
++  XmpApp::State GetState() const { return state_.load(std::memory_order_acquire); }
++
++  bool IsIdle() const { return GetState() == XmpApp::State::kIdle; }
++  bool IsPlaying() const { return GetState() == XmpApp::State::kPlaying; }
++  bool IsPaused() const { return GetState() == XmpApp::State::kPaused; }
++  bool IsSongLoaded() const { return active_song_.load(std::memory_order_acquire) != nullptr; }
++
++  bool IsInRepeatMode() const { return repeat_mode_ == XmpApp::RepeatMode::kPlaylist; }
++
++  bool IsLastSongInPlaylist() const;
++
++  X_STATUS SetVolume(float volume);
++  const std::atomic<float>* GetVolume() const { return &volume_; }
++
++  void SetPlaybackMode(XmpApp::PlaybackMode playback_mode) { playback_mode_ = playback_mode; }
++  XmpApp::PlaybackMode GetPlaybackMode() const { return playback_mode_; }
++
++  void SetRepeatMode(XmpApp::RepeatMode repeat_mode) { repeat_mode_ = repeat_mode; }
++  XmpApp::RepeatMode GetRepeatMode() { return repeat_mode_; }
++
++  void SetPlaybackFlags(XmpApp::PlaybackFlags playback_flags) { playback_flags_ = playback_flags; }
++  XmpApp::PlaybackFlags GetPlaybackFlags() const { return playback_flags_; }
++
++  struct ControllerSettings {
++    XmpApp::PlaybackMode playback_mode = XmpApp::PlaybackMode::kInOrder;
++    XmpApp::RepeatMode repeat_mode = XmpApp::RepeatMode::kPlaylist;
++    XmpApp::PlaybackFlags playback_flags = XmpApp::PlaybackFlags::kDefault;
++    // Initial return before anything sets it.
++    // 20 x log10(0.251189) = -12 dB
++    float volume = 0.251189f;
++  };
++  ControllerSettings& GetControllerSettings(XMP_CLIENT xmp_client);
++
++  void SetXMPOverride(bool xmp_override) { xmp_override_ = xmp_override; }
++  bool IsXMPOverrideEnabled() const { return xmp_override_; }
++
++  uint32_t GetDashInitState() const { return dash_init_state; }
++
++  void SetXMPClient(XMP_CLIENT xmp_client) { xmp_client_ = xmp_client; }
++
++  void SetPlaybackController(PlaybackController playback_controller);
++
++  PlaybackController GetPlaybackController() const { return playback_controller_; }
++
++  XMP_CLIENT GetXMPClient() const { return xmp_client_; }
++
++  bool IsTitleInPlaybackControl() const {
++    if (IsXMPOverrideEnabled()) {
++      return false;
++    }
++
++    const bool game_control =
++        xmp_client_ == XMP_CLIENT::Game && playback_controller_ == PlaybackController::Game;
++
++    return game_control || xmp_override_ || is_title_rendering_enabled_;
++  }
++
++  void SetCaptureCallback(uint32_t callback, uint32_t context, bool title_render);
++
++  void AddPlaylist(uint32_t handle, std::unique_ptr<XmpApp::Playlist> playlist);
++  void RemovePlaylist(uint32_t handle);
++
++  XmpApp::Song* GetCurrentSong() const { return active_song_.load(std::memory_order_acquire); }
++
++ private:
++  enum class PlayResult { kSuccessful, kForcedFinish, kFailure };
++
++  struct Request {
++    std::u16string file_path;
++    uint32_t song_handle = 0;
++    // stop_serial_ when the song was picked; a Stop since then bumps it.
++    uint32_t serial = 0;
++  };
++
++  void OnStateChanged();
++
++  void WorkerThreadMain();
++  void PlaySong(const Request& request);
++  PlayResult DecodeSong(const Request& request, AVFormatContext* format_context,
++                        AVCodecContext* codec_context, int stream_index);
++  // Appends the frame to pending_samples_ and submits every whole driver frame.
++  // False when the song was stopped while waiting for a free slot.
++  bool QueueFrame(const Request& request, const AVFrame* frame, int channel_count);
++  bool SubmitFrame(const Request& request, float* samples);
++  void DrainDriver(const Request& request);
++  void EndSong(const Request& request, PlayResult result);
++  std::span<uint8_t> LoadSongToMemory(const std::u16string& file_path);
++
++  bool IsCurrent(const Request& request) const {
++    return stop_serial_.load(std::memory_order_acquire) == request.serial;
++  }
++
++  // Requires mutex_. Returns whether a song was playing or paused.
++  bool StopLocked(std::unique_lock<std::mutex>& lock, bool force);
++  // Requires mutex_. Queues song for the worker.
++  void StartLocked(XmpApp::Song* song);
++  XmpApp::Playlist* FindPlaylistLocked(uint32_t handle) const;
++  bool IsLastSongInPlaylistLocked() const;
++  // Requires mutex_. The song after (or before) current_song_handle_ in the
++  // active playlist, wrapping around; null when there is none.
++  XmpApp::Song* AdjacentSongLocked(bool forward) const;
++  void WakeWorker();
++
++  std::atomic<XmpApp::State> state_ = XmpApp::State::kIdle;
++  bool xmp_override_ = false;
++  XmpApp::PlaybackMode playback_mode_ = XmpApp::PlaybackMode::kInOrder;
++  XmpApp::RepeatMode repeat_mode_ = XmpApp::RepeatMode::kPlaylist;
++  XmpApp::PlaybackFlags playback_flags_ = XmpApp::PlaybackFlags::kDefault;
++  PlaybackController playback_controller_ = PlaybackController::Game;
++  XMP_CLIENT xmp_client_ = XMP_CLIENT::Game;
++  ControllerSettings controller_settings_[4];
++  std::atomic<float> volume_ = 0.0f;
++  uint32_t dash_init_state = 0;
++
++  std::unordered_map<uint32_t, std::unique_ptr<XmpApp::Playlist>> playlists_;
++  XmpApp::Playlist* active_playlist_ = nullptr;
++  std::atomic<XmpApp::Song*> active_song_ = nullptr;
++
++  uint32_t current_song_handle_ = 0;
++
++  uint32_t callback_ = 0;
++  uint32_t callback_context_ = 0;
++  bool is_title_rendering_enabled_ = false;
++
++  AudioSystem* audio_system_ = nullptr;
++  system::KernelState* kernel_state_ = nullptr;
++
++  // Guards the playlists, the active song and the worker handshake below.
++  mutable std::mutex mutex_;
++  std::condition_variable worker_cv_;
++  bool worker_running_ = false;
++  // A song was picked and the worker has not taken it yet.
++  bool start_requested_ = false;
++  // The worker is between taking a song and finishing with it.
++  bool in_play_ = false;
++  std::atomic<uint32_t> stop_serial_ = 0;
++  std::unique_ptr<rex::thread::Thread> worker_thread_;
++
++  // Interleaved decoder output not yet submitted. It only grows to the largest
++  // decoded frame, so steady decoding allocates nothing.
++  std::vector<float> pending_samples_;
++  size_t pending_count_ = 0;
++
++  // Driver part - This should be integrated into audio_system, but it isn't
++  // really compatible with it.
++  std::unique_ptr<AudioDriver> driver_ = nullptr;
++  std::unique_ptr<rex::thread::Semaphore> driver_semaphore_ = {};
++  std::mutex driver_mutex_ = {};
++
++  bool SetupDriver(uint32_t sample_rate, uint32_t channels);
++  void DeleteDriver();
++};
++
++}  // namespace rex::audio
+diff --git a/include/rex/audio/audio_system.h b/include/rex/audio/audio_system.h
+index be3601d..0343ab8 100644
+--- a/include/rex/audio/audio_system.h
++++ b/include/rex/audio/audio_system.h
+@@ -31,6 +31,7 @@ namespace rex::audio {
+ constexpr memory::fourcc_t kAudioSaveSignature = memory::make_fourcc("XAUD");
+ 
+ class AudioDriver;
++class AudioMediaPlayer;
+ class XmaDecoder;
+ 
+ class AudioSystem : public system::IAudioSystem {
+@@ -40,6 +41,8 @@ class AudioSystem : public system::IAudioSystem {
+   memory::Memory* memory() const { return memory_; }
+   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
+   XmaDecoder* xma_decoder() const { return xma_decoder_.get(); }
++  // The XMP title-playlist player. Created by Setup.
++  AudioMediaPlayer* media_player() const { return media_player_.get(); }
+ 
+   virtual X_STATUS Setup(system::KernelState* kernel_state);
+   virtual void Shutdown();
+@@ -75,6 +78,7 @@ class AudioSystem : public system::IAudioSystem {
+   memory::Memory* memory_ = nullptr;
+   runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
+   std::unique_ptr<XmaDecoder> xma_decoder_;
++  std::unique_ptr<AudioMediaPlayer> media_player_;
+   uint32_t queued_frames_;
+ 
+   std::atomic<bool> worker_running_ = {false};
+diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
+index d939d62..500d3a7 100644
+--- a/include/rex/kernel/xam/apps/xmp_app.h
++++ b/include/rex/kernel/xam/apps/xmp_app.h
+@@ -8,17 +8,39 @@
+  ******************************************************************************
+  *
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ * @modified    2026 - Message layer ported from Xenia Canary 451f915
+  */
+ 
+ #include <memory>
+ #include <string>
+-#include <unordered_map>
+ #include <vector>
+ 
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/app_manager.h>
+ #include <rex/thread/mutex.h>
+ 
++namespace rex::audio {
++class AudioMediaPlayer;
++
++enum class XMP_CLIENT : uint32_t {
++  Dash,
++  HUD,
++  Game,
++  Remote,
++  MusicPlayer,
++  MSAL,
++  MCE,
++};
++
++enum class PlaybackController : uint32_t {
++  Game,
++  User,
++  Dash,
++  MCE,
++  Restore,
++};
++}  // namespace rex::audio
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -27,6 +49,217 @@ namespace apps {
+ // Only source of docs for a lot of these functions:
+ // https://github.com/oukiar/freestyledash/blob/master/Freestyle/Scenes/Media/Music/ScnMusic.cpp
+ 
++constexpr system::XNotificationID kXNotificationXmpStateChanged = 0x0A000001;
++constexpr system::XNotificationID kXNotificationXmpPlaybackBehaviorChanged = 0x0A000002;
++constexpr system::XNotificationID kXNotificationXmpPlaybackControllerChanged = 0x0A000003;
++constexpr system::XNotificationID kXNotificationXmpTitlePlayListContentChanged = 0x8A000005;
++constexpr system::XNotificationID kXNotificationXmpDashInitChanged = 0x8A000009;
++constexpr system::XNotificationID kXNotificationXmpPlaybackBehaviorChangedEx = 0x8A00000A;
++
++struct XMP_SONGDESCRIPTOR {
++  rex::be<uint32_t> file_path_ptr;
++  rex::be<uint32_t> title_ptr;
++  rex::be<uint32_t> artist_ptr;
++  rex::be<uint32_t> album_ptr;
++  rex::be<uint32_t> album_artist_ptr;
++  rex::be<uint32_t> genre_ptr;
++  rex::be<uint32_t> track_number;
++  rex::be<uint32_t> duration;
++  rex::be<uint32_t> song_format;
++};
++static_assert_size(XMP_SONGDESCRIPTOR, 36);
++
++struct XMP_UNK_SONG_STRUCT {
++  rex::be<uint32_t> unk1;  // 0x0 - 1
++  uint8_t data1[0x2C];     // 0x4
++  rex::be<uint32_t> unk2;  // 0x30 - 3
++  uint8_t unknown[0x460];
++};
++static_assert_size(XMP_UNK_SONG_STRUCT, 0x494);
++
++constexpr uint32_t kMaxXmpMetadataStringLength = 40;
++
++struct XMP_SONGINFO {
++  rex::be<uint32_t> handle;
++
++  uint8_t unknown[0x23C];
++  rex::be<char16_t> title[kMaxXmpMetadataStringLength];
++  rex::be<char16_t> artist[kMaxXmpMetadataStringLength];
++  rex::be<char16_t> album[kMaxXmpMetadataStringLength];
++  rex::be<char16_t> album_artist[kMaxXmpMetadataStringLength];
++  rex::be<char16_t> genre[kMaxXmpMetadataStringLength];
++  rex::be<uint32_t> track_number;
++  rex::be<uint32_t> duration;
++  rex::be<uint32_t> song_format;
++  rex::be<uint32_t> unknown_1;
++};
++static_assert_size(XMP_SONGINFO, 0x3E0);
++
++struct MSAL_MEDIASOURCEINFO {
++  uint8_t data1[0x28];      // 0x0
++  rex::be<uint32_t> unkn1;  // 0x28 - 1, 6, 7
++  rex::be<uint32_t> unkn2;  // 0x2C - 2, flag?
++  rex::be<uint32_t> unkn3;  // 0x30 - 1, 5
++  uint8_t unknown[0x80];    // 0x34
++};
++static_assert_size(MSAL_MEDIASOURCEINFO, 0xB4);
++
++struct XMP_PLAY_TITLE_PLAYLIST {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> storage_ptr;
++  rex::be<uint32_t> song_handle;
++};
++static_assert_size(XMP_PLAY_TITLE_PLAYLIST, 0xC);
++
++struct XMP_STOP {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> no_wait;
++};
++static_assert_size(XMP_STOP, 0x8);
++
++struct XMP_SET_PLAYBACK_BEHAVIOR {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> playback_mode;
++  rex::be<uint32_t> repeat_mode;
++  rex::be<uint32_t> flags;
++};
++static_assert_size(XMP_SET_PLAYBACK_BEHAVIOR, 0x10);
++
++struct XMP_GET_STATUS {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> state_ptr;
++};
++static_assert_size(XMP_GET_STATUS, 0x8);
++
++struct XMP_GET_VOLUME {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> volume_ptr;
++};
++static_assert_size(XMP_GET_VOLUME, 0x8);
++
++struct XMP_SET_VOLUME {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<float> value;
++};
++static_assert_size(XMP_SET_VOLUME, 0x8);
++
++struct XMP_CREATE_TITLE_PLAYLIST {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> storage_ptr;
++  rex::be<uint32_t> storage_size;
++  rex::be<uint32_t> songs_ptr;
++  rex::be<uint32_t> song_count;
++  rex::be<uint32_t> playlist_name_ptr;
++  rex::be<uint32_t> flags;
++  rex::be<uint32_t> song_handles_ptr;
++  rex::be<uint32_t> playlist_handle_ptr;
++};
++static_assert_size(XMP_CREATE_TITLE_PLAYLIST, 0x24);
++
++struct XMP_GET_CURRENT_SONG {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> unk_ptr;   // XMP_UNK_SONG_STRUCT
++  rex::be<uint32_t> info_ptr;  // XMP_SONGINFO
++};
++static_assert_size(XMP_GET_CURRENT_SONG, 0xC);
++
++struct XMP_DELETE_TITLE_PLAYLIST {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> storage_ptr;
++};
++static_assert_size(XMP_DELETE_TITLE_PLAYLIST, 0x8);
++
++struct XMP_SET_PLAYBACK_CONTROLLER {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<audio::PlaybackController> playback_controller_request;
++  rex::be<uint32_t> playback_controller_locked;
++};
++static_assert_size(XMP_SET_PLAYBACK_CONTROLLER, 0xC);
++
++struct XMP_GET_PLAYBACK_CONTROLLER {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> playback_controller_ptr;
++  rex::be<uint32_t> playback_controller_locked_ptr;
++};
++static_assert_size(XMP_GET_PLAYBACK_CONTROLLER, 0xC);
++
++struct XMP_CREATE_USER_PLAYLIST_ENUMERATOR {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> flags;
++  rex::be<uint32_t> private_enum_structure_ptr;
++};
++static_assert_size(XMP_CREATE_USER_PLAYLIST_ENUMERATOR, 0xC);
++
++struct XMP_GET_PLAYBACK_BEHAVIOR {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> playback_mode_ptr;
++  rex::be<uint32_t> repeat_mode_ptr;
++  rex::be<uint32_t> playback_flags_ptr;
++};
++static_assert_size(XMP_GET_PLAYBACK_BEHAVIOR, 0x10);
++
++struct XMP_GET_MEDIA_SOURCES {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> get_connected_sources_only;
++  rex::be<uint32_t> media_resources_ptr;  // *MSAL_MEDIASOURCEINFO
++  rex::be<uint32_t> max_source;
++  rex::be<uint32_t> sources_returned_ptr;
++};
++static_assert_size(XMP_GET_MEDIA_SOURCES, 0x14);
++
++struct XMP_GET_TITLE_PLAYLIST_BUFFER_SIZE {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> song_count;
++  rex::be<uint32_t> size_ptr;
++};
++static_assert_size(XMP_GET_TITLE_PLAYLIST_BUFFER_SIZE, 0xC);
++
++struct XMP_DASH_INIT {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> buffer_ptr;     // used by XamEnumerate
++  rex::be<uint32_t> buffer_length;  // used by XamEnumerate
++  rex::be<uint32_t> unk1;
++  rex::be<uint32_t> unk2;
++  rex::be<uint32_t> storage_ptr;
++};
++static_assert_size(XMP_DASH_INIT, 0x18);
++
++struct XMP_GET_NUM_SONGS_IN_TITLE_PLAYLIST {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> playlist_ptr;
++  rex::be<uint32_t> song_count_ptr;
++};
++static_assert_size(XMP_GET_NUM_SONGS_IN_TITLE_PLAYLIST, 0xC);
++
++struct XMP_CAPTURE_OUTPUT {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> callback;
++  rex::be<uint32_t> context;
++  rex::be<uint32_t> title_render;
++};
++static_assert_size(XMP_CAPTURE_OUTPUT, 0x10);
++
++struct XMP_SET_MEDIA_SOURCE_WORKSPACE {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> workspace_type;
++  rex::be<uint32_t> storage_ptr;
++  rex::be<uint32_t> storage_length;
++};
++static_assert_size(XMP_SET_MEDIA_SOURCE_WORKSPACE, 0x10);
++
++struct XMP_GET_MEDIA_SOURCE {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> unk1;
++  rex::be<uint32_t> media_resources_ptr;  // *MSAL_MEDIASOURCEINFO
++};
++static_assert_size(XMP_GET_MEDIA_SOURCE, 0xC);
++
++struct XMP_GET_DASH_INIT_STATE {
++  rex::be<audio::XMP_CLIENT> xmp_client;
++  rex::be<uint32_t> dash_init_state_ptr;
++};
++static_assert_size(XMP_GET_DASH_INIT_STATE, 0x8);
++
+ class XmpApp : public system::xam::App {
+  public:
+   enum class State : uint32_t {
+@@ -34,24 +267,24 @@ class XmpApp : public system::xam::App {
+     kPlaying = 1,
+     kPaused = 2,
+   };
+-  enum class PlaybackClient : uint32_t {
+-    kSystem = 0,
+-    kTitle = 1,
+-  };
+   enum class PlaybackMode : uint32_t {
+-    // kInOrder = ?,
+-    kUnknown = 0,
++    kInOrder = 0,
++    kShuffle = 1,
+   };
+   enum class RepeatMode : uint32_t {
+-    // kNoRepeat = ?,
+-    kUnknown = 0,
++    kPlaylist = 0,
++    kNoRepeat = 1,
++  };
++  enum class PlaybackFlags : uint32_t {
++    kDefault = 0,
++    kAutoPause = 1,
++  };
++  enum class SongFormat : uint32_t {
++    kWma = 0,
++    kMp3 = 1,
+   };
+-  struct Song {
+-    enum class Format : uint32_t {
+-      kWma = 0,
+-      kMp3 = 1,
+-    };
+ 
++  struct Song {
+     uint32_t handle;
+     std::u16string file_path;
+     std::u16string name;
+@@ -61,7 +294,7 @@ class XmpApp : public system::xam::App {
+     std::u16string genre;
+     uint32_t track_number;
+     uint32_t duration_ms;
+-    Format format;
++    SongFormat format;
+   };
+   struct Playlist {
+     uint32_t handle;
+@@ -79,36 +312,35 @@ class XmpApp : public system::xam::App {
+                                    uint32_t flags, uint32_t out_song_handles,
+                                    uint32_t out_playlist_handle);
+   X_HRESULT XMPDeleteTitlePlaylist(uint32_t playlist_handle);
+-  X_HRESULT XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle);
+-  X_HRESULT XMPContinue();
+-  X_HRESULT XMPStop(uint32_t unk);
+-  X_HRESULT XMPPause();
+-  X_HRESULT XMPNext();
+-  X_HRESULT XMPPrevious();
++  X_HRESULT XMPPlayTitlePlaylist(audio::XMP_CLIENT xmp_client, uint32_t playlist_handle,
++                                 uint32_t song_handle);
++  X_HRESULT XMPAccessCheck(audio::XMP_CLIENT xmp_client);
++  X_HRESULT XMPContinue(audio::XMP_CLIENT xmp_client);
++  X_HRESULT XMPStop(audio::XMP_CLIENT xmp_client, bool no_wait);
++  X_HRESULT XMPPause(audio::XMP_CLIENT xmp_client);
++  X_HRESULT XMPNext(audio::XMP_CLIENT xmp_client);
++  X_HRESULT XMPPrevious(audio::XMP_CLIENT xmp_client);
++  X_HRESULT XMPSetPlaybackBehavior(audio::XMP_CLIENT xmp_client, PlaybackMode playback_mode,
++                                   RepeatMode repeat_mode, PlaybackFlags playback_flags);
++  X_HRESULT XMPGetPlaybackBehavior(audio::XMP_CLIENT xmp_client, uint32_t playback_mode_ptr,
++                                   uint32_t repeat_mode_ptr, uint32_t playback_flags_ptr);
++  X_HRESULT XMPSetVolume(audio::XMP_CLIENT xmp_client, float volume);
++  X_HRESULT XMPGetVolume(audio::XMP_CLIENT xmp_client, uint32_t volume_ptr);
++  X_HRESULT XMPGetTitlePlaylistBufferSize(audio::XMP_CLIENT xmp_client, uint32_t song_count,
++                                          uint32_t storage_ptr);
+ 
+   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                 uint32_t buffer_length) override;
+ 
+  private:
+-  static const uint32_t kMsgStateChanged = 0x0A000001;
+-  static const uint32_t kMsgPlaybackBehaviorChanged = 0x0A000002;
+-  static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
+-
+-  void OnStateChanged();
+-
+-  State state_;
+-  PlaybackClient playback_client_;
+-  PlaybackMode playback_mode_;
+-  RepeatMode repeat_mode_;
+-  uint32_t unknown_flags_;
+-  float volume_;
+-  Playlist* active_playlist_;
+-  int active_song_index_;
++  // Owned by the audio system, so null when the runtime runs without one.
++  audio::AudioMediaPlayer* media_player() const;
+ 
+   rex::thread::global_critical_region global_critical_region_;
+-  std::unordered_map<uint32_t, Playlist*> playlists_;
+-  uint32_t next_playlist_handle_;
+-  uint32_t next_song_handle_;
++
++  // TODO: Remove it and replace with guest handles!
++  uint32_t next_playlist_handle_ = 0;
++  uint32_t next_song_handle_ = 0;
+ };
+ 
+ }  // namespace apps
+diff --git a/include/rex/system/xtypes.h b/include/rex/system/xtypes.h
+index d0e8f67..576b41b 100644
+--- a/include/rex/system/xtypes.h
++++ b/include/rex/system/xtypes.h
+@@ -85,6 +85,7 @@ typedef uint32_t X_RESULT;
+ #define X_ERROR_ACCESS_DENIED X_RESULT_FROM_WIN32(0x00000005L)
+ #define X_ERROR_INVALID_HANDLE X_RESULT_FROM_WIN32(0x00000006L)
+ #define X_ERROR_NO_MORE_FILES X_RESULT_FROM_WIN32(0x00000012L)
++#define X_ERROR_NOT_SUPPORTED X_RESULT_FROM_WIN32(0x00000032L)
+ #define X_ERROR_INVALID_PARAMETER X_RESULT_FROM_WIN32(0x00000057L)
+ #define X_ERROR_INSUFFICIENT_BUFFER X_RESULT_FROM_WIN32(0x0000007AL)
+ #define X_ERROR_INVALID_NAME X_RESULT_FROM_WIN32(0x0000007BL)
+@@ -111,6 +112,8 @@ typedef uint32_t X_HRESULT;
+ #define X_E_FALSE static_cast<X_HRESULT>(0x80000000L)
+ #define X_E_SUCCESS X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS)
+ #define X_E_FAIL static_cast<X_HRESULT>(0x80004005L)
++#define X_E_ACCESS_DENIED X_HRESULT_FROM_WIN32(X_ERROR_ACCESS_DENIED)
++#define X_E_NOT_SUPPORTED X_HRESULT_FROM_WIN32(X_ERROR_NOT_SUPPORTED)
+ #define X_E_NO_MORE_FILES X_HRESULT_FROM_WIN32(X_ERROR_NO_MORE_FILES)
+ #define X_E_INVALIDARG X_HRESULT_FROM_WIN32(X_ERROR_INVALID_PARAMETER)
+ #define X_E_DEVICE_NOT_CONNECTED X_HRESULT_FROM_WIN32(X_ERROR_DEVICE_NOT_CONNECTED)
+diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
+index 6f0701a..5042d44 100644
+--- a/src/audio/CMakeLists.txt
++++ b/src/audio/CMakeLists.txt
+@@ -4,6 +4,7 @@
+ add_library(rexaudio OBJECT
+     
+     audio_driver.cpp
++    audio_media_player.cpp
+     audio_system.cpp
+     downmix.cpp
+     pacing_audio_driver.cpp
+diff --git a/src/audio/audio_media_player.cpp b/src/audio/audio_media_player.cpp
+new file mode 100644
+index 0000000..2c89d39
+--- /dev/null
++++ b/src/audio/audio_media_player.cpp
+@@ -0,0 +1,818 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2024 Xenia Canary. All rights reserved.                          *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    2026 - Ported to the ReXGlue runtime from Xenia Canary 451f915
++ */
++
++#include <algorithm>
++#include <cstring>
++#include <iterator>
++#include <random>
++#include <utility>
++
++#include <rex/assert.h>
++#include <rex/audio/audio_media_player.h>
++#include <rex/audio/audio_system.h>
++#include <rex/audio/pacing_audio_driver.h>
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/filesystem/entry.h>
++#include <rex/filesystem/file.h>
++#include <rex/filesystem/vfs.h>
++#include <rex/logging.h>
++#include <rex/string/utf8.h>
++#include <rex/system/kernel_state.h>
++
++extern "C" {
++#if REX_COMPILER_MSVC
++#pragma warning(push)
++#pragma warning(disable : 4101 4244 5033)
++#endif
++#include "libavcodec/avcodec.h"
++#include "libavformat/avformat.h"
++#include "libavformat/avio.h"
++#if REX_COMPILER_MSVC
++#pragma warning(pop)
++#endif
++}  // extern "C"
++
++REXCVAR_DEFINE_BOOL(enable_xmp, true, "Audio", "Enables Music Player playback.");
++REXCVAR_DEFINE_DOUBLE(xmp_default_volume, 0.7, "Audio",
++                      "Music Player volume (0.0-1.0) until the title sets one. Stands in for "
++                      "the dashboard music volume setting, which defaults to 0.7.");
++
++namespace rex::audio {
++
++namespace {
++
++// Same budget as a guest audio client: about 1.1 s of 44.1 kHz stereo.
++constexpr uint32_t kQueuedFrames = 64;
++constexpr int kAvioBufferSize = 32 * 1024;
++// Longest a playing driver may go without returning a slot before the end of
++// a song stops waiting for it.
++constexpr std::chrono::milliseconds kDrainStallTimeout{250};
++
++struct SongReader {
++  const uint8_t* data;
++  int64_t size;
++  int64_t position;
++};
++
++int ReadSong(void* opaque, uint8_t* buffer, int buffer_size) {
++  auto* reader = static_cast<SongReader*>(opaque);
++  const int64_t left = reader->size - reader->position;
++  if (left <= 0) {
++    return AVERROR_EOF;
++  }
++  const int count = static_cast<int>(std::min<int64_t>(buffer_size, left));
++  std::memcpy(buffer, reader->data + reader->position, count);
++  reader->position += count;
++  return count;
++}
++
++int64_t SeekSong(void* opaque, int64_t offset, int whence) {
++  auto* reader = static_cast<SongReader*>(opaque);
++  if (whence & AVSEEK_SIZE) {
++    return reader->size;
++  }
++  int64_t position;
++  switch (whence & ~AVSEEK_FORCE) {
++    case SEEK_SET:
++      position = offset;
++      break;
++    case SEEK_CUR:
++      position = reader->position + offset;
++      break;
++    case SEEK_END:
++      position = reader->size + offset;
++      break;
++    default:
++      return AVERROR(EINVAL);
++  }
++  if (position < 0 || position > reader->size) {
++    return AVERROR(EINVAL);
++  }
++  reader->position = position;
++  return position;
++}
++
++// Opens the first audio stream of a song already in memory. The demuxer reads
++// through io, which the caller keeps and frees.
++bool OpenSong(AVIOContext* io, AVFormatContext** out_format, AVCodecContext** out_codec,
++              int* out_stream_index) {
++  AVFormatContext* format_context = avformat_alloc_context();
++  if (!format_context) {
++    return false;
++  }
++  format_context->pb = io;
++  // Frees format_context on failure.
++  int ret = avformat_open_input(&format_context, nullptr, nullptr, nullptr);
++  if (ret < 0) {
++    REXAPU_ERROR("AudioMediaPlayer: avformat_open_input failed: {:X}", ret);
++    return false;
++  }
++  *out_format = format_context;
++
++  ret = avformat_find_stream_info(format_context, nullptr);
++  if (ret < 0) {
++    REXAPU_ERROR("AudioMediaPlayer: avformat_find_stream_info failed: {:X}", ret);
++    return false;
++  }
++  const int stream_index =
++      av_find_best_stream(format_context, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
++  if (stream_index < 0) {
++    REXAPU_ERROR("AudioMediaPlayer: no audio stream");
++    return false;
++  }
++  const AVCodecParameters* parameters = format_context->streams[stream_index]->codecpar;
++  const AVCodec* decoder = avcodec_find_decoder(parameters->codec_id);
++  if (!decoder) {
++    REXAPU_ERROR("AudioMediaPlayer: no decoder for codec {}",
++                 static_cast<int>(parameters->codec_id));
++    return false;
++  }
++  AVCodecContext* codec_context = avcodec_alloc_context3(decoder);
++  if (!codec_context) {
++    return false;
++  }
++  *out_codec = codec_context;
++  ret = avcodec_parameters_to_context(codec_context, parameters);
++  if (ret < 0) {
++    return false;
++  }
++  ret = avcodec_open2(codec_context, decoder, nullptr);
++  if (ret < 0) {
++    REXAPU_ERROR("AudioMediaPlayer: avcodec_open2 failed: {:X}", ret);
++    return false;
++  }
++  *out_stream_index = stream_index;
++  return true;
++}
++
++}  // namespace
++
++AudioMediaPlayer::AudioMediaPlayer(AudioSystem* audio_system, system::KernelState* kernel_state)
++    : volume_(static_cast<float>(std::clamp(REXCVAR_GET(xmp_default_volume), 0.0, 1.0))),
++      audio_system_(audio_system),
++      kernel_state_(kernel_state) {}
++
++AudioMediaPlayer::~AudioMediaPlayer() {
++  Shutdown();
++}
++
++void AudioMediaPlayer::Setup() {
++  if (!REXCVAR_GET(enable_xmp)) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (worker_thread_) {
++    return;
++  }
++  worker_running_ = true;
++  worker_thread_ = rex::thread::Thread::Create({}, [this] { WorkerThreadMain(); });
++  if (!worker_thread_) {
++    worker_running_ = false;
++    REXAPU_ERROR("AudioMediaPlayer: failed to create the worker thread");
++    return;
++  }
++  worker_thread_->set_name("Audio Media Player");
++}
++
++void AudioMediaPlayer::Shutdown() {
++  {
++    std::unique_lock<std::mutex> lock(mutex_);
++    StopLocked(lock, true);
++    worker_running_ = false;
++    worker_cv_.notify_all();
++  }
++  if (worker_thread_) {
++    rex::thread::Wait(worker_thread_.get(), false);
++    worker_thread_.reset();
++  }
++  DeleteDriver();
++}
++
++void AudioMediaPlayer::WorkerThreadMain() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  while (true) {
++    worker_cv_.wait(lock, [this] { return !worker_running_ || start_requested_; });
++    if (!worker_running_) {
++      break;
++    }
++    start_requested_ = false;
++    XmpApp::Song* song = active_song_.load(std::memory_order_relaxed);
++    if (!song) {
++      continue;
++    }
++    // The playlist can go away while the song plays, so the worker keeps its
++    // own copy of what it needs.
++    Request request;
++    request.file_path = song->file_path;
++    request.song_handle = song->handle;
++    request.serial = stop_serial_.load(std::memory_order_relaxed);
++    in_play_ = true;
++
++    lock.unlock();
++    PlaySong(request);
++    lock.lock();
++  }
++}
++
++X_STATUS AudioMediaPlayer::Play(uint32_t playlist_handle, uint32_t song_handle, bool force) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (!FindPlaylistLocked(playlist_handle)) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++
++  // I've set it to false (force) for PGR3
++  if (!IsIdle() || IsSongLoaded() || in_play_) {
++    StopLocked(lock, force);
++  }
++
++  // Look again: the wait for the worker released the lock.
++  XmpApp::Playlist* playlist = FindPlaylistLocked(playlist_handle);
++  if (!playlist || playlist->songs.empty()) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++  active_playlist_ = playlist;
++
++  if (!song_handle) {
++    StartLocked(playlist->songs.front().get());
++    return X_STATUS_SUCCESS;
++  }
++
++  auto song_itr = std::ranges::find_if(
++      std::as_const(playlist->songs),
++      [song_handle](const std::unique_ptr<XmpApp::Song>& song) {
++        return song->handle == song_handle;
++      });
++  if (song_itr == playlist->songs.cend()) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++
++  StartLocked(song_itr->get());
++  return X_STATUS_SUCCESS;
++}
++
++void AudioMediaPlayer::PlaySong(const Request& request) {
++  std::span<uint8_t> song_buffer = LoadSongToMemory(request.file_path);
++  if (song_buffer.empty()) {
++    REXAPU_ERROR("AudioMediaPlayer: cannot read {}", rex::string::to_utf8(request.file_path));
++    EndSong(request, PlayResult::kFailure);
++    return;
++  }
++
++  SongReader reader = {song_buffer.data(), static_cast<int64_t>(song_buffer.size()), 0};
++  AVIOContext* io = nullptr;
++  if (auto* io_buffer = static_cast<uint8_t*>(av_malloc(kAvioBufferSize))) {
++    io = avio_alloc_context(io_buffer, kAvioBufferSize, 0, &reader, ReadSong, nullptr, SeekSong);
++    if (!io) {
++      av_free(io_buffer);
++    }
++  }
++
++  AVFormatContext* format_context = nullptr;
++  AVCodecContext* codec_context = nullptr;
++  int stream_index = -1;
++  PlayResult result = PlayResult::kFailure;
++  if (io && OpenSong(io, &format_context, &codec_context, &stream_index)) {
++    if (SetupDriver(codec_context->sample_rate, codec_context->channels)) {
++      bool started = false;
++      {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (IsCurrent(request)) {
++          state_.store(XmpApp::State::kPlaying, std::memory_order_release);
++          started = true;
++        }
++      }
++      if (started) {
++        OnStateChanged();
++        {
++          std::lock_guard<std::mutex> guard(driver_mutex_);
++          // Always apply the stored volume to the newly created driver
++          driver_->SetVolume(volume_);
++        }
++        result = DecodeSong(request, format_context, codec_context, stream_index);
++        if (result == PlayResult::kSuccessful) {
++          DrainDriver(request);
++        }
++      } else {
++        result = PlayResult::kForcedFinish;
++      }
++    } else {
++      REXAPU_ERROR("AudioMediaPlayer: driver initialization failed");
++    }
++  } else {
++    REXAPU_ERROR("AudioMediaPlayer: cannot decode {}", rex::string::to_utf8(request.file_path));
++  }
++
++  // Cleanup after work. The demuxer does not own a caller-supplied AVIO context.
++  avcodec_free_context(&codec_context);
++  avformat_close_input(&format_context);
++  if (io) {
++    av_freep(&io->buffer);
++    avio_context_free(&io);
++  }
++  av_free(song_buffer.data());
++
++  EndSong(request, result);
++}
++
++AudioMediaPlayer::PlayResult AudioMediaPlayer::DecodeSong(const Request& request,
++                                                          AVFormatContext* format_context,
++                                                          AVCodecContext* codec_context,
++                                                          int stream_index) {
++  AVPacket* packet = av_packet_alloc();
++  AVFrame* frame = av_frame_alloc();
++  if (!packet || !frame) {
++    av_frame_free(&frame);
++    av_packet_free(&packet);
++    return PlayResult::kFailure;
++  }
++
++  const int channel_count = codec_context->channels;
++  PlayResult result = PlayResult::kSuccessful;
++  pending_count_ = 0;
++  bool end_of_file = false;
++  while (!end_of_file && result == PlayResult::kSuccessful) {
++    if (!IsCurrent(request)) {
++      result = PlayResult::kForcedFinish;
++      break;
++    }
++
++    int ret = av_read_frame(format_context, packet);
++    if (ret < 0) {
++      // Drain the decoder, which still holds the last frame.
++      end_of_file = true;
++      ret = avcodec_send_packet(codec_context, nullptr);
++    } else if (packet->stream_index != stream_index) {
++      av_packet_unref(packet);
++      continue;
++    } else {
++      ret = avcodec_send_packet(codec_context, packet);
++      av_packet_unref(packet);
++    }
++    if (ret < 0) {
++      REXAPU_WARN("AudioMediaPlayer: error sending packet for decoding: {:X}", ret);
++      continue;
++    }
++
++    while (true) {
++      ret = avcodec_receive_frame(codec_context, frame);
++      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
++        break;
++      }
++      if (ret < 0) {
++        REXAPU_WARN("AudioMediaPlayer: error during decoding: {:X}", ret);
++        break;
++      }
++      if (!QueueFrame(request, frame, channel_count)) {
++        result = PlayResult::kForcedFinish;
++        break;
++      }
++    }
++  }
++
++  // The tail of the song is shorter than a frame; pad it rather than drop it.
++  if (result == PlayResult::kSuccessful && pending_count_) {
++    std::fill(pending_samples_.begin() + pending_count_,
++              pending_samples_.begin() + AudioDriver::kFrameSamplesMax, 0.0f);
++    if (!SubmitFrame(request, pending_samples_.data())) {
++      result = PlayResult::kForcedFinish;
++    }
++  }
++  pending_count_ = 0;
++
++  av_frame_free(&frame);
++  av_packet_free(&packet);
++  return result;
++}
++
++bool AudioMediaPlayer::QueueFrame(const Request& request, const AVFrame* frame,
++                                  int channel_count) {
++  const size_t frame_samples = static_cast<size_t>(frame->nb_samples) * channel_count;
++  const size_t needed =
++      std::max<size_t>(pending_count_ + frame_samples, AudioDriver::kFrameSamplesMax);
++  if (pending_samples_.size() < needed) {
++    pending_samples_.resize(needed);
++  }
++
++  float* out = pending_samples_.data() + pending_count_;
++  switch (frame->format) {
++    case AV_SAMPLE_FMT_FLTP:
++      for (int sample = 0; sample < frame->nb_samples; sample++) {
++        for (int ch = 0; ch < channel_count; ch++) {
++          *out++ = reinterpret_cast<const float*>(frame->data[ch])[sample];
++        }
++      }
++      break;
++    case AV_SAMPLE_FMT_FLT:
++      std::memcpy(out, frame->data[0], frame_samples * sizeof(float));
++      break;
++    default:
++      return true;
++  }
++  pending_count_ += frame_samples;
++
++  size_t offset = 0;
++  while (pending_count_ - offset >= AudioDriver::kFrameSamplesMax) {
++    if (!SubmitFrame(request, pending_samples_.data() + offset)) {
++      pending_count_ = 0;
++      return false;
++    }
++    offset += AudioDriver::kFrameSamplesMax;
++  }
++  if (offset) {
++    pending_count_ -= offset;
++    std::memmove(pending_samples_.data(), pending_samples_.data() + offset,
++                 pending_count_ * sizeof(float));
++  }
++  return true;
++}
++
++bool AudioMediaPlayer::SubmitFrame(const Request& request, float* samples) {
++  // Stop releases a slot to get the worker out of this wait.
++  rex::thread::Wait(driver_semaphore_.get(), false);
++  if (!IsCurrent(request)) {
++    return false;
++  }
++
++  // XMP should be processed on Audio thread. Some games goes insane when they
++  // have additional unexpected guest thread (NG2 for example). Canary leaves the
++  // XMPCaptureOutput callback disabled for that reason, and so does this port.
++  driver_->SubmitFrame(samples);
++  return true;
++}
++
++void AudioMediaPlayer::DrainDriver(const Request& request) {
++  // Every slot back means the driver has played every frame of the song. Canary
++  // waits for one slot only, and the next song's driver drops the rest.
++  uint32_t returned = 0;
++  while (returned < kQueuedFrames && IsCurrent(request)) {
++    if (rex::thread::Wait(driver_semaphore_.get(), false, kDrainStallTimeout) ==
++        rex::thread::WaitResult::kSuccess) {
++      ++returned;
++    } else if (!IsPaused()) {
++      break;
++    }
++  }
++}
++
++void AudioMediaPlayer::EndSong(const Request& request, PlayResult result) {
++  bool state_changed = false;
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    in_play_ = false;
++    // A Stop, Next, Previous or Play since the song was picked already chose
++    // what happens next.
++    if (IsCurrent(request)) {
++      state_changed = !IsIdle();
++      state_.store(XmpApp::State::kIdle, std::memory_order_release);
++      active_song_.store(nullptr, std::memory_order_release);
++      if (result == PlayResult::kSuccessful && active_playlist_ &&
++          !active_playlist_->songs.empty()) {
++        if (!IsLastSongInPlaylistLocked()) {
++          if (XmpApp::Song* next = AdjacentSongLocked(true)) {
++            StartLocked(next);
++          }
++        } else if (IsInRepeatMode()) {
++          // We're after last song in playlist
++          StartLocked(active_playlist_->songs.front().get());
++        }
++      }
++    }
++    worker_cv_.notify_all();
++  }
++
++  if (state_changed) {
++    OnStateChanged();
++  }
++  // A drained driver has nothing left to play, and one that was stopped must
++  // not play out its queue.
++  DeleteDriver();
++}
++
++void AudioMediaPlayer::Pause() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!IsPlaying()) {
++      return;
++    }
++    {
++      std::lock_guard<std::mutex> guard(driver_mutex_);
++      if (driver_) {
++        driver_->Pause();
++      }
++    }
++    state_.store(XmpApp::State::kPaused, std::memory_order_release);
++  }
++  OnStateChanged();
++}
++
++void AudioMediaPlayer::Stop(bool change_state, bool force) {
++  bool was_active;
++  {
++    std::unique_lock<std::mutex> lock(mutex_);
++    was_active = StopLocked(lock, force);
++  }
++  if (was_active && change_state) {
++    OnStateChanged();
++  }
++}
++
++bool AudioMediaPlayer::StopLocked(std::unique_lock<std::mutex>& lock, bool force) {
++  start_requested_ = false;
++  const bool was_active = !IsIdle();
++  if (!was_active && !IsSongLoaded() && !in_play_) {
++    return false;
++  }
++
++  state_.store(XmpApp::State::kIdle, std::memory_order_release);
++  active_song_.store(nullptr, std::memory_order_release);
++  stop_serial_.fetch_add(1, std::memory_order_acq_rel);
++  // A paused driver returns no slots, so wake the worker rather than resume
++  // the driver and let the queued audio play out.
++  WakeWorker();
++
++  if (!force) {
++    worker_cv_.wait(lock, [this] { return !in_play_; });
++  }
++  return was_active;
++}
++
++void AudioMediaPlayer::StartLocked(XmpApp::Song* song) {
++  active_song_.store(song, std::memory_order_release);
++  current_song_handle_ = song->handle;
++  start_requested_ = true;
++  worker_cv_.notify_all();
++}
++
++void AudioMediaPlayer::WakeWorker() {
++  std::lock_guard<std::mutex> guard(driver_mutex_);
++  if (driver_semaphore_) {
++    driver_semaphore_->Release(1, nullptr);
++  }
++}
++
++void AudioMediaPlayer::Continue() {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!IsPaused()) {
++      return;
++    }
++    state_.store(XmpApp::State::kPlaying, std::memory_order_release);
++    std::lock_guard<std::mutex> guard(driver_mutex_);
++    if (driver_) {
++      driver_->Resume();
++    }
++  }
++  OnStateChanged();
++}
++
++X_STATUS AudioMediaPlayer::Next() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (!active_playlist_) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++
++  if (IsSongLoaded() || in_play_) {
++    StopLocked(lock, false);
++  }
++
++  // There is no song with such ID?
++  XmpApp::Song* song = AdjacentSongLocked(true);
++  if (!song) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++  StartLocked(song);
++  return X_STATUS_SUCCESS;
++}
++
++X_STATUS AudioMediaPlayer::Previous() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (!active_playlist_) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++
++  if (IsSongLoaded() || in_play_) {
++    StopLocked(lock, false);
++  }
++
++  XmpApp::Song* song = AdjacentSongLocked(false);
++  if (!song) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++  StartLocked(song);
++  return X_STATUS_SUCCESS;
++}
++
++XmpApp::Song* AudioMediaPlayer::AdjacentSongLocked(bool forward) const {
++  if (!active_playlist_ || active_playlist_->songs.empty()) {
++    return nullptr;
++  }
++  const auto& songs = active_playlist_->songs;
++  auto itr = std::ranges::find_if(songs, [this](const std::unique_ptr<XmpApp::Song>& song) {
++    return song->handle == current_song_handle_;
++  });
++  if (itr == songs.cend()) {
++    return nullptr;
++  }
++
++  if (forward) {
++    itr = std::next(itr);
++    return itr != songs.cend() ? itr->get() : songs.front().get();
++  }
++  // We're at the first entry, we need to go to the end.
++  if (itr == songs.cbegin()) {
++    return songs.back().get();
++  }
++  return std::prev(itr)->get();
++}
++
++XmpApp::Playlist* AudioMediaPlayer::FindPlaylistLocked(uint32_t handle) const {
++  auto itr = playlists_.find(handle);
++  return itr != playlists_.cend() ? itr->second.get() : nullptr;
++}
++
++std::span<uint8_t> AudioMediaPlayer::LoadSongToMemory(const std::u16string& file_path) {
++  // Find file based on provided path?
++  filesystem::File* vfs_file = nullptr;
++  filesystem::FileAction file_action;
++  X_STATUS result = kernel_state_->file_system()->OpenFile(
++      nullptr, rex::string::to_utf8(file_path), filesystem::FileDisposition::kOpen,
++      filesystem::FileAccess::kGenericRead, false, true, &vfs_file, &file_action);
++  if (result != X_STATUS_SUCCESS || !vfs_file) {
++    return {};
++  }
++
++  const size_t file_size = vfs_file->entry()->size();
++  uint8_t* data = file_size ? static_cast<uint8_t*>(av_malloc(file_size)) : nullptr;
++  if (!data) {
++    vfs_file->Destroy();
++    return {};
++  }
++  std::span<uint8_t> buffer = {data, file_size};
++
++  size_t bytes_read = 0;
++  result = vfs_file->ReadSync(buffer, 0, &bytes_read);
++  vfs_file->Destroy();
++  if (result != X_STATUS_SUCCESS || bytes_read != file_size) {
++    // Read failed. We need to manually release resources from av_malloc.
++    av_free(data);
++    return {};
++  }
++
++  return buffer;
++}
++
++void AudioMediaPlayer::AddPlaylist(uint32_t handle, std::unique_ptr<XmpApp::Playlist> playlist) {
++  std::lock_guard<std::mutex> lock(mutex_);
++  if (playlists_.count(handle) != 0) {
++    return;
++  }
++
++  if (playback_mode_ == XmpApp::PlaybackMode::kShuffle) {
++    auto rng = std::default_random_engine{};
++    std::ranges::shuffle(playlist->songs, rng);
++  }
++
++  playlists_.insert({handle, std::move(playlist)});
++}
++
++void AudioMediaPlayer::RemovePlaylist(uint32_t handle) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (playlists_.count(handle) == 0) {
++    return;
++  }
++
++  // The worker may still be reading the song, so wait for it before the
++  // playlist goes.
++  if (playlists_[handle].get() == active_playlist_) {
++    StopLocked(lock, false);
++    active_playlist_ = nullptr;
++  }
++
++  playlists_.erase(handle);
++}
++
++X_STATUS AudioMediaPlayer::SetVolume(float volume) {
++  volume_.store(std::min(volume, 1.0f));
++
++  std::lock_guard<std::mutex> guard(driver_mutex_);
++  if (!driver_) {
++    return X_STATUS_UNSUCCESSFUL;
++  }
++
++  driver_->SetVolume(volume_);
++  return X_STATUS_SUCCESS;
++}
++
++AudioMediaPlayer::ControllerSettings& AudioMediaPlayer::GetControllerSettings(
++    XMP_CLIENT xmp_client) {
++  PlaybackController controller = PlaybackController::User;
++  if (xmp_client == XMP_CLIENT::Game) {
++    controller = PlaybackController::Game;
++  } else if (xmp_client == XMP_CLIENT::MCE) {
++    controller = PlaybackController::MCE;
++  }
++
++  return controller_settings_[uint32_t(controller)];
++}
++
++void AudioMediaPlayer::SetPlaybackController(PlaybackController playback_controller) {
++  const bool changed = playback_controller != playback_controller_;
++  playback_controller_ = playback_controller;
++  if (!changed || uint32_t(playback_controller) >= std::size(controller_settings_)) {
++    return;
++  }
++
++  const ControllerSettings& settings = controller_settings_[uint32_t(playback_controller)];
++  SetPlaybackMode(settings.playback_mode);
++  SetRepeatMode(settings.repeat_mode);
++  SetPlaybackFlags(settings.playback_flags);
++  SetVolume(settings.volume);
++}
++
++bool AudioMediaPlayer::IsLastSongInPlaylist() const {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return IsLastSongInPlaylistLocked();
++}
++
++bool AudioMediaPlayer::IsLastSongInPlaylistLocked() const {
++  if (!active_playlist_) {
++    return false;
++  }
++
++  const auto& songs = active_playlist_->songs;
++  auto itr = std::ranges::find_if(songs, [this](const std::unique_ptr<XmpApp::Song>& song) {
++    return song->handle == current_song_handle_;
++  });
++  return itr == songs.cend() || std::next(itr) == songs.cend();
++}
++
++void AudioMediaPlayer::SetCaptureCallback([[maybe_unused]] uint32_t callback, uint32_t context,
++                                          [[maybe_unused]] bool title_render) {
++  // TODO: Something is incorrect with callback and causes audio to be muted!
++  callback_ = 0;
++  callback_context_ = context;
++  is_title_rendering_enabled_ = false;  // title_render;
++}
++
++void AudioMediaPlayer::OnStateChanged() {
++  kernel_state_->BroadcastNotification(kernel::xam::apps::kXNotificationXmpStateChanged,
++                                       static_cast<uint32_t>(GetState()));
++}
++
++bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
++  DeleteDriver();
++
++  std::lock_guard<std::mutex> guard(driver_mutex_);
++  if (!sample_rate || !channels || channels > AudioDriver::kFrameSamplesMax) {
++    return false;
++  }
++  driver_semaphore_ = rex::thread::Semaphore::Create(kQueuedFrames, kQueuedFrames);
++
++  if (!driver_semaphore_) {
++    return false;
++  }
++
++  if (audio_system_) {
++    driver_.reset(
++        audio_system_->CreateDriver(driver_semaphore_.get(), sample_rate, channels, false));
++  }
++  if (driver_ && driver_->Initialize()) {
++    return true;
++  }
++  if (driver_) {
++    driver_->Shutdown();
++    driver_.reset();
++  }
++  driver_ = std::make_unique<PacingAudioDriver>(driver_semaphore_.get(), sample_rate,
++                                                AudioDriver::kFrameSamplesMax / channels);
++  if (!driver_->Initialize()) {
++    driver_.reset();
++    driver_semaphore_.reset();
++    return false;
++  }
++  REXAPU_WARN("APU: failed to create or initialize a media driver; continuing silently");
++
++  return true;
++}
++
++void AudioMediaPlayer::DeleteDriver() {
++  std::lock_guard<std::mutex> guard(driver_mutex_);
++  if (driver_) {
++    // Stop the driver before destroying the semaphore used by its callbacks.
++    driver_->Shutdown();
++    driver_.reset();
++  }
++  driver_semaphore_.reset();
++}
++
++}  // namespace rex::audio
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 3dcc841..73e62b0 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/audio_driver.h>
++#include <rex/audio/audio_media_player.h>
+ #include <rex/audio/audio_system.h>
+ #include <rex/audio/flags.h>
+ #include <rex/audio/xma/decoder.h>
+@@ -93,6 +94,9 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
+   worker_thread_->set_name("Audio Worker");
+   worker_thread_->Create();
+ 
++  media_player_ = std::make_unique<AudioMediaPlayer>(this, kernel_state);
++  media_player_->Setup();
++
+   return X_STATUS_SUCCESS;
+ }
+ 
+@@ -187,6 +191,11 @@ int AudioSystem::FindFreeClient() {
+ void AudioSystem::Initialize() {}
+ 
+ void AudioSystem::Shutdown() {
++  // Its drivers come from this system, so it goes first.
++  if (media_player_) {
++    media_player_->Shutdown();
++  }
++
+   if (!worker_running_) {
+     return;
+   }
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index a5e9088..92cfaf8 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -7,12 +7,18 @@
+  ******************************************************************************
+  *
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ * @modified    2026 - Message layer ported from Xenia Canary 451f915
+  */
+ 
++#include <algorithm>
++#include <cstring>
++
++#include <rex/audio/audio_media_player.h>
++#include <rex/audio/audio_system.h>
+ #include <rex/kernel/xam/apps/xmp_app.h>
+ #include <rex/logging.h>
+-#include <rex/system/xthread.h>
+-#include <rex/thread.h>
++#include <rex/runtime.h>
++#include <rex/string/utf8.h>
+ 
+ namespace rex {
+ namespace kernel {
+@@ -22,29 +28,39 @@ using namespace rex::system::xam;
+ namespace apps {
+ using namespace rex::system;
+ 
+-XmpApp::XmpApp(KernelState* kernel_state)
+-    : App(kernel_state, 0xFA),
+-      state_(State::kIdle),
+-      playback_client_(PlaybackClient::kTitle),
+-      playback_mode_(PlaybackMode::kUnknown),
+-      repeat_mode_(RepeatMode::kUnknown),
+-      unknown_flags_(0),
+-      volume_(1.0f),
+-      active_playlist_(nullptr),
+-      active_song_index_(0),
+-      next_playlist_handle_(1),
+-      next_song_handle_(1) {}
++namespace {
++
++std::u16string ReadGuestString(memory::Memory* memory, uint32_t guest_ptr) {
++  if (!guest_ptr) {
++    return {};
++  }
++  return memory::load_and_swap<std::u16string>(memory->TranslateVirtual(guest_ptr));
++}
++
++// store_and_swap writes no terminator, so leave room for the one the memset
++// supplies and keep long tags out of the following field.
++void StoreSongInfoString(rex::be<char16_t>* field, const std::u16string& value) {
++  const size_t length = std::min<size_t>(value.size(), kMaxXmpMetadataStringLength - 1);
++  memory::store_and_swap<std::u16string_view>(field, std::u16string_view(value).substr(0, length));
++}
++
++}  // namespace
++
++XmpApp::XmpApp(KernelState* kernel_state) : App(kernel_state, 0xFA) {}
++
++audio::AudioMediaPlayer* XmpApp::media_player() const {
++  auto* audio_system = static_cast<audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
++  return audio_system ? audio_system->media_player() : nullptr;
++}
+ 
+ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
+-  if (!XThread::GetCurrentThread()->main_thread()) {
+-    // Some stupid games will hammer this on a thread - induce a delay
+-    // here to keep from starving real threads.
+-    rex::thread::Sleep(std::chrono::milliseconds(1));
++  if (!state_ptr) {
++    return X_E_INVALIDARG;
+   }
++  const uint32_t state = static_cast<uint32_t>(media_player()->GetState());
+ 
+-  REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);
+-  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(state_ptr),
+-                                   static_cast<uint32_t>(state_));
++  REXKRNL_DEBUG("XMPGetStatus({:08X}) -> {:d}", state_ptr, state);
++  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(state_ptr), state);
+   return X_E_SUCCESS;
+ }
+ 
+@@ -57,35 +73,40 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
+       "{:08X})",
+       songs_ptr, song_count, playlist_name_ptr, rex::string::to_utf8(playlist_name), flags,
+       out_song_handles, out_playlist_handle);
++
+   auto playlist = std::make_unique<Playlist>();
+-  playlist->handle = ++next_playlist_handle_;
++  uint32_t playlist_handle;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    playlist_handle = ++next_playlist_handle_;
++  }
++  playlist->handle = playlist_handle;
+   playlist->name = playlist_name;
+   playlist->flags = flags;
+   if (songs_ptr) {
++    auto* song_descriptor = memory_->TranslateVirtual<XMP_SONGDESCRIPTOR*>(songs_ptr);
++
+     for (uint32_t i = 0; i < song_count; ++i) {
+       auto song = std::make_unique<Song>();
+-      song->handle = ++next_song_handle_;
+-      uint8_t* song_base = memory_->TranslateVirtual(songs_ptr + (i * 36));
+-      song->file_path = memory::load_and_swap<std::u16string>(
+-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 0)));
+-      song->name = memory::load_and_swap<std::u16string>(
+-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 4)));
+-      song->artist = memory::load_and_swap<std::u16string>(
+-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 8)));
+-      song->album = memory::load_and_swap<std::u16string>(
+-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 12)));
+-      song->album_artist = memory::load_and_swap<std::u16string>(
+-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 16)));
+-      song->genre = memory::load_and_swap<std::u16string>(
+-          memory_->TranslateVirtual(memory::load_and_swap<uint32_t>(song_base + 20)));
+-      song->track_number = memory::load_and_swap<uint32_t>(song_base + 24);
+-      song->duration_ms = memory::load_and_swap<uint32_t>(song_base + 28);
+-      song->format = static_cast<Song::Format>(memory::load_and_swap<uint32_t>(song_base + 32));
++      {
++        auto global_lock = global_critical_region_.Acquire();
++        song->handle = ++next_song_handle_;
++      }
++      song->file_path = ReadGuestString(memory_, song_descriptor[i].file_path_ptr);
++      song->name = ReadGuestString(memory_, song_descriptor[i].title_ptr);
++      song->artist = ReadGuestString(memory_, song_descriptor[i].artist_ptr);
++      song->album = ReadGuestString(memory_, song_descriptor[i].album_ptr);
++      song->album_artist = ReadGuestString(memory_, song_descriptor[i].album_artist_ptr);
++      song->genre = ReadGuestString(memory_, song_descriptor[i].genre_ptr);
++      song->track_number = song_descriptor[i].track_number;
++      song->duration_ms = song_descriptor[i].duration;
++      song->format = static_cast<SongFormat>(uint32_t(song_descriptor[i].song_format));
++
+       if (out_song_handles) {
+         memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(out_song_handles + (i * 4)),
+                                          song->handle);
+       }
+-      playlist->songs.emplace_back(std::move(song));
++      playlist->songs.push_back(std::move(song));
+     }
+   }
+   if (out_playlist_handle) {
+@@ -93,378 +114,570 @@ X_HRESULT XmpApp::XMPCreateTitlePlaylist(uint32_t songs_ptr, uint32_t song_count
+                                      playlist->handle);
+   }
+ 
+-  auto global_lock = global_critical_region_.Acquire();
+-  playlists_.insert({playlist->handle, playlist.get()});
+-  playlist.release();
++  media_player()->AddPlaylist(playlist_handle, std::move(playlist));
++  kernel_state_->BroadcastNotification(kXNotificationXmpTitlePlayListContentChanged, 0);
++
+   return X_E_SUCCESS;
+ }
+ 
+ X_HRESULT XmpApp::XMPDeleteTitlePlaylist(uint32_t playlist_handle) {
+   REXKRNL_DEBUG("XMPDeleteTitlePlaylist({:08X})", playlist_handle);
+-  auto global_lock = global_critical_region_.Acquire();
+-  auto it = playlists_.find(playlist_handle);
+-  if (it == playlists_.end()) {
+-    REXKRNL_ERROR("Playlist {:08X} not found", playlist_handle);
+-    return X_E_NOTFOUND;
++  media_player()->RemovePlaylist(playlist_handle);
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XmpApp::XMPPlayTitlePlaylist(audio::XMP_CLIENT xmp_client, uint32_t playlist_handle,
++                                       uint32_t song_handle) {
++  REXKRNL_DEBUG("XMPPlayTitlePlaylist(client={:08X}, {:08X}, {:08X})", uint32_t(xmp_client),
++                playlist_handle, song_handle);
++  if (!playlist_handle) {
++    return X_E_INVALIDARG;
+   }
+-  auto playlist = it->second;
+-  if (playlist == active_playlist_) {
+-    XMPStop(0);
++  const X_HRESULT result = XMPAccessCheck(xmp_client);
++  if (XFAILED(result)) {
++    return result;
+   }
+-  playlists_.erase(it);
+-  delete playlist;
++  media_player()->Play(playlist_handle, song_handle, false);
++  kernel_state_->BroadcastNotification(kXNotificationXmpPlaybackBehaviorChanged, 1);
+   return X_E_SUCCESS;
+ }
+ 
+-X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_handle) {
+-  REXKRNL_DEBUG("XMPPlayTitlePlaylist({:08X}, {:08X})", playlist_handle, song_handle);
+-  Playlist* playlist = nullptr;
+-  {
+-    auto global_lock = global_critical_region_.Acquire();
+-    auto it = playlists_.find(playlist_handle);
+-    if (it == playlists_.end()) {
+-      REXKRNL_ERROR("Playlist {:08X} not found", playlist_handle);
+-      return X_E_NOTFOUND;
++X_HRESULT XmpApp::XMPAccessCheck(audio::XMP_CLIENT xmp_client) {
++  const auto* player = media_player();
++  const auto controller = player->GetPlaybackController();
++  if (xmp_client == audio::XMP_CLIENT::Game) {
++    // Override flag is the XMPSetPlaybackController lock word.
++    if (controller != audio::PlaybackController::Game || player->IsXMPOverrideEnabled()) {
++      return X_E_ACCESS_DENIED;
+     }
+-    playlist = it->second;
++  } else if (controller == audio::PlaybackController::Game) {
++    return X_E_ACCESS_DENIED;
++  }
++  if (controller == audio::PlaybackController::Dash ||
++      controller == audio::PlaybackController::MCE) {
++    return X_E_ACCESS_DENIED;
+   }
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XmpApp::XMPContinue(audio::XMP_CLIENT xmp_client) {
++  REXKRNL_DEBUG("XMPContinue(client={:08X})", uint32_t(xmp_client));
++  const X_HRESULT result = XMPAccessCheck(xmp_client);
++  if (XFAILED(result)) {
++    return result;
++  }
++  media_player()->Continue();
++  return X_E_SUCCESS;
++}
+ 
+-  if (playback_client_ == PlaybackClient::kSystem) {
+-    REXKRNL_WARN("XMPPlayTitlePlaylist: System playback is enabled!");
+-    return X_E_SUCCESS;
++X_HRESULT XmpApp::XMPStop(audio::XMP_CLIENT xmp_client, bool no_wait) {
++  REXKRNL_DEBUG("XMPStop(client={:08X}, no_wait={})", uint32_t(xmp_client), no_wait);
++  const X_HRESULT result = XMPAccessCheck(xmp_client);
++  if (XFAILED(result)) {
++    return result;
+   }
++  media_player()->Stop(true, no_wait);
++  return X_E_SUCCESS;
++}
+ 
+-  // Start playlist?
+-  REXKRNL_WARN("Playlist playback not supported");
+-  active_playlist_ = playlist;
+-  active_song_index_ = 0;
+-  state_ = State::kPlaying;
+-  OnStateChanged();
+-  kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
++X_HRESULT XmpApp::XMPPause(audio::XMP_CLIENT xmp_client) {
++  REXKRNL_DEBUG("XMPPause(client={:08X})", uint32_t(xmp_client));
++  const X_HRESULT result = XMPAccessCheck(xmp_client);
++  if (XFAILED(result)) {
++    return result;
++  }
++  media_player()->Pause();
+   return X_E_SUCCESS;
+ }
+ 
+-X_HRESULT XmpApp::XMPContinue() {
+-  REXKRNL_DEBUG("XMPContinue()");
+-  if (state_ == State::kPaused) {
+-    state_ = State::kPlaying;
++X_HRESULT XmpApp::XMPNext(audio::XMP_CLIENT xmp_client) {
++  REXKRNL_DEBUG("XMPNext(client={:08X})", uint32_t(xmp_client));
++  const X_HRESULT result = XMPAccessCheck(xmp_client);
++  if (XFAILED(result)) {
++    return result;
+   }
+-  OnStateChanged();
++  media_player()->Next();
+   return X_E_SUCCESS;
+ }
+ 
+-X_HRESULT XmpApp::XMPStop(uint32_t unk) {
+-  assert_zero(unk);
+-  REXKRNL_DEBUG("XMPStop({:08X})", unk);
+-  active_playlist_ = nullptr;  // ?
+-  active_song_index_ = 0;
+-  state_ = State::kIdle;
+-  OnStateChanged();
++X_HRESULT XmpApp::XMPPrevious(audio::XMP_CLIENT xmp_client) {
++  REXKRNL_DEBUG("XMPPrevious(client={:08X})", uint32_t(xmp_client));
++  const X_HRESULT result = XMPAccessCheck(xmp_client);
++  if (XFAILED(result)) {
++    return result;
++  }
++  media_player()->Previous();
+   return X_E_SUCCESS;
+ }
+ 
+-X_HRESULT XmpApp::XMPPause() {
+-  REXKRNL_DEBUG("XMPPause()");
+-  if (state_ == State::kPlaying) {
+-    state_ = State::kPaused;
++X_HRESULT XmpApp::XMPSetPlaybackBehavior(audio::XMP_CLIENT xmp_client, PlaybackMode playback_mode,
++                                         RepeatMode repeat_mode, PlaybackFlags playback_flags) {
++  REXKRNL_DEBUG("XMPSetPlaybackBehavior(client={:08X}, {:08X}, {:08X}, {:08X})",
++                uint32_t(xmp_client), uint32_t(playback_mode), uint32_t(repeat_mode),
++                uint32_t(playback_flags));
++  if (xmp_client == audio::XMP_CLIENT::MCE) {
++    return X_E_NOT_SUPPORTED;
++  }
++  // Only notify if the settings change and apply them to playback only
++  // if the caller has control.
++  auto* player = media_player();
++  auto& settings = player->GetControllerSettings(xmp_client);
++  const bool changed = playback_mode != settings.playback_mode ||
++                       repeat_mode != settings.repeat_mode ||
++                       playback_flags != settings.playback_flags;
++  settings.playback_mode = playback_mode;
++  settings.repeat_mode = repeat_mode;
++  settings.playback_flags = playback_flags;
++  if (changed) {
++    kernel_state_->BroadcastNotification(xmp_client == audio::XMP_CLIENT::Game
++                                             ? kXNotificationXmpPlaybackBehaviorChanged
++                                             : kXNotificationXmpPlaybackBehaviorChangedEx,
++                                         0);
++  }
++  if (XSUCCEEDED(XMPAccessCheck(xmp_client))) {
++    player->SetPlaybackMode(playback_mode);
++    player->SetRepeatMode(repeat_mode);
++    player->SetPlaybackFlags(playback_flags);
+   }
+-  OnStateChanged();
+   return X_E_SUCCESS;
+ }
+ 
+-X_HRESULT XmpApp::XMPNext() {
+-  REXKRNL_DEBUG("XMPNext()");
+-  if (!active_playlist_) {
+-    return X_E_NOTFOUND;
++X_HRESULT XmpApp::XMPGetPlaybackBehavior(audio::XMP_CLIENT xmp_client, uint32_t playback_mode_ptr,
++                                         uint32_t repeat_mode_ptr, uint32_t playback_flags_ptr) {
++  REXKRNL_DEBUG("XMPGetPlaybackBehavior(client={:08X}, {:08X}, {:08X}, {:08X})",
++                uint32_t(xmp_client), playback_mode_ptr, repeat_mode_ptr, playback_flags_ptr);
++  if (!playback_mode_ptr && !repeat_mode_ptr && !playback_flags_ptr) {
++    return X_E_INVALIDARG;
++  }
++  const auto& settings = media_player()->GetControllerSettings(xmp_client);
++  if (playback_mode_ptr) {
++    memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(playback_mode_ptr),
++                                     uint32_t(settings.playback_mode));
++  }
++  if (repeat_mode_ptr) {
++    memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(repeat_mode_ptr),
++                                     uint32_t(settings.repeat_mode));
++  }
++  if (playback_flags_ptr) {
++    memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(playback_flags_ptr),
++                                     uint32_t(settings.playback_flags));
+   }
+-  state_ = State::kPlaying;
+-  active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
+-  OnStateChanged();
+   return X_E_SUCCESS;
+ }
+ 
+-X_HRESULT XmpApp::XMPPrevious() {
+-  REXKRNL_DEBUG("XMPPrevious()");
+-  if (!active_playlist_) {
+-    return X_E_NOTFOUND;
++X_HRESULT XmpApp::XMPSetVolume(audio::XMP_CLIENT xmp_client, float volume) {
++  REXKRNL_DEBUG("XMPSetVolume(client={:08X}, {:g})", uint32_t(xmp_client), volume);
++  // 0.0 to 1.0, else INVALID_PARAMETER before the controller is even looked at.
++  if (volume < 0.0f || volume > 1.0f) {
++    return X_E_INVALIDARG;
+   }
+-  state_ = State::kPlaying;
+-  if (!active_song_index_) {
+-    active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
+-  } else {
+-    --active_song_index_;
++  if (xmp_client == audio::XMP_CLIENT::MCE) {
++    return X_E_NOT_SUPPORTED;
++  }
++  auto* player = media_player();
++  player->GetControllerSettings(xmp_client).volume = volume;
++  if (XSUCCEEDED(XMPAccessCheck(xmp_client))) {
++    player->SetVolume(volume);
++  }
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XmpApp::XMPGetVolume(audio::XMP_CLIENT xmp_client, uint32_t volume_ptr) {
++  REXKRNL_DEBUG("XMPGetVolume(client={:08X}, {:08X})", uint32_t(xmp_client), volume_ptr);
++  if (!volume_ptr) {
++    return X_E_INVALIDARG;
+   }
+-  OnStateChanged();
++  memory::store_and_swap<float>(memory_->TranslateVirtual(volume_ptr),
++                                media_player()->GetControllerSettings(xmp_client).volume);
+   return X_E_SUCCESS;
+ }
+ 
+-void XmpApp::OnStateChanged() {
+-  kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
++X_HRESULT XmpApp::XMPGetTitlePlaylistBufferSize(audio::XMP_CLIENT xmp_client, uint32_t song_count,
++                                                uint32_t size_ptr) {
++  /* Note:
++      - Query of size for XamAlloc - the result of the alloc is passed to
++     0x0007000D.
++  */
++  REXKRNL_DEBUG(
++      "XMPGetTitlePlaylistBufferSize(XMP client: 0x{:08X}, Song count: "
++      "0x{:08X}, Size ptr: 0x{:08X})",
++      uint32_t(xmp_client), song_count, size_ptr);
++
++  if (xmp_client == audio::XMP_CLIENT::HUD || !size_ptr || !song_count) {
++    return X_E_INVALIDARG;
++  }
++  uint32_t size = 0;
++  if (xmp_client == audio::XMP_CLIENT::Dash || xmp_client == audio::XMP_CLIENT::Game) {
++    size = song_count * 0x3E8 + 0x88;
++  }
++  // We don't use the storage, so just fudge the number.
++  memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(size_ptr), size);
++  return X_E_SUCCESS;
+ }
+ 
+ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                       uint32_t buffer_length) {
++  if (!media_player()) {
++    static bool warned = false;
++    if (!warned) {
++      warned = true;
++      REXKRNL_WARN("XMP: no audio system, so no music player; failing XMP messages");
++    }
++    return X_E_FAIL;
++  }
++
+   // NOTE: buffer_length may be zero or valid.
+   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+   switch (message) {
+     case 0x00070002: {
+-      assert_true(!buffer_length || buffer_length == 12);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint32_t storage_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
+-      uint32_t song_handle = memory::load_and_swap<uint32_t>(buffer + 8);  // 0?
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_PLAY_TITLE_PLAYLIST));
++      auto* args = reinterpret_cast<XMP_PLAY_TITLE_PLAYLIST*>(buffer);
+       uint32_t playlist_handle =
+-          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(storage_ptr));
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPPlayTitlePlaylist(playlist_handle, song_handle);
++          memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_ptr));
++      return XMPPlayTitlePlaylist(args->xmp_client, playlist_handle, args->song_handle);
+     }
+     case 0x00070003: {
+       assert_true(!buffer_length || buffer_length == 4);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPContinue();
++      auto xmp_client = static_cast<audio::XMP_CLIENT>(memory::load_and_swap<uint32_t>(buffer));
++      return XMPContinue(xmp_client);
+     }
+     case 0x00070004: {
+-      assert_true(!buffer_length || buffer_length == 8);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint32_t unk = memory::load_and_swap<uint32_t>(buffer + 4);
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPStop(unk);
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_STOP));
++      auto* args = reinterpret_cast<XMP_STOP*>(buffer);
++      return XMPStop(args->xmp_client, args->no_wait != 0);
+     }
+     case 0x00070005: {
+       assert_true(!buffer_length || buffer_length == 4);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPPause();
++      auto xmp_client = static_cast<audio::XMP_CLIENT>(memory::load_and_swap<uint32_t>(buffer));
++      return XMPPause(xmp_client);
+     }
+     case 0x00070006: {
+       assert_true(!buffer_length || buffer_length == 4);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPNext();
++      auto xmp_client = static_cast<audio::XMP_CLIENT>(memory::load_and_swap<uint32_t>(buffer));
++      return XMPNext(xmp_client);
+     }
+     case 0x00070007: {
+       assert_true(!buffer_length || buffer_length == 4);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPPrevious();
++      auto xmp_client = static_cast<audio::XMP_CLIENT>(memory::load_and_swap<uint32_t>(buffer));
++      return XMPPrevious(xmp_client);
+     }
+     case 0x00070008: {
+-      assert_true(!buffer_length || buffer_length == 16);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> playback_mode;
+-        rex::be<uint32_t> repeat_mode;
+-        rex::be<uint32_t> flags;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 16);
+-
+-      assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
+-      REXKRNL_DEBUG("XMPSetPlaybackBehavior({:08X}, {:08X}, {:08X})", uint32_t(args->playback_mode),
+-                    uint32_t(args->repeat_mode), uint32_t(args->flags));
+-      playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
+-      repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
+-      unknown_flags_ = args->flags;
+-      kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 0);
+-      return X_E_SUCCESS;
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_SET_PLAYBACK_BEHAVIOR));
++      auto* args = reinterpret_cast<XMP_SET_PLAYBACK_BEHAVIOR*>(buffer);
++      return XMPSetPlaybackBehavior(args->xmp_client,
++                                    static_cast<PlaybackMode>(uint32_t(args->playback_mode)),
++                                    static_cast<RepeatMode>(uint32_t(args->repeat_mode)),
++                                    static_cast<PlaybackFlags>(uint32_t(args->flags)));
+     }
+     case 0x00070009: {
+-      assert_true(!buffer_length || buffer_length == 8);
+-      uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint32_t state_ptr = memory::load_and_swap<uint32_t>(buffer + 4);  // out ptr to 4b - expect 0
+-      assert_true(xmp_client == 0x00000002);
+-      return XMPGetStatus(state_ptr);
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_STATUS));
++      auto* args = reinterpret_cast<XMP_GET_STATUS*>(buffer);
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game);
++      return XMPGetStatus(args->state_ptr);
+     }
+     case 0x0007000B: {
+-      assert_true(!buffer_length || buffer_length == 8);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> volume_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 8);
+-
+-      assert_true(args->xmp_client == 0x00000002);
+-      REXKRNL_DEBUG("XMPGetVolume({:08X})", uint32_t(args->volume_ptr));
+-      memory::store_and_swap<float>(memory_->TranslateVirtual(args->volume_ptr), volume_);
+-      return X_E_SUCCESS;
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_VOLUME));
++      auto* args = reinterpret_cast<XMP_GET_VOLUME*>(buffer);
++      return XMPGetVolume(args->xmp_client, args->volume_ptr);
+     }
+     case 0x0007000C: {
+-      assert_true(!buffer_length || buffer_length == 8);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<float> value;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 8);
+-
+-      assert_true(args->xmp_client == 0x00000002);
+-      REXKRNL_DEBUG("XMPSetVolume({:g})", float(args->value));
+-      volume_ = args->value;
+-      return X_E_SUCCESS;
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_SET_VOLUME));
++      auto* args = reinterpret_cast<XMP_SET_VOLUME*>(buffer);
++      return XMPSetVolume(args->xmp_client, args->value);
+     }
+     case 0x0007000D: {
+-      assert_true(!buffer_length || buffer_length == 36);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> storage_ptr;
+-        rex::be<uint32_t> storage_size;
+-        rex::be<uint32_t> songs_ptr;
+-        rex::be<uint32_t> song_count;
+-        rex::be<uint32_t> playlist_name_ptr;
+-        rex::be<uint32_t> flags;
+-        rex::be<uint32_t> song_handles_ptr;
+-        rex::be<uint32_t> playlist_handle_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 36);
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_CREATE_TITLE_PLAYLIST));
++      auto* args = reinterpret_cast<XMP_CREATE_TITLE_PLAYLIST*>(buffer);
+ 
+       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->playlist_handle_ptr),
+                                        args->storage_ptr);
+-      assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
+-      std::u16string playlist_name;
+-      if (!args->playlist_name_ptr) {
+-        playlist_name = u"";
+-      } else {
+-        playlist_name = memory::load_and_swap<std::u16string>(
+-            memory_->TranslateVirtual(args->playlist_name_ptr));
+-      }
+-      // dummy_alloc_ptr is the result of a XamAlloc of storage_size.
+-      assert_true(uint32_t(args->storage_size) == 4 + uint32_t(args->song_count) * 128);
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game ||
++                  args->xmp_client == audio::XMP_CLIENT::Dash);
++      std::u16string playlist_name = ReadGuestString(memory_, args->playlist_name_ptr);
++
+       return XMPCreateTitlePlaylist(args->songs_ptr, args->song_count, args->playlist_name_ptr,
+                                     playlist_name, args->flags, args->song_handles_ptr,
+                                     args->storage_ptr);
+     }
+     case 0x0007000E: {
+-      assert_true(!buffer_length || buffer_length == 12);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> unk_ptr;  // 0
+-        rex::be<uint32_t> info_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 12);
+-
+-      auto info = memory_->TranslateVirtual(args->info_ptr);
+-      assert_true(args->xmp_client == 0x00000002);
++      // XMPGetCurrentSong
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_CURRENT_SONG));
++      auto* args = reinterpret_cast<XMP_GET_CURRENT_SONG*>(buffer);
++
++      auto* info = memory_->TranslateVirtual<XMP_SONGINFO*>(args->info_ptr);
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game);
+       assert_zero(args->unk_ptr);
+-      REXKRNL_ERROR("XMPGetInfo?({:08X}, {:08X})", uint32_t(args->unk_ptr),
++      REXKRNL_DEBUG("XMPGetCurrentSong({:08X}, {:08X})", uint32_t(args->unk_ptr),
+                     uint32_t(args->info_ptr));
+-      if (!active_playlist_) {
++
++      Song* current_song = media_player()->GetCurrentSong();
++
++      if (!current_song) {
+         return X_E_FAIL;
+       }
+-      auto& song = active_playlist_->songs[active_song_index_];
+-      memory::store_and_swap<uint32_t>(info + 0, song->handle);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 0, song->name);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 40, song->artist);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 80, song->album);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 120, song->album_artist);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 160, song->genre);
+-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 200, song->track_number);
+-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 204, song->duration_ms);
+-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 208, static_cast<uint32_t>(song->format));
++
++      std::memset(info, 0, sizeof(XMP_SONGINFO));
++
++      info->handle = current_song->handle;
++      StoreSongInfoString(info->title, current_song->name);
++      StoreSongInfoString(info->artist, current_song->artist);
++      StoreSongInfoString(info->album, current_song->album);
++      StoreSongInfoString(info->album_artist, current_song->album_artist);
++      StoreSongInfoString(info->genre, current_song->genre);
++      info->track_number = current_song->track_number;
++      info->duration = current_song->duration_ms;
++      info->song_format = static_cast<uint32_t>(current_song->format);
+       return X_E_SUCCESS;
+     }
+     case 0x00070013: {
+-      assert_true(!buffer_length || buffer_length == 8);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> storage_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 8);
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_DELETE_TITLE_PLAYLIST));
++      auto* args = reinterpret_cast<XMP_DELETE_TITLE_PLAYLIST*>(buffer);
+ 
+       uint32_t playlist_handle =
+           memory::load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_ptr));
+-      assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game ||
++                  args->xmp_client == audio::XMP_CLIENT::Dash);
+       return XMPDeleteTitlePlaylist(playlist_handle);
+     }
+     case 0x0007001A: {
+       // XMPSetPlaybackController
+-      assert_true(!buffer_length || buffer_length == 12);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> controller;
+-        rex::be<uint32_t> playback_client;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 12);
+-
+-      assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
+-                  (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
+-      REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
+-                    uint32_t(args->playback_client));
+-
+-      playback_client_ = PlaybackClient(uint32_t(args->playback_client));
+-      kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_SET_PLAYBACK_CONTROLLER));
++      auto* args = reinterpret_cast<XMP_SET_PLAYBACK_CONTROLLER*>(buffer);
++
++      const bool XMP_User_Dash =
++          args->xmp_client == audio::XMP_CLIENT::Dash &&
++          args->playback_controller_request == audio::PlaybackController::User;
++      const bool XMPOverrideBackgroundMusic =
++          args->xmp_client == audio::XMP_CLIENT::Game &&
++          args->playback_controller_request == audio::PlaybackController::Game;
++      const bool XMPRestoreBackgroundMusic =
++          args->xmp_client == audio::XMP_CLIENT::Game &&
++          args->playback_controller_request == audio::PlaybackController::Restore;
++
++      assert_true(XMPOverrideBackgroundMusic || XMPRestoreBackgroundMusic || XMP_User_Dash);
++      (void)XMP_User_Dash;
++      (void)XMPOverrideBackgroundMusic;
++      (void)XMPRestoreBackgroundMusic;
++
++      REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X}, {:08X})",
++                    uint32_t(args->xmp_client.get()),
++                    uint32_t(args->playback_controller_request.get()),
++                    uint32_t(args->playback_controller_locked));
++
++      auto* player = media_player();
++
++      if (args->playback_controller_request == audio::PlaybackController::Restore) {
++        player->SetXMPClient(audio::XMP_CLIENT::Game);
++        player->SetPlaybackController(audio::PlaybackController::Game);
++      } else {
++        player->SetXMPClient(args->xmp_client);
++        player->SetPlaybackController(args->playback_controller_request.get());
++      }
++
++      player->SetXMPOverride(args->playback_controller_locked.get() != 0);
++
++      // 58411446
++      kernel_state_->BroadcastNotification(kXNotificationXmpPlaybackControllerChanged,
++                                           player->IsTitleInPlaybackControl());
++
+       return X_E_SUCCESS;
+     }
+     case 0x0007001B: {
+       // XMPGetPlaybackController
+-      assert_true(!buffer_length || buffer_length == 12);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> controller_ptr;
+-        rex::be<uint32_t> locked_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 12);
+-
+-      assert_true(args->xmp_client == 0x00000002);
+-      REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
+-                    uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
+-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
+-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
+-
+-      if (!XThread::GetCurrentThread()->main_thread()) {
+-        // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
+-        rex::thread::Sleep(std::chrono::milliseconds(10));
+-      }
++      // No access check here, titles ask in every state.
++      // 4B4E0806 reads controller == 0 && !locked out of these two before it
++      // sets music volume. Passes 0, not volume, if false.
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_PLAYBACK_CONTROLLER));
++      auto* args = reinterpret_cast<XMP_GET_PLAYBACK_CONTROLLER*>(buffer);
++
++      REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})",
++                    uint32_t(args->xmp_client.get()), uint32_t(args->playback_controller_ptr),
++                    uint32_t(args->playback_controller_locked_ptr));
++
++      const auto* player = media_player();
++
++      auto* controller = memory_->TranslateVirtual<rex::be<audio::PlaybackController>*>(
++          args->playback_controller_ptr);
++      *controller = player->GetPlaybackController();
+ 
++      auto* playback_controller_locked =
++          memory_->TranslateVirtual<rex::be<uint32_t>*>(args->playback_controller_locked_ptr);
++      *playback_controller_locked = player->IsXMPOverrideEnabled();
++      return X_E_SUCCESS;
++    }
++    case 0x00070025: {
++      // XMPCreateUserPlaylistEnumerator
++      // For whatever reason buffer_length is 0 in this case.
++      // Return buffer size is set to be items * 0x338 bytes.
++      // Games used in:
++      // 54540809, 494707D4
++      auto* args = reinterpret_cast<XMP_CREATE_USER_PLAYLIST_ENUMERATOR*>(buffer);
++
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game);
++
++      REXKRNL_DEBUG("XMPCreateUserPlaylistEnumerator({:08X}, {:08X}, {:08X})",
++                    uint32_t(args->xmp_client.get()), uint32_t(args->flags),
++                    uint32_t(args->private_enum_structure_ptr));
++      if (!args->private_enum_structure_ptr || args->xmp_client != audio::XMP_CLIENT::Game) {
++        return X_E_INVALIDARG;
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x00070029: {
+       // XMPGetPlaybackBehavior
+-      assert_true(!buffer_length || buffer_length == 16);
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> playback_mode_ptr;
+-        rex::be<uint32_t> repeat_mode_ptr;
+-        rex::be<uint32_t> unk3_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 16);
+-
+-      assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
+-      REXKRNL_DEBUG("XMPGetPlaybackBehavior({:08X}, {:08X}, {:08X})",
+-                    uint32_t(args->playback_mode_ptr), uint32_t(args->repeat_mode_ptr),
+-                    uint32_t(args->unk3_ptr));
+-      if (args->playback_mode_ptr) {
+-        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->playback_mode_ptr),
+-                                         static_cast<uint32_t>(playback_mode_));
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_PLAYBACK_BEHAVIOR));
++      auto* args = reinterpret_cast<XMP_GET_PLAYBACK_BEHAVIOR*>(buffer);
++      return XMPGetPlaybackBehavior(args->xmp_client, args->playback_mode_ptr,
++                                    args->repeat_mode_ptr, args->playback_flags_ptr);
++    }
++    case 0x0007002B: {
++      constexpr uint8_t kMaxSourcesForMediaPlayer = 10;
++      // XMPGetMediaSources
++      // Called on the NXE and Kinect dashboard after clicking on the picture,
++      // video, and music library
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_MEDIA_SOURCES));
++      auto* args = reinterpret_cast<XMP_GET_MEDIA_SOURCES*>(buffer);
++
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game ||
++                  args->xmp_client == audio::XMP_CLIENT::Dash);
++      REXKRNL_DEBUG(
++          "XMPGetMediaSources({:08X}, {:08X}, {:08X}, {:08X}, {:08X}), "
++          "unimplemented",
++          uint32_t(args->xmp_client.get()), args->get_connected_sources_only.get(),
++          args->media_resources_ptr.get(), args->max_source.get(),
++          args->sources_returned_ptr.get());
++
++      if (!args->sources_returned_ptr) {
++        return X_E_INVALIDARG;
++      }
++
++      if (!args->media_resources_ptr) {
++        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->sources_returned_ptr),
++                                         kMaxSourcesForMediaPlayer);
++        return X_E_SUCCESS;
+       }
+-      if (args->repeat_mode_ptr) {
+-        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->repeat_mode_ptr),
+-                                         static_cast<uint32_t>(repeat_mode_));
++
++      if (args->max_source.get() < kMaxSourcesForMediaPlayer) {
++        return 0x80070008;
+       }
+-      if (args->unk3_ptr) {
+-        memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->unk3_ptr), unknown_flags_);
++
++      for (uint8_t i = 0; i < kMaxSourcesForMediaPlayer; ++i) {
++        // Some 0xB4 struct, but no idea what it is.
++        auto* entry = memory_->TranslateVirtual(args->media_resources_ptr.get() + (i * 0xB4));
++
++        std::memset(entry, 0x0, 0x28);
++        memory::store_and_swap<uint32_t>(entry, i);
+       }
++
++      // We're returning 0 which means there is no source of media available.
++      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->sources_returned_ptr), 0);
+       return X_E_SUCCESS;
+     }
+     case 0x0007002E: {
+-      assert_true(!buffer_length || buffer_length == 12);
+-      // Query of size for XamAlloc - the result of the alloc is passed to
+-      // 0x0007000D.
+-      struct {
+-        rex::be<uint32_t> xmp_client;
+-        rex::be<uint32_t> song_count;
+-        rex::be<uint32_t> size_ptr;
+-      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+-      static_assert_size(decltype(*args), 12);
+-
+-      assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
+-      // We don't use the storage, so just fudge the number.
+-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->size_ptr),
+-                                       4 + uint32_t(args->song_count) * 128);
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_TITLE_PLAYLIST_BUFFER_SIZE));
++      auto* args = reinterpret_cast<XMP_GET_TITLE_PLAYLIST_BUFFER_SIZE*>(buffer);
++      return XMPGetTitlePlaylistBufferSize(args->xmp_client, args->song_count, args->size_ptr);
++    }
++    case 0x0007002F: {
++      // XMPDashInit
++      // Called on the start up of all dashboard versions before kinect
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_DASH_INIT));
++      auto* args = reinterpret_cast<XMP_DASH_INIT*>(buffer);
++
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Dash);
++      REXKRNL_DEBUG(
++          "XMPDashInit({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}), "
++          "unimplemented",
++          uint32_t(args->xmp_client.get()), args->buffer_ptr.get(), args->buffer_length.get(),
++          args->unk1.get(), args->unk2.get(), args->storage_ptr.get());
++
++      if (args->xmp_client != audio::XMP_CLIENT::Dash || !args->storage_ptr ||
++          !args->buffer_ptr) {
++        return X_E_INVALIDARG;
++      }
++
++      kernel_state_->BroadcastNotification(kXNotificationXmpDashInitChanged, 1);
++      return X_E_SUCCESS;
++    }
++    case 0x00070031: {
++      // XMPGetNumSongsInTitlePlaylist
++      // Song count exist at playlist_ptr->0x78, if playlist_ptr->0xc == 0 or 1
++      // return song count, else return zero
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_NUM_SONGS_IN_TITLE_PLAYLIST));
++      auto* args = reinterpret_cast<XMP_GET_NUM_SONGS_IN_TITLE_PLAYLIST*>(buffer);
++
++      REXKRNL_DEBUG(
++          "XMPGetNumSongsInTitlePlaylist({:08X}, {:08X}, {:08X}), "
++          "unimplemented",
++          uint32_t(args->xmp_client.get()), args->playlist_ptr.get(), args->song_count_ptr.get());
++
++      if (!args->playlist_ptr || !args->song_count_ptr) {
++        return X_E_INVALIDARG;
++      }
++      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->song_count_ptr), 0);
+       return X_E_SUCCESS;
+     }
+     case 0x0007003D: {
+-      // XMPCaptureOutput - not sure how this works :/
+-      REXKRNL_DEBUG("XMPCaptureOutput(...)");
+-      assert_always("XMP output not unimplemented");
+-      return X_E_FAIL;
++      // XMPCaptureOutput
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_CAPTURE_OUTPUT));
++      auto* args = reinterpret_cast<XMP_CAPTURE_OUTPUT*>(buffer);
++
++      REXKRNL_DEBUG("XMPCaptureOutput({:08X}, {:08X}, {:08X}, {:08X})",
++                    uint32_t(args->xmp_client.get()), args->callback.get(), args->context.get(),
++                    args->title_render.get());
++      media_player()->SetCaptureCallback(args->callback, args->context,
++                                         static_cast<bool>(args->title_render));
++      return X_E_SUCCESS;
++    }
++    case 0x00070044: {
++      // XMPSetMediaSourceWorkspace
++      // Called on the start up of all dashboard versions before kinect
++      // When it returns X_E_INVALIDARG you can access the music player up to
++      // version 5787
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_SET_MEDIA_SOURCE_WORKSPACE));
++      auto* args = reinterpret_cast<XMP_SET_MEDIA_SOURCE_WORKSPACE*>(buffer);
++
++      assert_true(args->xmp_client == audio::XMP_CLIENT::Game ||
++                  args->xmp_client == audio::XMP_CLIENT::HUD ||
++                  args->xmp_client == audio::XMP_CLIENT::Dash);
++      REXKRNL_DEBUG(
++          "XMPSetMediaSourceWorkspace({:08X}, {:08X}, {:08X}, {:08X}), "
++          "unimplemented",
++          uint32_t(args->xmp_client.get()), args->workspace_type.get(), args->storage_ptr.get(),
++          args->storage_length.get());
++
++      if (args->xmp_client > audio::XMP_CLIENT::Game ||
++          (!args->storage_ptr && args->workspace_type != 3)) {
++        return X_E_INVALIDARG;
++      }
++      return X_E_SUCCESS;
++    }
++    case 0x00070046: {
++      // XMPGetMediaSource
++      // Called on when deleting music in storage
++      assert_true(!buffer_length || buffer_length == sizeof(XMP_GET_MEDIA_SOURCE));
++      auto* args = reinterpret_cast<XMP_GET_MEDIA_SOURCE*>(buffer);
++
++      REXKRNL_DEBUG(
++          "XMPGetMediaSource({:08X}, {:08X}, {:08X}), "
++          "unimplemented",
++          uint32_t(args->xmp_client.get()), args->unk1.get(), args->media_resources_ptr.get());
++      if (!args->media_resources_ptr) {
++        return X_E_INVALIDARG;
++      }
++      // Until valid source information provided
++      return X_E_FAIL;  // X_E_SUCCESS
++    }
++    case 0x00070053: {
++      // Called on the blades dashboard Version 4532-5787 after clicking on the
++      // picture or video library. It only receives buffer
++      auto* args = reinterpret_cast<XMP_GET_DASH_INIT_STATE*>(buffer);
++      REXKRNL_DEBUG("XMPGetDashInitState({:08X}, {:08X})", uint32_t(args->xmp_client.get()),
++                    args->dash_init_state_ptr.get());
++
++      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->dash_init_state_ptr),
++                                       media_player()->GetDashInitState());
++      return X_E_SUCCESS;
+     }
+   }
+   REXKRNL_ERROR(
+-- 
+2.50.1
+

@@ -1,0 +1,198 @@
+From cd2388e583ca15a354d32a3794b64232b070d72d Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:07:56 -0400
+Subject: [PATCH 07/32] thread: block the timer queue's dispatch thread until
+ its next timer
+
+The timer queue's dispatch thread waited for new timers with
+disruptorplus's spin_wait_strategy, which spins, then yields the time
+slice 19 times out of 20 and sleeps 1 ms the 20th. With only the 1 ms
+KeTimeStampBundle timer queued (HighResolutionTimer, xboxkrnl_module.cpp)
+the thread never sleeps for long, and under Wine each yield is a system
+call; on a Steam Deck that is CPU time taken from the APU's shared 15 W
+budget.
+
+Wait on a condition variable instead: until the earliest timer is due,
+or without a timeout when the queue is empty, and wake when a timer is
+queued. disruptorplus has a blocking_wait_strategy, but its timed waits
+pass the predicate before the timeout to std::condition_variable and do
+not compile, so the strategy is defined here. The empty-queue case no
+longer passes time_point::max() as a deadline, which a condition
+variable converts to the system clock and can overflow.
+
+Condition variable timeouts on Windows are rounded up to the system
+timer period (15.6 ms by default), so the queue holds a 1 ms period
+(timeBeginPeriod) while it runs. Xenia Canary sets the process timer
+resolution at startup for the same reason (src/xenia/base/main_win.cc,
+NtSetTimerResolution). The destructor joins the dispatch thread before
+releasing the period.
+
+Part of the runtime changes that took Project Gotham Racing 4 on the
+Steam Deck from 78.7 to 89.4 fps (pgr4-native README, "Steam Deck
+(OLED)"); no run measures it on its own.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/core/CMakeLists.txt  |  5 ++-
+ src/core/timer_queue.cpp | 84 +++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 79 insertions(+), 10 deletions(-)
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..eb4a875 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -98,7 +98,10 @@ target_include_directories(rexcore PRIVATE
+     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
+ )
+ 
+-if(APPLE)
++if(WIN32)
++    # timeBeginPeriod for the timer queue
++    target_link_libraries(rexcore PRIVATE winmm)
++elseif(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..d7e8c1a 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -10,23 +10,71 @@
+  */
+ 
+ #include <algorithm>
++#include <condition_variable>
+ #include <forward_list>
++#include <mutex>
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
++#include <rex/platform.h>
+ #include <rex/thread.h>
+ #include <rex/thread/timer_queue.h>
+ 
++#if REX_PLATFORM_WIN32
++#include "platform_win.h"
++
++#include <timeapi.h>
++#endif
++
+ namespace dp = disruptorplus;
+ 
+ namespace rex::thread {
+ 
+ using WaitItem = TimerQueueWaitItem;
+ 
++// A disruptorplus wait strategy that blocks on a condition variable. disruptorplus ships one
++// (blocking_wait_strategy), but its timed waits pass the predicate before the timeout to
++// std::condition_variable and do not compile.
++class BlockingWaitStrategy {
++ public:
++  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
++                                      const std::atomic<dp::sequence_t>* const sequences[]) {
++    dp::sequence_t result;
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.wait(lock, [&] {
++      result = dp::minimum_sequence_after(sequence, count, sequences);
++      return dp::difference(result, sequence) >= 0;
++    });
++    return result;
++  }
++
++  template <typename Clock, typename Duration>
++  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
++                                      const std::atomic<dp::sequence_t>* const sequences[],
++                                      const std::chrono::time_point<Clock, Duration>& timeout) {
++    dp::sequence_t result;
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.wait_until(lock, timeout, [&] {
++      result = dp::minimum_sequence_after(sequence, count, sequences);
++      return dp::difference(result, sequence) >= 0;
++    });
++    return result;
++  }
++
++  void signal_all_when_blocking() {
++    // Under the mutex, so a waiter between its check and its wait cannot miss the signal.
++    std::lock_guard<std::mutex> lock(mutex_);
++    cv_.notify_all();
++  }
++
++ private:
++  std::mutex mutex_;
++  std::condition_variable cv_;
++};
++
+ class TimerQueue {
+  public:
+   using clock = WaitItem::clock;
+@@ -38,6 +86,11 @@ class TimerQueue {
+         wait_strategy_(),
+         claim_strategy_(kWaitCount, wait_strategy_),
+         consumed_(wait_strategy_) {
++#if REX_PLATFORM_WIN32
++    // The dispatch thread sleeps on a condition variable, whose timeouts Windows rounds up to
++    // the system timer period (15.6 ms by default). The 1 ms KeTimeStampBundle timer needs 1 ms.
++    timer_period_set_ = timeBeginPeriod(1) == TIMERR_NOERROR;
++#endif
+     claim_strategy_.add_claim_barrier(consumed_);
+     dispatch_thread_ =
+         std::jthread([this](std::stop_token stop_token) { TimerThreadMain(stop_token); });
+@@ -51,8 +104,13 @@ class TimerQueue {
+                                                 clock::duration::zero());
+     wait_item->Disarm();
+     QueueTimer(std::move(wait_item));
++    dispatch_thread_.join();
+ 
+-    // std::jthread auto-joins on destruction
++#if REX_PLATFORM_WIN32
++    if (timer_period_set_) {
++      timeEndPeriod(1);
++    }
++#endif
+   }
+ 
+   void TimerThreadMain(std::stop_token stop_token) {
+@@ -66,10 +124,13 @@ class TimerQueue {
+ 
+     while (!stop_token.stop_requested()) {
+       {
+-        // Consume new wait items and add them to sorted wait queue
+-        dp::sequence_t available = claim_strategy_.wait_until_published(
+-            next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++        // Sleep until the earliest timer is due or a new one is queued, then add new wait
++        // items to the sorted wait queue.
++        dp::sequence_t available =
++            wait_queue_.empty()
++                ? claim_strategy_.wait_until_published(next_sequence, next_sequence - 1)
++                : claim_strategy_.wait_until_published(next_sequence, next_sequence - 1,
++                                                       wait_queue_.front()->due_);
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+@@ -142,9 +203,14 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Blocking rather than spinning: the queue holds a few timers firing at most every 1 ms, and
++  // a spinning dispatch thread keeps a host core busy for nothing.
++  BlockingWaitStrategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<BlockingWaitStrategy> claim_strategy_;
++  dp::sequence_barrier<BlockingWaitStrategy> consumed_;
++#if REX_PLATFORM_WIN32
++  bool timer_period_set_ = false;
++#endif
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+-- 
+2.50.1
+

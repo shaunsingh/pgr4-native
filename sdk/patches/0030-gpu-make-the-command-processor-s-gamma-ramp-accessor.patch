@@ -1,0 +1,54 @@
+From 4a8090a2188a451bd3a76e88668d532b2b979247 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:49:06 -0400
+Subject: [PATCH 30/32] gpu: make the command processor's gamma ramp accessors
+ public
+
+The guest programs the display controller's gamma ramp (the 256-entry
+table or the PWL ramp) through DC_LUT register writes, which the
+command processor keeps in gamma_ramp_256_entry_table_ and
+gamma_ramp_pwl_rgb_. Only backend subclasses can read them, through
+protected accessors. A presenter outside the backend, such as a host
+renderer that draws the guest's frames itself, needs the same ramp to
+show the image as the console would; without it the output is too
+light.
+
+Move the two const accessors to the public section, unchanged.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/graphics/command_processor.h | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 291e5f9..ac55b09 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -129,6 +129,13 @@ class CommandProcessor {
+   bool Save(::rex::stream::ByteStream* stream);
+   bool Restore(::rex::stream::ByteStream* stream);
+ 
++  // The display gamma ramps as the guest's DC_LUT register writes left them, for presenters
++  // outside the backend. Written on the command processor thread.
++  const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table() const {
++    return gamma_ramp_256_entry_table_;
++  }
++  const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const { return gamma_ramp_pwl_rgb_[0]; }
++
+  protected:
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+@@ -158,10 +165,6 @@ class CommandProcessor {
+   void WriteLoopRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+   void WriteREGISTERSRangeFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+ 
+-  const reg::DC_LUT_30_COLOR* gamma_ramp_256_entry_table() const {
+-    return gamma_ramp_256_entry_table_;
+-  }
+-  const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const { return gamma_ramp_pwl_rgb_[0]; }
+   virtual void OnGammaRamp256EntryTableValueWritten() {}
+   virtual void OnGammaRampPWLValueWritten() {}
+ 
+-- 
+2.50.1
+

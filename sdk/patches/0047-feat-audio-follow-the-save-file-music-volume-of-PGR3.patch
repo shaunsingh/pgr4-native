@@ -1,0 +1,382 @@
+From 7ee51249729bd5107de49777c0cfb75da2413c8f Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:40:44 -0400
+Subject: [PATCH 47/48] feat(audio): follow the save-file music volume of PGR3,
+ PGR4 and DOAX2
+
+Some titles keep their music volume in their own save data and never send
+XMPSetVolume, so the XMP player stays at its default volume whatever the
+player picks in the options menu. PGR4 is one: it never sends XMPSetVolume
+(0x7000C), and Canary's table puts its music slider (0-10) at byte 2 of
+the 344-byte savegame record.
+
+This ports Xenia Canary's XmpVolumePatch (451f915,
+src/xenia/kernel/util/xmp_volume_patch.{h,cc} and its hooks in
+kernel_state.cc, xboxkrnl_io.cc and xam_input.cc). For a known title it
+watches reads and writes of the save file, maps the volume byte to
+[0.0001, 1] and hands it to the player; after a read it also keeps the
+guest address of the record and re-reads the byte whenever a controller
+packet number changes, so the slider takes effect before the game saves.
+Titles: DOAX2 (544307D2, ups.dat), PGR3 (4D5307D1, profile.save) and PGR4
+(4D5307F9, savegame).
+
+Differences from Canary:
+
+- The record address, last volume and last packet number are atomics;
+  file I/O and input polling come from different guest threads.
+- The polled byte is read only while its page is still readable, and the
+  address is dropped once it is not, since the record buffer belongs to
+  the title.
+- KernelState creates the patch in SetExecutableModule as Canary does but
+  does not free it in TerminateTitle: guest threads that ignore the
+  cooperative exit keep running there and may still be inside a hook.
+  The next SetExecutableModule replaces it.
+- The read hook runs on the status of the read itself.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/system/kernel_state.h          |   4 +
+ include/rex/system/util/xmp_volume_patch.h |  70 ++++++++++
+ src/kernel/xam/xam_input.cpp               |   8 +-
+ src/kernel/xboxkrnl/xboxkrnl_io.cpp        |  14 ++
+ src/system/CMakeLists.txt                  |   1 +
+ src/system/kernel_state.cpp                |   3 +
+ src/system/util/xmp_volume_patch.cpp       | 143 +++++++++++++++++++++
+ 7 files changed, 242 insertions(+), 1 deletion(-)
+ create mode 100644 include/rex/system/util/xmp_volume_patch.h
+ create mode 100644 src/system/util/xmp_volume_patch.cpp
+
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 9b9cf9e..68eafda 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -32,6 +32,7 @@
+ #include <rex/system/util/native_list.h>
+ #include <rex/system/util/object_table.h>
+ #include <rex/system/util/xdbf_utils.h>
++#include <rex/system/util/xmp_volume_patch.h>
+ #include <rex/system/xam/app_manager.h>
+ #include <rex/system/xam/content_manager.h>
+ #include <rex/system/xam/user_profile.h>
+@@ -201,6 +202,8 @@ class KernelState {
+   xam::ContentManager* content_manager() const { return content_manager_.get(); }
+   xam::UserProfile* user_profile() const { return user_profile_.get(); }
+ 
++  util::XmpVolumePatch* xmp_volume_patch() const { return xmp_volume_patch_.get(); }
++
+   // Access must be guarded by the global critical region.
+   util::ObjectTable* object_table() { return &object_table_; }
+ 
+@@ -354,6 +357,7 @@ class KernelState {
+   std::unique_ptr<xam::AppManager> app_manager_;
+   std::unique_ptr<xam::ContentManager> content_manager_;
+   std::unique_ptr<xam::UserProfile> user_profile_;
++  std::unique_ptr<util::XmpVolumePatch> xmp_volume_patch_;
+ 
+   rex::thread::global_critical_region global_critical_region_;
+ 
+diff --git a/include/rex/system/util/xmp_volume_patch.h b/include/rex/system/util/xmp_volume_patch.h
+new file mode 100644
+index 0000000..49fe6a4
+--- /dev/null
++++ b/include/rex/system/util/xmp_volume_patch.h
+@@ -0,0 +1,70 @@
++#pragma once
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    2026 - Ported to the ReXGlue runtime from Xenia Canary 451f915
++ */
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++namespace rex::system {
++class KernelState;
++}  // namespace rex::system
++
++namespace rex::system::util {
++
++// Patch for games that store their BGM volume in a save file but never call
++// XMPSetVolume. Each game just needs to specify:
++//   - file_name:    substring to match in the file name
++//   - write_length: exact length of the write containing the volume byte
++//                   (0 to match any write >= offset + 1)
++//   - offset:       byte offset of the volume value within the write buffer
++//   - max_value:    maximum volume value (maps to 1.0f)
++//
++// On savegame read/write, the patch reads the volume byte and syncs it to
++// the XMP audio player. It also captures the guest memory address of the
++// buffer and re-reads it on controller input changes to detect in-game
++// volume adjustments before they are saved.
++struct XmpVolumeConfig {
++  const char* file_name;
++  uint32_t write_length;
++  uint32_t offset;
++  uint8_t max_value;
++};
++
++class XmpVolumePatch {
++ public:
++  XmpVolumePatch(KernelState* kernel_state, const XmpVolumeConfig& config)
++      : kernel_state_(kernel_state), config_(config) {}
++
++  void OnFileWrite(const std::string& name, const uint8_t* buffer, uint32_t length,
++                   uint32_t guest_address);
++  void OnFileRead(const std::string& name, const uint8_t* buffer, uint32_t length,
++                  uint32_t guest_address);
++  void OnInputPoll(uint32_t packet_number);
++
++  static std::unique_ptr<XmpVolumePatch> CreateForTitle(uint32_t title_id, KernelState* ks);
++
++ private:
++  bool Matches(const std::string& name, uint32_t length) const;
++  void ApplyVolume(const uint8_t* buffer, uint32_t length);
++  void PollGuestVolume();
++  void SetPlayerVolume(float volume);
++
++  KernelState* kernel_state_;
++  XmpVolumeConfig config_;
++  // File I/O and input polling run on different guest threads.
++  std::atomic<uint32_t> settings_guest_addr_ = 0;
++  std::atomic<uint8_t> last_volume_ = 0xFF;
++  std::atomic<uint32_t> last_packet_number_ = 0;
++};
++
++}  // namespace rex::system::util
+diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
+index 80c3634..f3f0ec9 100644
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -112,7 +112,13 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
+   }
+ 
+   auto* is = input_system();
+-  return is->GetState(actual_user_index, input_state);
++  const X_RESULT result = is->GetState(actual_user_index, input_state);
++  if (input_state && result == X_ERROR_SUCCESS) {
++    if (auto* patch = REX_KERNEL_STATE()->xmp_volume_patch()) {
++      patch->OnInputPoll(input_state->packet_number);
++    }
++  }
++  return result;
+ }
+ 
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index cce4f65..f76477e 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -221,6 +221,13 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+         io_status_block->information = bytes_read;
+       }
+ 
++      if (XSUCCEEDED(result)) {
++        if (auto* patch = REX_KERNEL_STATE()->xmp_volume_patch()) {
++          auto* host_buffer = REX_KERNEL_MEMORY()->TranslateVirtual(buffer.guest_address());
++          patch->OnFileRead(file->name(), host_buffer, buffer_length, buffer.guest_address());
++        }
++      }
++
+       // Queue the APC callback. It must be delivered via the APC mechanism even
+       // though were are completing immediately.
+       // Low bit probably means do not queue to IO ports.
+@@ -412,6 +419,13 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
+         io_status_block->information = static_cast<uint32_t>(bytes_written);
+       }
+ 
++      if (XSUCCEEDED(result)) {
++        if (auto* patch = REX_KERNEL_STATE()->xmp_volume_patch()) {
++          auto* host_buffer = REX_KERNEL_MEMORY()->TranslateVirtual(buffer.guest_address());
++          patch->OnFileWrite(file->name(), host_buffer, buffer_length, buffer.guest_address());
++        }
++      }
++
+       // Queue the APC callback. It must be delivered via the APC mechanism even
+       // though were are completing immediately.
+       // Low bit probably means do not queue to IO ports.
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 05979a3..a836563 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -27,6 +27,7 @@ set(REXSYSTEM_SOURCES
+     util/native_list.cpp
+     util/xdbf_utils.cpp
+     util/gameinfo_utils.cpp
++    util/xmp_volume_patch.cpp
+ 
+     # XAM services
+     xam/app_manager.cpp
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..495dff4 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -642,6 +642,9 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
+     rex::string::copy_truncating(variable_ptr, executable_module_->path(), kExLoadedImageNameSize);
+   }
+ 
++  // Initialize file I/O hooks for XMP volume title-specific patches.
++  xmp_volume_patch_ = util::XmpVolumePatch::CreateForTitle(title_id(), this);
++
+   // Spin up deferred dispatch worker.
+   // TODO(benvanik): move someplace more appropriate (out of ctor, but around
+   // here).
+diff --git a/src/system/util/xmp_volume_patch.cpp b/src/system/util/xmp_volume_patch.cpp
+new file mode 100644
+index 0000000..94f77b4
+--- /dev/null
++++ b/src/system/util/xmp_volume_patch.cpp
+@@ -0,0 +1,143 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    2026 - Ported to the ReXGlue runtime from Xenia Canary 451f915
++ */
++
++#include <rex/system/util/xmp_volume_patch.h>
++
++#include <rex/audio/audio_media_player.h>
++#include <rex/audio/audio_system.h>
++#include <rex/logging.h>
++#include <rex/runtime.h>
++#include <rex/system/kernel_state.h>
++#include <rex/system/xmemory.h>
++
++namespace rex::system::util {
++
++namespace {
++
++// Convert a volume byte to a float in [0.0001, 1.0]. Uses a near-zero floor
++// instead of 0.0f so the audio player doesn't interpret it as "never set"
++// and override with the default volume.
++float ByteToVolume(uint8_t value, uint8_t max_value) {
++  if (value == 0) {
++    return 0.0001f;
++  }
++  return static_cast<float>(value) / static_cast<float>(max_value);
++}
++
++}  // namespace
++
++bool XmpVolumePatch::Matches(const std::string& name, uint32_t length) const {
++  if (name.find(config_.file_name) == std::string::npos) {
++    return false;
++  }
++  if (config_.write_length != 0) {
++    return length == config_.write_length;
++  }
++  return length >= config_.offset + 1;
++}
++
++void XmpVolumePatch::SetPlayerVolume(float volume) {
++  auto* audio_system = static_cast<audio::AudioSystem*>(kernel_state_->emulator()->audio_system());
++  if (auto* player = audio_system ? audio_system->media_player() : nullptr) {
++    player->SetVolume(volume);
++  }
++}
++
++void XmpVolumePatch::ApplyVolume(const uint8_t* buffer, [[maybe_unused]] uint32_t length) {
++  uint8_t volume_byte = buffer[config_.offset];
++  if (volume_byte > config_.max_value) {
++    return;
++  }
++
++  float volume = ByteToVolume(volume_byte, config_.max_value);
++
++  REXSYS_DEBUG("XmpVolumePatch: volume={}/{} -> {:.2f}", volume_byte, config_.max_value, volume);
++
++  last_volume_ = volume_byte;
++  SetPlayerVolume(volume);
++}
++
++void XmpVolumePatch::PollGuestVolume() {
++  const uint32_t settings_addr = settings_guest_addr_.load(std::memory_order_relaxed);
++  if (!settings_addr) {
++    return;
++  }
++
++  auto* mem = kernel_state_->memory();
++  uint32_t vol_addr = settings_addr + config_.offset;
++  // The read buffer is the title's; stop following it once it is unmapped.
++  auto* heap = mem->LookupHeap(vol_addr);
++  uint32_t protect = 0;
++  if (!heap || !heap->QueryProtect(vol_addr, &protect) ||
++      !(protect & memory::kMemoryProtectRead)) {
++    settings_guest_addr_.store(0, std::memory_order_relaxed);
++    return;
++  }
++  uint8_t current = mem->TranslateVirtual<uint8_t*>(vol_addr)[0];
++
++  if (current == last_volume_ || current > config_.max_value) {
++    return;
++  }
++
++  last_volume_ = current;
++  float volume = ByteToVolume(current, config_.max_value);
++
++  REXSYS_DEBUG("XmpVolumePatch: polled volume change={}/{} -> {:.2f}", current, config_.max_value,
++               volume);
++
++  SetPlayerVolume(volume);
++}
++
++void XmpVolumePatch::OnFileWrite(const std::string& name, const uint8_t* buffer, uint32_t length,
++                                 [[maybe_unused]] uint32_t guest_address) {
++  if (Matches(name, length)) {
++    ApplyVolume(buffer, length);
++  }
++}
++
++void XmpVolumePatch::OnFileRead(const std::string& name, const uint8_t* buffer, uint32_t length,
++                                uint32_t guest_address) {
++  if (Matches(name, length)) {
++    settings_guest_addr_.store(guest_address, std::memory_order_relaxed);
++    ApplyVolume(buffer, length);
++  }
++}
++
++void XmpVolumePatch::OnInputPoll(uint32_t packet_number) {
++  if (last_packet_number_.exchange(packet_number, std::memory_order_relaxed) == packet_number) {
++    return;
++  }
++  PollGuestVolume();
++}
++
++std::unique_ptr<XmpVolumePatch> XmpVolumePatch::CreateForTitle(uint32_t title_id,
++                                                               KernelState* ks) {
++  XmpVolumeConfig config;
++
++  switch (title_id) {
++    case 0x544307D2:  // DOAX2
++      config = {"ups.dat", 0, 0x50, 100};
++      break;
++    case 0x4D5307D1:  // PGR3
++      config = {"profile.save", 528, 19, 10};
++      break;
++    case 0x4D5307F9:  // PGR4
++      config = {"savegame", 344, 2, 10};
++      break;
++    default:
++      return nullptr;
++  }
++
++  REXSYS_INFO("XmpVolumePatch: Loading for title {:08X}", title_id);
++  return std::make_unique<XmpVolumePatch>(ks, config);
++}
++
++}  // namespace rex::system::util
+-- 
+2.50.1
+

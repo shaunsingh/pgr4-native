@@ -1,0 +1,75 @@
+From 306e0dff7bd6269fe7167ef718c72045bc96ddd7 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:30:49 -0400
+Subject: [PATCH 17/32] ui: add d3d12_present_vsync to present on the display's
+ vblank
+
+The D3D12 presenter always presents with a sync interval of 0, allowing
+tearing where the swap chain supports it, which suits a host refresh
+rate that is no multiple of the guest's. A game paced by the guest's
+own vblank on a fixed-rate panel (the Steam Deck's, PGR4 at 60 or
+90 Hz) tears instead.
+
+With d3d12_present_vsync (default off, so the default is unchanged)
+the presenter presents with a sync interval of 1 and without
+DXGI_PRESENT_ALLOW_TEARING, and reports the connection as implicitly
+vsynced, as the Vulkan presenter does for FIFO. MTR-PGR4 adds the same
+option and turns it on in its launcher.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/ui/d3d12/d3d12_presenter.cpp | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..62d75a5 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -32,6 +32,9 @@
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
++REXCVAR_DEFINE_BOOL(d3d12_present_vsync, false, "UI/D3D12",
++                    "Present on the display's vertical blank, without tearing")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -350,7 +353,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   if (paint_context_.swap_chain) {
+     if (was_paintable && paint_context_.swap_chain_width == new_swap_chain_width &&
+         paint_context_.swap_chain_height == new_swap_chain_height) {
+-      is_vsync_implicit_out = false;
++      is_vsync_implicit_out = REXCVAR_GET(d3d12_present_vsync);
+       return SurfacePaintConnectResult::kSuccessUnchanged;
+     }
+     paint_context_.AwaitSwapChainUsageCompletion();
+@@ -478,7 +481,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+         provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + i));
+   }
+ 
+-  is_vsync_implicit_out = false;
++  is_vsync_implicit_out = REXCVAR_GET(d3d12_present_vsync);
+   return SurfacePaintConnectResult::kSuccess;
+ }
+ 
+@@ -1154,10 +1157,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // variable refresh rate in borderless fullscreen (note that if DXGI
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+-  // presentation model used in Direct3D 12).
++  // presentation model used in Direct3D 12). d3d12_present_vsync waits for vsync instead.
++  const bool present_vsync = REXCVAR_GET(d3d12_present_vsync);
+   HRESULT present_result = paint_context_.swap_chain->Present(
+-      0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++      present_vsync ? 1 : 0,
++      DXGI_PRESENT_RESTART |
++          (!present_vsync && paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING
++                                                                      : 0));
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+-- 
+2.50.1
+

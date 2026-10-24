@@ -1,0 +1,50 @@
+From 82a9dfc229eb166261f1bd86a70ddc932ab27a79 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:04:52 -0400
+Subject: [PATCH 40/48] fix(audio): read the XMA loop subframe end from bits
+ 14-16 of DWORD 1
+
+The XMA context lives in guest memory, where the guest's XMA library
+code reads and writes it as the hardware layout, so the bit positions in
+XMA_CONTEXT_DATA have to match that layout. The context declared
+loop_subframe_end as a 2-bit field at bit 12 and an unknown 3-bit field
+at bit 14. Xenia Canary lays DWORD 1 out as loop_subframe_start:2 at bit
+12, loop_subframe_end:3 at bit 14 and loop_subframe_skip:3 at bit 17
+(src/xenia/apu/xma_context.h, XMA_CONTEXT_DATA, at 451f915), and its
+loop handling in XmaContextNew::Decode reads loop_subframe_end from
+there.
+
+With the old layout the decoder read the loop end subframe from the
+loop start field, so the last frame of a loop could be cut at the wrong
+subframe. Loop starts were unaffected: loop_subframe_skip was already at
+bit 17.
+
+Take Canary's layout. loop_subframe_start is unused, as in Canary.
+XMAInitializeContext and XMASetLoopData copy the host loop data into
+these fields by name and need no change.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/audio/xma/context.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 8426798..0ef1ccd 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -62,10 +62,10 @@ struct XMA_CONTEXT_DATA {
+   uint32_t input_buffer_1_packet_count : 12;  // XMASetInputBuffer1, number of
+                                               // 2KB packets. Max 4095 packets.
+                                               // These packets form a block.
+-  uint32_t loop_subframe_end : 2;             // +12bit, XMAPlaybackSetLoop
++  uint32_t loop_subframe_start : 2;           // +12bit, XMAPlaybackSetLoop
++  uint32_t loop_subframe_end : 3;             // +14bit, XMAPlaybackSetLoop
+                                               // dwLoopSubframeEnd: last loop frame
+                                               // plays subframes 0..end
+-  uint32_t unk_dword_1_a : 3;                 // +14bit
+   uint32_t loop_subframe_skip : 3;            // +17bit, XMAPlaybackSetLoop
+                                               // dwLoopSubframeSkip: subframes to
+                                               // discard at loop start; 4 = whole
+-- 
+2.50.1
+

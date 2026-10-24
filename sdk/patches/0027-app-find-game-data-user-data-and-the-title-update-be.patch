@@ -1,0 +1,85 @@
+From ff13f073b08e1ce29f22f6c120d17ae76010ed7f Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:46:57 -0400
+Subject: [PATCH 27/32] app: find game data, user data and the title update
+ beside the executable
+
+ReXApp has no game data unless --game_data_root is passed, and the
+config file beside the executable cannot provide it, because the config
+is loaded only after the paths are resolved. A self-contained install,
+the executable with its game files, title update and saves in one
+folder, needs every run to pass the same three paths.
+
+Default the roots to folders beside the executable when they exist and
+no cvar is given:
+- game_data_root: game/
+- user_data_root: userdata/, for an install that has game/ beside the
+  executable; otherwise the platform user folder as before
+- update_data_root: title-update/
+Explicit cvars and OnConfigurePaths still take precedence, and a
+missing game folder still fails, now with a message naming both ways to
+provide it.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/ui/rex_app.cpp | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 9ff54e8..7d86df5 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -107,26 +107,37 @@ bool ReXApp::OnInitialize() {
+ bool ReXApp::SetupEnvironment() {
+   auto exe_dir = rex::filesystem::GetExecutableFolder();
+ 
++  // Game data: cvar override, or the game folder beside the executable, if any. The config file
++  // loads only after the paths are set, so a self-contained install needs defaults beside it.
+   std::filesystem::path game_dir;
++  bool self_contained = false;
+   std::string game_data_cvar = REXCVAR_GET(game_data_root);
+   if (!game_data_cvar.empty()) {
+     game_dir = game_data_cvar;
++  } else if (std::error_code ec; std::filesystem::is_directory(exe_dir / "game", ec)) {
++    game_dir = exe_dir / "game";
++    self_contained = true;
+   }
+ 
+-  // User data: cvar override, or platform user directory
++  // User data: cvar override, the userdata folder beside the executable of a self-contained
++  // install, or platform user directory
+   std::filesystem::path user_dir;
+   std::string user_data_cvar = REXCVAR_GET(user_data_root);
+   if (!user_data_cvar.empty()) {
+     user_dir = user_data_cvar;
++  } else if (self_contained) {
++    user_dir = exe_dir / "userdata";
+   } else {
+     user_dir = rex::filesystem::GetUserFolder() / GetName();
+   }
+ 
+-  // Update data: cvar override, or empty (opt-in)
++  // Update data: cvar override, the title-update folder beside the executable, if any, or empty
+   std::filesystem::path update_dir;
+   std::string update_data_cvar = REXCVAR_GET(update_data_root);
+   if (!update_data_cvar.empty()) {
+     update_dir = update_data_cvar;
++  } else if (std::error_code ec; std::filesystem::is_directory(exe_dir / "title-update", ec)) {
++    update_dir = exe_dir / "title-update";
+   }
+ 
+   // Cache: cvar override, or user_dir/cache
+@@ -200,7 +211,9 @@ bool ReXApp::SetupEnvironment() {
+ 
+ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   if (paths.game_data_root.empty()) {
+-    auto msg = std::string("--game_data_root was not provided.");
++    auto msg = std::string(
++        "No game data: put the game's files in the folder named game beside the executable, or "
++        "pass --game_data_root.");
+     REXLOG_ERROR("{}", msg);
+     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+     return false;
+-- 
+2.50.1
+

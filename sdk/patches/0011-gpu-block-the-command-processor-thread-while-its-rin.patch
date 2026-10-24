@@ -1,0 +1,138 @@
+From 0648c4f24d02a3b6617a30152f979ba02b9834b1 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:12:54 -0400
+Subject: [PATCH 11/32] gpu: block the command processor thread while its ring
+ is empty
+
+With nothing left in the ring, WorkerThreadMain yielded in a loop: 500
+MaybeYield calls, then a 5 ms event wait between yields, and
+UpdateWritePointer set the event on every write pointer update. Whenever
+the guest had nothing queued, the thread spent the time in sched_yield
+(NtYieldExecution under Wine) and short waits, system calls that, on a
+Steam Deck, come out of the APU's shared 15 W budget.
+
+Spin on PAUSE for up to 20 us to catch back-to-back kicks, then block on
+the event until there is work. The worker publishes that it is about to
+block (worker_waiting_, sequentially consistent like the write pointer's
+store and load, so either the worker sees the new write pointer or
+UpdateWritePointer sees the flag), and UpdateWritePointer sets the event
+only then, so a busy worker costs the guest no kernel call per kick.
+CallInThread now sets the event too: a queued function used to wait for
+the worker's next poll, at most 5 ms, and would otherwise wait for the
+next kick. Shutdown already sets it. The 5 ms timeout stays as a safety
+net.
+
+Part of the runtime changes that took Project Gotham Racing 4 on a Steam
+Deck under Proton from 78.7 to 89.4 fps (pgr4-native README, "Steam Deck
+(OLED)"); no run measures it on its own.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/graphics/command_processor.h |  3 ++
+ src/graphics/command_processor.cpp       | 47 ++++++++++++++++--------
+ 2 files changed, 34 insertions(+), 16 deletions(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index da8e432..291e5f9 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -254,6 +254,9 @@ class CommandProcessor {
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
++  // Set while the worker is about to block on write_ptr_index_event_ (see WorkerThreadMain):
++  // only then does UpdateWritePointer signal it.
++  std::atomic<bool> worker_waiting_{false};
+ 
+   // Some titles submit writes beyond the emulated register file range in PM4
+   // packets. Preserve these values so dependent packet logic can still observe
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 1de3657..301b3f0 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,12 +10,14 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+ #include <string_view>
+ 
+ #include <fmt/format.h>
++#include <simde/x86/sse2.h>
+ 
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+@@ -162,6 +164,7 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
+     fn();
+   } else {
+     pending_fns_.push(std::move(fn));
++    write_ptr_index_event_->Set();
+   }
+ }
+ 
+@@ -214,23 +217,32 @@ void CommandProcessor::WorkerThreadMain() {
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+       // We've run out of commands to execute.
+-      // We spin here waiting for new ones, as the overhead of waiting on our
+-      // event is too high.
++      // Spin briefly for back-to-back kicks, then block until UpdateWritePointer, CallInThread
++      // or Shutdown sets the event. (Yielding in a loop costs a host core's worth of yields
++      // while the guest has nothing queued.)
+       PrepareForWait();
+-      uint32_t loop_count = 0;
+-      do {
+-        // If we spin around too much, revert to a "low-power" state.
+-        if (loop_count > 500) {
+-          const int wait_time_ms = 5;
+-          rex::thread::Wait(write_ptr_index_event_.get(), true,
+-                            std::chrono::milliseconds(wait_time_ms));
+-        }
+-
+-        rex::thread::MaybeYield();
+-        loop_count++;
++      const auto idle = [&] {
+         write_ptr_index = write_ptr_index_.load();
+-      } while (worker_running_ && pending_fns_.empty() &&
+-               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
++        return worker_running_ && pending_fns_.empty() &&
++               (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index);
++      };
++      constexpr auto kIdleSpin = std::chrono::microseconds(20);
++      const auto spin_start = std::chrono::steady_clock::now();
++      for (uint32_t spin = 1; idle(); ++spin) {
++        simde_mm_pause();
++        if (!(spin & 63) && std::chrono::steady_clock::now() - spin_start >= kIdleSpin) {
++          break;
++        }
++      }
++      while (idle()) {
++        // Sequentially consistent, like the write pointer's store and load: either idle() below
++        // sees the new write pointer, or UpdateWritePointer sees the flag and sets the event.
++        worker_waiting_.store(true);
++        if (idle()) {
++          rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
++        }
++        worker_waiting_.store(false);
++      }
+       ReturnFromWait();
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+@@ -329,7 +341,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+ 
+ void CommandProcessor::UpdateWritePointer(uint32_t value) {
+   write_ptr_index_ = value;
+-  write_ptr_index_event_->Set();
++  // The worker reads the write pointer itself unless it is blocked (WorkerThreadMain).
++  if (worker_waiting_.load()) {
++    write_ptr_index_event_->Set();
++  }
+ }
+ 
+ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+-- 
+2.50.1
+

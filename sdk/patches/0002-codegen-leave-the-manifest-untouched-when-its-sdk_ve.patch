@@ -1,0 +1,39 @@
+From 3818bd0cfd0e7de68fbb67287067052f19a19db8 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:02:07 -0400
+Subject: [PATCH 02/32] codegen: leave the manifest untouched when its
+ sdk_version stamp is current
+
+WriteSdkVersionStamp rewrote the manifest after every codegen run, even
+when the sdk_version line already held the current version. The rewrite
+makes the manifest newer than the codegen output, so a project that runs
+codegen from its build (generated/rexglue.cmake) reran codegen and rebuilt
+every generated source on each build.
+
+Return before writing when the existing stamp already matches. This is
+the same change MTR-PGR4 carries in its patched SDK
+(patches/rexglue-v0.10.0.patch, src/codegen/manifest.cpp).
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/codegen/manifest.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/codegen/manifest.cpp b/src/codegen/manifest.cpp
+index 4065fdb..bc3494e 100644
+--- a/src/codegen/manifest.cpp
++++ b/src/codegen/manifest.cpp
+@@ -223,6 +223,10 @@ bool ManifestConfig::WriteSdkVersionStamp(const std::filesystem::path& path,
+   }
+ 
+   if (stamp_idx) {
++    // Rewriting an unchanged manifest would make it newer than the codegen output, and a build
++    // that runs codegen on a stale manifest would then regenerate everything on every build.
++    if (lines[*stamp_idx] == stamp_line)
++      return true;
+     lines[*stamp_idx] = stamp_line;
+   } else if (project_header_idx) {
+     lines.insert(lines.begin() + *project_header_idx + 1, stamp_line);
+-- 
+2.50.1
+

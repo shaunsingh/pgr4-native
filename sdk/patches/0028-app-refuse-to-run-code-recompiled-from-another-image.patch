@@ -1,0 +1,61 @@
+From b24b18c37009f5c6e4df58e5a3f9621b812da2ac Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:47:24 -0400
+Subject: [PATCH 28/32] app: refuse to run code recompiled from another image
+ than the one loaded
+
+The recompiled code is valid only for the image codegen read: the XEX
+with the title update it was generated with applied. Since the runtime
+applies a title update found on update:, a missing, extra or different
+title update now changes the loaded image without any error, and the
+title then runs recompiled functions over code and data that are not
+theirs, which fails far from the cause.
+
+After the XEX loads, compare the executable module's image size with
+the image_size codegen recorded in PPCImageInfo, and when they differ
+stop with an error that names both sizes and the update data root. A
+zero image_size (not recorded) skips the check.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/ui/rex_app.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 7d86df5..ea3f29a 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -36,6 +36,8 @@
+ #include <rex/system/achievement_manager.h>
+ #include <rex/system/gpu_plugin.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/user_module.h>
++#include <rex/system/xex_module.h>
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
+ #include <rex/ui/keybinds.h>
+@@ -302,6 +304,21 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     return false;
+   }
+ 
++  // The recompiled code matches only the image it was generated from. A missing or different
++  // title update loads another image, of another size, under the same code.
++  if (auto module = runtime_->kernel_state()->GetExecutableModule();
++      module && module->xex_module() && ppc_info_.image_size &&
++      module->xex_module()->image_size() != ppc_info_.image_size) {
++    auto msg = fmt::format(
++        "{} loads as a {:#x}-byte image, but the code was recompiled from a {:#x}-byte one. "
++        "Is the title update it was generated with in place (update data: '{}')?",
++        xex_image, module->xex_module()->image_size(), ppc_info_.image_size,
++        update_data_root_.string());
++    REXLOG_ERROR("{}", msg);
++    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
++    return false;
++  }
++
+   OnPostLoadXexImage();
+ 
+   if (ppc_info_.rexcrt_heap) {
+-- 
+2.50.1
+

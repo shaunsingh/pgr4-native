@@ -1,0 +1,91 @@
+From e1cdbf880cd8f74e7c69b5cd38f8cd068004cdcd Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:29:42 -0400
+Subject: [PATCH 16/32] gpu: add gpu_vblank_deadline_timer to sleep the vblank
+ thread to its deadline
+
+The guest vblank thread checks the guest clock every 1 ms and raises the
+vblanks that are due, so each vblank reaches the guest up to one sleep,
+1 to 2 ms with a 1 ms timer period, after its deadline.
+
+With gpu_vblank_deadline_timer (default off) the thread sleeps until
+the next deadline instead, on the GPU module's PreciseSleep (a
+high-resolution waitable timer on Windows, NtDelayExecution under Wine).
+The remaining guest ticks are converted to host time through the guest
+tick ratio, so a guest time scalar is honoured. The cadence is
+unchanged: deadlines still advance by whole intervals from the last
+one, and vblanks missed while the callbacks ran are delivered at once.
+The sleep is capped at 100 ms so that shutdown stays prompt, and the
+1 ms poll remains the fallback.
+
+MTR-PGR4 enables this behaviour in its launcher for PGR4. Xenia Canary's
+vsync thread likewise sleeps a vblank interval with NanoSleep
+(NtDelayExecution) rather than polling (src/xenia/gpu/graphics_system.cc).
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/graphics/graphics_system.cpp | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..fe1303e 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -31,6 +31,8 @@
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
++#include "util/precise_sleep.h"
++
+ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -39,6 +41,11 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+ 
++REXCVAR_DEFINE_BOOL(gpu_vblank_deadline_timer, false, "GPU",
++                    "Sleep the guest vblank thread until its next vblank with a high-resolution "
++                    "sleep instead of polling every millisecond")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace {
+ 
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+@@ -158,6 +165,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        const uint64_t host_tick_frequency = chrono::Clock::QueryHostTickFrequency();
++        PreciseSleep precise_sleep;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+@@ -166,6 +175,24 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             MarkVblank();
+             last_frame_time += interval_ticks;
+           }
++          if (REXCVAR_GET(gpu_vblank_deadline_timer)) {
++            // The vblank callbacks may have taken long enough to reach the next deadline.
++            current_time = chrono::Clock::QueryGuestTickCount();
++            uint64_t elapsed_ticks = current_time - last_frame_time;
++            if (elapsed_ticks >= interval_ticks) {
++              continue;
++            }
++            // Guest ticks are host ticks times first / second.
++            auto [ratio_numerator, ratio_denominator] = chrono::Clock::guest_tick_ratio();
++            double remaining_host_ticks = double(interval_ticks - elapsed_ticks) *
++                                          double(ratio_denominator) / double(ratio_numerator);
++            // At most 100 ms, so that shutdown is still noticed soon.
++            auto remaining = std::chrono::nanoseconds(int64_t(
++                std::min(remaining_host_ticks * 1e9 / double(host_tick_frequency), 1e8)));
++            if (precise_sleep.SleepFor(remaining)) {
++              continue;
++            }
++          }
+           rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
+         return 0;
+-- 
+2.50.1
+

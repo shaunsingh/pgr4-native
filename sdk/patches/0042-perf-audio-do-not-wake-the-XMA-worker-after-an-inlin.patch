@@ -1,0 +1,48 @@
+From a45cf1f8a9715f32b0cf03a4e5fa92a07f9155b5 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 12:06:05 -0400
+Subject: [PATCH 42/48] perf(audio): do not wake the XMA worker after an inline
+ kick decode
+
+A context kick decodes the kicked contexts at once on the writing
+thread, and XmaContext::Work takes the context lock and clears the
+enable before it decodes, so by the end of the kick none of them is left
+for the worker. The kick still set work_event_, and the woken worker
+walked all 320 contexts, about 18 KB apart, reading each one's enable
+flag and finding nothing to do.
+
+In Project Gotham Racing 4 on a Steam Deck that sweep was 8.6 % of a
+core, 71 % of it on the enable load (one cache miss per context). With
+the wake removed the worker stays idle, the game's audio thread went
+from 52 % to 47 % of a core and a scripted race from 69.1 to 70.6 fps.
+
+Pause, resume and shutdown still set the event, and a context whose
+kick finds it locked by the worker waits on the lock and decodes after
+it, so nothing is left pending.
+
+Xenia Canary has no inline decode (XmaDecoder::WriteRegister only wakes
+work_event_ on a kick, src/xenia/apu/xma_decoder.cc at 451f915); this
+change only concerns ReXGlue's inline path.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ src/audio/xma_decoder.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
+index a0a178d..4366dfc 100644
+--- a/src/audio/xma_decoder.cpp
++++ b/src/audio/xma_decoder.cpp
+@@ -304,7 +304,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+         }
+       }
+     }
+-    work_event_->Set();
++    // Work() consumes the enable, so every kicked context is done by now. Waking
++    // the worker here only made it sweep all contexts and find nothing.
+   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
+     // Context lock command.
+     // This requests a lock by flagging the context.
+-- 
+2.50.1
+
