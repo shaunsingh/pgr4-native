@@ -1,8 +1,10 @@
 # pgr4-native
 
-A native Direct3D 12 renderer for the Project Gotham Racing 4 static recompilation
-([MissingThePixel/MTR-PGR4](https://github.com/MissingThePixel/MTR-PGR4), built on the
-[ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK).
+A native Direct3D 12 renderer for a static recompilation of Project Gotham Racing 4 (Title
+Update #2), built on the [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK with fixes from
+[Xenia Canary](https://github.com/xenia-canary/xenia-canary). It began on
+[MissingThePixel/MTR-PGR4](https://github.com/MissingThePixel/MTR-PGR4); the game projects and
+SDK patches are now this repository's own (`game/`, `sdk/`).
 
 The recompiled game normally draws through ReXGlue's Xenos plugin, which emulates the Xbox 360
 GPU by replaying its command stream. This renderer hooks the game's own Xbox 360 D3D calls in
@@ -686,7 +688,32 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   `deck-run.sh --mode release` runs an unpacked package as a player starts it. td-186: the
   package found `game/` and created its save in `userdata/`. td-188: race 89.4 fps, 1 % low
   66.1, 0.1 % low 56.9, p99 frame 14.16 ms.
-## Why a native renderer can beat emulation
+- The build no longer starts from an MTR-PGR4 checkout. `native/build.sh` clones ReXGlue at
+  the commit `sdk/rexglue.lock` names and applies `sdk/patches/` (from ReXGlue `development`,
+  Xenia Canary or this project, as each header says), then generates and builds this
+  repository's game projects (`game/pgr4`, `game/gw`). The Windows workflow on MTR-PGR4 moved
+  to `retired/`. td-192: race 89.4 fps, 1 % low 65.1; td-193, the image check: 45.3-47.8 dB.
+  td-190 lost the device once in a race (amdgpu rejected a command submission, -2, in
+  ReXGlue's D3D12 device thread); no run since repeated it.
+- Geometry Wars in the garage draws: `gw_recompiled.toml` names the Xenos plugin, which the
+  SDK does not load by default (td-204).
+- The release settings turn on 16x anisotropic filtering (`pgr4_native_anisotropy = 16`).
+  td-205: race 89.2 fps, 1 % low 59.5; td-207: 88.9, 55.0; td-214: 89.4, 62.2. 8x (td-206):
+  87.5, 51.9.
+- HDR10 output (`--pgr4_native_hdr`, on). The game renders its scene and tone map pass into
+  a float target and resolves it into a 10-bit front buffer that clips at 1 (td-208's draw
+  log: the last pass applies exposure, bloom, vignette and dither and no tone curve). On a
+  display that takes HDR10 (under Proton, `DXVK_HDR=1`: `play.sh` sets it) the resolver also
+  keeps an FP16 copy of that resolve and the present blit shows it: up to 1 as in SDR, with
+  SDR white at `--pgr4_native_hdr_paper_white` (400 nits), above it linear, with a shoulder
+  under the display's peak, in BT.2020 and PQ. `deck-run.sh --hdr` runs it in an HDR
+  gamescope and saves HDR10 AVIFs with `--shots`, which `native/tools/hdr_shot.py` measures.
+  td-221's race shot: p50 10 nits, p99 483, max 637; 2.5 % of pixels above SDR white. GPU
+  time: the resolve 0.107 ms SDR against 0.188 HDR, the blit 0.371 against 0.408 (td-218,
+  td-219). td-215, HDR in a nested gamescope that tone maps it back to SDR on the same GPU:
+  race 88.5 fps, 1 % low 58.8.
+- The present blit clears only the bars around the image: 0.398 to 0.371 ms (td-216, td-218).
+  td-218: race 89.4 fps, 1 % low 64.1, 0.1 % low 49.8, p99 frame 14.43 ms.## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
@@ -867,33 +894,33 @@ Several files port Xenia/ReXGlue code (BSD-3-Clause), among them `draw`, `render
 
 ## Building
 
-You need Windows 10 or 11, Visual Studio 2022 Build Tools (x64), LLVM (clang-cl), CMake, Ninja,
-PowerShell 7 and Git. You also need the files from your own PGR4 disc, extracted to a folder
-(`default.xex`, `gw.xex`, `Game\`, `UI\` and so on), and Title Update #2's `default.xexp` and
-`Pgr4TitleUpdate.bin` in another (`-Update <folder>`, `title-update/README.md`). This
-repository contains no game data, and the recompiled C++ that the build generates from
-`default.xex` must not be published.
+The build runs on Linux (it is developed on a Steam Deck under SteamOS) and cross-compiles the
+Windows x64 executables with clang-cl and lld-link; the result runs under Proton. You need
+clang, lld and the llvm tools, CMake, Ninja, Python 3 and Git. When `clang-cl` is not on `PATH`,
+`native/build.sh` runs itself in a distrobox container (default `pgr4dev`; the Deck's has Arch's
+clang 23.1.3 and cmake 4.4.4, the versions the release build pins). You also need the files from
+your own PGR4 disc, extracted to a folder (`default.xex`, `gw.xex`, `Game\`, `UI\` and so on),
+and Title Update #2's `default.xexp` and `Pgr4TitleUpdate.bin` in another
+(`title-update/README.md`). This repository contains no game data, and the C++ that the build
+generates from the game's executables must not be published.
 
-1. Build MTR-PGR4 and its patched ReXGlue SDK:
-   `pwsh -File build\build-mtr.ps1 -Root C:\recomp\builds\pgr4 -Game <disc folder> -Stage prep,sdk`
-2. Build the renderer into its own tree. This copies the MTR-PGR4 checkout, applies the two SDK
-   patches, adds the hooks and `native\src\native\` to the game, then builds:
-   `pwsh -File native\build.ps1 -Root C:\recomp\builds\pgr4 -Game <disc folder> -Dest <tree>`
-3. Run it: `pwsh -File native\run.ps1 -Action start -Dest <tree> -Game <disc folder> -Native -Extra "--pgr4_native_primary"`.
-   Add `--pgr4_native_render_thread=false` to the `-Extra` flags for the single-thread path. `run.ps1`
-   starts the game in the interactive desktop session through a scheduled task, so it also
-   works over SSH. `-Action stop` closes it. The game's executable is
-   `<tree>\run\runtime\pgr4_recompiled.exe`. `-Tap` turns on the debug decoder
-   (`--pgr4_d3d_tap`), which costs about 0.8 ms per frame.
+1. The MSVC CRT and Windows SDK, at pinned versions: `build/fetch-xwin.sh` (into `~/recomp/xwin`;
+   running it accepts Microsoft's license terms for those files).
+2. Build: `native/build.sh --game <disc folder> --update <title update folder>`. It clones ReXGlue
+   at the commit `sdk/rexglue.lock` names, applies `sdk/patches/` in order, builds the codegen
+   tool and the SDK, generates and builds the game projects in `game/` (PGR4 with the renderer,
+   and the garage's Geometry Wars) and installs them into
+   `~/recomp/builds/pgr4/native-deck/run/runtime`. Its header lists the options (`--dest`,
+   `--pgo`, `--march`, `--stage`).
+3. Play: `proton/play.sh --install` installs that build as the one to play and writes the desktop
+   entry Steam's "Add a Non-Steam Game" lists ("PGR4 (native renderer)"); `proton/play.sh`
+   starts it. `proton/deck-run.sh <tree> <tag>` runs the measured race instead.
 
-`build.ps1` expects `native\` and `instrument\` side by side, as in this repository.
-
-Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` with
-`proton run` and the game flags that `run.ps1` passes.
-
-A release ZIP for players comes from `native/tools/package_release.py --version <tag>` after
-a build; its `README.md` (`native/release/README.md`) says where the game files go.
-
+Pushing a `v*` tag builds the same way on GitHub Actions (`.github/workflows/release.yml`, with the
+game files from a private repository) and publishes a release ZIP for players, made by
+`native/tools/package_release.py`; its `README.md` (`native/release/README.md`) says where the
+game files go. The ZIP holds no game data or generated code: the executables, the ReXGlue DLLs,
+the default configuration and the licenses.
 ## Flags
 
 | Flag | Default | Effect |
@@ -909,7 +936,7 @@ a build; its `README.md` (`native/release/README.md`) says where the game files 
 | `--pgr4_native_submit_draws=<n>` | 256 | Submit the frame so far every n draws, so the GPU starts on it while the rest is recorded (0: once per frame) |
 | `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |
 | `--pgr4_native_profile` | false | Per-stage CPU time of the draw path, added to the CSV |
-| `--pgr4_native_capture_dir=<dir>` | off | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one, and `draw-debug.txt` there is read. Off, none of them is polled (`run.ps1 -Native`: `C:\recomp\logs\pgr4-native-captures`) |
+| `--pgr4_native_capture_dir=<dir>` | off | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one, and `draw-debug.txt` there is read. Off, none of them is polled (`deck-run.sh` and `play.sh --debug` set one) |
 | `--pgr4_native_capture_frame=<n>` | -1 (off) | Capture the front buffers at this native frame |
 | `--pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and its PSNR, holding the game thread; false: the native PNG alone, written from a thread |
 | `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 5 s of frames; write whole-image jumps and F12's 5 s (with a capture folder) to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
@@ -921,13 +948,16 @@ a build; its `README.md` (`native/release/README.md`) says where the game files 
 | `--pgr4_native_low_latency` | true | With the frames paced on the display: begin each frame as late as the time recent frames waited for the display allows, so a frame limit lowers the latency |
 | `--pgr4_native_latency_margin_us=<n>` | 4000 | With `--pgr4_native_low_latency`: how long before the display shows a frame the GPU should have finished it |
 | `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
-| `--pgr4_native_anisotropy=<n>` | 1 | At least n-times anisotropic filtering (2, 4, 8, 16) for the game's linearly filtered textures with mips; 1: the game's own |
+| `--pgr4_native_anisotropy=<n>` | 1 | At least n-times anisotropic filtering (2, 4, 8, 16) for the game's linearly filtered textures with mips; 1: the game's own (the release settings: 16) |
+| `--pgr4_native_hdr` | true | HDR10 output when the display takes it (under Proton, `DXVK_HDR=1`): the scene's highlights above SDR white reach the screen; false or no HDR display: the console's SDR image |
+| `--pgr4_native_hdr_peak_nits=<n>` | 0 | HDR: the peak the highlights are fitted to (0: the display's, 1000 when it reports none) |
+| `--pgr4_native_hdr_paper_white=<n>` | 400 | HDR: the luminance of SDR white (the HUD, the game's 1.0) in nits; 400 matches gamescope's SDR content |
 | `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
 | `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
 
 With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
-(`--gpu_skip_draws`, added by `native/rexglue-native-primary.patch`). The debug flags not in
+(`--gpu_skip_draws`, added by `sdk/patches/0031`). The debug flags not in
 the table (resolve dumps and self-test, the watch, texture and state tracker checks, the tap's
 trace, frame CSV and draw skips, the debug window's size) are described where they are defined,
 in the `REXCVAR_DEFINE_*` lines of `native/src`.
@@ -948,7 +978,7 @@ in the `REXCVAR_DEFINE_*` lines of `native/src`.
 | `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
 | `pacing.py` | Frame pacing from the CSV and the pacer's present log: time steps, shown intervals, start-to-display latency, their mismatch |
 
-It also has a texture untiling harness and an offline shader translation test. `proton/` has the
+It also has an offline shader translation test (`shader_xlate_test`). `proton/` has the
 Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads and
 other processes), `pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls
 and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
@@ -980,7 +1010,8 @@ keeps the sampled modules in `<log>-perf-modules/` for `perf_symbols.py`.
 - Steam Deck: one run (td-181) aborted at 130 s, before the race, with glibc's
   `free(): invalid pointer` on Wine's Unix side (RADV, winevulkan or Wine itself) and no kernel
   or GPU fault. The core was not kept and a review of the renderer's object lifetimes found
-  nothing; the rerun (td-182) was clean. Watch for it.- Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
+  nothing; the rerun (td-182) was clean. Watch for it.
+- Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
   pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
   compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
   and neither has a Quebec snow race the bench never ran (td-91: 90.0 fps, 1 % low 67.7); a play
@@ -995,42 +1026,18 @@ keeps the sampled modules in `<log>-perf-modules/` for `perf_symbols.py`.
 
 ## Tooling and agents
 
-The renderer was built and tuned by coding agents, several at a time, driving one Windows PC.
-The tooling for that is in this repository:
+The renderer was built and tuned by coding agents. It started on a Windows PC with a lab of
+PowerShell scripts driven over SSH (now in `retired/`, see `retired/README.md`) and moved to the
+Steam Deck, which builds, runs and measures it on its own:
 
-- `tools/lab/`: the `lab` CLI (Bun). `lab pgr4 <verb>` syncs this checkout (or a commit) to a
-  build tree on the Windows host, builds it, runs the scripted race, and reports profiled
-  stages, frame time, a paired A/B verdict (`ab`), the image check against the Xenos plugin
-  (`oracle`, `diff`) or a demo clip. `lab pgr4 help` lists the verbs.
-- `lab/` and `run/`: the PowerShell scripts those verbs run on the host: a FIFO queue and lock
-  so only one game runs at a time, GUI launches in the desktop session, the input player and
-  the St Petersburg route.
-- `proton/`: the same race under Proton on Linux.
-- `docs/`: how the renderer works, the measuring workflow, the perf plan, research notes, and
-  setup for Windows (`docs/running-on-windows.md`) and Proton (`docs/proton.md`).
-- `AGENTS.md`, `skills/pgr4-native/` and `prompts/`: what an agent reads first, the renderer
-  performance rules taken from other Xbox 360 ports, and the briefs used to run a wave of
-  agents with one integrator.
-
-To use it you need [Bun](https://bun.sh) 1.1 or newer on the machine you drive from, and
-[fleet](https://github.com/safzanpirani/fleet) with your Windows PC added as a host (OpenSSH
-server, PowerShell 7). Then:
-
-```sh
-bun install
-export RECOMP_HOST=<fleet host name of the Windows PC>
-bun tools/lab/cli.ts pgr4 help
-bun tools/lab/cli.ts pgr4 scripts      # install lab/ and run/ on the host
-```
-
-The scripts assume `C:\recomp` on the host (`builds\pgr4`, `logs`, `locks`); a junction works if
-C: is small. Give each build tree an inbound firewall rule before its first run, or the "allow
-access" prompt steals focus from the input player
-(`New-NetFirewallRule -Direction Inbound -Action Block -Program <tree>\run\runtime\pgr4_recompiled.exe -DisplayName pgr4-<Name>`).
-Stay logged in to the desktop and run as that user: games start in the desktop session through
-a scheduled task. The host also needs Python 3 with numpy and Pillow, and ffmpeg with NVENC for
-demo clips.
-
+- `native/build.sh` and `build/`: the cross build and its toolchain.
+- `proton/`: `deck-run.sh` (one measured race: route, frame times, GPU load and APU power,
+  oracle captures, perf samples), `play.sh` (play sessions and debugging sessions) and
+  `route_player.py`, which plays the scripted routes in `run/`.
+- `native/tools/`: the analysis scripts above, and `package_release.py`.
+- `docs/`: how the renderer works, the design, the perf plan and research notes.
+- `AGENTS.md` and `skills/pgr4-native/`: what an agent reads first, and the renderer
+  performance rules taken from other Xbox 360 ports.
 ## About this repository
 
 The code, tooling and docs are developed in a private repository and published here
