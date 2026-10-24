@@ -1091,7 +1091,7 @@ constexpr NativeClass NativeClassOf(Cat c) {
 thread_local uint32_t t_native_depth = 0;  // active draw/clear/resolve/Swap calls
 thread_local bool t_pending_vertices = false;
 thread_local pgr4::native::HookArgs t_pending_args;
-thread_local uint32_t t_original_depth = 0;  // hooked originals running on this thread
+thread_local uint32_t t_original_depth = 0;  // hooked originals running (profiler on)
 thread_local pgr4::native::TilingCall t_tiling_call = pgr4::native::TilingCall::kNone;
 
 // Hooked functions that neither the renderer nor the state tracker needs to see: no draw,
@@ -1147,7 +1147,11 @@ thread_local GuestD3dTimes t_guest_d3d_times;
 template <FnId kId, GuestFn kFn>
 inline void RunOriginal(PPCContext& c, uint8_t* b) {
   namespace nat = pgr4::native;
-  if (t_original_depth++ == 0 && nat::profile::g.on) [[unlikely]] {
+  if (!nat::profile::On()) [[likely]] {
+    kFn(c, b);
+    return;
+  }
+  if (t_original_depth++ == 0) {
     const uint64_t start = nat::profile::Now();
     kFn(c, b);
     const uint64_t ticks = nat::profile::Now() - start;
@@ -1281,7 +1285,7 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
       static_assert(kClass == kNatSwap);
       r->OnSwap(base, a);
       NoteFrameBegin();
-      if (nat::profile::g.on) LogGuestD3dTimes();
+      if (nat::profile::On()) LogGuestD3dTimes();
     }
   }
 }

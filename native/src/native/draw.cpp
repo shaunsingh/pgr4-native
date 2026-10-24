@@ -3109,7 +3109,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       uint32_t i = uint32_t(std::countr_zero(remaining));
       remaining &= remaining - 1;
       sys.texture_swizzled_signs[i >> 2] |= uint32_t(signs[i]) << ((i & 3) * 8);
-      if (profile::g.on) {
+      if (profile::On()) {
         const uint32_t* f = s.fetch(i);
         const uint8_t sg = signs[i];
         ++diag.fetch_classes[sg == 0 ? 0 : sg == 0x3F ? 1 : sg == 0xFF ? 2 : sg == 0x55 ? 3 : 4];
@@ -3514,7 +3514,7 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->store.Flush();
   impl_->frame_draws = 0;
   impl_->WriteSnapshots(completed_fence);
-  if (profile::g.on && ++impl_->diag.frames >= 300) {
+  if (profile::On() && ++impl_->diag.frames >= 300) {
     Impl::Diag& d = impl_->diag;
     const double n = double(std::max<uint64_t>(d.draws, 1));
     auto per = [&](uint64_t v) { return double(v) / n; };

@@ -4,13 +4,14 @@
 // appends one column per stage to the native CSV. Off by default: then each Mark is one predictable
 // branch.
 //
-// Threading: one State per thread. With the render thread (renderer.h) the guest thread's
-// stages (read_state, cap_*, track, imm_vs) are handed to the render thread at each Swap and
-// added to its State before the CSV row is written.
+// Threading: one switch for the process, one State per thread. With the render thread
+// (renderer.h) the guest thread's stages (read_state, cap_*, track, imm_vs) are handed to the
+// render thread at each Swap and added to its State before the CSV row is written.
 #pragma once
 
 #include "clock.h"
 
+#include <atomic>
 #include <cstdint>
 
 namespace pgr4::native::profile {
@@ -76,8 +77,12 @@ inline constexpr const char* kCounterNames[kCounterCount] = {
     "bind_hit",    "bind_mru",       "bind_miss_empty",  "bind_miss_fetch", "bind_miss_tex",
     "bind_nomemo", "get_miss_fetch", "get_miss_changed", "srv_memo_hit",    "tex_upload_skip"};
 
+// --pgr4_native_profile, set once by NativeRenderer::Initialize. Atomic because the hooks that
+// pass straight through read it on any guest thread without going through NativeRenderer::Get.
+inline std::atomic<bool> enabled{false};
+inline bool On() { return enabled.load(std::memory_order_relaxed); }
+
 struct State {
-  bool on = false;
   uint64_t last = 0;
   uint64_t ticks[kStageCount] = {};
   uint64_t track_calls = 0;
@@ -91,11 +96,11 @@ inline uint64_t Now() { return Ticks(); }
 
 // Starts a run of stages.
 inline void Begin() {
-  if (g.on) g.last = Now();
+  if (On()) g.last = Now();
 }
 // Charges the time since the previous Begin/Mark to `stage`.
 inline void Mark(Stage stage) {
-  if (!g.on) return;
+  if (!On()) return;
   const uint64_t t = Now();
   g.ticks[stage] += t - g.last;
   g.last = t;
@@ -104,7 +109,7 @@ inline void Mark(Stage stage) {
 // Times one call outside the Begin/Mark chain.
 class Scope {
  public:
-  explicit Scope(Stage s) : stage_(s), start_(g.on ? Now() : 0) {}
+  explicit Scope(Stage s) : stage_(s), start_(On() ? Now() : 0) {}
   ~Scope() {
     if (start_) g.ticks[stage_] += Now() - start_;
   }

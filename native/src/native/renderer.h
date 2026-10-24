@@ -129,14 +129,17 @@ struct FrameStats {
 class NativeRenderer {
  public:
   // The renderer, created on first use when --pgr4_native is on; nullptr when it is off or
-  // when D3D12 initialization failed (logged once). Cheap enough to call per hook.
+  // when D3D12 initialization failed (logged once).
   static NativeRenderer* Get();
   // The renderer while it draws the game: Get(), except after the renderer switch handed the
-  // game to the Xenos plugin (primary mode, bind_renderer_switch). The hooks use this one; while
-  // it is null the guest D3D runs unchanged and nothing is tracked.
+  // game to the Xenos plugin (primary mode, bind_renderer_switch) or a frame failed. The hooks
+  // use this one, a single load while the renderer draws; while it is null the guest D3D runs
+  // unchanged and nothing is tracked.
   static NativeRenderer* Live() {
-    NativeRenderer* r = Get();
-    return r && r->live_.load(std::memory_order_relaxed) ? r : nullptr;
+    if (NativeRenderer* r = live_.load(std::memory_order_acquire)) [[likely]]
+      return r;
+    Get();  // creates the renderer on first use
+    return live_.load(std::memory_order_acquire);
   }
 
   // True while the renderer presents the game's frames and paces them on the display
@@ -217,8 +220,8 @@ class NativeRenderer {
   void HandOver(uint8_t* base, uint32_t device);
   void TakeBack();
 
-  static inline std::atomic<bool> paces_frames_{false};  // pacer_->pacing(), for any thread
-  std::atomic<bool> live_{true};
+  static inline std::atomic<bool> paces_frames_{false};       // pacer_->pacing(), for any thread
+  static inline std::atomic<NativeRenderer*> live_{nullptr};  // Live()
   std::atomic<bool> switch_requested_{false};
   bool switch_bound_ = false;  // primary mode with --pgr4_native_renderer_switch
 

@@ -257,6 +257,7 @@ NativeRenderer* NativeRenderer::Get() {
       delete n;
       return static_cast<NativeRenderer*>(nullptr);
     }
+    live_.store(n, std::memory_order_release);
     return n;
   }();
   return g_failed ? nullptr : r;
@@ -333,7 +334,7 @@ bool NativeRenderer::Initialize() {
     switch_bound_ = true;
   }
   csv_ = std::make_unique<Csv>();
-  profile::g.on = REXCVAR_GET(pgr4_native_profile);
+  profile::enabled.store(REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
   const std::string& path = REXCVAR_GET(pgr4_native_csv);
   if (!path.empty()) {
     csv_->file = std::fopen(path.c_str(), "w");
@@ -350,7 +351,7 @@ bool NativeRenderer::Initialize() {
           "tex_mb,tex_count,tex_evicted,tex_evict_us,views,pso_generic,"
           "pad_buttons,pad_lt,pad_rt,pad_lx,pad_ly,pad_rx,pad_ry,submits,"
           "guest_begin_ms,guest_swap_ms,pace_wait_us,present");
-      if (profile::g.on) {
+      if (profile::On()) {
         for (const char* n : profile::kStageNames) std::fprintf(csv_->file, ",st_%s_us", n);
         std::fprintf(csv_->file,
                      ",track_calls,tex_memo_miss,tex_created,tex_create_us,"
@@ -412,7 +413,6 @@ void NativeRenderer::BeginFrameModules() {
 
 void NativeRenderer::RenderThreadMain() {
   SetThreadDescription(GetCurrentThread(), L"PGR4 native render");
-  profile::g.on = REXCVAR_GET(pgr4_native_profile);
   Queue& q = *queue_;
   for (;;) {
     std::unique_ptr<Queue::Batch> b;
@@ -465,7 +465,7 @@ void NativeRenderer::RenderThreadMain() {
             stats_.pace_wait_ns = s.pace_wait_ns;
             stats_.state_fail += s.state_fail;
             draw_->AddPrepareCounters(s.prep);
-            if (profile::g.on) {
+            if (profile::On()) {
               for (uint32_t i = 0; i < profile::kStageCount; ++i) profile::g.ticks[i] += s.ticks[i];
               profile::g.track_calls += s.track_calls;
             }
@@ -651,7 +651,7 @@ void NativeRenderer::HandOver(uint8_t* base, uint32_t device) {
   rex::cvar::SetFlagByName("gpu_skip_draws", "false");
   // The plugin presents on its own: the game waits for its vblanks again.
   paces_frames_.store(false, std::memory_order_relaxed);
-  live_.store(false, std::memory_order_relaxed);
+  live_.store(nullptr, std::memory_order_relaxed);
   REXLOG_INFO("PGR4 native: renderer switch: the Xenos plugin draws");
 }
 
@@ -660,7 +660,7 @@ void NativeRenderer::TakeBack() {
   // takes the game window back (OwnGameWindow), and the pacing with it.
   GuestState().Resync();
   rex::cvar::SetFlagByName("gpu_skip_draws", "true");
-  live_.store(true, std::memory_order_relaxed);
+  live_.store(this, std::memory_order_release);
   REXLOG_INFO("PGR4 native: renderer switch: native draws");
 }
 
@@ -726,6 +726,7 @@ void NativeRenderer::SubmitEarly() {
 
 void NativeRenderer::Fail() {
   g_failed = true;
+  live_.store(nullptr, std::memory_order_relaxed);
   paces_frames_.store(false, std::memory_order_relaxed);
   if (pacer_) pacer_->Stop();
   REXLOG_ERROR("PGR4 native: frame {} failed; native path off for the rest of the run",
@@ -861,7 +862,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
         s.pace_wait_ns / 1000.0, (unsigned long long)s.present);
     csv_->evicted_prev = textures_->stats().evicted;
     csv_->evict_ns_prev = textures_->stats().evict_ns;
-    if (profile::g.on) {
+    if (profile::On()) {
       for (uint64_t t : profile::g.ticks)
         std::fprintf(csv_->file, ",%.1f", double(TicksToNs(t)) / 1000.0);
       std::fprintf(csv_->file, ",%llu", (unsigned long long)profile::g.track_calls);
@@ -901,7 +902,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
   w.frame_ns += frame_ns;
   w.hook_ns += s.hook_ns;
   w.hook_wait_ns += s.hook_wait_ns;
-  if (profile::g.on) {
+  if (profile::On()) {
     for (uint32_t i = 0; i < profile::kStageCount; ++i) w.stage_ticks[i] += profile::g.ticks[i];
     w.track_calls += profile::g.track_calls;
     for (uint64_t& t : profile::g.ticks) t = 0;
@@ -918,7 +919,7 @@ void NativeRenderer::WriteCsv(const FrameStats& s, uint64_t frame_ns) {
         frame_index_, w.draws / n, w.draw_ns / 1000.0 / n,
         w.draws ? w.draw_ns / 1000.0 / double(w.draws) : 0.0, w.swap_ns / 1000.0 / n,
         w.frame_ns / 1e6 / n, w.hook_ns / 1000.0 / n, w.hook_wait_ns / 1000.0 / n);
-    if (profile::g.on && w.draws) {
+    if (profile::On() && w.draws) {
       // ns per draw for each stage (the hook-side ones are per draw too, for comparison).
       std::string line;
       char item[64];
