@@ -16,6 +16,10 @@ pgr4_native_primary = true
 # walking fix follows it.
 pgr4_60fps = true
 
+# At least 16x anisotropic filtering on the game's mipmapped, linearly filtered textures. Race on
+# the Deck at 90 Hz: 88.9-89.4 fps, GPU busy 84-87 %.
+pgr4_native_anisotropy = 16
+
 # Runtime settings.
 execute_unclipped_draw_vs_on_cpu = true
 gpu_plugin = "xenos"
