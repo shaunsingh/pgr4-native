@@ -13,7 +13,8 @@
 
 REXCVAR_DEFINE_STRING(pgr4_native_shader_dump_dir, "", "PGR4 native",
                       "Write every translation (DXBC) to <dir>/<ucode hash>_<modification>.<vs|ps>"
-                      ".dxbc as it is made (empty = off)");
+                      ".dxbc as it is made, and every shader's ucode disassembly to "
+                      "<dir>/<ucode hash>.<vs|ps>.txt (empty = off)");
 
 namespace pgr4::native {
 
@@ -21,6 +22,20 @@ namespace {
 double Us(std::chrono::steady_clock::time_point since) {
   return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - since)
       .count();
+}
+
+const char* Stage(const DxbcShader& shader) {
+  return shader.type() == rex::graphics::xenos::ShaderType::kVertex ? "vs" : "ps";
+}
+
+void DumpFile(const char* name, const void* data, size_t size) {
+  const std::filesystem::path dir(REXCVAR_GET(pgr4_native_shader_dump_dir));
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (std::FILE* out = _wfopen((dir / name).c_str(), L"wb")) {
+    std::fwrite(data, 1, size, out);
+    std::fclose(out);
+  }
 }
 }  // namespace
 
@@ -45,6 +60,13 @@ DxbcShader* ShaderCache::Load(rex::graphics::xenos::ShaderType type, const uint3
   auto shader = std::make_unique<DxbcShader>(type, hash, guest_ucode, dword_count);
   shader->AnalyzeUcode(disasm_buffer_);
   stats_.analyze_us += Us(t);
+  if (!REXCVAR_GET(pgr4_native_shader_dump_dir).empty()) {
+    char name[40];
+    std::snprintf(name, sizeof(name), "%016llX.%s.txt", static_cast<unsigned long long>(hash),
+                  Stage(*shader));
+    const std::string& text = shader->ucode_disassembly();
+    DumpFile(name, text.data(), text.size());
+  }
   ++stats_.shaders;
   return shaders_.emplace(hash, std::move(shader)).first->second.get();
 }
@@ -65,20 +87,13 @@ DxbcShader::Translation* ShaderCache::Translate(DxbcShader& shader, uint64_t mod
     stats_.translate_us += us;
     stats_.max_translate_us = std::max(stats_.max_translate_us, us);
     ++stats_.translations;
-    if (const std::string& dir = REXCVAR_GET(pgr4_native_shader_dump_dir);
-        !dir.empty() && translation->is_valid()) {
+    if (!REXCVAR_GET(pgr4_native_shader_dump_dir).empty() && translation->is_valid()) {
       char name[64];
       std::snprintf(name, sizeof(name), "%016llX_%016llX.%s.dxbc",
                     static_cast<unsigned long long>(shader.ucode_data_hash()),
-                    static_cast<unsigned long long>(modification),
-                    shader.type() == rex::graphics::xenos::ShaderType::kVertex ? "vs" : "ps");
-      std::error_code ec;
-      std::filesystem::create_directories(dir, ec);
-      if (std::FILE* out = _wfopen((std::filesystem::path(dir) / name).c_str(), L"wb")) {
-        const std::vector<uint8_t>& binary = translation->translated_binary();
-        std::fwrite(binary.data(), 1, binary.size(), out);
-        std::fclose(out);
-      }
+                    static_cast<unsigned long long>(modification), Stage(shader));
+      const std::vector<uint8_t>& binary = translation->translated_binary();
+      DumpFile(name, binary.data(), binary.size());
     }
     if (!translation->is_valid()) {
       ++stats_.failures;
