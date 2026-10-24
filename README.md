@@ -638,6 +638,18 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   ms (BeginTiling's clears now run in the first draw's span). Clearing the whole target rather
   than the guest's rectangles (td-159) saved nothing: 8.96 ms. td-161, the image check:
   46.5-47.6 dB. td-162 against td-157: race 89.2 against 89.3 fps, 1 % low 59.5 against 59.4.
+- The upload of a texture the frame has not bound yet goes into a list that runs ahead of the
+  frame's list, in the same submission, with its barriers batched: on the frame's list each
+  upload ended a vkd3d render pass. DXVK moves transfers out of order under the same condition
+  (`prepareOutOfOrderTransfer`). Every upload in the race qualifies (td-170: 9462 of 9462). The
+  untile job arms its texture's page watches just before it reads, so those protection changes
+  (about 20 µs each under Wine) leave the render thread, and a texture whose mips follow its
+  base takes one change for both. td-169 against td-167 (profiled): race 89.1 against 88.2 fps,
+  1 % low 58.9 against 54.0, 14 frames over 16 ms against 27; the textures stage of the worst
+  burst frame 5.1 against 9.9 ms. The upload list itself costs about 31 µs per texture
+  (td-170), the copies in vkd3d and RADV. td-171, the coherency check: clean. td-172, the image
+  check: 45.9-47.2 dB. td-173 against td-162: race 89.2 against 89.2 fps, 1 % low 58.1 against
+  59.5, 0.1 % low 44.6 against 43.5, within the spread between runs.
 
 ## Why a native renderer can beat emulation
 
