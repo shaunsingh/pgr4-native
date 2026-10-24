@@ -8,7 +8,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
-#include <xmmintrin.h>
+#include <simde/x86/sse.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -323,7 +323,7 @@ bool D3D12Device::CloseAndExecute() {
   if (Failed(list_->Close(), "CommandList::Close")) return false;
   // The constant uploads are streaming stores, which are weakly ordered: make them visible
   // before the GPU can read them.
-  _mm_sfence();
+  simde_mm_sfence();
   ID3D12CommandList* lists[] = {list_.Get()};
   queue_->ExecuteCommandLists(1, lists);
   return true;

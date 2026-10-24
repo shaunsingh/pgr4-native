@@ -34,7 +34,7 @@
 #include <rex/system/xmemory.h>
 
 #include <xxhash.h>
-#include <emmintrin.h>
+#include <simde/x86/sse2.h>
 
 #include <algorithm>
 #include <array>
@@ -554,20 +554,23 @@ D3D12_SAMPLER_DESC SamplerDesc(const SamplerKey& k) {
 inline bool Equal(const void* a, const void* b, uint32_t size) {
   auto* x = static_cast<const uint8_t*>(a);
   auto* y = static_cast<const uint8_t*>(b);
-  auto load = [](const uint8_t* p) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)); };
-  auto zero = [](__m128i v) {
-    return _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())) == 0xFFFF;
+  auto load = [](const uint8_t* p) {
+    return simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(p));
+  };
+  auto zero = [](simde__m128i v) {
+    return simde_mm_movemask_epi8(simde_mm_cmpeq_epi8(v, simde_mm_setzero_si128())) == 0xFFFF;
   };
   uint32_t i = 0;
   for (; i + 64 <= size; i += 64) {
-    const __m128i d = _mm_or_si128(_mm_or_si128(_mm_xor_si128(load(x + i), load(y + i)),
-                                                _mm_xor_si128(load(x + i + 16), load(y + i + 16))),
-                                   _mm_or_si128(_mm_xor_si128(load(x + i + 32), load(y + i + 32)),
-                                                _mm_xor_si128(load(x + i + 48), load(y + i + 48))));
+    const simde__m128i d = simde_mm_or_si128(
+        simde_mm_or_si128(simde_mm_xor_si128(load(x + i), load(y + i)),
+                          simde_mm_xor_si128(load(x + i + 16), load(y + i + 16))),
+        simde_mm_or_si128(simde_mm_xor_si128(load(x + i + 32), load(y + i + 32)),
+                          simde_mm_xor_si128(load(x + i + 48), load(y + i + 48))));
     if (!zero(d)) return false;
   }
   for (; i + 16 <= size; i += 16)
-    if (!zero(_mm_xor_si128(load(x + i), load(y + i)))) return false;
+    if (!zero(simde_mm_xor_si128(load(x + i), load(y + i)))) return false;
   return i == size || std::memcmp(x + i, y + i, size - i) == 0;
 }
 
@@ -608,20 +611,23 @@ void PackFloats(CachedCbv& cb, const DxbcShader* shader, const uint32_t* regs, u
   const uint32_t size = n * 16;
   const bool resized = cb.size != size;
   cb.size = size;
-  __m128i* out = reinterpret_cast<__m128i*>(cb.last);
-  __m128i diff = _mm_setzero_si128();
+  simde__m128i* out = reinterpret_cast<simde__m128i*>(cb.last);
+  simde__m128i diff = simde_mm_setzero_si128();
   for (uint32_t i = 0; i < 4; ++i) {
     uint64_t bits = bitmap[i];
     const uint32_t* base = regs + reg_base + (i << 8);
     while (bits) {
       const uint32_t b = uint32_t(std::countr_zero(bits));
       bits &= bits - 1;
-      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(base + (b << 2)));
-      diff = _mm_or_si128(diff, _mm_xor_si128(v, _mm_load_si128(out)));
-      _mm_store_si128(out++, v);
+      const simde__m128i v =
+          simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(base + (b << 2)));
+      diff = simde_mm_or_si128(diff, simde_mm_xor_si128(v, simde_mm_load_si128(out)));
+      simde_mm_store_si128(out++, v);
     }
   }
-  if (resized || _mm_movemask_epi8(_mm_cmpeq_epi8(diff, _mm_setzero_si128())) != 0xFFFF) cb.gpu = 0;
+  if (resized ||
+      simde_mm_movemask_epi8(simde_mm_cmpeq_epi8(diff, simde_mm_setzero_si128())) != 0xFFFF)
+    cb.gpu = 0;
 }
 
 }  // namespace
@@ -1841,9 +1847,10 @@ bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
     const uint32_t vectors = std::max<uint32_t>((cb.size + 15) / 16, 1);
     UploadPool::Alloc a;
     if (!constant_upload.Allocate(vectors * 16, 256, r.frame_fence(), &a)) return false;
-    auto* dst = reinterpret_cast<__m128i*>(a.cpu);
-    const auto* src = reinterpret_cast<const __m128i*>(cb.last);
-    for (uint32_t i = 0; i < vectors; ++i) _mm_stream_si128(dst + i, _mm_load_si128(src + i));
+    auto* dst = reinterpret_cast<simde__m128i*>(a.cpu);
+    const auto* src = reinterpret_cast<const simde__m128i*>(cb.last);
+    for (uint32_t i = 0; i < vectors; ++i)
+      simde_mm_stream_si128(dst + i, simde_mm_load_si128(src + i));
     cb.gpu = a.gpu;
     ++diag.cbv_uploads[root_index & 15];
     diag.cbv_bytes[root_index & 15] += cb.size;

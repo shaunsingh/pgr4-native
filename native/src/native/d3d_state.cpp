@@ -10,7 +10,7 @@
 #include <rex/logging.h>
 #include <xxhash.h>
 
-#include <emmintrin.h>
+#include <simde/x86/sse2.h>
 
 #include <bit>
 #include <cstring>
@@ -82,16 +82,20 @@ void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, ui
     }
   };
   auto eq4 = [&](uint32_t i) {
-    const __m128i g = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i * 4));
-    const __m128i m = _mm_loadu_si128(reinterpret_cast<const __m128i*>(raw_ + reg + i));
-    return _mm_cmpeq_epi32(g, m);
+    const simde__m128i g = simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(p + i * 4));
+    const simde__m128i m =
+        simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(raw_ + reg + i));
+    return simde_mm_cmpeq_epi32(g, m);
   };
-  auto equal_lanes = [](__m128i eq) { return uint32_t(_mm_movemask_ps(_mm_castsi128_ps(eq))); };
+  auto equal_lanes = [](simde__m128i eq) {
+    return uint32_t(simde_mm_movemask_ps(simde_mm_castsi128_ps(eq)));
+  };
   // Most of what the flushing calls copy is unchanged: 16 registers per branch.
   uint32_t i = 0;
   for (; i + 16 <= count; i += 16) {
-    const __m128i e0 = eq4(i), e1 = eq4(i + 4), e2 = eq4(i + 8), e3 = eq4(i + 12);
-    if (_mm_movemask_epi8(_mm_and_si128(_mm_and_si128(e0, e1), _mm_and_si128(e2, e3))) == 0xFFFF)
+    const simde__m128i e0 = eq4(i), e1 = eq4(i + 4), e2 = eq4(i + 8), e3 = eq4(i + 12);
+    if (simde_mm_movemask_epi8(
+            simde_mm_and_si128(simde_mm_and_si128(e0, e1), simde_mm_and_si128(e2, e3))) == 0xFFFF)
       continue;
     update(i, ~(equal_lanes(e0) | equal_lanes(e1) << 4 | equal_lanes(e2) << 8 |
                 equal_lanes(e3) << 12) &
