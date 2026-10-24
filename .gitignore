@@ -1,4 +1,7 @@
 # Build trees, logs and anything game-derived stay out of this repository.
+*.xex
+*.xexp
+Pgr4TitleUpdate.bin
 out/
 generated/
 *.log

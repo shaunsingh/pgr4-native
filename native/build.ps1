@@ -22,7 +22,7 @@
 #            (..\title-update\addresses.txt), and apply ..\title-update\apply_game_patches.patch
 #            for the one patched function TU#2 changed.
 #   sdk      configure + build + install the SDK copy (clang-cl, Release) into $Dest\sdk-install.
-#   game     codegen Title Update #2: $Game\default.xex with ..\title-update\default.xexp beside
+#   game     codegen Title Update #2: $Game\default.xex with $Update\default.xexp beside
 #            it (copies in $Dest\title-update-image), with the copy's manifest and TU#2's entry
 #            options (..\title-update\entrypoint.toml); MTR's game patches included. Build
 #            out\pgr4\pgr4_recompiled.exe (no Geometry Wars, no launcher).
@@ -30,12 +30,17 @@
 #            runtime's update:\ when no --update_data_root is given); seeds userdata\ from the
 #            instrumented build's profile if this one has none (read-only copy).
 #
+# -Update holds the player's copy of Title Update #2's two files, default.xexp and
+# Pgr4TitleUpdate.bin, which ..\title-update\game-files.sha256 identifies: the generated code
+# matches only that update.
+#
 # Run: run.ps1 beside this script.
 param(
     [string[]]$Stage = 'all',
     [string]$Root = 'C:\recomp\builds\pgr4',
     [string]$Dest = '',                              # default: $Root\native
     [string]$Game = 'C:\recomp\dumps\pgr4\game',
+    [string]$Update = 'C:\recomp\dumps\pgr4\title-update',
     [int]$Jobs = 6,
     [switch]$Force
 )
@@ -57,6 +62,17 @@ $TitleUpdate = Join-Path $PSScriptRoot '..\title-update'
 $AddressMap = Join-Path $TitleUpdate 'addresses.txt'
 $Retarget = Join-Path $PSScriptRoot 'tools\tu_address_map.py'
 $GamePatch = Join-Path $TitleUpdate 'apply_game_patches.patch'
+$UpdateFiles = @('default.xexp', 'Pgr4TitleUpdate.bin')
+# The player's Title Update #2 files in $Update, checked against the ones the code is generated for.
+function Assert-Update {
+    foreach ($line in Get-Content (Join-Path $TitleUpdate 'game-files.sha256')) {
+        if ($line -notmatch '^([0-9a-f]{64})  (\S+)$') { continue }
+        $f = Join-Path $Update $Matches[2]
+        if (-not (Test-Path $f) -or (Get-FileHash -Algorithm SHA256 $f).Hash -ne $Matches[1].ToUpper()) {
+            throw "$f is not Title Update #2's (title-update\README.md)"
+        }
+    }
+}
 $Sources = @('pgr4_d3d_trace.cpp', 'd3d_surface.inc') | ForEach-Object { Join-Path $PSScriptRoot "src\$_" }
 $NativeSrc = Join-Path $PSScriptRoot 'src\native'
 # Appended to the game's CMakeLists.txt by prep, replaced whole when it changes. The two SDK
@@ -217,9 +233,10 @@ if (Want 'sdk') {
 if (Want 'game') {
     Step 'game' {
         $tuEntry = Join-Path $TitleUpdate 'entrypoint.toml'
-        foreach ($f in @((Join-Path $Game 'default.xex'), (Join-Path $TitleUpdate 'default.xexp'), $tuEntry, $AddressMap)) {
+        foreach ($f in @((Join-Path $Game 'default.xex'), $tuEntry, $AddressMap)) {
             if (-not (Test-Path $f)) { throw "missing $f" }
         }
+        Assert-Update
         $rexglue = Join-Path $Sdk 'bin\rexglue.exe'
         if (-not (Test-Path $rexglue)) { throw "missing $rexglue; run the sdk stage first" }
         Use-VcEnv
@@ -227,7 +244,7 @@ if (Want 'game') {
         # default.xex with TU#2's default.xexp next to it (copied only when changed).
         $image = Join-Path $Dest 'title-update-image'
         New-Item -ItemType Directory -Force -Path $image | Out-Null
-        foreach ($f in @((Join-Path $Game 'default.xex'), (Join-Path $TitleUpdate 'default.xexp'))) {
+        foreach ($f in @((Join-Path $Game 'default.xex'), (Join-Path $Update 'default.xexp'))) {
             $to = Join-Path $image (Split-Path $f -Leaf)
             if (-not (Test-Path $to) -or (Get-FileHash $f).Hash -ne (Get-FileHash $to).Hash) { Copy-Item $f $to -Force }
         }
@@ -314,9 +331,10 @@ if (Want 'install') {
             if (-not (Test-Path $f)) { throw "missing $f" }
             Copy-Item $f $runtime -Force
         }
+        Assert-Update
         $tuDir = Join-Path $runtime 'title-update'
         New-Item -ItemType Directory -Force -Path $tuDir | Out-Null
-        foreach ($f in @('default.xexp', 'Pgr4TitleUpdate.bin')) { Copy-Item (Join-Path $TitleUpdate $f) $tuDir -Force }
+        foreach ($f in $UpdateFiles) { Copy-Item (Join-Path $Update $f) $tuDir -Force }
         $user = Join-Path $runtime 'userdata'
         $seed = Join-Path $Root 'instrumented\run\runtime\userdata'
         if (-not (Test-Path $user) -and (Test-Path $seed)) {

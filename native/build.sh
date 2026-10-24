@@ -6,7 +6,7 @@
 # only read, never modified.
 #
 #   native/build.sh [--stage prep,sdk,game,install] [--root DIR] [--dest DIR] [--game DIR]
-#                   [--jobs N] [--march x86-64-v3] [--mtune znver2] [--pgo gen|off|FILE] [--force]
+#                   [--update DIR] [--jobs N] [--march x86-64-v3] [--mtune znver2] [--pgo gen|off|FILE] [--force]
 #
 # Stages, in order (default: all):
 #   prep     rsync $root/MTR-PGR4 (source and patched SDK source; no build dirs, no generated
@@ -20,12 +20,16 @@
 #            renderer's frame pacer sets).
 #   sdk      build the codegen tool (rexglue) for this machine into $dest/host-sdk, then
 #            cross-build the SDK copy and install it into $dest/sdk-install.
-#   game     codegen Title Update #2: $game/default.xex with title-update/default.xexp beside it
+#   game     codegen Title Update #2: $game/default.xex with $update/default.xexp beside it
 #            (copies in $dest/title-update-image), with the copy's manifest and TU#2's entry
 #            options (title-update/entrypoint.toml); MTR's game patches included. Build
 #            out/pgr4/pgr4_recompiled.exe.
 #   install  $dest/run/runtime: exe, rexruntime.dll, rexgpu-xenos.dll, and title-update/ (the
 #            runtime's update:\ when no --update_data_root is given).
+#
+# --update DIR holds the player's copy of Title Update #2's two files, default.xexp and
+# Pgr4TitleUpdate.bin, which title-update/game-files.sha256 identifies: the generated code
+# matches only that update.
 #
 # --march / --mtune set the target CPU of the SDK and the game. The default is the Steam Deck's
 # Zen 2: x86-64-v3 brings FMA (the recompiled code's thousands of std::fma calls become one
@@ -58,6 +62,7 @@ stages=all
 root=$HOME/recomp/builds/pgr4
 dest=""
 game=$HOME/recomp/dumps/pgr4/game
+update=$HOME/recomp/dumps/pgr4/title-update
 jobs=$(( $(nproc) > 2 ? $(nproc) - 2 : 1 ))
 march=x86-64-v3
 mtune=znver2
@@ -70,6 +75,7 @@ while [[ $# -gt 0 ]]; do
     --root) root=$2; shift 2 ;;
     --dest) dest=$2; shift 2 ;;
     --game) game=$2; shift 2 ;;
+    --update) update=$2; shift 2 ;;
     --jobs) jobs=$2; shift 2 ;;
     --march) march=$2; shift 2 ;;
     --mtune) mtune=$2; shift 2 ;;
@@ -89,7 +95,7 @@ if ! command -v clang-cl >/dev/null; then
   box=${PGR4_DISTROBOX:-pgr4dev}
   command -v distrobox >/dev/null || { echo "clang-cl not on PATH and no distrobox" >&2; exit 1; }
   exec distrobox enter "$box" -- "$here/build.sh" --stage "$stages" --root "$root" \
-    ${dest:+--dest "$dest"} --game "$game" --jobs "$jobs" --march "$march" --mtune "$mtune" \
+    ${dest:+--dest "$dest"} --game "$game" --update "$update" --jobs "$jobs" --march "$march" --mtune "$mtune" \
     --pgo "$pgo" $([[ $force == 1 ]] && echo --force)
 fi
 
@@ -147,6 +153,11 @@ step() {
   echo "=== $name done in $((SECONDS - t0)) s"
 }
 need() { local f; for f in "$@"; do [[ -e $f ]] || { echo "missing $f" >&2; exit 1; }; done; }
+# The player's Title Update #2 files in $update, checked against the ones the code is generated for.
+need_update() {
+  (cd "$update" && sha256sum --quiet -c "$title_update/game-files.sha256") ||
+    { echo "$update: not Title Update #2's files (title-update/README.md)" >&2; exit 1; }
+}
 # Configures build tree $1 with compile flags $2, linker flags $3 and the cmake arguments after
 # them. CMake takes CFLAGS/CXXFLAGS/LDFLAGS only when it creates a cache, so a tree configured
 # with other flags starts over (and Ninja, seeing new command lines, rebuilds every object). A
@@ -307,13 +318,14 @@ sdk_stage() {
 
 game_stage() {
   need "$game/default.xex" "$host_rexglue" "$sdk/lib/cmake/rexglue/rexglueConfig.cmake" \
-    "$title_update/default.xexp" "$title_update/entrypoint.toml" "$title_update/addresses.txt"
+    "$title_update/entrypoint.toml" "$title_update/addresses.txt"
+  need_update
   local manifest=$tree/pgr4_local.toml image=$dest/title-update-image f
   # Codegen applies an XEX patch found beside the XEX it loads: a copy of the disc's default.xex
   # with TU#2's default.xexp next to it (copied only when changed, the codegen check below
   # compares their times).
   mkdir -p "$image"
-  for f in "$game/default.xex" "$title_update/default.xexp"; do
+  for f in "$game/default.xex" "$update/default.xexp"; do
     cmp -s "$f" "$image/$(basename "$f")" || cp -p "$f" "$image/"
   done
   # Same manifest rewrite as build.ps1: the image path, register-as-local codegen (see the
@@ -411,11 +423,12 @@ install_stage() {
   local runtime=$dest/run/runtime
   local files=("$tree/out/pgr4/pgr4_recompiled.exe" "$sdk/bin/rexruntime.dll" "$sdk/bin/rexgpu-xenos.dll")
   need "${files[@]}"
+  need_update
   mkdir -p "$runtime/title-update"
   # New files, not rewritten ones: a running game keeps the image it mapped, and a perf run's
   # hard links (deck-run.sh --perf) keep the modules it sampled.
   cp --remove-destination "${files[@]}" "$runtime/"
-  cp -f "$title_update/default.xexp" "$title_update/Pgr4TitleUpdate.bin" "$runtime/title-update/"
+  cp -f "$update/default.xexp" "$update/Pgr4TitleUpdate.bin" "$runtime/title-update/"
   # Their linker maps, for deck-run.sh --perf (perf_symbols.py).
   local map
   for map in "$tree/out/pgr4/pgr4_recompiled.map" "$sdk_src"/out/win-amd64/{rexruntime,rexgpu-xenos}.map; do
