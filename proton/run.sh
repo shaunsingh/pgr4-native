@@ -33,35 +33,33 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
+case $mode in primary|none|oracle) ;; *) echo "unknown mode $mode" >&2; exit 2 ;; esac
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=common.sh
+source "$here/common.sh"
 c=${PGR4_C:-/mnt/windows-c}
 runtime=$c/recomp/builds/pgr4/native-$tree/run/runtime
 game=$c/recomp/dumps/pgr4/game
 keys=$c/recomp/builds/pgr4/lab-scripts/run/route-stpetersburg.keys
 tools=$c/recomp/builds/pgr4/lab-scripts/perf
 top=$HOME/pgr4-proton
-proton=${PROTON:-$(ls -d "$top"/proton/GE-Proton*/ 2>/dev/null | sort -V | tail -1)}
-proton=${proton%/}
-[[ -x $proton/proton ]] || { echo "no Proton at '$proton' (set PROTON=<dir with ./proton>)" >&2; exit 1; }
+find_proton
 [[ -f $runtime/pgr4_recompiled.exe ]] || { echo "no exe in $runtime" >&2; exit 1; }
-pgrep -f 'pgr4_recompiled\.exe' >/dev/null && { echo "a pgr4_recompiled.exe is already running" >&2; exit 1; }
+check_no_game
 [[ -w /dev/uinput ]] || { echo "/dev/uinput is not writable: sudo setfacl -m u:$USER:rw /dev/uinput" >&2; exit 1; }
 
 mkdir -p "$top/logs" "$top/prefix" "$top/userdata"
-find "$top/userdata" -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} +   # fresh save, keep caches
+fresh_save "$top/userdata"
 stamp=$(date +%Y%m%d-%H%M%S)
 base=$top/logs/pgr4-proton-$tag-$stamp
 ilog=$top/logs/pgr4-co-input-$tag.log
 rm -f "$ilog"
-win() { echo "Z:${1//\//\\}"; }   # Proton maps Z: to /
 
-args=(--game_data_root "$(win "$game")" --user_data_root "$(win "$top/userdata")"
-  --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync --xmp_music_gain 0.35
-  --d3d12_texture_shared_heaps --gpu_vblank_deadline_timer --gpu_wait_reg_mem_high_res
-  --no-clear_memory_page_state --gpu_ring_wake_fast --texture_resource_reuse
-  --texture_reuse_pool_limit_mib=256 --texture_cache_memory_limit_soft_lifetime=30
-  --fullscreen=false --window_width=1280 "--window_height=$height" --mnk_mode
-  --guest_frame_stats --pgr4_d3d_stats_frames=150 --log_file "$(win "$base.log")")
+# MTR's launcher arguments at 30 fps, as native/run.ps1 starts the Windows runs this one is
+# compared with: no 60 FPS option, the guest's default vblank rate.
+mtr_args "$game" "$top/userdata"
+args+=(--fullscreen=false --window_width=1280 "--window_height=$height" --mnk_mode
+  --guest_frame_stats --log_file "$(win "$base.log")")
 [[ $tap == 1 ]] && args+=(--pgr4_d3d_tap)
 [[ $mode == primary ]] && args+=(--pgr4_native --pgr4_native_primary)
 capdir=$top/captures-$tag
@@ -92,15 +90,16 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 sig=$(ls -t "$XDG_RUNTIME_DIR"/hypr/ | head -1)
 export HYPRLAND_INSTANCE_SIGNATURE=$sig
 cleanup() {
-  pkill -f 'pgr4_recompiled\.exe' 2>/dev/null || true
+  signal_prefix_games TERM "$top/prefix"
   sleep 3
-  pkill -9 -f 'pgr4_recompiled\.exe' 2>/dev/null || true
+  signal_prefix_games KILL "$top/prefix"
   [[ -n ${player:-} ]] && kill "$player" 2>/dev/null || true
   echo "stopped $(date +%T)"
   echo "log: $base.log"
   echo "input: $ilog"
 }
 trap cleanup EXIT
+exit_on_signals
 # Hyprland 0.56 with a Lua config: dispatchers are Lua expressions.
 out=$(hyprctl dispatch "hl.dsp.exec_cmd(\"$launcher\")" 2>&1) || true
 [[ $out == ok ]] || { echo "hyprctl exec failed: $out" >&2; exit 1; }
@@ -110,7 +109,7 @@ player=$!
 
 deadline=$((SECONDS + 300)); ok=0
 while (( SECONDS < deadline )); do
-  sleep 2
+  nap 2
   if grep -q '^\S\+ mark race' "$ilog" 2>/dev/null; then ok=1; break; fi
   if grep -q 'error' "$ilog" 2>/dev/null; then break; fi
   pgrep -f 'pgr4_recompiled\.exe' >/dev/null || { echo "GAME EXITED $(date +%T)"; break; }
@@ -119,11 +118,11 @@ echo "route reached mark race: $ok $(date +%T)"
 [[ $ok == 1 ]] || { tail -5 "$ilog" 2>/dev/null; exit 1; }
 if [[ $mode == oracle ]]; then
   # The game takes one capture per request file at its next Swap and deletes the file.
-  for _ in 1 2 3; do sleep 5; : > "$capdir/capture.request"; done
-  sleep $((hold > 15 ? hold - 15 : 0))
+  for _ in 1 2 3; do nap 5; : > "$capdir/capture.request"; done
+  nap $((hold > 15 ? hold - 15 : 0))
   echo "captures:"; cat "$capdir/captures.csv" 2>/dev/null || echo "  none"
 else
-  sleep "$hold"
+  nap "$hold"
 fi
 alive=0; pgrep -f 'pgr4_recompiled\.exe' >/dev/null && alive=1
 echo "alive at end: $alive $(date +%T)"

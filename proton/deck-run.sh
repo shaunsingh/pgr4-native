@@ -48,7 +48,8 @@
 # --catch keeps the last 5 s of frames shown in memory and writes the frames around each
 # whole-image jump to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch;
 # native/tools/flicker.py shows them).
-# --keys FILE drives the game with that route_player.py script instead of run/route-stpetersburg.keys.
+# --keys FILE drives the game with that route_player.py script instead of run/route-stpetersburg.keys;
+# frame_times.py checks the run against the route's draw counts in FILE's .draws, if there is one.
 # --race-draws N is the median draws per frame that shows the race is on (St Petersburg draws
 # 4000+; a Quebec street race about 2000, its menus 1500-2000).
 # --draw-log FRAMES writes the native renderer's log of every draw, clear and resolve of the
@@ -112,6 +113,8 @@ case $view in window) backend=wayland ;; sdl) backend=sdl ;; headless) backend=h
 [[ -z $output || $output =~ ^[A-Za-z0-9_-]+$ ]] || { echo "bad output name $output" >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "$here/.." && pwd)
+# shellcheck source=common.sh
+source "$here/common.sh"
 if [[ -f $tree/pgr4_recompiled.exe ]]; then
   runtime=$(cd "$tree" && pwd)
 else
@@ -121,16 +124,10 @@ game=${PGR4_GAME:-$HOME/recomp/dumps/pgr4/game}
 keys=${keys:-$repo/run/route-stpetersburg.keys}
 [[ -f $keys ]] || { echo "no key script $keys" >&2; exit 2; }
 top=$HOME/pgr4-proton
-compat=$HOME/.local/share/Steam/compatibilitytools.d
-shopt -s nullglob
-protons=("$compat"/GE-Proton*/ "$top"/proton/GE-Proton*/)
-shopt -u nullglob
-proton=${PROTON:-$(printf '%s\n' "${protons[@]}" | sort -V | tail -1)}
-proton=${proton%/}
-[[ -x $proton/proton ]] || { echo "no Proton at '$proton' (set PROTON=<dir with ./proton>)" >&2; exit 1; }
+find_proton
 [[ -f $runtime/pgr4_recompiled.exe ]] || { echo "no exe in $runtime" >&2; exit 1; }
 [[ -f $game/default.xex ]] || { echo "no game files in $game (set PGR4_GAME)" >&2; exit 1; }
-pgrep -f 'pgr4_recompiled\.exe' >/dev/null && { echo "a pgr4_recompiled.exe is already running" >&2; exit 1; }
+check_no_game
 if [[ $session == desktop && ! -w /dev/uinput ]]; then
   echo "/dev/uinput is not writable: sudo setfacl -m u:$USER:rw /dev/uinput" >&2; exit 1
 fi
@@ -140,21 +137,16 @@ export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 export DISPLAY=${DISPLAY:-:0}
 
 mkdir -p "$top/logs" "$top/prefix" "$top/userdata" "$top/cache"
-find "$top/userdata" -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} +   # fresh save, keep caches
+fresh_save "$top/userdata"
 stamp=$(date +%Y%m%d-%H%M%S)
 base=$top/logs/pgr4-proton-$tag-$stamp
 ilog=$top/logs/pgr4-co-input-$tag.log
 rm -f "$ilog"
-win() { echo "Z:${1//\//\\}"; }   # Proton maps Z: to /
 
-# MTR's launcher arguments for 60 fps (launcher/Launcher.cs), then the measurement flags.
-args=(--game_data_root "$(win "$game")" --user_data_root "$(win "$top/userdata")"
-  --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync --xmp_music_gain 0.35
-  --pgr4_60fps --pgr4_garage_walk_fix --d3d12_texture_shared_heaps --gpu_vblank_deadline_timer
-  --gpu_wait_reg_mem_high_res --no-clear_memory_page_state --gpu_ring_wake_fast --texture_resource_reuse
-  --texture_reuse_pool_limit_mib=256 --texture_cache_memory_limit_soft_lifetime=30
-  "--window_width=$width" "--window_height=$height" "--video_mode_refresh_rate=$refresh" --mnk_mode
-  --guest_frame_stats --pgr4_d3d_stats_frames=150 --log_file "$(win "$base.log")")
+# MTR's launcher arguments for 60 fps, then the measurement flags.
+mtr_args "$game" "$top/userdata" 60fps
+args+=("--window_width=$width" "--window_height=$height" "--video_mode_refresh_rate=$refresh"
+  --mnk_mode --guest_frame_stats --log_file "$(win "$base.log")")
 if [[ $fullscreen == 1 ]]; then args+=(--fullscreen); else args+=(--fullscreen=false); fi
 [[ $tap == 1 ]] && args+=(--pgr4_d3d_tap)
 [[ $mode == primary ]] && args+=(--pgr4_native --pgr4_native_primary)
@@ -194,7 +186,7 @@ echo "${cmd[*]}" > "$base-cmdline.txt"
 stop_game() {
   WINEPREFIX=$top/prefix/pfx "$proton/files/bin/wineserver" -k 2>/dev/null || true
   sleep 2
-  pkill -9 -f 'pgr4_recompiled\.exe' 2>/dev/null || true
+  signal_prefix_games KILL "$top/prefix"
   # gamescope exits by itself once the game is gone, and ignores SIGTERM when it does not.
   if [[ -n ${gamescope:-} ]] && kill -0 "$gamescope" 2>/dev/null; then
     kill "$gamescope" 2>/dev/null || true
@@ -202,11 +194,11 @@ stop_game() {
     kill -KILL "$gamescope" 2>/dev/null || true
   fi
 }
-# The game process: of the processes that match, the one with the most threads (not Proton's
-# launcher or a wrapper).
+# The game process: of this prefix's processes that match, the one with the most threads (not
+# Proton's launcher or a wrapper).
 game_pid() {
   local p n best="" max=0
-  for p in $(pgrep -f 'pgr4_recompiled\.exe'); do
+  for p in $(prefix_game_pids "$top/prefix"); do
     n=$(find "/proc/$p/task" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
     (( n > max )) && { max=$n; best=$p; }
   done
@@ -219,6 +211,7 @@ cleanup() {
   stop_game
   [[ -n $output ]] && qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$kwin_script" >/dev/null 2>&1 || true
   [[ -n ${shooter:-} ]] && kill "$shooter" 2>/dev/null || true
+  [[ -n ${limiter:-} ]] && kill "$limiter" 2>/dev/null || true
   [[ -n ${player:-} ]] && kill "$player" 2>/dev/null || true
   [[ -n ${sampler:-} ]] && kill "$sampler" 2>/dev/null || true
   [[ -n ${tracer:-} ]] && rm -f "$base-server.fifo"
@@ -227,13 +220,7 @@ cleanup() {
   echo "input: $ilog"
 }
 trap cleanup EXIT
-# Bash runs the EXIT trap after a signal only if the signal is handled; make it an exit.
-trap 'exit 143' TERM
-trap 'exit 130' INT
-# Bash defers traps until a foreground command returns, so a plain `sleep 900` would hold off
-# the cleanup (and kill a later run's game when it finally fires); waiting on a background
-# sleep lets a signal through at once.
-nap() { sleep "$1" & wait $!; }
+exit_on_signals
 
 player_args=(--script "$keys" --log "$ilog" --timeout 300 --width "$width" --height "$height"
   --stretch "$stretch")
@@ -301,6 +288,8 @@ EOF
       timeout 10 gamescopectl debug_set_fps_limit "$limit_fps" >/dev/null 2>&1 ||
         echo "gamescopectl debug_set_fps_limit $limit_fps failed" >&2
       echo "frame limit $limit_fps at $(date +%T)" ) &
+    # Killed at the end: left running, it would set the frame limit of the next run's gamescope.
+    limiter=$!
   fi
   player_args+=(--wm gamescope --input xtest)
   rm -rf "$shotdir"; mkdir -p "$shotdir"
@@ -347,7 +336,7 @@ while (( SECONDS < deadline )); do
   pgrep -f 'pgr4_recompiled\.exe' >/dev/null || { echo "GAME EXITED $(date +%T)"; break; }
   if [[ $mode != none && $startup_checked == 0 ]] && (( SECONDS - launched >= 45 )); then
     startup_checked=1
-    if (( $(wc -l < "$base-frames.csv" 2>/dev/null || echo 0) <= 1 )); then
+    if (( $(wc -l 2>/dev/null < "$base-frames.csv" || echo 0) <= 1 )); then
       echo "STARTUP HANG $(date +%T): no frame 45 s after launch"; sample_stuck; break
     fi
   fi
@@ -380,7 +369,8 @@ if (( perf_secs > 0 )); then
   # (hard links: the next build installs new files), for perf_symbols.py and disassembly.
   cp "/proc/$pid/maps" "$base-perf.maps"
   mkdir -p "$base-perf-modules"
-  for module in "$runtime"/*.exe "$runtime"/*.dll "$runtime"/*.map; do
+  shopt -s nullglob; modules=("$runtime"/*.exe "$runtime"/*.dll "$runtime"/*.map); shopt -u nullglob
+  for module in "${modules[@]}"; do
     ln -f "$module" "$base-perf-modules/" 2>/dev/null || cp "$module" "$base-perf-modules/"
   done
   perf record -q -e cycles:u -F 999 -p "$pid" -o "$base-perf.data" -- sleep "$perf_secs" \
@@ -426,9 +416,10 @@ if [[ -n ${pmustat:-} ]]; then
 fi
 fps=$(python3 "$repo/native/tools/perf_fps.py" "$base.log" "$race_hms" 40 2>&1 || true)
 head -n 1 <<< "$fps"
-ref_draws=$repo/run/route-stpetersburg.draws
+# The route's per-second draw counts (frame_times.py --fingerprint), when it has them.
+ref=(); [[ -f ${keys%.keys}.draws ]] && ref=(--ref "${keys%.keys}.draws")
 [[ -s $base-frames.csv ]] && { python3 "$repo/native/tools/frame_times.py" "$base-frames.csv" "$base.log" "$race_hms" 40 \
-  ${ref_draws:+--ref "$ref_draws"} || true
+  "${ref[@]}" || true
   python3 "$repo/native/tools/pacing.py" "$base-frames.csv" "$base.log" "$race_hms" 40 || true; }
 python3 "$here/deck_sampler.py" summary "$base-sampler.csv" "$race_hms" 40 || true
 if [[ -n ${tracer:-} ]]; then
