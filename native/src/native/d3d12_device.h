@@ -29,7 +29,9 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <thread>
+#include <vector>
 
 #include "win_handle.h"
 
@@ -74,12 +76,6 @@ class D3D12Device {
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* command_queue() const { return queue_.Get(); }
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
-  // A list that runs ahead of what the frame's list recorded since the last Submit, for copies
-  // and barriers that would otherwise split its render passes (TextureCache::
-  // RecordDeferredUploads). Opened on the frame's second allocator at the first call after a
-  // submission; the next Submit or EndFrame submits it first, in the same ExecuteCommandLists.
-  // GpuTimer passes do not include it. nullptr on failure (logged).
-  ID3D12GraphicsCommandList* upload_list();
 
   // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV.
   ID3D12Resource* back_buffer() const { return back_buffers_[back_index_].Get(); }
@@ -101,13 +97,17 @@ class D3D12Device {
   // the window keeps the previous frame), signals the frame fence, follows the game window's
   // client size, then waits for the slot kFramesInFlight frames back and opens the next frame's
   // list.
+  // `first`: closed lists that run ahead of the frame's in the same ExecuteCommandLists, for
+  // work that would otherwise split its render passes (TextureCache::CloseUploadLists); the
+  // frame's fence covers them, GpuTimer passes do not.
   // Returns false once the device or swapchain failed (logged once); the caller stops.
-  bool EndFrame(bool present = true);
-  // Submits what the frame recorded so far and continues it in the same list, reset on the
-  // frame's allocator, so the GPU starts on it while the rest of the frame is recorded. The
-  // frame fence and slot stay the frame's (EndFrame signals once for all of its submissions).
-  // Nothing bound on the list carries over. Returns false on failure (logged).
-  bool Submit();
+  bool EndFrame(bool present = true, std::span<ID3D12CommandList* const> first = {});
+  // Submits what the frame recorded so far (after `first`, as in EndFrame) and continues it in
+  // the same list, reset on the frame's allocator, so the GPU starts on it while the rest of the
+  // frame is recorded. The frame fence and slot stay the frame's (EndFrame signals once for all
+  // of its submissions). Nothing bound on the list carries over. Returns false on failure
+  // (logged).
+  bool Submit(std::span<ID3D12CommandList* const> first = {});
   // Where the last EndFrame spent its time.
   struct EndFrameTimes {
     uint64_t submit_ns = 0;   // Close + ExecuteCommandLists
@@ -136,7 +136,7 @@ class D3D12Device {
   bool CreateWindowThread(const wchar_t* title);
   bool CreateSwapchain(HWND hwnd);
   bool OpenList();
-  bool CloseAndExecute();
+  bool CloseAndExecute(std::span<ID3D12CommandList* const> first);
   bool GetBackBuffers();
   bool FollowWindowSize();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -155,9 +155,7 @@ class D3D12Device {
   uint64_t slot_fence_[kFramesInFlight] = {};
   uint32_t slot_ = 0;
   ComPtr<ID3D12GraphicsCommandList> list_;
-  ComPtr<ID3D12CommandAllocator> upload_allocators_[kFramesInFlight];
-  ComPtr<ID3D12GraphicsCommandList> upload_list_;
-  bool upload_open_ = false;
+  std::vector<ID3D12CommandList*> submit_lists_;  // CloseAndExecute's
   EndFrameTimes end_frame_times_;
 
   ComPtr<IDXGISwapChain3> swapchain_;

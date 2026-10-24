@@ -16,7 +16,7 @@ n = len(sel)
 draws = sum(f(r, "draws") for r in sel) / n
 print(f"frame_ms median {statistics.median(f(r,'frame_ms') for r in sel):.2f} mean {sum(f(r,'frame_ms') for r in sel)/n:.2f}")
 for k in ["draws", "clears", "resolves", "draw_us", "clear_us", "resolve_us", "swap_us", "pso_created", "upload_kb", "textures", "track_calls",
-          "tex_memo_miss", "tex_created", "tex_create_us", "tex_uploads", "tex_deferred", "tex_upload_kb", "tex_upload_us", "tex_untile_us",
+          "tex_memo_miss", "tex_created", "tex_create_us", "tex_uploads", "tex_deferred", "tex_upload_kb", "tex_upload_us", "tex_untile_us", "tex_record_us",
           "tex_resolved_copies", "tex_copy_resolved_us", "srv_lookups", "srv_created", "samplers_created",
           "bind_hits", "bind_misses", "bind_hit", "bind_mru", "bind_miss_empty", "bind_miss_fetch", "bind_miss_tex",
           "bind_nomemo", "get_miss_fetch", "get_miss_changed", "srv_memo_hit", "tex_upload_skip"]:

@@ -155,9 +155,7 @@ class GpuCheck {
     Place(d.xkey.mip_page << 12, d.mips, d.mips_bytes);
     TextureBinding b;
     ++fence_value_;
-    const bool got = cache_->Get(d.fetch, list_.Get(), fence_value_, &b);
-    cache_->RecordDeferredUploads(list_.Get());  // a new texture's upload is deferred
-    if (!got) {
+    if (!cache_->Get(d.fetch, list_.Get(), fence_value_, &b)) {
       std::printf("GPU   %s: TextureCache::Get failed\n", name.c_str());
       Submit();
       return false;
@@ -255,9 +253,11 @@ class GpuCheck {
     list_->ResourceBarrier(1, &b);
   }
   bool Submit() {
-    if (FAILED(list_->Close())) return false;
-    ID3D12CommandList* lists[] = {list_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
+    // A new texture's upload is deferred to the cache's upload list, which runs first.
+    std::vector<ID3D12CommandList*> lists;
+    if (!cache_->CloseUploadLists(&lists) || FAILED(list_->Close())) return false;
+    lists.push_back(list_.Get());
+    queue_->ExecuteCommandLists(UINT(lists.size()), lists.data());
     queue_->Signal(fence_.Get(), fence_value_);
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     fence_->SetEventOnCompletion(fence_value_, ev);

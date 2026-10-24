@@ -4,8 +4,8 @@
 // size, pitch, format, endianness, tiling, packed mips, mip count). Get() returns the texture
 // for a fetch constant, uploading it first when it is new or stale:
 //   - guest memory: untiled on the CPU (UntileTexture) into an upload buffer, copied on the
-//     frame's command list, or, for a texture the frame has not bound yet, ahead of it
-//     (RecordDeferredUploads);
+//     frame's command list, or, for a texture the frame has not bound yet, on an upload list
+//     that runs ahead of it (CloseUploadLists);
 //   - resolve destinations: the resolve module's host image (ResolvedLookup) instead. A 2D
 //     texture with one subresource that an image covers exactly binds the image itself;
 //     others copy it per level/slice when it is newer than the texture's copy.
@@ -17,9 +17,9 @@
 // policy, see Budget) once the GPU has finished the frames that used them.
 //
 // Threading: everything but MarkCapture runs on the thread that records the frame (the render
-// thread by default); MarkCapture runs on the guest D3D thread, the untile jobs (watch arming and
-// untile) on the untile workers, and the invalidation callback on any guest thread that faults on
-// a watched page.
+// thread by default); MarkCapture runs on the guest D3D thread, the untile jobs (watch arming,
+// untile, upload list recording) on the untile workers, and the invalidation callback on any guest
+// thread that faults on a watched page.
 #pragma once
 
 #include "resolve.h"  // ResolvedImage
@@ -87,7 +87,8 @@ class TextureCache {
     // creation), Upload (buffer creation + untile + copies) and CopyResolved.
     uint64_t memo_misses = 0, created = 0, create_ns = 0, upload_ns = 0, copy_resolved_ns = 0;
     uint64_t evicted = 0, evict_ns = 0;  // textures evicted over the budget, time in Retire
-    uint64_t deferred_uploads = 0;       // uploads recorded by RecordDeferredUploads
+    uint64_t deferred_uploads = 0;       // uploads on the upload lists (CloseUploadLists)
+    uint64_t upload_record_ns = 0;       // recording them (worker CPU, as untile_ns)
   };
   // Texture memory budget, by the resources' allocation sizes. Over soft_bytes, textures unused
   // for soft_lifetime_ms are evicted; over hard_bytes, the least recently used ones regardless.
@@ -141,28 +142,32 @@ class TextureCache {
   bool Get(const uint32_t fetch[6], ID3D12GraphicsCommandList* list, uint64_t frame_fence,
            TextureBinding* out, uint64_t captured = kCapturedNow);
 
-  // In the game, untiling runs on worker threads: Upload records the GPU copies (or defers
-  // them, see RecordDeferredUploads) and queues the untile into their upload memory (offline it
-  // runs inline). Call this before the lists holding the copies are submitted; the GPU reads the
-  // upload memory only then.
+  // In the game, untiling runs on worker threads: Upload records the GPU copies on the frame's
+  // list or defers them (CloseUploadLists), and queues the untile into their upload memory
+  // (offline it runs inline). Call this before the lists holding the copies are submitted; the
+  // GPU reads the upload memory only then.
   void FinishUploads();
   // Without waiting: whether every untile queued so far has finished, so the list may be
   // submitted now.
   bool UploadsDone();
 
-  // The upload of a texture the frame has not bound yet is deferred: its copies and barriers are
-  // recorded here, into a list the caller submits ahead of the frame's list (in the same
-  // ExecuteCommandLists), with the transitions batched into one barrier before the copies and
-  // one after them. On the frame's list each upload is a copy and a barrier between draws, which
-  // vkd3d-proton records by ending the render pass (about 54 µs per texture created in the race).
-  // No command the frame recorded reads such a texture, so running its upload first changes
-  // nothing it sees. DXVK moves transfers to its init command buffer under the same condition
-  // (DxvkContext::prepareOutOfOrderTransfer). Call before every submission of the frame's list.
-  bool has_deferred_uploads() const { return !deferred_copies_.empty(); }
-  void RecordDeferredUploads(ID3D12GraphicsCommandList* list);
+  // The upload of a texture the frame has not bound yet is deferred: the thread that untiles it
+  // records its barriers and copies on an upload list of its own (one per untile worker), which
+  // runs ahead of the frame's list. On the frame's list each upload is a copy and a barrier
+  // between draws, which vkd3d-proton records by ending the render pass (about 54 µs per texture
+  // created in the race), and recording the copies takes about 31 µs per texture in vkd3d-proton
+  // and RADV (td-170), which the workers take off the render thread. No command the frame
+  // recorded reads such a texture, so running its upload first changes nothing it sees. DXVK
+  // moves transfers to its init command buffer under the same condition
+  // (DxvkContext::prepareOutOfOrderTransfer).
+  // Before each submission of the frame's list, once the untiles finished (FinishUploads, or
+  // UploadsDone true): closes the upload lists recorded since the last call and appends them to
+  // *lists, to be submitted first in the same ExecuteCommandLists. False if recording one failed
+  // (logged).
+  bool CloseUploadLists(std::vector<ID3D12CommandList*>* lists);
 
-  // Recycles upload memory of frames the GPU finished and evicts textures over the budget. Once
-  // per Swap, after the submission.
+  // Recycles upload memory and upload list allocators of frames the GPU finished and evicts
+  // textures over the budget. Once per Swap, after the submission.
   void Retire(uint64_t completed_fence);
 
   // Whether the binding Get returned for this texture can be bound again without a Get: not
@@ -212,8 +217,19 @@ class TextureCache {
   void EvictOverBudget(uint64_t completed_fence);
   // Unlinks t from every structure that refers to it, frees its memory and its slot.
   void Destroy(Texture& t);
-  // defer: recorded by RecordDeferredUploads instead of on `list`; t ends in shader-read state.
+  // defer: on an upload list instead of `list` (CloseUploadLists); t ends in shader-read state.
   bool Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence, bool defer);
+  // An upload's copies from its upload memory into the texture, one per footprint.
+  struct UploadCopies {
+    ID3D12Resource* texture = nullptr;
+    ID3D12Resource* source = nullptr;
+    uint64_t source_offset = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;  // the texture's (HostFormat::resource)
+    uint32_t block_width = 1, block_height = 1;
+    uint32_t mip_levels = 1;
+  };
+  static void RecordCopies(ID3D12GraphicsCommandList* list, const UploadCopies& copies,
+                           const std::vector<HostSubresource>& footprints);
   // A texture resource in COPY_DEST state, placed in a pooled heap at *placed (kCommitted if it
   // does not fit one or a heap cannot be created); *bytes: its allocation size.
   HRESULT CreateTextureResource(D3D12_RESOURCE_DESC& desc,
@@ -258,10 +274,34 @@ class TextureCache {
     uint32_t upload_number = 0;  // the texture's Upload count (the slow-upload log)
     uint32_t base_bytes = 0, mips_bytes = 0;
     TextureConversion conversion = TextureConversion::kCopy;
+    UploadCopies copies;
+    // A deferred upload: the copies are recorded after the untile, on the untiling thread's
+    // upload list for the frame completing at frame_fence, with the texture going from `state`
+    // to COPY_DEST before them and to shader read after. Otherwise Upload recorded them.
+    bool deferred = false;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+    uint64_t frame_fence = 0;
+  };
+  // An untiling thread's upload list: the deferred uploads it untiled since the last
+  // CloseUploadLists. Its command allocators are pooled by the frame fence of the lists recorded
+  // on them and reset once the GPU passed it, as Xenia's D3D12CommandProcessor pools its own.
+  // While untiles run only its thread touches it, CloseUploadLists only while none run.
+  struct UploadList {
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;  // the frame's, from the first open
+    uint64_t allocator_fence = 0;
+    // (frame fence, allocator), oldest first.
+    std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12CommandAllocator>>> retired;
+    bool open = false;
   };
   // Untiles one job; returns its time in ns.
   static uint64_t RunUntile(const UntileJob& job, std::vector<uint8_t>* scratch);
-  void WorkerMain();
+  // Records a deferred job's upload on `uploads`; returns its time in ns. On failure (logged)
+  // CloseUploadLists returns false.
+  uint64_t RecordDeferredUpload(const UntileJob& job, UploadList* uploads);
+  // `uploads` open for the frame completing at frame_fence; null on failure (logged).
+  ID3D12GraphicsCommandList* OpenUploadList(UploadList* uploads, uint64_t frame_fence);
+  void WorkerMain(UploadList* uploads);
 
   ID3D12Device* device_;
   const uint8_t* membase_;                 // guest physical address 0
@@ -316,12 +356,10 @@ class TextureCache {
   // Guest physical address of every subresource CopyResolved looks up -> the textures there.
   std::unordered_map<uint32_t, std::vector<Texture*>> resolve_targets_;
   UploadPool upload_{32u << 20};  // untiled data, the copies' source
-  // Deferred uploads (Upload with defer) until RecordDeferredUploads.
-  struct DeferredCopy {
-    D3D12_TEXTURE_COPY_LOCATION dst, src;
-  };
-  std::vector<D3D12_RESOURCE_BARRIER> deferred_to_copy_, deferred_to_read_;
-  std::vector<DeferredCopy> deferred_copies_;
+  // One per untile worker, or one for the inline untiles offline; sized before the workers start.
+  std::vector<UploadList> upload_lists_;
+  std::atomic<uint64_t> completed_fence_{0};  // Retire's: upload list allocators up to it are free
+  std::atomic<bool> upload_list_failed_{false};
   // Texture memory: textures are placed in large heaps (CreatePlacedResource costs a fraction of
   // CreateCommittedResource: 627 textures took 138 ms at race start as committed resources),
   // best fit, and an evicted texture's range coalesces with its free neighbours.
@@ -344,7 +382,8 @@ class TextureCache {
   std::deque<UntileJob> jobs_;
   uint32_t jobs_busy_ = 0;  // queued + running
   bool stopping_ = false;
-  std::atomic<uint64_t> worker_untile_ns_{0};  // folded into stats_ by FinishUploads
+  // Folded into stats_ by FinishUploads.
+  std::atomic<uint64_t> worker_untile_ns_{0}, worker_record_ns_{0};
   Stats stats_;
 };
 

@@ -160,6 +160,7 @@ void ForEachResolveAddress(const TextureKey& key, const texture_util::TextureGue
 
 TextureCache::TextureCache(ID3D12Device* device, const uint8_t* physical_membase)
     : device_(device), membase_(physical_membase) {
+  upload_lists_.resize(1);
   upload_.SetDevice(device_);
   upload_.Reserve(4);  // the race start keeps 3 in flight (HitchFix)
   StartSpareHeap();
@@ -188,8 +189,9 @@ TextureCache::TextureCache(ID3D12Device* device, rex::memory::Memory* memory)
   std::from_chars(trace.data(), trace.data() + trace.size(), trace_address_, 16);
   // A quarter of the hardware threads, 1-4: 4 on an i9-13900K, 2 on a Steam Deck.
   const uint32_t n = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 4u);
+  upload_lists_.resize(n);
   for (uint32_t i = 0; i < n; ++i) {
-    workers_.emplace_back([this] { WorkerMain(); });
+    workers_.emplace_back([this, uploads = &upload_lists_[i]] { WorkerMain(uploads); });
     SetThreadDescription(workers_.back().native_handle(), L"PGR4 native untile");
   }
 }
@@ -208,7 +210,7 @@ TextureCache::~TextureCache() {
 #endif
 }
 
-void TextureCache::WorkerMain() {
+void TextureCache::WorkerMain(UploadList* uploads) {
   std::vector<uint8_t> scratch;
   std::unique_lock<std::mutex> lock(jobs_mutex_);
   for (;;) {
@@ -219,6 +221,8 @@ void TextureCache::WorkerMain() {
     lock.unlock();
     ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     worker_untile_ns_.fetch_add(RunUntile(job, &scratch), std::memory_order_relaxed);
+    if (job.deferred)
+      worker_record_ns_.fetch_add(RecordDeferredUpload(job, uploads), std::memory_order_relaxed);
     lock.lock();
     if (--jobs_busy_ == 0) idle_cv_.notify_all();
   }
@@ -229,6 +233,7 @@ void TextureCache::FinishUploads() {
   std::unique_lock<std::mutex> lock(jobs_mutex_);
   idle_cv_.wait(lock, [this] { return jobs_busy_ == 0; });
   stats_.untile_ns += worker_untile_ns_.exchange(0, std::memory_order_relaxed);
+  stats_.upload_record_ns += worker_record_ns_.exchange(0, std::memory_order_relaxed);
 }
 
 bool TextureCache::UploadsDone() {
@@ -673,44 +678,29 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   // ClearDirty's order, with the watches armed by the untile job just before it reads: their
   // protection changes (about 20 µs each under Wine) run off the render thread.
   t.dirty.store(false, std::memory_order_release);
-  // The copies read the upload memory only once the list is submitted, after FinishUploads.
+  UntileJob job;
+  UploadCopies& copies = job.copies;
+  copies.texture = t.resource.Get();
+  copies.source = a.resource;
+  copies.source_offset = a.offset;
+  copies.format = t.host->resource;
+  if (t.host->block_compressed) {
+    const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
+    copies.block_width = info->block_width;
+    copies.block_height = info->block_height;
+  }
+  copies.mip_levels = key.mip_levels();
   if (defer) {
-    ID3D12Resource* r = t.resource.Get();
-    if (t.state != D3D12_RESOURCE_STATE_COPY_DEST)
-      deferred_to_copy_.push_back(TransitionBarrier(r, t.state, D3D12_RESOURCE_STATE_COPY_DEST));
-    deferred_to_read_.push_back(TransitionBarrier(r, D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead));
+    job.deferred = true;
+    job.state = t.state;
+    job.frame_fence = frame_fence;
     t.state = kShaderRead;
     ++stats_.deferred_uploads;
   } else {
+    // The copies read the upload memory only once the list is submitted, after FinishUploads.
     Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
+    RecordCopies(list, copies, footprints_);
   }
-  uint32_t bw = 1, bh = 1;
-  if (t.host->block_compressed) {
-    const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
-    bw = info->block_width;
-    bh = info->block_height;
-  }
-  for (const HostSubresource& s : footprints_) {
-    D3D12_TEXTURE_COPY_LOCATION dst = {};
-    dst.pResource = t.resource.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = s.level + s.slice * key.mip_levels();
-    D3D12_TEXTURE_COPY_LOCATION src = {};
-    src.pResource = a.resource;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = a.offset + s.offset;
-    src.PlacedFootprint.Footprint.Format = t.host->resource;
-    src.PlacedFootprint.Footprint.Width = s.block_columns * bw;
-    src.PlacedFootprint.Footprint.Height = s.block_rows * bh;
-    src.PlacedFootprint.Footprint.Depth = s.depth;
-    src.PlacedFootprint.Footprint.RowPitch = s.row_pitch;
-    if (defer)
-      deferred_copies_.push_back({dst, src});
-    else
-      list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-  }
-
-  UntileJob job;
   job.key = key;
   job.layout = t.layout;
   if (key.base_page) {
@@ -731,6 +721,7 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   if (workers_.empty()) {
     ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     stats_.untile_ns += RunUntile(job, &untile_scratch_);
+    if (job.deferred) stats_.upload_record_ns += RecordDeferredUpload(job, &upload_lists_[0]);
     footprints_ = std::move(job.footprints);
   } else {
     {
@@ -974,19 +965,102 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   return true;
 }
 
-void TextureCache::RecordDeferredUploads(ID3D12GraphicsCommandList* list) {
-  if (deferred_copies_.empty()) return;
-  if (!deferred_to_copy_.empty())
-    list->ResourceBarrier(UINT(deferred_to_copy_.size()), deferred_to_copy_.data());
-  for (const DeferredCopy& c : deferred_copies_)
-    list->CopyTextureRegion(&c.dst, 0, 0, 0, &c.src, nullptr);
-  list->ResourceBarrier(UINT(deferred_to_read_.size()), deferred_to_read_.data());
-  deferred_to_copy_.clear();
-  deferred_copies_.clear();
-  deferred_to_read_.clear();
+void TextureCache::RecordCopies(ID3D12GraphicsCommandList* list, const UploadCopies& copies,
+                                const std::vector<HostSubresource>& footprints) {
+  for (const HostSubresource& s : footprints) {
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = copies.texture;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = s.level + s.slice * copies.mip_levels;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = copies.source;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = copies.source_offset + s.offset;
+    src.PlacedFootprint.Footprint.Format = copies.format;
+    src.PlacedFootprint.Footprint.Width = s.block_columns * copies.block_width;
+    src.PlacedFootprint.Footprint.Height = s.block_rows * copies.block_height;
+    src.PlacedFootprint.Footprint.Depth = s.depth;
+    src.PlacedFootprint.Footprint.RowPitch = s.row_pitch;
+    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  }
+}
+
+uint64_t TextureCache::RecordDeferredUpload(const UntileJob& job, UploadList* uploads) {
+  const uint64_t t0 = NowNs();
+  ID3D12GraphicsCommandList* list = OpenUploadList(uploads, job.frame_fence);
+  if (!list) {
+    upload_list_failed_.store(true, std::memory_order_relaxed);
+    return 0;
+  }
+  // One transition per call: vkd3d-proton folds transitions between COPY_DEST and shader read
+  // into the next copy's barrier and the list's last one (its trivial copy barrier path).
+  ID3D12Resource* r = job.copies.texture;
+  if (job.state != D3D12_RESOURCE_STATE_COPY_DEST) {
+    const D3D12_RESOURCE_BARRIER b =
+        TransitionBarrier(r, job.state, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->ResourceBarrier(1, &b);
+  }
+  RecordCopies(list, job.copies, job.footprints);
+  const D3D12_RESOURCE_BARRIER b =
+      TransitionBarrier(r, D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead);
+  list->ResourceBarrier(1, &b);
+  return NowNs() - t0;
+}
+
+ID3D12GraphicsCommandList* TextureCache::OpenUploadList(UploadList* uploads, uint64_t frame_fence) {
+  UploadList& u = *uploads;
+  if (u.open) return u.list.Get();
+  if (u.allocator && u.allocator_fence != frame_fence)
+    u.retired.emplace_back(u.allocator_fence, std::move(u.allocator));
+  HRESULT hr = S_OK;
+  if (!u.allocator) {
+    if (!u.retired.empty() &&
+        u.retired.front().first <= completed_fence_.load(std::memory_order_relaxed)) {
+      u.allocator = std::move(u.retired.front().second);
+      u.retired.pop_front();
+      hr = u.allocator->Reset();
+    } else {
+      hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           IID_PPV_ARGS(u.allocator.GetAddressOf()));
+    }
+    if (FAILED(hr)) {
+      REXLOG_ERROR("PGR4 native textures: upload list allocator failed: {:08X}", uint32_t(hr));
+      u.allocator.Reset();
+      return nullptr;
+    }
+    u.allocator_fence = frame_fence;
+  }
+  if (u.list) {
+    hr = u.list->Reset(u.allocator.Get(), nullptr);
+  } else {
+    hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, u.allocator.Get(), nullptr,
+                                    IID_PPV_ARGS(u.list.GetAddressOf()));
+    if (SUCCEEDED(hr)) u.list->SetName(L"pgr4 native uploads");
+  }
+  if (FAILED(hr)) {
+    REXLOG_ERROR("PGR4 native textures: upload list reset failed: {:08X}", uint32_t(hr));
+    return nullptr;
+  }
+  u.open = true;
+  return u.list.Get();
+}
+
+bool TextureCache::CloseUploadLists(std::vector<ID3D12CommandList*>* lists) {
+  for (UploadList& u : upload_lists_) {
+    if (!u.open) continue;
+    u.open = false;
+    const HRESULT hr = u.list->Close();
+    if (FAILED(hr)) {
+      REXLOG_ERROR("PGR4 native textures: upload list close failed: {:08X}", uint32_t(hr));
+      return false;
+    }
+    lists->push_back(u.list.Get());
+  }
+  return !upload_list_failed_.load(std::memory_order_relaxed);
 }
 
 void TextureCache::Retire(uint64_t completed_fence) {
+  completed_fence_.store(completed_fence, std::memory_order_relaxed);
   upload_.EndFrame(completed_fence);
   now_ms_ = NowNs() / 1000000;
   EvictOverBudget(completed_fence);

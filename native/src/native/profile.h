@@ -30,7 +30,7 @@ enum Stage : uint32_t {
   kVertices,   // RequestRange (vertex fetch, indices) + FlushCopies
   kCbv,        // UploadCbv b0..b4
   kRecord,     // fixed-function state, render targets, IA, draw call
-  kSubmit,     // NativeRenderer::SubmitEarly when it submits: RecordUploads, Submit
+  kSubmit,     // NativeRenderer::SubmitEarly when it submits: CloseUploadLists, Submit
   // Hook side (pgr4_d3d_trace.cpp), outside OnDraw.
   kTrack,        // ReadDirtyMasks + GuestStateTracker::AfterCall, every flushing call
   kImmediateVs,  // GuestStateTracker::AfterImmediateVs
@@ -49,7 +49,7 @@ enum Stage : uint32_t {
   // D3D functions at the outermost hooked call, i.e. the D3D library's own work (packet
   // building, state flushes) that a recompilation which replaces the D3D API would not run.
   kGuestD3d,
-  // Nested inside kSubmit or the swap: TextureCache::RecordDeferredUploads.
+  // Nested inside kSubmit or the swap: NativeRenderer::CloseUploadLists.
   kUploadList,
   kStageCount
 };

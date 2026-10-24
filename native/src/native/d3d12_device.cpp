@@ -178,25 +178,16 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
     REXLOG_ERROR("PGR4 native: CreateEvent failed: error {}", GetLastError());
     return false;
   }
-  for (uint32_t i = 0; i < kFramesInFlight; ++i)
+  for (auto& a : allocators_)
     if (Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                               IID_PPV_ARGS(allocators_[i].GetAddressOf())),
-               "CreateCommandAllocator") ||
-        Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                               IID_PPV_ARGS(upload_allocators_[i].GetAddressOf())),
-               "CreateCommandAllocator(upload)"))
+                                               IID_PPV_ARGS(a.GetAddressOf())),
+               "CreateCommandAllocator"))
       return false;
   if (Failed(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(),
                                         nullptr, IID_PPV_ARGS(list_.GetAddressOf())),
-             "CreateCommandList") ||
-      Failed(
-          device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, upload_allocators_[0].Get(),
-                                     nullptr, IID_PPV_ARGS(upload_list_.GetAddressOf())),
-          "CreateCommandList(upload)") ||
-      Failed(upload_list_->Close(), "CommandList::Close(upload)"))
+             "CreateCommandList"))
     return false;
   list_->SetName(L"pgr4 native frame");
-  upload_list_->SetName(L"pgr4 native uploads");
 
   BOOL tearing = FALSE;
   factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
@@ -331,52 +322,35 @@ bool D3D12Device::OpenList() {
   WaitFence(slot_fence_[slot_]);
   end_frame_times_.fence_ns = NowNs() - t0;
   if (Failed(allocators_[slot_]->Reset(), "CommandAllocator::Reset") ||
-      Failed(upload_allocators_[slot_]->Reset(), "CommandAllocator::Reset(upload)") ||
       Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
     return false;
   if (gpu_timer_) gpu_timer_->BeginFrame(list_.Get(), slot_);
   return true;
 }
 
-ID3D12GraphicsCommandList* D3D12Device::upload_list() {
-  if (!upload_open_) {
-    if (Failed(upload_list_->Reset(upload_allocators_[slot_].Get(), nullptr),
-               "CommandList::Reset(upload)"))
-      return nullptr;
-    upload_open_ = true;
-  }
-  return upload_list_.Get();
-}
-
-bool D3D12Device::CloseAndExecute() {
-  ID3D12CommandList* lists[2];
-  uint32_t n = 0;
-  if (upload_open_) {
-    upload_open_ = false;
-    if (Failed(upload_list_->Close(), "CommandList::Close(upload)")) return false;
-    lists[n++] = upload_list_.Get();
-  }
+bool D3D12Device::CloseAndExecute(std::span<ID3D12CommandList* const> first) {
   if (Failed(list_->Close(), "CommandList::Close")) return false;
-  lists[n++] = list_.Get();
+  submit_lists_.assign(first.begin(), first.end());
+  submit_lists_.push_back(list_.Get());
   // The constant uploads are streaming stores, which are weakly ordered: make them visible
   // before the GPU can read them.
   simde_mm_sfence();
-  queue_->ExecuteCommandLists(n, lists);
+  queue_->ExecuteCommandLists(UINT(submit_lists_.size()), submit_lists_.data());
   return true;
 }
 
-bool D3D12Device::Submit() {
+bool D3D12Device::Submit(std::span<ID3D12CommandList* const> first) {
   if (gpu_timer_) gpu_timer_->Pass(list_.Get(), GpuTimer::KeySubmit());
   // A list may be reset while its submission runs; the allocator only once the frame's fence
   // completed (OpenList).
-  return CloseAndExecute() &&
+  return CloseAndExecute(first) &&
          !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
 }
 
-bool D3D12Device::EndFrame(bool present) {
+bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
   const uint64_t t0 = NowNs();
   if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
-  if (!CloseAndExecute()) return false;
+  if (!CloseAndExecute(first)) return false;
   const uint64_t t1 = NowNs();
   const bool shown = swapchain_ && present;
   HRESULT hr = !shown   ? S_OK

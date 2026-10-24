@@ -768,19 +768,16 @@ void NativeRenderer::SubmitEarly() {
   if (every <= 0 || stats_.draws - draws_submitted_ < uint64_t(every) || !textures_->UploadsDone())
     return;
   profile::Scope scope(profile::kSubmit);
-  if (!RecordUploads() || !device_->Submit()) return Fail();
+  if (!CloseUploadLists() || !device_->Submit(upload_lists_)) return Fail();
   draw_->InvalidateListState(DrawRenderer::ListBreak::kSubmit);
   draws_submitted_ = stats_.draws;
   ++stats_.submits;
 }
 
-bool NativeRenderer::RecordUploads() {
-  if (!textures_->has_deferred_uploads()) return true;
+bool NativeRenderer::CloseUploadLists() {
   profile::Scope scope(profile::kUploadList);
-  ID3D12GraphicsCommandList* list = device_->upload_list();
-  if (!list) return false;
-  textures_->RecordDeferredUploads(list);
-  return true;
+  upload_lists_.clear();
+  return textures_->CloseUploadLists(&upload_lists_);
 }
 
 void NativeRenderer::Fail() {
@@ -852,7 +849,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_untile_ns = NowNs() - u0;
   draw_->BeforeSubmit();
   const uint64_t fence = d.frame_fence();
-  if (!RecordUploads() || !d.EndFrame(shown)) return Fail();
+  if (!CloseUploadLists() || !d.EndFrame(shown, upload_lists_)) return Fail();
   const D3D12Device::EndFrameTimes& et = d.end_frame_times();
   stats_.swap_submit_ns = et.submit_ns;
   stats_.swap_present_ns = et.present_ns;
@@ -987,6 +984,7 @@ void NativeRenderer::AppendCsvProfileColumns(bool header, std::string* line) {
       Fix1("tex_upload_kb", (t.upload_bytes - p.upload_bytes) / 1024.0),
       Fix1("tex_upload_us", (t.upload_ns - p.upload_ns) / 1000.0),
       Fix1("tex_untile_us", (t.untile_ns - p.untile_ns) / 1000.0),
+      Fix1("tex_record_us", (t.upload_record_ns - p.upload_record_ns) / 1000.0),
       Uint("tex_resolved_copies", t.resolved_copies - p.resolved_copies),
       Fix1("tex_copy_resolved_us", (t.copy_resolved_ns - p.copy_resolved_ns) / 1000.0),
       Uint("tex_resolved_aliases", t.resolved_aliases - p.resolved_aliases),

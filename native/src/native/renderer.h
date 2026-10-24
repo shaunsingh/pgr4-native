@@ -34,8 +34,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 struct ID3D12Device;
+struct ID3D12CommandList;
 struct ID3D12CommandQueue;
 struct ID3D12GraphicsCommandList;
 
@@ -160,9 +162,9 @@ class NativeRenderer {
   // After a draw: submits the frame so far once --pgr4_native_submit_draws draws were recorded
   // since the last submission.
   void SubmitEarly();
-  // Before each submission: the texture uploads Get deferred, into the device's upload list.
-  // False on failure (logged).
-  bool RecordUploads();
+  // Before each submission, once the untiles finished: the texture upload lists to submit first
+  // (TextureCache::CloseUploadLists), into upload_lists_. False on failure (logged).
+  bool CloseUploadLists();
   // A failed submission or present: logs and turns the native path off for the rest of the run.
   // In primary mode it also releases the game window to ReXGlue's presenter (on the thread that
   // records, which owns the swapchain), and the guest thread hands the game to the Xenos plugin
@@ -220,7 +222,8 @@ class NativeRenderer {
   FrameStats stats_;
   // Ticks inside ExecuteDraw, ExecuteClear and ExecuteResolve, into stats_ at the Swap.
   uint64_t draw_ticks_ = 0, clear_ticks_ = 0, resolve_ticks_ = 0;
-  uint64_t draws_submitted_ = 0;  // stats_.draws at the frame's last SubmitEarly
+  uint64_t draws_submitted_ = 0;                  // stats_.draws at the frame's last SubmitEarly
+  std::vector<ID3D12CommandList*> upload_lists_;  // CloseUploadLists'
   struct Csv;
   std::unique_ptr<Csv> csv_;
 };
