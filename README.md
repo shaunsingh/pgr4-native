@@ -612,6 +612,22 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   render thread takes 32 µs in the median and 44 µs at most from writing a row to finishing the
   frame (78 µs and 27 ms). Of the race's frames over 20 ms, three waited in Present for the GPU
   and one uploaded 2 MB of textures.
+- A pass over the renderer's code for correctness and clarity. Resolve clears the whole source
+  rectangle even where the copy is clipped or fails, as the guest D3D does; a frame that fails
+  in primary mode hands the game to the Xenos plugin at the next Swap and the window back to
+  ReXGlue's presenter, instead of leaving it black; a failed vertex copy no longer leaves its
+  pages marked valid. The pipeline library's names carry the root signature's hash, so a
+  changed root signature never loads a stale pipeline (td-155 started from an empty library:
+  1161 pipelines queued in the menus, no compile waits in the race). Repeated warnings are
+  limited per call site (`log.h`), the hooked functions are one list (`hook_args.h`), the
+  presenter's and the resolver's debug tools are files of their own, and dead code (the
+  bindful root signature, the raw resolve path, unused settings and statistics) is gone. The
+  render thread's queue entries are prefetched for writing with PREFETCHW (`-mprfchw`). The
+  Proton scripts share `proton/common.sh` and stop only their own prefix's game. The PGO profile
+  is taken again (td-155). td-156, the image check: 45.3-46.2 dB against the Xenos plugin.
+  td-157 against td-154: race 89.3 against 89.1 fps, 1 % low 59.4 against 59.2; 17 of 3449
+  shown frames more than 1.5 times the median interval apart against 11, interval sd 0.79
+  against 0.65 ms, within the spread between runs.
 
 ## Why a native renderer can beat emulation
 
