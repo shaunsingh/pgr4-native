@@ -231,6 +231,7 @@ class GuestStateTracker {
     raw_[reg] = __builtin_bswap32(value);
     Record(reg, value);
   }
+  // `count` registers from guest memory at `src` (LoadLiterals).
   void Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count);
   // The float constants and block registers whose bit is set in `flushed` (masks +0..+40, host
   // order).

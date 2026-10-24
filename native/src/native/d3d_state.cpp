@@ -10,12 +10,14 @@
 #include <rex/logging.h>
 #include <xxhash.h>
 
-#include <simde/x86/avx2.h>
+#include <simde/x86/sse2.h>
 
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <iterator>
 #include <span>
+#include <utility>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
                     "After each game draw, compare the guest register shadow with the tracked "
@@ -73,6 +75,71 @@ constexpr uint64_t kShaderLoadBlocks = (0xFFFFull << 42) | (0x1Full << 12) | 0xF
 // Vertex fetch constant 31 (mask +24 bit 0): BeginVertices' inline vertex buffer.
 constexpr uint64_t kFetch31 = 1ull;
 
+// The most registers one CopyFlushed takes (every block, all groups).
+constexpr uint32_t kFlushedMax = [] {
+  uint32_t n = 0;
+  for (const Block& b : kFlushBlocks) n += b.count;
+  return n;
+}();
+// Update<6> (fetch constants) compares 8 registers per group: the last group's two extra lanes
+// are the first VS constants, in the device and in raw_.
+static_assert(dev::kFetchConstants + 192 * 4 == dev::kVsConstants);
+static_assert(0x4800 + 192 + 2 <= kGuestRegisterCount);
+
+// Bit k: register k of the four at p (guest order) equals raw[k].
+inline uint32_t Same4(const uint8_t* p, const uint32_t* raw) {
+  const simde__m128i a = simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(p));
+  const simde__m128i b = simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(raw));
+  return uint32_t(simde_mm_movemask_ps(simde_mm_castsi128_ps(simde_mm_cmpeq_epi32(a, b))));
+}
+
+// Registers reg..reg + kN - 1: those whose value at p (guest order) differs from raw[0..kN - 1]
+// are taken into raw and regs (host order) and appended to `out`. 128-bit compares: a function
+// with 256-bit registers ends in VZEROUPPER, which the Zenbleed workaround makes slow on the
+// Deck's Zen 2.
+template <uint32_t kN>
+[[gnu::always_inline]] inline RegWrite* Update(const uint8_t* p, uint32_t reg, uint32_t* raw,
+                                               uint32_t* regs, RegWrite* out) {
+  static_assert(kN == 1 || kN == 6 || kN % 4 == 0);
+  uint64_t differ;
+  if constexpr (kN == 1) {
+    uint32_t v;
+    std::memcpy(&v, p, 4);
+    differ = v != raw[0];
+  } else {
+    uint64_t same = 0;
+    for (uint32_t i = 0; i < kN; i += 4) same |= uint64_t(Same4(p + i * 4, raw + i)) << i;
+    differ = ~same & (~0ull >> (64 - kN));
+  }
+  for (; differ; differ &= differ - 1) {
+    const uint32_t i = uint32_t(std::countr_zero(differ));
+    uint32_t v;
+    std::memcpy(&v, p + i * 4, 4);
+    raw[i] = v;
+    regs[i] = __builtin_bswap32(v);
+    *out++ = {reg + i, regs[i]};
+  }
+  return out;
+}
+
+// The groups of kFlushBlocks[kI] whose bit is set in `mask`, in register order.
+template <size_t kI>
+[[gnu::always_inline]] inline RegWrite* FlushBlock(const uint8_t* base, uint32_t device,
+                                                   uint64_t mask, uint32_t* raw, uint32_t* regs,
+                                                   RegWrite* out) {
+  constexpr Block b = kFlushBlocks[kI];
+  uint64_t m = (mask & b.bits) << (63 - b.top);  // group g at bit 63 - g
+  if (!m) return out;
+  const uint8_t* const p = HostPtr(base, device + b.offset);
+  do {
+    const uint32_t g = uint32_t(std::countl_zero(m));
+    m ^= (1ull << 63) >> g;
+    const uint32_t first = b.reg + g * b.per;
+    out = Update<b.per>(p + g * b.per * 4, first, raw + first, regs + first, out);
+  } while (m);
+  return out;
+}
+
 // Shader-rebind dirty bits in the mask at +16 (sub_826DEDC8): 19 vertex shader, 20 pixel shader.
 constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 
@@ -90,61 +157,22 @@ void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, ui
   const uint8_t* const p = HostPtr(base, src);
   RegLog& log = sink_ ? *sink_ : discard_;
   RegWrite* out = log.Reserve(count);
-  // Takes the registers first + k for each bit k of `differ`.
-  auto update = [&](uint32_t first, uint32_t differ) {
-    for (; differ; differ &= differ - 1) {
-      const uint32_t i = first + uint32_t(std::countr_zero(differ));
-      uint32_t v;
-      std::memcpy(&v, p + i * 4, 4);
-      const uint32_t value = __builtin_bswap32(v);
-      raw_[reg + i] = v;
-      regs_[reg + i] = value;
-      *out++ = {reg + i, value};
-    }
-  };
-  auto load = [](const void* q) {
-    return simde_mm256_loadu_si256(static_cast<const simde__m256i*>(q));
-  };
-  auto same = [](simde__m256i a, simde__m256i b) {  // bit k: lane k equal
-    return uint32_t(
-        simde_mm256_movemask_ps(simde_mm256_castsi256_ps(simde_mm256_cmpeq_epi32(a, b))));
-  };
-  // Most of what the flushing calls copy is unchanged: one branch per 16 registers.
   uint32_t i = 0;
-  for (; i + 16 <= count; i += 16) {
-    const uint32_t equal = same(load(p + i * 4), load(raw_ + reg + i)) |
-                           same(load(p + i * 4 + 32), load(raw_ + reg + i + 8)) << 8;
-    if (equal != 0xFFFF) update(i, ~equal & 0xFFFF);
-  }
-  // The rest, 8 at a time. The masked loads do not read the lanes past `count`, which may lie
-  // past the end of the guest's allocation.
-  for (; i < count; i += 8) {
-    const uint32_t n = std::min(count - i, 8u);
-    const simde__m256i lanes = simde_mm256_cmpgt_epi32(
-        simde_mm256_set1_epi32(int32_t(n)), simde_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-    const uint32_t equal =
-        same(simde_mm256_maskload_epi32(reinterpret_cast<const int32_t*>(p + i * 4), lanes),
-             simde_mm256_maskload_epi32(reinterpret_cast<const int32_t*>(raw_ + reg + i), lanes));
-    update(i, ~equal & ((1u << n) - 1));
-  }
+  for (; i + 4 <= count; i += 4)
+    out = Update<4>(p + i * 4, reg + i, raw_ + reg + i, regs_ + reg + i, out);
+  // One at a time: the source may end with the guest's allocation.
+  for (; i < count; ++i) out = Update<1>(p + i * 4, reg + i, raw_ + reg + i, regs_ + reg + i, out);
   if (sink_) log.Commit(out);
 }
 
 void GuestStateTracker::CopyFlushed(const uint8_t* base, uint32_t device,
                                     const uint64_t flushed[6]) {
-  for (const Block& b : kFlushBlocks) {
-    uint64_t m = (flushed[b.mask] & b.bits) << (63 - b.top);  // group g at bit 63 - g
-    uint32_t g = 0;
-    while (m) {
-      const uint32_t skip = uint32_t(std::countl_zero(m));
-      m <<= skip;
-      g += skip;
-      const uint32_t run = uint32_t(std::countl_one(m));
-      Copy(b.reg + g * b.per, base, device + b.offset + g * b.per * 4, run * b.per);
-      g += run;
-      m = run < 64 ? m << run : 0;
-    }
-  }
+  RegLog& log = sink_ ? *sink_ : discard_;
+  RegWrite* out = log.Reserve(kFlushedMax);
+  [&]<size_t... kI>(std::index_sequence<kI...>) {
+    ((out = FlushBlock<kI>(base, device, flushed[kFlushBlocks[kI].mask], raw_, regs_, out)), ...);
+  }(std::make_index_sequence<std::size(kFlushBlocks)>());
+  if (sink_) log.Commit(out);
 }
 void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr) {
   static uint64_t checks = 0, differing = 0;
