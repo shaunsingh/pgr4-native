@@ -30,6 +30,7 @@ enum Stage : uint32_t {
   kVertices,   // RequestRange (vertex fetch, indices) + FlushCopies
   kCbv,        // UploadCbv b0..b4
   kRecord,     // fixed-function state, render targets, IA, draw call
+  kSubmit,     // NativeRenderer::SubmitEarly when it submits: RecordUploads, Submit
   // Hook side (pgr4_d3d_trace.cpp), outside OnDraw.
   kTrack,        // ReadDirtyMasks + GuestStateTracker::AfterCall, every flushing call
   kImmediateVs,  // GuestStateTracker::AfterImmediateVs
@@ -48,14 +49,16 @@ enum Stage : uint32_t {
   // D3D functions at the outermost hooked call, i.e. the D3D library's own work (packet
   // building, state flushes) that a recompilation which replaces the D3D API would not run.
   kGuestD3d,
+  // Nested inside kSubmit or the swap: TextureCache::RecordDeferredUploads.
+  kUploadList,
   kStageCount
 };
 
 inline constexpr const char* kStageNames[kStageCount] = {
-    "read_state", "shaders",  "setup",       "rt_bind",      "translate",  "pipeline",
-    "textures",   "sysconst", "pack",        "vertices",     "cbv",        "record",
-    "track",      "imm_vs",   "cap_shaders", "cap_vertices", "cap_record", "tex_miss",
-    "tex_get",    "tex_srv",  "cap_watch",   "guest_d3d"};
+    "read_state", "shaders",  "setup",   "rt_bind",     "translate",    "pipeline",
+    "textures",   "sysconst", "pack",    "vertices",    "cbv",          "record",
+    "submit",     "track",    "imm_vs",  "cap_shaders", "cap_vertices", "cap_record",
+    "tex_miss",   "tex_get",  "tex_srv", "cap_watch",   "guest_d3d",    "upload_list"};
 
 // Per-frame event counts (CSV columns, reset every frame), counted while the profiler is on.
 enum Counter : uint32_t {

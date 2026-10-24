@@ -178,16 +178,25 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
     REXLOG_ERROR("PGR4 native: CreateEvent failed: error {}", GetLastError());
     return false;
   }
-  for (auto& a : allocators_)
+  for (uint32_t i = 0; i < kFramesInFlight; ++i)
     if (Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                               IID_PPV_ARGS(a.GetAddressOf())),
-               "CreateCommandAllocator"))
+                                               IID_PPV_ARGS(allocators_[i].GetAddressOf())),
+               "CreateCommandAllocator") ||
+        Failed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(upload_allocators_[i].GetAddressOf())),
+               "CreateCommandAllocator(upload)"))
       return false;
   if (Failed(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(),
                                         nullptr, IID_PPV_ARGS(list_.GetAddressOf())),
-             "CreateCommandList"))
+             "CreateCommandList") ||
+      Failed(
+          device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, upload_allocators_[0].Get(),
+                                     nullptr, IID_PPV_ARGS(upload_list_.GetAddressOf())),
+          "CreateCommandList(upload)") ||
+      Failed(upload_list_->Close(), "CommandList::Close(upload)"))
     return false;
   list_->SetName(L"pgr4 native frame");
+  upload_list_->SetName(L"pgr4 native uploads");
 
   BOOL tearing = FALSE;
   factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
@@ -322,19 +331,37 @@ bool D3D12Device::OpenList() {
   WaitFence(slot_fence_[slot_]);
   end_frame_times_.fence_ns = NowNs() - t0;
   if (Failed(allocators_[slot_]->Reset(), "CommandAllocator::Reset") ||
+      Failed(upload_allocators_[slot_]->Reset(), "CommandAllocator::Reset(upload)") ||
       Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
     return false;
   if (gpu_timer_) gpu_timer_->BeginFrame(list_.Get(), slot_);
   return true;
 }
 
+ID3D12GraphicsCommandList* D3D12Device::upload_list() {
+  if (!upload_open_) {
+    if (Failed(upload_list_->Reset(upload_allocators_[slot_].Get(), nullptr),
+               "CommandList::Reset(upload)"))
+      return nullptr;
+    upload_open_ = true;
+  }
+  return upload_list_.Get();
+}
+
 bool D3D12Device::CloseAndExecute() {
+  ID3D12CommandList* lists[2];
+  uint32_t n = 0;
+  if (upload_open_) {
+    upload_open_ = false;
+    if (Failed(upload_list_->Close(), "CommandList::Close(upload)")) return false;
+    lists[n++] = upload_list_.Get();
+  }
   if (Failed(list_->Close(), "CommandList::Close")) return false;
+  lists[n++] = list_.Get();
   // The constant uploads are streaming stores, which are weakly ordered: make them visible
   // before the GPU can read them.
   simde_mm_sfence();
-  ID3D12CommandList* lists[] = {list_.Get()};
-  queue_->ExecuteCommandLists(1, lists);
+  queue_->ExecuteCommandLists(n, lists);
   return true;
 }
 

@@ -74,6 +74,12 @@ class D3D12Device {
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* command_queue() const { return queue_.Get(); }
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
+  // A list that runs ahead of what the frame's list recorded since the last Submit, for copies
+  // and barriers that would otherwise split its render passes (TextureCache::
+  // RecordDeferredUploads). Opened on the frame's second allocator at the first call after a
+  // submission; the next Submit or EndFrame submits it first, in the same ExecuteCommandLists.
+  // GpuTimer passes do not include it. nullptr on failure (logged).
+  ID3D12GraphicsCommandList* upload_list();
 
   // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV.
   ID3D12Resource* back_buffer() const { return back_buffers_[back_index_].Get(); }
@@ -149,6 +155,9 @@ class D3D12Device {
   uint64_t slot_fence_[kFramesInFlight] = {};
   uint32_t slot_ = 0;
   ComPtr<ID3D12GraphicsCommandList> list_;
+  ComPtr<ID3D12CommandAllocator> upload_allocators_[kFramesInFlight];
+  ComPtr<ID3D12GraphicsCommandList> upload_list_;
+  bool upload_open_ = false;
   EndFrameTimes end_frame_times_;
 
   ComPtr<IDXGISwapChain3> swapchain_;

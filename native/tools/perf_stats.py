@@ -10,12 +10,13 @@ rows = [r for r in rows if r.get("frame_ms")]
 sel = rows[-last:]
 f = lambda r, k: float(r[k]) if r.get(k) not in (None, "") else 0.0
 cols = [k for k in rows[0].keys() if k.startswith("st_")]
+NESTED = {"st_cap_watch_us", "st_upload_list_us", "st_guest_d3d_us"}
 print(f"{path}: {len(rows)} rows, using last {len(sel)}")
 n = len(sel)
 draws = sum(f(r, "draws") for r in sel) / n
 print(f"frame_ms median {statistics.median(f(r,'frame_ms') for r in sel):.2f} mean {sum(f(r,'frame_ms') for r in sel)/n:.2f}")
 for k in ["draws", "clears", "resolves", "draw_us", "clear_us", "resolve_us", "swap_us", "pso_created", "upload_kb", "textures", "track_calls",
-          "tex_memo_miss", "tex_created", "tex_create_us", "tex_uploads", "tex_upload_kb", "tex_upload_us", "tex_untile_us",
+          "tex_memo_miss", "tex_created", "tex_create_us", "tex_uploads", "tex_deferred", "tex_upload_kb", "tex_upload_us", "tex_untile_us",
           "tex_resolved_copies", "tex_copy_resolved_us", "srv_lookups", "srv_created", "samplers_created",
           "bind_hits", "bind_misses", "bind_hit", "bind_mru", "bind_miss_empty", "bind_miss_fetch", "bind_miss_tex",
           "bind_nomemo", "get_miss_fetch", "get_miss_changed", "srv_memo_hit", "tex_upload_skip"]:
@@ -27,8 +28,9 @@ tot = 0.0
 for k in cols:
     vals = [f(r, k) for r in sel]
     m = sum(vals) / n
-    # st_tex_* are nested inside st_textures; st_guest_d3d overlaps st_track (hook side).
-    if not k.startswith("st_tex_") and k != "st_guest_d3d_us":
+    # Nested timers: st_tex_* in st_textures, st_cap_watch in st_cap_vertices, st_upload_list in
+    # st_submit or the swap; st_guest_d3d overlaps st_track (hook side).
+    if not k.startswith("st_tex_") and k not in NESTED:
         tot += m
     print(f"  {k:22s} {m:10.1f} {statistics.median(vals):10.1f} {1000*m/max(draws,1):10.0f}")
 print(f"  sum of stages {tot:.1f} us/frame")

@@ -155,7 +155,9 @@ class GpuCheck {
     Place(d.xkey.mip_page << 12, d.mips, d.mips_bytes);
     TextureBinding b;
     ++fence_value_;
-    if (!cache_->Get(d.fetch, list_.Get(), fence_value_, &b)) {
+    const bool got = cache_->Get(d.fetch, list_.Get(), fence_value_, &b);
+    cache_->RecordDeferredUploads(list_.Get());  // a new texture's upload is deferred
+    if (!got) {
       std::printf("GPU   %s: TextureCache::Get failed\n", name.c_str());
       Submit();
       return false;

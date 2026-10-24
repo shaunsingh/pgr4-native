@@ -160,6 +160,9 @@ class NativeRenderer {
   // After a draw: submits the frame so far once --pgr4_native_submit_draws draws were recorded
   // since the last submission.
   void SubmitEarly();
+  // Before each submission: the texture uploads Get deferred, into the device's upload list.
+  // False on failure (logged).
+  bool RecordUploads();
   // A failed submission or present: logs and turns the native path off for the rest of the run.
   // In primary mode it also releases the game window to ReXGlue's presenter (on the thread that
   // records, which owns the swapchain), and the guest thread hands the game to the Xenos plugin

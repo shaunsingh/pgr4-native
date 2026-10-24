@@ -81,8 +81,10 @@ Measured on the race (13900K): `Main XThread` ~98 % in every mode (the game itse
      the command. Commands go into batches of 256 (a Swap ends a batch).
 3. Render thread: applies each command's register pairs to its own register file, then runs the
    module (`Draw(base, s, prep)`, `Clear`, `Resolve`, Swap). At Swap: present blit,
-   `TextureCache::FinishUploads` (waits for the untile workers), `EndFrame` (close, execute,
-   Present, fence), retirement of upload memory, the CSV row.
+   `TextureCache::FinishUploads` (waits for the untile workers), `RecordUploads` (the uploads
+   of textures first bound in the frame, into the upload list that runs ahead of the frame's
+   list), `EndFrame` (close, execute both, Present, fence), retirement of upload memory, the CSV
+   row. A mid-frame submission (`SubmitEarly`) records and submits the same way.
 4. Pacing: at Swap F the game thread waits until the render thread finished Swap F-1, so the
    renderer is at most one frame behind. `hook_wait_us` in the CSV is that wait; it was 0 in every
    steady race window measured. Captures (`capture.request`) with the Xenos copy run their
@@ -102,7 +104,8 @@ reuse buffers sooner than on real hardware. The renderer therefore:
 - Copies vertex and index data at hook time on the game thread (`RequestRange`). Dynamic buffers
   may be rewritten soon after the draw, and the copy must hold the draw-time data.
 - Reads texture data late, on the untile workers, before the frame's command list is submitted.
-  The page watch is armed before the read, so a write after it marks the texture stale again.
+  The untile job arms the page watch just before its read, so a write after it marks the
+  texture stale again.
   Consequence: a texture the game rewrites every frame (`12B60000`, 256x512 R5G6B5) can show the
   next frame's contents.
 - Reads shader ucode at capture time (`Prepare`), because immediate VS loads are patched copies
@@ -229,14 +232,17 @@ for the frame `luma_frame`).
 
 With `--pgr4_native_profile`, also:
 - `st_<stage>_us` for each stage in `profile.h`: `read_state, shaders, setup, rt_bind,
-  translate, pipeline, textures, sysconst, pack, vertices, cbv, record, track, imm_vs, tex_miss,
-  tex_get, tex_srv, guest_d3d`, plus `cap_shaders, cap_vertices, cap_record` (game-thread
-  capture) with the render thread. `tex_miss`, `tex_get` and `tex_srv` are sub-timers inside
-  `textures`. `guest_d3d` is the time inside the original guest D3D functions at the outermost
-  hook, including nested tracking. These four are left out of the stage sum.
-- `track_calls, tex_memo_miss, tex_created, tex_create_us, tex_uploads, tex_upload_kb,
-  tex_upload_us, tex_untile_us` (worker CPU), `tex_resolved_copies, tex_copy_resolved_us,
-  tex_resolved_aliases, srv_lookups, srv_created, samplers_created, bind_hits, bind_misses`.
+  translate, pipeline, textures, sysconst, pack, vertices, cbv, record, submit` (mid-frame
+  submissions), `track, imm_vs, tex_miss, tex_get, tex_srv, guest_d3d, upload_list`, plus
+  `cap_shaders, cap_vertices, cap_watch, cap_record` (game-thread capture) with the render
+  thread. `tex_miss`, `tex_get` and `tex_srv` are sub-timers inside `textures`, `cap_watch`
+  inside `cap_vertices`, `upload_list` (recording the upload list) inside `submit` or the swap.
+  `guest_d3d` is the time inside the original guest D3D functions at the outermost hook,
+  including nested tracking. These six are left out of the stage sum.
+- `track_calls, tex_memo_miss, tex_created, tex_create_us, tex_uploads, tex_deferred` (of
+  them, on the upload list), `tex_upload_kb, tex_upload_us, tex_untile_us` (worker CPU),
+  `tex_resolved_copies, tex_copy_resolved_us, tex_resolved_aliases, srv_lookups, srv_created,
+  samplers_created, bind_hits, bind_misses`.
 - Counters (`profile.h` `kCounterNames`): `bind_hit, bind_mru, bind_miss_empty,
   bind_miss_fetch, bind_miss_tex, bind_nomemo, get_miss_fetch, get_miss_changed, srv_memo_hit,
   tex_upload_skip`.

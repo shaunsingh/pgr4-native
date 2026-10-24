@@ -767,10 +767,20 @@ void NativeRenderer::SubmitEarly() {
   const int32_t every = REXCVAR_GET(pgr4_native_submit_draws);
   if (every <= 0 || stats_.draws - draws_submitted_ < uint64_t(every) || !textures_->UploadsDone())
     return;
-  if (!device_->Submit()) return Fail();
+  profile::Scope scope(profile::kSubmit);
+  if (!RecordUploads() || !device_->Submit()) return Fail();
   draw_->InvalidateListState(DrawRenderer::ListBreak::kSubmit);
   draws_submitted_ = stats_.draws;
   ++stats_.submits;
+}
+
+bool NativeRenderer::RecordUploads() {
+  if (!textures_->has_deferred_uploads()) return true;
+  profile::Scope scope(profile::kUploadList);
+  ID3D12GraphicsCommandList* list = device_->upload_list();
+  if (!list) return false;
+  textures_->RecordDeferredUploads(list);
+  return true;
 }
 
 void NativeRenderer::Fail() {
@@ -842,7 +852,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_untile_ns = NowNs() - u0;
   draw_->BeforeSubmit();
   const uint64_t fence = d.frame_fence();
-  if (!d.EndFrame(shown)) return Fail();
+  if (!RecordUploads() || !d.EndFrame(shown)) return Fail();
   const D3D12Device::EndFrameTimes& et = d.end_frame_times();
   stats_.swap_submit_ns = et.submit_ns;
   stats_.swap_present_ns = et.present_ns;
@@ -973,6 +983,7 @@ void NativeRenderer::AppendCsvProfileColumns(bool header, std::string* line) {
       Uint("tex_created", t.created - p.created),
       Fix1("tex_create_us", (t.create_ns - p.create_ns) / 1000.0),
       Uint("tex_uploads", t.uploads - p.uploads),
+      Uint("tex_deferred", t.deferred_uploads - p.deferred_uploads),
       Fix1("tex_upload_kb", (t.upload_bytes - p.upload_bytes) / 1024.0),
       Fix1("tex_upload_us", (t.upload_ns - p.upload_ns) / 1000.0),
       Fix1("tex_untile_us", (t.untile_ns - p.untile_ns) / 1000.0),

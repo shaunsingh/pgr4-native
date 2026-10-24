@@ -217,6 +217,7 @@ void TextureCache::WorkerMain() {
     UntileJob job = std::move(jobs_.front());
     jobs_.pop_front();
     lock.unlock();
+    ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     worker_untile_ns_.fetch_add(RunUntile(job, &scratch), std::memory_order_relaxed);
     lock.lock();
     if (--jobs_busy_ == 0) idle_cv_.notify_all();
@@ -260,10 +261,17 @@ bool TextureCache::ClampRange(uint32_t start, uint32_t length, uint32_t* end) {
   return true;
 }
 
-void TextureCache::ArmWatch(uint32_t physical, uint32_t length) {
+void TextureCache::ArmWatches(const TextureKey& key, uint32_t base_bytes, uint32_t mips_bytes) {
 #ifndef PGR4_TEXTURES_OFFLINE
-  if (memory_ && length)
-    memory_->EnablePhysicalMemoryAccessCallbacks(physical, length, true, false);
+  if (!memory_) return;
+  const uint32_t base = key.base_page << 12, mips = key.mip_page << 12;
+  // Mips from the page after the base's last: one protection change for both.
+  if (base_bytes && mips_bytes && mips == base + ((base_bytes + kPageMask) & ~kPageMask)) {
+    memory_->EnablePhysicalMemoryAccessCallbacks(base, mips - base + mips_bytes, true, false);
+    return;
+  }
+  if (base_bytes) memory_->EnablePhysicalMemoryAccessCallbacks(base, base_bytes, true, false);
+  if (mips_bytes) memory_->EnablePhysicalMemoryAccessCallbacks(mips, mips_bytes, true, false);
 #endif
 }
 
@@ -349,8 +357,7 @@ void TextureCache::ClearDirty(Texture& t) {
   // Clear the flag, re-arm the page watches, then read: a write after the watch is armed marks
   // the texture stale again, a write before it is already in the data the untile reads.
   t.dirty.store(false, std::memory_order_release);
-  ArmWatch(t.key.base_page << 12, t.base_bytes);
-  ArmWatch(t.key.mip_page << 12, t.mips_bytes);
+  ArmWatches(t.key, t.base_bytes, t.mips_bytes);
 }
 
 void TextureCache::ResetResolved(Texture& t) {
@@ -645,7 +652,8 @@ void TextureCache::Transition(Texture& t, ID3D12GraphicsCommandList* list,
   t.state = to;
 }
 
-bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence) {
+bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence,
+                          bool defer) {
   const TextureKey& key = t.key;
   uint64_t size = GetHostFootprints(key, true, &footprints_);
   if (!size) return false;
@@ -662,9 +670,20 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   if (!upload_.Allocate(size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, frame_fence, &a))
     return false;
 
-  ClearDirty(t);
+  // ClearDirty's order, with the watches armed by the untile job just before it reads: their
+  // protection changes (about 20 µs each under Wine) run off the render thread.
+  t.dirty.store(false, std::memory_order_release);
   // The copies read the upload memory only once the list is submitted, after FinishUploads.
-  Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
+  if (defer) {
+    ID3D12Resource* r = t.resource.Get();
+    if (t.state != D3D12_RESOURCE_STATE_COPY_DEST)
+      deferred_to_copy_.push_back(TransitionBarrier(r, t.state, D3D12_RESOURCE_STATE_COPY_DEST));
+    deferred_to_read_.push_back(TransitionBarrier(r, D3D12_RESOURCE_STATE_COPY_DEST, kShaderRead));
+    t.state = kShaderRead;
+    ++stats_.deferred_uploads;
+  } else {
+    Transition(t, list, D3D12_RESOURCE_STATE_COPY_DEST);
+  }
   uint32_t bw = 1, bh = 1;
   if (t.host->block_compressed) {
     const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
@@ -685,7 +704,10 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
     src.PlacedFootprint.Footprint.Height = s.block_rows * bh;
     src.PlacedFootprint.Footprint.Depth = s.depth;
     src.PlacedFootprint.Footprint.RowPitch = s.row_pitch;
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    if (defer)
+      deferred_copies_.push_back({dst, src});
+    else
+      list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
   }
 
   UntileJob job;
@@ -707,6 +729,7 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   job.mips_bytes = t.mips_bytes;
   job.conversion = t.host->conversion;
   if (workers_.empty()) {
+    ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     stats_.untile_ns += RunUntile(job, &untile_scratch_);
     footprints_ = std::move(job.footprints);
   } else {
@@ -867,6 +890,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
     }
   }
   if (t->failed) return false;
+  const bool first_use = t->used_fence != frame_fence;
   MarkUsed(*t, frame_fence);
   const bool was_dirty = t->dirty.load(std::memory_order_acquire);
   const bool stale =
@@ -883,7 +907,7 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   }
   if (was_dirty && !(stale && capture_order_)) {
     const uint64_t u0 = NowNs();
-    const bool uploaded = Upload(*t, list, frame_fence);
+    const bool uploaded = Upload(*t, list, frame_fence, first_use);
     stats_.upload_ns += NowNs() - u0;
     if (!uploaded) return false;
   }
@@ -948,6 +972,18 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   memo.binding = *out;
   memo.binding.stale = false;  // a memo hit needs the texture clean
   return true;
+}
+
+void TextureCache::RecordDeferredUploads(ID3D12GraphicsCommandList* list) {
+  if (deferred_copies_.empty()) return;
+  if (!deferred_to_copy_.empty())
+    list->ResourceBarrier(UINT(deferred_to_copy_.size()), deferred_to_copy_.data());
+  for (const DeferredCopy& c : deferred_copies_)
+    list->CopyTextureRegion(&c.dst, 0, 0, 0, &c.src, nullptr);
+  list->ResourceBarrier(UINT(deferred_to_read_.size()), deferred_to_read_.data());
+  deferred_to_copy_.clear();
+  deferred_copies_.clear();
+  deferred_to_read_.clear();
 }
 
 void TextureCache::Retire(uint64_t completed_fence) {
