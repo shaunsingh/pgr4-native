@@ -448,7 +448,14 @@ TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFor
     desc.Format = host.resource;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    HRESULT hr = CreateTextureResource(desc, &t.resource, &t.placed, &t.bytes);
+    // D3D12 allows 4 KB placement only for a texture whose most detailed slice takes at most
+    // 64 KB (D3D12_RESOURCE_DESC, small resources); vkd3d-proton applies the same estimate.
+    const uint32_t bw = host.block_compressed ? info->block_width : 1;
+    const uint32_t bh = host.block_compressed ? info->block_height : 1;
+    const bool small_placement =
+        uint64_t(key.width) * key.height * info->bytes_per_block() / (bw * bh) <=
+        D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    HRESULT hr = CreateTextureResource(desc, small_placement, &t.resource, &t.placed, &t.bytes);
     if (FAILED(hr)) {
       PGR4_LOG_FIRST(1, ERROR,
                      "PGR4 native textures: texture resource {}x{}x{} {} failed: {:08X} (logged "
@@ -600,11 +607,16 @@ bool TextureCache::AddHeap() {
   return true;
 }
 
-HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc, ComPtr<ID3D12Resource>* out,
-                                            uint64_t* placed, uint64_t* bytes) {
-  // 4 KB placement when the driver allows it for this texture, else 64 KB.
-  desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
-  D3D12_RESOURCE_ALLOCATION_INFO info = device_->GetResourceAllocationInfo(0, 1, &desc);
+HRESULT TextureCache::CreateTextureResource(D3D12_RESOURCE_DESC& desc, bool small_placement,
+                                            ComPtr<ID3D12Resource>* out, uint64_t* placed,
+                                            uint64_t* bytes) {
+  // 4 KB placement when the driver allows it for this texture, else 64 KB. Outside the size
+  // rule the 4 KB query only fails (and vkd3d-proton logs it twice): 343 textures of a race run.
+  D3D12_RESOURCE_ALLOCATION_INFO info = {};
+  if (small_placement) {
+    desc.Alignment = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT;
+    info = device_->GetResourceAllocationInfo(0, 1, &desc);
+  }
   if (info.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) {
     desc.Alignment = 0;
     info = device_->GetResourceAllocationInfo(0, 1, &desc);

@@ -231,8 +231,9 @@ class TextureCache {
   static void RecordCopies(ID3D12GraphicsCommandList* list, const UploadCopies& copies,
                            const std::vector<HostSubresource>& footprints);
   // A texture resource in COPY_DEST state, placed in a pooled heap at *placed (kCommitted if it
-  // does not fit one or a heap cannot be created); *bytes: its allocation size.
-  HRESULT CreateTextureResource(D3D12_RESOURCE_DESC& desc,
+  // does not fit one or a heap cannot be created); *bytes: its allocation size. small_placement:
+  // within the size rule for 4 KB placement.
+  HRESULT CreateTextureResource(D3D12_RESOURCE_DESC& desc, bool small_placement,
                                 Microsoft::WRL::ComPtr<ID3D12Resource>* out, uint64_t* placed,
                                 uint64_t* bytes);
   static constexpr uint64_t kCommitted = ~0ull;
