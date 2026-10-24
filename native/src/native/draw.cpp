@@ -2724,6 +2724,18 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     std::fprintf(draw_log, " cvs=%016llX cps=%016llX\n",
                  (unsigned long long)float_hash(vs, XE_GPU_REG_SHADER_CONSTANT_000_X),
                  (unsigned long long)float_hash(ps, XE_GPU_REG_SHADER_CONSTANT_256_X));
+    if (ps) {
+      std::fprintf(draw_log, "  pc");
+      const Shader::ConstantRegisterMap& map = ps->constant_register_map();
+      for (uint32_t w = 0; w < 4; ++w)
+        for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1) {
+          const uint32_t c = w * 64 + uint32_t(std::countr_zero(bits));
+          const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4;
+          std::fprintf(draw_log, " %u=%g,%g,%g,%g", c, regs.Get<float>(r), regs.Get<float>(r + 1),
+                       regs.Get<float>(r + 2), regs.Get<float>(r + 3));
+        }
+      std::fputc('\n', draw_log);
+    }
   }
   // With dynamic depth bias the polygon offset is not part of the pipeline.
   const float depth_bias = float(key.depth_bias);
