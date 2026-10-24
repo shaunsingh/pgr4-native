@@ -129,6 +129,31 @@ int32_t MapSpan(uint32_t base, uint32_t pitch, const GridSpan& s, const EdramGri
   return n;
 }
 
+// A pending clear's rectangle: empty for the whole target.
+bool IsWhole(const D3D12_RECT& r) { return r.right <= r.left || r.bottom <= r.top; }
+
+bool Contains(const D3D12_RECT& outer, const D3D12_RECT& r) {
+  return outer.left <= r.left && outer.top <= r.top && outer.right >= r.right &&
+         outer.bottom >= r.bottom;
+}
+
+bool Intersects(const D3D12_RECT& a, const D3D12_RECT& b) {
+  return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+// One clear call of `v` over `rects` (none: the whole target).
+void Record(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
+            const D3D12_RECT* rects, UINT n) {
+  if (rt->depth) {
+    RenderTargets::Transition(list, rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    list->ClearDepthStencilView(rt->view, D3D12_CLEAR_FLAGS(v.flags), v.depth, v.stencil, n,
+                                n ? rects : nullptr);
+  } else {
+    RenderTargets::Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list->ClearRenderTargetView(rt->view, v.color, n, n ? rects : nullptr);
+  }
+}
+
 }  // namespace
 
 SurfaceRegs SurfaceRegsFromRegisters(const uint32_t* regs) {
@@ -235,6 +260,7 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   rt->state = initial;
   rt->width = uint32_t(d.Width);
   rt->height = height;
+  rt->pending_count = 0;  // a grown target loses the old one's content
   if (rt->view_index == UINT32_MAX) {
     rt->view_index = AllocView(rt->depth);
     if (rt->view_index == UINT32_MAX) {
@@ -371,6 +397,7 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
     if (!rt) return false;
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     if (rt->fill_seq != fill_seq_) SyncEdram(list, rt);
+    if (rt->pending_count) Flush(list, rt);
     out->color[i] = rt;
     out->rtv[i] = rt->view;
     out->color_count = i + 1;
@@ -381,6 +408,7 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
     RenderTarget* rt = GetDepth(regs, height);
     if (!rt) return false;
     Transition(list, rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if (rt->pending_count) Flush(list, rt);
     out->depth = rt;
     out->dsv = rt->view;
     out->width = std::min(out->width, rt->width);
@@ -471,8 +499,6 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
 void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
                           uint32_t bound_colors, bool depth_bound, uint32_t height,
                           const ClearParams& p) {
-  const UINT nrects = UINT(p.rects.size());
-  const D3D12_RECT* rects = nrects ? p.rects.data() : nullptr;
   // What the clear leaves in the EDRAM, in pixels from the surface's base. A whole-surface
   // clear covers the rows of the call's height hint (the target itself may be taller).
   const std::vector<D3D12_RECT>& edram = p.edram_rects.empty() ? p.rects : p.edram_rects;
@@ -486,10 +512,10 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
     if (!(p.flags >> i & 1) || !(bound_colors >> i & 1)) continue;
     RenderTarget* rt = GetColor(regs, i, height);
     if (!rt) continue;
-    Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    // Outside the rectangles the target shows what the EDRAM holds there.
-    if (nrects && rt->fill_seq != fill_seq_) SyncEdram(list, rt);
-    list->ClearRenderTargetView(rt->view, p.color, nrects, rects);
+    ClearValue v;
+    v.flags = 1;
+    std::memcpy(v.color, p.color, sizeof(v.color));
+    Defer(list, rt, v, p.rects);
     if (edram.empty()) {
       RecordFill(*rt, {0, 0, LONG(rt->pitch), LONG(edram_rows(*rt))}, p.color);
     } else {
@@ -503,12 +529,83 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
   if (df && depth_bound) {
     RenderTarget* rt = GetDepth(regs, height);
     if (rt) {
-      Transition(list, rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-      list->ClearDepthStencilView(rt->view, df, std::clamp(p.depth, 0.0f, 1.0f), p.stencil, nrects,
-                                  rects);
+      ClearValue v;
+      v.flags = df;
+      v.depth = std::clamp(p.depth, 0.0f, 1.0f);
+      v.stencil = p.stencil;
+      Defer(list, rt, v, p.rects);
       if (!fills_.empty()) DropFills(*rt, edram_rows(*rt));
     }
   }
+}
+
+void RenderTargets::Defer(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
+                          const std::vector<D3D12_RECT>& rects) {
+  DropCovered(rt, v.flags, rects.data(), rects.size());
+  // Outside the rectangles the target shows what the EDRAM holds there.
+  if (!rects.empty() && rt->fill_seq != fill_seq_) SyncEdram(list, rt);
+  const size_t n = std::max<size_t>(rects.size(), 1);
+  if (rt->pending_count + n > kMaxPendingClears) Flush(list, rt);
+  if (n > kMaxPendingClears) {
+    Record(list, rt, v, rects.data(), UINT(rects.size()));
+    return;
+  }
+  if (rects.empty()) {
+    rt->pending[rt->pending_count++] = {v, {}};
+  } else {
+    for (const D3D12_RECT& r : rects) rt->pending[rt->pending_count++] = {v, r};
+  }
+}
+
+void RenderTargets::DropCovered(RenderTarget* rt, uint32_t flags, const D3D12_RECT* rects,
+                                size_t n) {
+  PendingClear* const begin = rt->pending.data();
+  PendingClear* const end =
+      std::remove_if(begin, begin + rt->pending_count, [&](const PendingClear& c) {
+        if ((flags & c.value.flags) != c.value.flags) return false;
+        if (!n) return true;
+        return !IsWhole(c.rect) && std::any_of(rects, rects + n, [&](const D3D12_RECT& r) {
+          return Contains(r, c.rect);
+        });
+      });
+  const uint32_t kept = uint32_t(end - begin);
+  if (log_ && kept != rt->pending_count)
+    std::fprintf(log_, "rt pending clears of %s base %u pitch %u x%u: %u dropped\n",
+                 rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
+                 rt->pending_count - kept);
+  rt->pending_count = kept;
+}
+
+void RenderTargets::Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
+  // Neighbours of one value (a tiled clear's tiles) go in one call.
+  D3D12_RECT rects[kMaxPendingClears];
+  uint32_t calls = 0;
+  for (uint32_t i = 0; i < rt->pending_count; ++calls) {
+    const PendingClear& first = rt->pending[i];
+    UINT n = 0;
+    if (IsWhole(first.rect)) {
+      ++i;
+    } else {
+      for (; i < rt->pending_count && !IsWhole(rt->pending[i].rect) &&
+             rt->pending[i].value == first.value;
+           ++i)
+        rects[n++] = rt->pending[i].rect;
+    }
+    Record(list, rt, first.value, rects, n);
+  }
+  if (log_)
+    std::fprintf(log_, "rt pending clears of %s base %u pitch %u x%u: %u recorded in %u calls\n",
+                 rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
+                 rt->pending_count, calls);
+  rt->pending_count = 0;
+}
+
+void RenderTargets::PrepareRead(ID3D12GraphicsCommandList* list, RenderTarget* rt,
+                                const D3D12_RECT& r) {
+  if (!rt->depth) SyncEdram(list, rt);
+  if (std::any_of(rt->pending.begin(), rt->pending.begin() + rt->pending_count,
+                  [&](const PendingClear& c) { return IsWhole(c.rect) || Intersects(c.rect, r); }))
+    Flush(list, rt);
 }
 
 void RenderTargets::RecordFill(const RenderTarget& rt, const D3D12_RECT& r, const float color[4]) {
@@ -584,6 +681,11 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
       if (x1 > x0 && y1 > y0) rects[nr++] = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
     }
     if (!nr) continue;
+    // The pending clears are older than the fill: those under it are never seen.
+    if (rt->pending_count) {
+      DropCovered(rt, 1, rects, nr);
+      if (rt->pending_count) Flush(list, rt);
+    }
     Transition(list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
     list->ClearRenderTargetView(rt->view, f.color, nr, rects);
     if (log_)

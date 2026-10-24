@@ -35,6 +35,7 @@
 
 #include "d3d12_device.h"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -77,6 +78,22 @@ constexpr uint32_t kDevTileRects = 12744;
 constexpr uint32_t kDevTileOrigins = 12984;
 constexpr uint32_t kMaxTiles = 15;
 
+// The values of one host target's clear: color, or depth and stencil.
+struct ClearValue {
+  uint32_t flags = 0;  // a color target: 1; a depth target: D3D12_CLEAR_FLAGS
+  float color[4] = {};
+  float depth = 1.0f;
+  uint8_t stencil = 0;
+  bool operator==(const ClearValue&) const = default;
+};
+
+// A clear of a host target not recorded yet: `value` over `rect` (empty: the whole target).
+struct PendingClear {
+  ClearValue value;
+  D3D12_RECT rect;
+};
+constexpr uint32_t kMaxPendingClears = 16;
+
 // One host render target.
 struct RenderTarget {
   bool depth = false;
@@ -95,6 +112,9 @@ struct RenderTarget {
   uint32_t view_index = 0;
   uint64_t last_frame = 0;  // frame of the last use, for eviction
   uint64_t fill_seq = 0;    // EDRAM fills up to this sequence are applied (SyncEdram)
+  // Clears not recorded yet, oldest first (RenderTargets::Clear).
+  std::array<PendingClear, kMaxPendingClears> pending{};
+  uint32_t pending_count = 0;
 };
 
 // Host targets for one draw.
@@ -140,14 +160,18 @@ class RenderTargets {
 
   // Host targets for a draw. color_mask bit i: guest RT i is used (its RB_COLOR_MASK nibble is
   // non-zero); depth_used: depth or stencil test/write enabled. height: rows the draw can
-  // touch (bottom of its scissor/viewport, clamped to 2048). Records the barriers to
-  // RENDER_TARGET / DEPTH_WRITE into `list`; the caller sets the RTVs/DSV from `out`.
+  // touch (bottom of its scissor/viewport, clamped to 2048). Records the targets' pending
+  // clears and the barriers to RENDER_TARGET / DEPTH_WRITE into `list`; the caller sets the
+  // RTVs/DSV from `out`.
   bool Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t color_mask,
             bool depth_used, uint32_t height, BoundTargets* out);
 
   // Guest Clear / ClearF (HookFn kClear / kClearF), after the guest call returned: the surfaces
   // bound in the device's register shadow and the clear values (reads guest memory only);
-  // false: nothing to clear. Clear then clears their host targets.
+  // false: nothing to clear. Clear then clears their host targets. Each clear is recorded at
+  // its target's next use (Bind, PrepareRead), and one that a later clear or EDRAM fill covers
+  // is dropped: EndTiling's resolve clears the scene's tiles, and the next frame's BeginTiling
+  // clears them again before anything reads them.
   static bool DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out);
   void Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t bound_colors,
              bool depth_bound, uint32_t height, const ClearParams& p);
@@ -157,9 +181,10 @@ class RenderTargets {
   RenderTarget* GetColor(const SurfaceRegs& regs, uint32_t index, uint32_t height);
   RenderTarget* GetDepth(const SurfaceRegs& regs, uint32_t height);
 
-  // Clears color target `rt` to the EDRAM fills recorded over its tiles since its last use.
-  // Bind and Clear do this; other readers of a target (resolve sources) call it first.
-  void SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt);
+  // Before reading rt's pixels in `r` outside a draw (resolve sources): records the EDRAM fills
+  // over its tiles since its last use, and its pending clears if one touches `r`, in the order
+  // the guest made them.
+  void PrepareRead(ID3D12GraphicsCommandList* list, RenderTarget* rt, const D3D12_RECT& r);
 
   static void Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt,
                          D3D12_RESOURCE_STATES state);
@@ -199,6 +224,18 @@ class RenderTargets {
   void RecordFill(const RenderTarget& rt, const D3D12_RECT& r, const float color[4]);
   // Drops the fills over rt's first `rows` rows of pixels.
   void DropFills(const RenderTarget& rt, uint32_t rows);
+  // Clears color target `rt` to the EDRAM fills recorded over its tiles since its last use
+  // (after its pending clears, which are older).
+  void SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt);
+
+  // Adds `v` over `rects` (none: all of the target) to rt's pending clears.
+  void Defer(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
+             const std::vector<D3D12_RECT>& rects);
+  // Drops rt's pending clears that a later write of planes `flags` over `rects` (none: all of
+  // the target) overwrites.
+  void DropCovered(RenderTarget* rt, uint32_t flags, const D3D12_RECT* rects, size_t n);
+  // Records rt's pending clears into `list`, oldest first.
+  void Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt);
 
   RenderTarget* Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height);
   void Retire(ComPtr<ID3D12Resource> resource);

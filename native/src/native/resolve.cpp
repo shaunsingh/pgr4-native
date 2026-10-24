@@ -835,7 +835,6 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
                    p.source, p.regs.surface_info);
     return false;
   }
-  if (!depth) targets_->SyncEdram(list, rt);
   // The source rectangle on the target. The clears cover all of it, the copy only what fits in
   // the destination level (ReXGlue's resolve clears the source rectangle whatever the copy).
   const int32_t x0 = std::max(p.x0, 0), y0 = std::max(p.y0, 0);
@@ -846,8 +845,11 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   const int32_t copy_x1 = std::min<int32_t>(x1, x0 + int32_t(p.dest_width) - dx);
   const int32_t copy_y1 = std::min<int32_t>(y1, y0 + int32_t(p.dest_height) - dy);
   bool ok = true;
-  if (copy_x1 > x0 && copy_y1 > y0 && dx >= 0 && dy >= 0)
-    ok = Copy(list, p, rt, {LONG(x0), LONG(y0), LONG(copy_x1), LONG(copy_y1)}, dx, dy);
+  if (copy_x1 > x0 && copy_y1 > y0 && dx >= 0 && dy >= 0) {
+    const D3D12_RECT src = {LONG(x0), LONG(y0), LONG(copy_x1), LONG(copy_y1)};
+    targets_->PrepareRead(list, rt, src);
+    ok = Copy(list, p, rt, src, dx, dy);
+  }
 
   // Clears of the source surfaces over the source rectangle (after the copy).
   if (p.clear_flags) {
