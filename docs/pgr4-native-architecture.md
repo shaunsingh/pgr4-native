@@ -46,7 +46,8 @@ Two modes:
 |---|---|---|
 | `Main XThread` (guest) | the game | Runs the game. Hooks run here: tracker updates, then either the whole native path (render thread off) or only the capture step (render thread on) |
 | `PGR4 native render` | `NativeRenderer` when `--pgr4_native_render_thread` (default true since 2026-10-21 23:20, owner's call; one of three race oracle captures still drops to 29.5-29.6 dB with it) | Replays captured commands into the modules; owns the command list, every D3D12 object and all module state |
-| `PGR4 native untile` (1-4) | `TextureCache` (a quarter of the hardware threads, clamped 1-4: 4 on an i9-13900K, 2 on a Deck) | Untiles guest textures into upload memory |
+| `PGR4 native untile` (1-4) | `TextureCache` (a quarter of the hardware threads, clamped 1-4: 4 on an i9-13900K, 2 on a Deck) | Arms a texture's page watches, untiles it into upload memory, and records the copies of first-bound textures on its upload list |
+| `PGR4 native watches` | `DrawRenderer` | Arms the page watches of the vertex and index runs `RequestRange` copied, and keeps each page valid whose hash is still the copy's |
 | `PGR4 native pipelines` | `DrawRenderer` when `--pgr4_native_async_pipelines` (default on) | Creates PSOs, loads/stores them in the `ID3D12PipelineLibrary`, runs prewarm jobs |
 | texture-heap `std::async` | `TextureCache::StartSpareHeap` | Creates the next 128 MB texture heap while the current one fills |
 | window thread | `D3D12Device` | Owns the debug window (`--pgr4_native` without `_primary`) |
@@ -72,8 +73,9 @@ Measured on the race (13900K): `Main XThread` ~98 % in every mode (the game itse
    - Draw: `ReadDrawState` (primitive, counts, index buffer, inline vertices, shader refs) and
      `DrawRenderer::Prepare`. Prepare does the shader lookup (`ShaderCache::Load` plus memos;
      an immediate VS's patched copy is read here while the tracker still holds it), the vertex
-     and index copies into upload memory (`RequestRange`, page watch included) and the
-     triangle-fan index conversion.
+     and index copies into upload memory (`RequestRange`; the page watches are armed after
+     the copy on the watch thread, see the valid-page bitmap below) and the triangle-fan index
+     conversion.
    - Clear: `RenderTargets::DecodeClear` (rects, colour, depth/stencil values, bound surfaces).
    - Resolve: `DecodeResolve` (arguments from the guest stack and parameter block).
    - Swap: `Presenter::ReadSwap` (the front buffer's fetch constant).
@@ -153,7 +155,7 @@ unless noted.
 | SRV memo | texture resource (not the fetch slot) | resource + view desc equal | draw.cpp |
 | Sampler memo | hashed table of (fetch dwords, filter overrides) | equal | draw.cpp |
 | `CachedCbv` (b0-b4) | each constant buffer's current bytes, kept in the CPU's copy (`last`); uploads are streaming stores the CPU never reads back | bytes equal | draw.cpp |
-| Valid-page bitmap | 4 KB guest pages mirrored into the shared-memory buffer | cleared by the page-watch callback on a guest write | draw.cpp (`RequestRange`) |
+| Valid-page bitmap | 4 KB guest pages mirrored into the shared-memory buffer | cleared by the page-watch callback on a guest write; set by the watch thread before it arms a copied run, and cleared again for each page whose hash changed since its copy (until then the run is pending and hashed by each request) | draw.cpp (`RequestRange`, `WatchThread`) |
 | Resolve targets | every subresource address `CopyResolved` looks up → textures there | `OnResolved(address)` marks those textures `resolve_pending` and bumps `change_epoch` | textures.cpp |
 | Pipeline library | hash of the root signature, the description and the bytecode | the driver accepts the library; otherwise it is rebuilt | `<cache_root>\pgr4-native\pipelines.d3d12lib` |
 | Pipeline list | key (shader pointers replaced by ucode hash + modification) + shader ucode | header matches `sizeof(PipelineKey)` and `kPipelineKeyVersion` (3) | `<cache_root>\pgr4-native\pipelines.bin` |
@@ -218,8 +220,9 @@ us_per_draw, frame_ms, host_draws, skipped, unsupported, failed, pso_created, up
 textures, textures_missing, front_buffer`. With the render thread: `hook_us` (game-thread time
 in the On* calls), `hook_wait_us` (waiting for the render thread at Swap), `reg_writes`
 (register values replayed). Then `swap_untile_us, swap_submit_us, swap_present_us, swap_fence_us,
-hook_max_us, watch_faults, gpu_prev_ms, copy_batches, watch_arms, watch_arm_pages, t_ms,
-hash_pages, hash_copies`, `pso_pending` (draws dropped while their pipeline compiles) and
+hook_max_us, watch_faults, gpu_prev_ms, copy_batches, watch_arms, watch_arm_pages,
+watch_arm_changed, watch_arm_us, t_ms, hash_pages, hash_copies` (the watch thread's protection
+changes, their pages, the pages written between their copy and the arm, and its time), `pso_pending` (draws dropped while their pipeline compiles) and
 `pso_wait_us` (time the frame waited at its end for those pipelines), `held` (1: the frame was
 not presented, it skipped such draws), `tex_stale` (texture bindings for draws the game queued
 before a newer write of the texture's memory; with `--pgr4_native_texture_capture_order` they
@@ -235,11 +238,11 @@ With `--pgr4_native_profile`, also:
 - `st_<stage>_us` for each stage in `profile.h`: `read_state, shaders, setup, rt_bind,
   translate, pipeline, textures, sysconst, pack, vertices, cbv, record, submit` (mid-frame
   submissions), `track, imm_vs, tex_miss, tex_get, tex_srv, guest_d3d, upload_list`, plus
-  `cap_shaders, cap_vertices, cap_watch, cap_record` (game-thread capture) with the render
-  thread. `tex_miss`, `tex_get` and `tex_srv` are sub-timers inside `textures`, `cap_watch`
-  inside `cap_vertices`, `upload_list` (closing the upload lists) inside `submit` or the swap.
-  `guest_d3d` is the time inside the original guest D3D functions at the outermost hook,
-  including nested tracking. These six are left out of the stage sum.
+  `cap_shaders, cap_vertices, cap_record` (game-thread capture) with the render thread.
+  `tex_miss`, `tex_get` and `tex_srv` are sub-timers inside `textures`, `upload_list`
+  (closing the upload lists) inside `submit` or the swap. `guest_d3d` is the time inside the
+  original guest D3D functions at the outermost hook, including nested tracking. These five are
+  left out of the stage sum.
 - `track_calls, tex_memo_miss, tex_created, tex_create_us, tex_uploads, tex_deferred` (of
   them, on the upload lists), `tex_upload_kb, tex_upload_us, tex_untile_us, tex_record_us`
   (worker CPU: untiles, upload list recording), `tex_resolved_copies, tex_copy_resolved_us,

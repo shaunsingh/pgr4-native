@@ -930,6 +930,8 @@ void NativeRenderer::AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bo
       Uint("copy_batches", ds.copy_batches),
       Uint("watch_arms", ds.watch_arms),
       Uint("watch_arm_pages", ds.watch_arm_pages),
+      Uint("watch_arm_changed", ds.watch_arm_changed),
+      Fix1("watch_arm_us", ds.watch_arm_ns / 1000.0),
       Fix3("t_ms", NowNs() / 1e6),
       Uint("hash_pages", ds.hash_pages),
       Uint("hash_copies", ds.hash_copies),

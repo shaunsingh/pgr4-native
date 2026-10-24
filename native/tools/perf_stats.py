@@ -10,7 +10,7 @@ rows = [r for r in rows if r.get("frame_ms")]
 sel = rows[-last:]
 f = lambda r, k: float(r[k]) if r.get(k) not in (None, "") else 0.0
 cols = [k for k in rows[0].keys() if k.startswith("st_")]
-NESTED = {"st_cap_watch_us", "st_upload_list_us", "st_guest_d3d_us"}
+NESTED = {"st_upload_list_us", "st_guest_d3d_us"}
 print(f"{path}: {len(rows)} rows, using last {len(sel)}")
 n = len(sel)
 draws = sum(f(r, "draws") for r in sel) / n
@@ -28,8 +28,8 @@ tot = 0.0
 for k in cols:
     vals = [f(r, k) for r in sel]
     m = sum(vals) / n
-    # Nested timers: st_tex_* in st_textures, st_cap_watch in st_cap_vertices, st_upload_list in
-    # st_submit or the swap; st_guest_d3d overlaps st_track (hook side).
+    # Nested timers: st_tex_* in st_textures, st_upload_list in st_submit or the swap;
+    # st_guest_d3d overlaps st_track (hook side).
     if not k.startswith("st_tex_") and k not in NESTED:
         tot += m
     print(f"  {k:22s} {m:10.1f} {statistics.median(vals):10.1f} {1000*m/max(draws,1):10.0f}")

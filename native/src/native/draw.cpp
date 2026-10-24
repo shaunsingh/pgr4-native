@@ -1032,6 +1032,14 @@ struct DrawRenderer::Impl {
       for (std::thread& t : pso_threads) t.join();
       library.Save();
     }
+    if (arm_thread.joinable()) {
+      {
+        std::lock_guard<std::mutex> lock(arm_mutex);
+        arm_stopping = true;
+      }
+      arm_cv.notify_one();
+      arm_thread.join();
+    }
     if (invalidation_handle && memory)
       memory->UnregisterPhysicalMemoryInvalidationCallback(invalidation_handle);
     r.textures().SetEvictCallback(nullptr);
@@ -1107,16 +1115,19 @@ struct DrawRenderer::Impl {
   // Whether [start, start + length) lies in guest physical memory (logged once if not).
   bool InSharedMemory(uint32_t start, uint32_t length);
   bool RequestRange(uint32_t start, uint32_t length, bool watch, std::vector<VertexCopy>& out);
-  // Sets (or clears) the valid bits of pages [first, end).
-  void SetValid(uint32_t first, uint32_t end, bool set) {
+  // Sets (or clears) the bits of pages [first, end) in a page bitmap (valid, pending). acq_rel
+  // orders what each thread wrote before it ahead of the other's reads after it: RequestRange's
+  // copy_hash stores before a valid bit it clears, the watch thread's valid bits before the
+  // pending bits it clears.
+  static void SetPageBits(std::atomic<uint64_t>* words, uint32_t first, uint32_t end, bool set) {
     for (uint32_t q = first; q < end;) {
       const uint32_t word_end = std::min(end, (q | 63) + 1);
       const uint32_t n = word_end - q;
       const uint64_t mask = (n == 64 ? ~0ull : ((1ull << n) - 1)) << (q & 63);
       if (set)
-        valid[q >> 6].fetch_or(mask, std::memory_order_relaxed);
+        words[q >> 6].fetch_or(mask, std::memory_order_acq_rel);
       else
-        valid[q >> 6].fetch_and(~mask, std::memory_order_relaxed);
+        words[q >> 6].fetch_and(~mask, std::memory_order_acq_rel);
       q = word_end;
     }
   }
@@ -1244,17 +1255,44 @@ struct DrawRenderer::Impl {
   std::unique_ptr<std::atomic<uint64_t>[]> hot;            // one bit per page
   std::unique_ptr<std::atomic<uint32_t>[]> armed_frame;    // watch_frame of the last arm
   std::unique_ptr<std::atomic<uint8_t>[]> quick_rewrites;  // quick rewrites in a row (to 2)
-  std::unique_ptr<uint64_t[]> hot_hash;    // XXH3 | 1 of the content last copied, 0: none
+  // PageHash of the page taken just before its last whole-page copy, 0: none or not copied.
+  std::unique_ptr<std::atomic<uint64_t>[]> copy_hash;
   std::unique_ptr<uint16_t[]> hot_hashes;  // hashes since the content last changed
+  uint64_t PageHash(uint32_t page) const {
+    return XXH3_64bits(membase + (size_t(page) << kPageShift), 1u << kPageShift) | 1;
+  }
   // watch_frame + 1 of the last write, 0: none.
   std::unique_ptr<std::atomic<uint32_t>[]> write_frame;
   std::atomic<uint32_t> watch_frame{0};
-  // Hot pages hashed and copied (content changed) since the last EndFrame.
+
+  // Watches are armed on a thread of their own (WatchThread): a protection change takes about
+  // 20 µs under Wine (mprotect and its TLB shootdown), and geometry streamed in arms hundreds in
+  // a frame (td-175: 100-420 in about 25 frames of the race, 1.6-6.5 ms of the game thread).
+  // A run RequestRange copies is hashed just before the copy and stays pending until then,
+  // hashed by every request like a hot page. The watch thread marks it valid, arms it, and keeps
+  // each page valid that still hashes as copied: a write before the arm shows in the hash, and
+  // one after it faults and clears the valid bit, which the watch thread does not set again.
+  // Runs queued back to back are armed with one protection change.
+  std::unique_ptr<std::atomic<uint64_t>[]> pending;  // one bit per page
+  struct ArmRun {
+    uint32_t first, end;  // pages
+    uint32_t request;     // WatchTrace's request number
+  };
+  std::mutex arm_mutex;
+  std::condition_variable arm_cv;
+  std::vector<ArmRun> arm_queue;
+  bool arm_idle = false, arm_stopping = false;
+  std::thread arm_thread;
+  void QueueArm(uint32_t first, uint32_t end, uint32_t request);
+  void WatchThread();
+
+  // Pages hashed (hot, pending, before a copy) and copied as they changed since EndFrame.
   std::atomic<uint64_t> hash_pages{0}, hash_copies{0};
   // Write-watch faults (InvalidationThunk calls) since the last EndFrame; any guest thread.
   std::atomic<uint64_t> watch_faults{0};
-  // RequestRange's EnablePhysicalMemoryAccessCallbacks calls and their pages since EndFrame.
-  std::atomic<uint64_t> watch_arms{0}, watch_arm_pages{0};
+  // The watch thread's protection changes, their pages, the pages found written since their
+  // copy, and its time, since EndFrame.
+  std::atomic<uint64_t> watch_arms{0}, watch_arm_pages{0}, watch_arm_changed{0}, watch_arm_ns{0};
 
   // --pgr4_native_watch_trace. Record: type (2 bits) << 62 | frame (22) << 40 | page (17) << 23
   // | pages (9, saturated) << 14 | request (14): arms of one RequestRange call share the request
@@ -1377,8 +1415,9 @@ bool DrawRenderer::Impl::Initialize() {
   armed_frame = std::make_unique<std::atomic<uint32_t>[]>(kPageCount);
   write_frame = std::make_unique<std::atomic<uint32_t>[]>(kPageCount);
   quick_rewrites = std::make_unique<std::atomic<uint8_t>[]>(kPageCount);
-  hot_hash = std::make_unique<uint64_t[]>(kPageCount);
+  copy_hash = std::make_unique<std::atomic<uint64_t>[]>(kPageCount);
   hot_hashes = std::make_unique<uint16_t[]>(kPageCount);
+  pending = std::make_unique<std::atomic<uint64_t>[]>(kPageCount / 64);
   segment_word_epoch = std::make_unique<uint32_t[]>(kPageCount / 64);
   segment_pages = std::make_unique<uint64_t[]>(kPageCount / 64);
   if (const std::string& path = REXCVAR_GET(pgr4_native_watch_trace); !path.empty())
@@ -1388,6 +1427,8 @@ bool DrawRenderer::Impl::Initialize() {
     REXLOG_INFO("PGR4 native draw: coherency check on");
   }
   invalidation_handle = memory->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
+  arm_thread = std::thread([this] { WatchThread(); });
+  SetThreadDescription(arm_thread.native_handle(), L"PGR4 native watches");
 
   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewHeapSize,
                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -1601,24 +1642,31 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
   const uint32_t trace_request =
       trace.file ? trace.request.fetch_add(1, std::memory_order_relaxed) : 0;
   const uint32_t frame = watch_frame.load(std::memory_order_relaxed);
-  // Hot pages whose content changed, copied in runs of adjacent pages.
+  // Hashed pages whose content changed, copied in runs of adjacent pages.
   uint32_t changed_first = 0, changed_end = 0;
   auto copy_changed = [&] {
     if (changed_first == changed_end ||
         copy(changed_first << kPageShift, (changed_end - changed_first) << kPageShift))
       return true;
-    // Hashed as changed but not copied: the next request copies them.
-    for (uint32_t q = changed_first; q < changed_end; ++q) hot_hash[q] = 0;
+    // Hashed as changed but not copied: the next request copies them. The watch thread may
+    // have found a pending one unchanged meanwhile, hence the valid bits.
+    for (uint32_t q = changed_first; q < changed_end; ++q)
+      copy_hash[q].store(0, std::memory_order_relaxed);
+    SetPageBits(valid.get(), changed_first, changed_end, false);
     return false;
   };
   uint64_t hashed = 0, changed = 0;
   uint32_t p = first;
   while (p <= last) {
-    // Skip valid pages that are not hot a 64-page word at a time (whole vertex buffers are
-    // requested per draw).
+    // Skip valid pages that are neither hot nor pending a 64-page word at a time (whole vertex
+    // buffers are requested per draw).
     const uint32_t w = p >> 6;
+    // Pending before valid: a pending bit seen clear makes the valid bit the watch thread left
+    // visible.
+    const uint64_t pending_bits = pending[w].load(std::memory_order_acquire);
     const uint64_t hot_bits = hot[w].load(std::memory_order_relaxed);
-    uint64_t work = (~valid[w].load(std::memory_order_relaxed) | hot_bits) & (~0ull << (p & 63));
+    uint64_t work =
+        (~valid[w].load(std::memory_order_relaxed) | hot_bits | pending_bits) & (~0ull << (p & 63));
     if (w == last >> 6) work &= ~0ull >> (63 - (last & 63));
     if (!work) {
       p = (w + 1) << 6;
@@ -1626,11 +1674,11 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
     }
     p = (w << 6) + uint32_t(std::countr_zero(work));
     const uint64_t bit = 1ull << (p & 63);
-    if (hot_bits & bit) {
+    if ((hot_bits | pending_bits) & bit) {
       ++hashed;
-      const uint64_t hash = XXH3_64bits(membase + (size_t(p) << kPageShift), 1u << kPageShift) | 1;
-      if (hash != hot_hash[p]) {
-        hot_hash[p] = hash;
+      const uint64_t hash = PageHash(p);
+      if (hash != copy_hash[p].load(std::memory_order_relaxed)) {
+        copy_hash[p].store(hash, std::memory_order_relaxed);
         hot_hashes[p] = 0;
         ++changed;
         if (changed_end != p) {
@@ -1641,41 +1689,38 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
         ++p;
         continue;
       }
-      if (++hot_hashes[p] < kHotMaxHashes) {
+      if ((pending_bits & bit) || ++hot_hashes[p] < kHotMaxHashes) {
         ++p;
         continue;
       }
-      // Read far more often than written: watched again, starting a run of invalid pages.
+      // Hot, but read far more often than written: watched again. Its copy is current.
       hot[w].fetch_and(~bit, std::memory_order_relaxed);
-      hot_hash[p] = 0;
       quick_rewrites[p].store(0, std::memory_order_relaxed);
+      armed_frame[p].store(frame, std::memory_order_relaxed);
+      pending[w].fetch_or(bit, std::memory_order_relaxed);
+      QueueArm(p, p + 1, trace_request);
+      ++p;
+      continue;
     }
     uint32_t run_end = p + 1;
     while (run_end <= last) {
-      const uint64_t b = 1ull << (run_end & 63);
-      if ((valid[run_end >> 6].load(std::memory_order_relaxed) |
-           hot[run_end >> 6].load(std::memory_order_relaxed)) &
-          b)
+      const uint32_t rw = run_end >> 6;
+      if ((valid[rw].load(std::memory_order_relaxed) | hot[rw].load(std::memory_order_relaxed) |
+           pending[rw].load(std::memory_order_relaxed)) &
+          (1ull << (run_end & 63)))
         break;
       ++run_end;
     }
-    // Valid and watched before reading, so a write during the copy invalidates again.
-    SetValid(p, run_end, true);
-    for (uint32_t q = p; q < run_end; ++q) armed_frame[q].store(frame, std::memory_order_relaxed);
-    const uint32_t from = p << kPageShift, size = (run_end - p) << kPageShift;
-    {
-      profile::Scope scope(profile::kCapWatch);
-      memory->EnablePhysicalMemoryAccessCallbacks(from, size, true, false);
-    }
-    watch_arms.fetch_add(1, std::memory_order_relaxed);
-    watch_arm_pages.fetch_add(run_end - p, std::memory_order_relaxed);
-    if (trace.file) trace.Add(WatchTrace::kArm, p, run_end - p, trace_request);
+    // Hashed before the copy, so a write between the two shows as a change.
+    for (uint32_t q = p; q < run_end; ++q)
+      copy_hash[q].store(PageHash(q), std::memory_order_relaxed);
+    hashed += run_end - p;
     ++pd.range_runs;
-    if (!copy(from, size)) {
-      // Not copied: invalid again, so the next request copies them.
-      SetValid(p, run_end, false);
-      return false;
-    }
+    // Not copied: neither valid nor pending, so the next request copies them.
+    if (!copy(p << kPageShift, (run_end - p) << kPageShift)) return false;
+    for (uint32_t q = p; q < run_end; ++q) armed_frame[q].store(frame, std::memory_order_relaxed);
+    SetPageBits(pending.get(), p, run_end, true);
+    QueueArm(p, run_end, trace_request);
     p = run_end;
   }
   if (hashed) {
@@ -1685,6 +1730,61 @@ bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watc
   if (!copy_changed()) return false;
   if (coherency) CheckRequest(start, length);
   return true;
+}
+
+void DrawRenderer::Impl::QueueArm(uint32_t first, uint32_t end, uint32_t request) {
+  bool wake;
+  {
+    std::lock_guard<std::mutex> lock(arm_mutex);
+    arm_queue.push_back({first, end, request});
+    wake = std::exchange(arm_idle, false);
+  }
+  if (wake) arm_cv.notify_one();
+}
+
+void DrawRenderer::Impl::WatchThread() {
+  std::vector<ArmRun> runs;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lock(arm_mutex);
+      while (arm_queue.empty() && !arm_stopping) {
+        arm_idle = true;
+        arm_cv.wait(lock);
+      }
+      if (arm_queue.empty()) return;
+      runs.swap(arm_queue);
+    }
+    const uint64_t t0 = NowNs();
+    std::sort(runs.begin(), runs.end(),
+              [](const ArmRun& a, const ArmRun& b) { return a.first < b.first; });
+    uint64_t arms = 0, pages = 0, changed = 0;
+    for (size_t i = 0; i < runs.size();) {
+      const uint32_t first = runs[i].first;
+      uint32_t end = runs[i].end;
+      size_t j = i + 1;
+      while (j < runs.size() && runs[j].first == end) end = runs[j++].end;
+      // Valid before the arm: a write after it faults and clears the bit, which stays clear.
+      SetPageBits(valid.get(), first, end, true);
+      memory->EnablePhysicalMemoryAccessCallbacks(first << kPageShift, (end - first) << kPageShift,
+                                                  true, false);
+      for (uint32_t q = first; q < end; ++q) {
+        if (PageHash(q) == copy_hash[q].load(std::memory_order_relaxed)) continue;
+        // Written between its copy and the arm: the next request copies it again.
+        SetPageBits(valid.get(), q, q + 1, false);
+        ++changed;
+      }
+      SetPageBits(pending.get(), first, end, false);
+      if (trace.file) trace.Add(WatchTrace::kArm, first, end - first, runs[i].request);
+      ++arms;
+      pages += end - first;
+      i = j;
+    }
+    runs.clear();
+    watch_arms.fetch_add(arms, std::memory_order_relaxed);
+    watch_arm_pages.fetch_add(pages, std::memory_order_relaxed);
+    watch_arm_changed.fetch_add(changed, std::memory_order_relaxed);
+    watch_arm_ns.fetch_add(NowNs() - t0, std::memory_order_relaxed);
+  }
 }
 
 void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
@@ -1702,13 +1802,13 @@ void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
     }
     const uint64_t bit = 1ull << (p & 63);
     const bool is_valid = valid[p >> 6].load(std::memory_order_relaxed) & bit;
-    const bool is_hot = hot[p >> 6].load(std::memory_order_relaxed) & bit;
+    const bool hashed = (hot[p >> 6].load(std::memory_order_relaxed) |
+                         pending[p >> 6].load(std::memory_order_relaxed)) &
+                        bit;
     // A write after this request copied or trusted the page: it faulted (valid cleared) or, on a
-    // hot page, changed the hash since. Either way the next request copies it.
+    // hot or pending page, changed the hash since. Either way the next request copies it.
     const bool written_since =
-        is_hot ? (XXH3_64bits(membase + (size_t(p) << kPageShift), 1u << kPageShift) | 1) !=
-                     hot_hash[p]
-               : !is_valid;
+        hashed ? PageHash(p) != copy_hash[p].load(std::memory_order_relaxed) : !is_valid;
     if (written_since) continue;
     ++c.stale;
     uint32_t differ = 0, first = UINT32_MAX;
@@ -1722,7 +1822,7 @@ void DrawRenderer::Impl::CheckRequest(uint32_t start, uint32_t length) {
                    "{}): {} of {} bytes differ from {:08X}, {} armed at frame {}, last write fault "
                    "frame {}",
                    stamp - 1, p, start, length, c.slot, differ, hi - lo, first,
-                   is_hot ? "hot" : "valid", armed_frame[p].load(std::memory_order_relaxed),
+                   hashed ? "hashed" : "valid", armed_frame[p].load(std::memory_order_relaxed),
                    int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
   }
 }
@@ -1835,7 +1935,9 @@ void DrawRenderer::Impl::CheckLateWrites() {
       if (!std::memcmp(membase + lo, c.shadow.get() + lo, hi - lo)) continue;
       const uint64_t bit = 1ull << (p & 63);
       if ((valid[p >> 6].load(std::memory_order_relaxed) & bit) &&
-          !(hot[p >> 6].load(std::memory_order_relaxed) & bit)) {
+          !((hot[p >> 6].load(std::memory_order_relaxed) |
+             pending[p >> 6].load(std::memory_order_relaxed)) &
+            bit)) {
         // Valid and watched, yet guest memory differs: a write the watch missed.
         ++stale;
         PGR4_LOG_FIRST(200, WARN,
@@ -3608,6 +3710,8 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   stats_.watch_faults = impl_->watch_faults.exchange(0, std::memory_order_relaxed);
   stats_.watch_arms = impl_->watch_arms.exchange(0, std::memory_order_relaxed);
   stats_.watch_arm_pages = impl_->watch_arm_pages.exchange(0, std::memory_order_relaxed);
+  stats_.watch_arm_changed = impl_->watch_arm_changed.exchange(0, std::memory_order_relaxed);
+  stats_.watch_arm_ns = impl_->watch_arm_ns.exchange(0, std::memory_order_relaxed);
   stats_.hash_pages = impl_->hash_pages.exchange(0, std::memory_order_relaxed);
   stats_.hash_copies = impl_->hash_copies.exchange(0, std::memory_order_relaxed);
   if (!impl_->threaded) impl_->watch_frame.fetch_add(1, std::memory_order_relaxed);

@@ -103,7 +103,9 @@ class DrawRenderer {
     uint64_t watch_faults = 0;  // guest writes caught by a page watch (any watcher), per frame
     uint64_t copy_batches = 0;  // groups of shared-memory copies, each between two barriers
     uint64_t watch_arms = 0, watch_arm_pages = 0;  // vertex/index watches armed (calls, pages)
-    uint64_t hash_pages = 0, hash_copies = 0;      // hot pages hashed, and copied as they changed
+    // ... pages found written between their copy and the arm, and the watch thread's time.
+    uint64_t watch_arm_changed = 0, watch_arm_ns = 0;
+    uint64_t hash_pages = 0, hash_copies = 0;  // pages hashed, and copied as they changed
     // --pgr4_native_coherency_check: pages whose guest memory differed from shared memory's
     // copy although the page watch said it was current, and pages rewritten after a draw of
     // the frame read them.
