@@ -10,10 +10,12 @@
 #include <rex/logging.h>
 #include <xxhash.h>
 
-#include <simde/x86/sse2.h>
+#include <simde/x86/avx2.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
+#include <span>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
                     "After each game draw, compare the guest register shadow with the tracked "
@@ -22,15 +24,17 @@ REXCVAR_DEFINE_BOOL(pgr4_native_track_verify, false, "PGR4 native",
 namespace pgr4::native {
 namespace {
 
-// Register blocks the draw functions flush with sub_826DDC90, (device offset, first register,
-// registers, dirty mask (device + 8 * mask), the mask bit of the first register, registers per
-// bit). The counts are the dirty-mask widths in sub_826D0340 (the shadow areas between the
-// offsets are longer for 0x2000: 19 dwords, of which only 16 are ever flushed). The flush
-// functions shift a block's bits to the top of the word and walk them with count-leading-zeros,
-// so bit `top - k` covers the k-th group of `per` registers.
+// The state the flushing calls send by dirty mask: (device offset, first register, registers,
+// dirty mask (device + 8 * mask), the mask bit of the first register, registers per bit). The
+// float constants (sub_826DE030) come first, then the register blocks of sub_826DDC90; their
+// counts are the dirty-mask widths in sub_826D0340 (the shadow areas between the offsets are
+// longer for 0x2000: 19 dwords, of which only 16 are ever flushed). The flush functions shift a
+// block's bits to the top of the word and walk them with count-leading-zeros, so bit `top - k`
+// covers the k-th group of `per` registers.
 struct Block {
   uint32_t offset, reg, count;
-  uint8_t mask, top, per, groups;  // groups = count / per, kept here: CopyDirty runs per draw
+  uint8_t mask, top, per, groups;
+  uint64_t bits;  // the block's bits in its mask
   constexpr Block(uint32_t offset, uint32_t reg, uint32_t count, uint8_t mask, uint8_t top,
                   uint8_t per)
       : offset(offset),
@@ -39,9 +43,12 @@ struct Block {
         mask(mask),
         top(top),
         per(per),
-        groups(uint8_t(count / per)) {}
+        groups(uint8_t(count / per)),
+        bits((~0ull >> (64 - count / per)) << (top + 1 - count / per)) {}
 };
-constexpr Block kRegisterBlocks[] = {
+constexpr Block kFlushBlocks[] = {
+    {dev::kVsConstants, 0x4000, 1024, 0, 63, 16},   // mask +0: c0..c255, 4 per bit
+    {dev::kPsConstants, 0x4400, 1024, 1, 63, 16},   // mask +8
     {10368, 0x2000, 16, 2, 57, 1},                  // mask +16 bits 57..42
     {10444, 0x2100, 21, 2, 41, 1},                  // mask +16 bits 41..21
     {10528, 0x2180, 5, 2, 16, 1},                   // mask +16 bits 16..12
@@ -53,6 +60,9 @@ constexpr Block kRegisterBlocks[] = {
     {dev::kFetchConstants, 0x4800, 192, 3, 31, 6},  // mask +24 bits 31..0, sub_826DDED0
     {dev::kBoolLoop, 0x4900, 40, 4, 56, 40},        // mask +32 bit 56
 };
+// The register blocks alone. Their shadow is what the GPU has after every flushing call; the
+// float constants' shadow may also hold values the game wrote without a dirty bit.
+constexpr std::span<const Block> kRegisterBlocks = std::span(kFlushBlocks).subspan<2>();
 
 // Mask +16 bits 17..20 make a draw call the shader load sub_826DEDC8 (bit 19 = vertex shader,
 // 20 = pixel shader). Besides the stream, it writes registers of the 0x2000, 0x2180 and 0x2200
@@ -68,63 +78,74 @@ constexpr uint64_t kVsRebind = 1ull << 19, kPsRebind = 1ull << 20;
 
 }  // namespace
 
+void RegLog::Grow(size_t capacity) {
+  capacity = std::max({capacity, capacity_ * 2, size_t(4096)});
+  auto data = std::make_unique_for_overwrite<RegWrite[]>(capacity);
+  if (size_) std::memcpy(data.get(), data_.get(), size_ * sizeof(RegWrite));
+  data_ = std::move(data);
+  capacity_ = capacity;
+}
+
 void GuestStateTracker::Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count) {
-  const uint8_t* p = HostPtr(base, src);
+  const uint8_t* const p = HostPtr(base, src);
+  RegLog& log = sink_ ? *sink_ : discard_;
+  RegWrite* out = log.Reserve(count);
   // Takes the registers first + k for each bit k of `differ`.
   auto update = [&](uint32_t first, uint32_t differ) {
     for (; differ; differ &= differ - 1) {
       const uint32_t i = first + uint32_t(std::countr_zero(differ));
       uint32_t v;
       std::memcpy(&v, p + i * 4, 4);
+      const uint32_t value = __builtin_bswap32(v);
       raw_[reg + i] = v;
-      regs_[reg + i] = __builtin_bswap32(v);
-      Record(reg + i, regs_[reg + i]);
+      regs_[reg + i] = value;
+      *out++ = {reg + i, value};
     }
   };
-  auto eq4 = [&](uint32_t i) {
-    const simde__m128i g = simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(p + i * 4));
-    const simde__m128i m =
-        simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(raw_ + reg + i));
-    return simde_mm_cmpeq_epi32(g, m);
+  auto load = [](const void* q) {
+    return simde_mm256_loadu_si256(static_cast<const simde__m256i*>(q));
   };
-  auto equal_lanes = [](simde__m128i eq) {
-    return uint32_t(simde_mm_movemask_ps(simde_mm_castsi128_ps(eq)));
+  auto same = [](simde__m256i a, simde__m256i b) {  // bit k: lane k equal
+    return uint32_t(
+        simde_mm256_movemask_ps(simde_mm256_castsi256_ps(simde_mm256_cmpeq_epi32(a, b))));
   };
-  // Most of what the flushing calls copy is unchanged: 16 registers per branch.
+  // Most of what the flushing calls copy is unchanged: one branch per 16 registers.
   uint32_t i = 0;
   for (; i + 16 <= count; i += 16) {
-    const simde__m128i e0 = eq4(i), e1 = eq4(i + 4), e2 = eq4(i + 8), e3 = eq4(i + 12);
-    if (simde_mm_movemask_epi8(
-            simde_mm_and_si128(simde_mm_and_si128(e0, e1), simde_mm_and_si128(e2, e3))) == 0xFFFF)
-      continue;
-    update(i, ~(equal_lanes(e0) | equal_lanes(e1) << 4 | equal_lanes(e2) << 8 |
-                equal_lanes(e3) << 12) &
-                  0xFFFFu);
+    const uint32_t equal = same(load(p + i * 4), load(raw_ + reg + i)) |
+                           same(load(p + i * 4 + 32), load(raw_ + reg + i + 8)) << 8;
+    if (equal != 0xFFFF) update(i, ~equal & 0xFFFF);
   }
-  for (; i + 4 <= count; i += 4) update(i, ~equal_lanes(eq4(i)) & 0xFu);
-  for (; i < count; ++i) {
-    uint32_t v;
-    std::memcpy(&v, p + i * 4, 4);
-    update(i, v != raw_[reg + i]);
+  // The rest, 8 at a time. The masked loads do not read the lanes past `count`, which may lie
+  // past the end of the guest's allocation.
+  for (; i < count; i += 8) {
+    const uint32_t n = std::min(count - i, 8u);
+    const simde__m256i lanes = simde_mm256_cmpgt_epi32(
+        simde_mm256_set1_epi32(int32_t(n)), simde_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    const uint32_t equal =
+        same(simde_mm256_maskload_epi32(reinterpret_cast<const int32_t*>(p + i * 4), lanes),
+             simde_mm256_maskload_epi32(reinterpret_cast<const int32_t*>(raw_ + reg + i), lanes));
+    update(i, ~equal & ((1u << n) - 1));
   }
+  if (sink_) log.Commit(out);
 }
 
-void GuestStateTracker::CopyDirty(const uint8_t* base, uint32_t device, const uint64_t dirty[6]) {
-  for (const Block& b : kRegisterBlocks) {
-    uint64_t m = (dirty[b.mask] << (63 - b.top)) & ~(~0ull >> b.groups);  // group g at bit 63 - g
+void GuestStateTracker::CopyFlushed(const uint8_t* base, uint32_t device,
+                                    const uint64_t flushed[6]) {
+  for (const Block& b : kFlushBlocks) {
+    uint64_t m = (flushed[b.mask] & b.bits) << (63 - b.top);  // group g at bit 63 - g
     uint32_t g = 0;
     while (m) {
-      const uint32_t skip = uint32_t(__builtin_clzll(m));
+      const uint32_t skip = uint32_t(std::countl_zero(m));
       m <<= skip;
       g += skip;
-      const uint32_t run = ~m ? uint32_t(__builtin_clzll(~m)) : 64;
+      const uint32_t run = uint32_t(std::countl_one(m));
       Copy(b.reg + g * b.per, base, device + b.offset + g * b.per * 4, run * b.per);
       g += run;
       m = run < 64 ? m << run : 0;
     }
   }
 }
-
 void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr) {
   static uint64_t checks = 0, differing = 0;
   static uint32_t reported = 0;
@@ -152,11 +173,11 @@ void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn
                 differing);
 }
 
-void GuestStateTracker::RecordInto(std::vector<RegWrite>* sink) {
+void GuestStateTracker::RecordInto(RegLog* sink) {
   if (sink && !synced_) {
     synced_ = true;
     for (uint32_t reg = 0; reg < kGuestRegisterCount; ++reg)
-      if (regs_[reg]) sink->emplace_back(reg, regs_[reg]);
+      if (regs_[reg]) sink->Append({reg, regs_[reg]});
   }
   sink_ = sink;
 }
@@ -195,9 +216,8 @@ void PrefetchIndexBuffer(const uint8_t* base, uint32_t device) {
 }
 
 void MarkAllDirty(uint8_t* base, uint32_t device) {
-  uint64_t add[6] = {~0ull, ~0ull, kShaderLoadBits, 0, 0, 0};  // masks +0, +8: all constants
-  for (const Block& b : kRegisterBlocks)
-    add[b.mask] |= (~0ull >> (64 - b.groups)) << (b.top + 1 - b.groups);
+  uint64_t add[6] = {0, 0, kShaderLoadBits, 0, 0, 0};
+  for (const Block& b : kFlushBlocks) add[b.mask] |= b.bits;
   for (uint32_t i = 0; i < 6; ++i) {
     const uint32_t a = device + dev::kDirtyMasks + i * 8;
     Store64(base, a, Load64(base, a) | add[i]);
@@ -216,9 +236,8 @@ void GuestStateTracker::Attach(const uint8_t* base, uint32_t device) {
     REXLOG_INFO("PGR4 native state: tracking device {:08X} (was {:08X})", device, device_);
   device_ = device;
   verify_ = REXCVAR_GET(pgr4_native_track_verify);
-  Copy(0x4000, base, device + dev::kVsConstants, 1024);
-  Copy(0x4400, base, device + dev::kPsConstants, 1024);
-  for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
+  constexpr uint64_t kAll[6] = {~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull};
+  CopyFlushed(base, device, kAll);
   vs_ = ps_ = {};
   inline_vertices_ = 0;
 }
@@ -236,42 +255,36 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
   const bool vs_imm_new = vs_imm_pending_valid_;
   vs_imm_pending_valid_ = false;
 
-  // Float constants: only the 4-vec4 groups whose dirty bit the call cleared reached the GPU
-  // (sub_826DE030; bit 63 - k = constants 4k..4k+3). The rest of the shadow may hold values
-  // the game wrote without a dirty bit (c247-c255 in the tap traces).
-  for (uint32_t m = 0; m < 2; ++m) {
-    uint64_t now = Load64(base, device + dev::kDirtyMasks + m * 8);
-    uint64_t flushed = e.dirty[m] & ~now;
-    const uint32_t reg = m ? 0x4400 : 0x4000, off = m ? dev::kPsConstants : dev::kVsConstants;
-    while (flushed) {
-      uint32_t k = uint32_t(__builtin_clzll(flushed));
-      flushed &= ~(1ull << (63 - k));
-      Copy(reg + k * 16, base, device + off + k * 64, 16);
-    }
-  }
-
+  // What the call sent to the GPU. Float constants: only the 4-vec4 groups whose dirty bit the
+  // call cleared (sub_826DE030; bit 63 - k = constants 4k..4k+3). The rest of the shadow may
+  // hold values the game wrote without a dirty bit (c247-c255 in the tap traces).
+  //
   // Register blocks, clip planes, fetch and bool/loop constants: at the end of every flushing
   // call the shadow equals what the GPU has for these (the tap traces show no other
   // differences: the draw flushes whatever is dirty, and Clear/Resolve re-dirty what they
   // overwrite in the stream, so the next draw restores it). A game draw changes only what was
   // dirty at its entry and what its shader load wrote; Clear, Resolve, Swap and the D3D's own
   // draws may write the shadow themselves, so after them every block is compared.
+  uint64_t flushed[6];
+  for (uint32_t m = 0; m < 2; ++m)
+    flushed[m] = e.dirty[m] & ~Load64(base, device + dev::kDirtyMasks + m * 8);
   const bool game_draw = fn_addr == guest_fn::kDrawIndexed || fn_addr == guest_fn::kDrawVertices ||
                          fn_addr == guest_fn::kBeginVertices;
   const bool stride_changed =
       fn_addr == guest_fn::kBeginVertices && ((r[3] >> 2) & 0xFF) != e.vertex_stride_dwords;
   if (game_draw) {
-    uint64_t dirty[6];
-    std::memcpy(dirty, e.dirty, sizeof(dirty));
-    if ((dirty[2] & kShaderLoadBits) || stride_changed) dirty[2] |= kShaderLoadBlocks;
-    if (inline_fetch_) dirty[3] |= kFetch31;
-    CopyDirty(base, device, dirty);
-    if (verify_) [[unlikely]]
-      Verify(base, device, fn_addr);
+    const bool shader_load = (e.dirty[2] & kShaderLoadBits) || stride_changed;
+    flushed[2] = e.dirty[2] | (shader_load ? kShaderLoadBlocks : 0);
+    flushed[3] = e.dirty[3] | (inline_fetch_ ? kFetch31 : 0);
+    flushed[4] = e.dirty[4];
+    flushed[5] = e.dirty[5];
   } else {
-    for (const Block& b : kRegisterBlocks) Copy(b.reg, base, device + b.offset, b.count);
+    std::fill(flushed + 2, flushed + 6, ~0ull);
   }
   inline_fetch_ = false;
+  CopyFlushed(base, device, flushed);
+  if (game_draw && verify_) [[unlikely]]
+    Verify(base, device, fn_addr);
 
   // Window scissor: sub_826C33C0 writes PA_SC_WINDOW_OFFSET/SCISSOR_TL/BR straight into the
   // stream from the rectangle SetScissorRect (fn_826C59D8) keeps at device+10436/+10440 (15-bit

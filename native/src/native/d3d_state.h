@@ -23,7 +23,9 @@
 // that (no copy of the register file; DrawState points at the tracker's array).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "renderer.h"
@@ -153,6 +155,32 @@ struct RegWrite {
   uint32_t reg, value;
 };
 
+// Register writes in order, appended through a cursor: Reserve(n) makes room for n more and
+// returns where they go, Commit(end) keeps the ones written before `end`. The tracker's copy
+// loop then keeps the cursor in a register (a vector's end would be reloaded after every store,
+// as clang-cl, like MSVC, does not assume strict aliasing).
+class RegLog {
+ public:
+  size_t size() const { return size_; }
+  const RegWrite& operator[](size_t i) const { return data_[i]; }
+  void clear() { size_ = 0; }
+  RegWrite* Reserve(size_t n) {
+    if (capacity_ - size_ < n) [[unlikely]]
+      Grow(size_ + n);
+    return data_.get() + size_;
+  }
+  void Commit(const RegWrite* end) { size_ = size_t(end - data_.get()); }
+  void Append(RegWrite w) {
+    *Reserve(1) = w;
+    ++size_;
+  }
+
+ private:
+  void Grow(size_t capacity);
+  std::unique_ptr<RegWrite[]> data_;
+  size_t size_ = 0, capacity_ = 0;
+};
+
 class GuestStateTracker {
  public:
   // After a flushing call returned. `r` = r3..r10 at entry (r[0] = device), `ret` = r3 after.
@@ -171,7 +199,7 @@ class GuestStateTracker {
   // From now on appends every register write that changes a value to `*sink`, in order (null:
   // none). The first sink also gets every non-zero register, as the copy it feeds starts zeroed
   // like regs_. The render thread replays these into its own register file (renderer.cpp).
-  void RecordInto(std::vector<RegWrite>* sink);
+  void RecordInto(RegLog* sink);
   // Forgets the device after calls the tracker did not see: the next flushing call attaches
   // again and copies the whole shadow (recording what changed).
   void Resync() {
@@ -195,7 +223,7 @@ class GuestStateTracker {
   // each register as the guest stores it (big-endian), so Copy compares guest memory with it
   // four registers at a time without swapping.
   void Record(uint32_t reg, uint32_t value) {
-    if (sink_) sink_->emplace_back(reg, value);
+    if (sink_) sink_->Append({reg, value});
   }
   void Put(uint32_t reg, uint32_t value) {
     if (regs_[reg] == value) return;
@@ -204,8 +232,9 @@ class GuestStateTracker {
     Record(reg, value);
   }
   void Copy(uint32_t reg, const uint8_t* base, uint32_t src, uint32_t count);
-  // The block registers whose bit is set in `dirty` (masks +0..+40, host order).
-  void CopyDirty(const uint8_t* base, uint32_t device, const uint64_t dirty[6]);
+  // The float constants and block registers whose bit is set in `flushed` (masks +0..+40, host
+  // order).
+  void CopyFlushed(const uint8_t* base, uint32_t device, const uint64_t flushed[6]);
   // --pgr4_native_track_verify: logs block registers whose shadow differs from regs_.
   void Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr);
   void LoadLiterals(const uint8_t* base, uint32_t table, uint32_t data);
@@ -224,8 +253,9 @@ class GuestStateTracker {
   bool verify_ = false;  // --pgr4_native_track_verify, read at Attach
   uint32_t regs_[kGuestRegisterCount] = {};
   uint32_t raw_[kGuestRegisterCount] = {};
-  std::vector<RegWrite>* sink_ = nullptr;  // RecordInto
-  bool synced_ = false;                    // a sink got the whole register file
+  RegLog* sink_ = nullptr;  // RecordInto
+  RegLog discard_;          // Copy's writes while there is no sink
+  bool synced_ = false;     // a sink got the whole register file
 };
 
 GuestStateTracker& GuestState();

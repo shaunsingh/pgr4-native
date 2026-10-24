@@ -170,7 +170,7 @@ struct NativeRenderer::Queue {
   };
   struct Batch {
     std::vector<Cmd> cmds;
-    std::vector<RegWrite> regs;
+    RegLog regs;
     std::vector<VertexCopy> copies;
     std::vector<uint32_t> segments;  // indices into copies where a copy segment starts
     std::vector<DrawCmd> draws;
