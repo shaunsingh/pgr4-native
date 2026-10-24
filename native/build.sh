@@ -121,11 +121,13 @@ native_src=$here/src/native
 # (FPSCRPlatform::InitHostExceptions), so speculated FP operations cannot trap. No caller reads
 # errno after a math function, so sqrt and friends compile to bare instructions.
 #
-# 128-bit vectors where the compiler picks the width (loops, struct copies): a function that
-# writes a 256-bit register runs VZEROUPPER before every call and return, and on the Deck, whose
-# microcode has no Zenbleed fix (the kernel sets the chicken bit instead), the instruction after
-# it took 4 % of the game and render threads' samples (td-145). Intrinsics keep their width.
-clang_cl_flags="/clang:-march=$march /clang:-mtune=$mtune /clang:-mprefer-vector-width=128 /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-"
+# 128-bit vectors where the compiler picks the width: a function that writes a 256-bit register
+# runs VZEROUPPER before every call and return, and on the Deck, whose microcode has no Zenbleed
+# fix (the kernel sets the chicken bit instead), the instruction after it took 4 % of the game
+# and render threads' samples (td-145). -mprefer-vector-width covers the vectorizers; struct
+# copies and fills follow allow-light-256-bit, a tuning feature of the Zen CPUs that lets them
+# use 256 bits regardless. Intrinsics keep their width.
+clang_cl_flags="/clang:-march=$march /clang:-mtune=$mtune /clang:-mprefer-vector-width=128 -Xclang -target-feature -Xclang -allow-light-256-bit /clang:-ffp-model=precise /clang:-fno-math-errno /Zc:char8_t-"
 export PATH=$HOME/recomp/tools/bin:$PATH
 
 IFS=, read -ra stage_list <<< "$stages"

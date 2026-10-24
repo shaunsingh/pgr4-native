@@ -7,6 +7,8 @@
 #include <rex/graphics/format/ucode.h>
 #include <rex/logging.h>
 
+#include <simde/x86/sse2.h>
+
 namespace pgr4::native {
 
 namespace {
@@ -168,12 +170,22 @@ size_t BoolSpecializer::KeyHash::operator()(const Key& k) const {
 
 DxbcShader* BoolSpecializer::Get(DxbcShader* shader, const uint32_t* bools) {
   if (!shader) return nullptr;
+  // 128 bits at a time: the compiler makes one 256-bit test of an OR loop over the 8 words, and
+  // a function that writes a 256-bit register runs VZEROUPPER before every call and return
+  // (build.sh).
+  const auto load = [](const uint32_t* p) {
+    return simde_mm_loadu_si128(reinterpret_cast<const simde__m128i*>(p));
+  };
   const uint32_t* tested = shader->constant_register_map().bool_bitmap;
-  uint32_t tests = 0;
-  for (uint32_t i = 0; i < 8; ++i) tests |= tested[i];
-  if (!tests) return shader;
+  const simde__m128i tested_lo = load(tested), tested_hi = load(tested + 4);
+  const simde__m128i any = simde_mm_or_si128(tested_lo, tested_hi);
+  if (simde_mm_movemask_epi8(simde_mm_cmpeq_epi8(any, simde_mm_setzero_si128())) == 0xFFFF)
+    return shader;
   Key key{shader, {}};
-  for (uint32_t i = 0; i < 8; ++i) key.bools[i] = bools[i] & tested[i];
+  simde_mm_storeu_si128(reinterpret_cast<simde__m128i*>(key.bools),
+                        simde_mm_and_si128(load(bools), tested_lo));
+  simde_mm_storeu_si128(reinterpret_cast<simde__m128i*>(key.bools + 4),
+                        simde_mm_and_si128(load(bools + 4), tested_hi));
   if (last_result_ && key == last_) return last_result_;
   last_ = key;
   auto [it, inserted] = specialized_.try_emplace(key, shader);

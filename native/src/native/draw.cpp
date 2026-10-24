@@ -605,10 +605,8 @@ struct CachedCbv {
 // `cb.last`, compared with what was there on the way (one register = 16 bytes = one SSE
 // load/store, no calls); 16 zero bytes for no shader or no constants (a CBV needs some data).
 void PackFloats(CachedCbv& cb, const DxbcShader* shader, const uint32_t* regs, uint32_t reg_base) {
-  const uint64_t* bitmap = shader ? shader->constant_register_map().float_bitmap : nullptr;
-  uint32_t n = 0;
-  if (bitmap)
-    for (uint32_t i = 0; i < 4; ++i) n += uint32_t(std::popcount(bitmap[i]));
+  const Shader::ConstantRegisterMap* map = shader ? &shader->constant_register_map() : nullptr;
+  const uint32_t n = map ? map->float_count : 0;  // the bitmap's population count
   if (!n) {
     static constexpr uint8_t kZero[16] = {};
     if (cb.size != 16 || !Equal(cb.last, kZero, 16)) {
@@ -624,7 +622,7 @@ void PackFloats(CachedCbv& cb, const DxbcShader* shader, const uint32_t* regs, u
   simde__m128i* out = reinterpret_cast<simde__m128i*>(cb.last);
   simde__m128i diff = simde_mm_setzero_si128();
   for (uint32_t i = 0; i < 4; ++i) {
-    uint64_t bits = bitmap[i];
+    uint64_t bits = map->float_bitmap[i];
     const uint32_t* base = regs + reg_base + (i << 8);
     while (bits) {
       const uint32_t b = uint32_t(std::countr_zero(bits));
@@ -786,6 +784,9 @@ struct DrawRenderer::Impl {
     uint32_t count = 0;  // bits in mask
     uint32_t n = 0;      // descriptor table entries (max bindless index + 1, at most 64)
     BindMemo* last = nullptr;
+    // Takes the slot for `shader`. Cold and out of line: its loops vectorize with 256-bit
+    // loads, and inlined they would make Draw run VZEROUPPER before its calls (build.sh).
+    [[gnu::cold, gnu::noinline]] void Assign(const DxbcShader& shader);
   };
   ShaderSlots shader_slots[512];
   // Whole-shader binding memo, 2-way set-associative by (shader, the fetch constants it reads):
@@ -1025,9 +1026,15 @@ struct DrawRenderer::Impl {
   bool RequestVertices(const DrawState& s, const DxbcShader& vs, std::vector<PendingCopy>& out);
   void Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep, std::vector<VertexCopy>* out);
   // A triangle fan as a host triangle list (v1, v2, v0), (v2, v3, v0)... like the plugin's
-  // primitive processor; guest indices are copied raw (the VS still swaps them).
-  void WriteFanIndices(const DrawState& s, uint32_t count, bool wide, uint8_t* out) const;
+  // primitive processor; guest indices are copied raw (the VS still swaps them). The guest
+  // indices are in physical memory (RequestVertices checked them); `count` >= 3. Out of line:
+  // the vectorized interleaved stores are 256 bits wide, and inlined they would make Prepare
+  // and Draw run VZEROUPPER before their calls (build.sh).
+  [[gnu::noinline]] void WriteFanIndices(const DrawState& s, uint32_t count, bool wide,
+                                         uint8_t* out) const;
   void ResetListState();
+  // Whether [start, start + length) lies in guest physical memory (logged once if not).
+  bool InSharedMemory(uint32_t start, uint32_t length);
   bool RequestRange(uint32_t start, uint32_t length, bool watch, std::vector<PendingCopy>& out);
   // Gives the shared buffer memory under [start, start + length) if it is reserved. Any thread;
   // the tile mappings are queued ahead of the copies the caller records afterwards.
@@ -1471,14 +1478,17 @@ void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
   shared_state = to;
 }
 
+bool DrawRenderer::Impl::InSharedMemory(uint32_t start, uint32_t length) {
+  if (start < kSharedMemorySize && kSharedMemorySize - start >= length) return true;
+  DRAW_LOG_ONCE(log_upload, "PGR4 native draw: range {:08X}+{:X} outside physical memory", start,
+                length);
+  return false;
+}
+
 bool DrawRenderer::Impl::RequestRange(uint32_t start, uint32_t length, bool watch,
                                       std::vector<PendingCopy>& out) {
   if (!length) return true;
-  if (start >= kSharedMemorySize || kSharedMemorySize - start < length) {
-    DRAW_LOG_ONCE(log_upload, "PGR4 native draw: range {:08X}+{:X} outside physical memory", start,
-                  length);
-    return false;
-  }
+  if (!InSharedMemory(start, length)) return false;
   const bool exact = !watch || upload_every_draw.load(std::memory_order_relaxed);
   if (preparing) draw_reads.emplace_back(start, start + length, exact);
   const uint64_t fence = upload_fence;
@@ -2159,29 +2169,34 @@ void DrawRenderer::Impl::Prewarm() {
         list.size() - prewarm_failed, prewarm_failed, prewarm_ms, prewarm_frames);
 }
 
-void DrawRenderer::Impl::WriteFanIndices(const DrawState& s, uint32_t count, bool wide,
-                                         uint8_t* out) const {
-  auto guest = [&](uint32_t i) -> uint32_t {
-    if (!s.indexed) return i;
-    const uint8_t* p = membase + s.index_address;
-    if (wide) {
-      uint32_t v;
-      std::memcpy(&v, p + size_t(i) * 4, 4);
-      return v;
-    }
-    uint16_t v;
-    std::memcpy(&v, p + size_t(i) * 2, 2);
+namespace {
+
+// Fan vertex i is guest index i of `guest`, or i itself without one.
+template <typename T>
+void FanAsList(const uint8_t* guest, uint32_t count, T* out) {
+  auto at = [guest](uint32_t i) {
+    if (!guest) return T(i);
+    T v;
+    std::memcpy(&v, guest + size_t(i) * sizeof(T), sizeof(T));
     return v;
   };
-  for (uint32_t t = 0; t + 2 < count; ++t) {
-    const uint32_t tri[3] = {guest(t + 1), guest(t + 2), guest(0)};
-    for (uint32_t k = 0; k < 3; ++k) {
-      if (wide)
-        reinterpret_cast<uint32_t*>(out)[t * 3 + k] = tri[k];
-      else
-        reinterpret_cast<uint16_t*>(out)[t * 3 + k] = uint16_t(tri[k]);
-    }
+  const T first = at(0);
+  for (uint32_t t = 0; t + 2 < count; ++t, out += 3) {
+    out[0] = at(t + 1);
+    out[1] = at(t + 2);
+    out[2] = first;
   }
+}
+
+}  // namespace
+
+void DrawRenderer::Impl::WriteFanIndices(const DrawState& s, uint32_t count, bool wide,
+                                         uint8_t* out) const {
+  const uint8_t* guest = s.indexed ? membase + s.index_address : nullptr;
+  if (wide)
+    FanAsList(guest, count, reinterpret_cast<uint32_t*>(out));
+  else
+    FanAsList(guest, count, reinterpret_cast<uint16_t*>(out));
 }
 
 DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
@@ -2220,8 +2235,8 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
   return memo.shader;
 }
 
-// Vertex ranges the VS fetches and the index range (not for fans: their indices are read
-// directly) into `out`.
+// Vertex ranges the VS fetches and the index range into `out`. Fan indices are only checked:
+// WriteFanIndices reads them from guest memory.
 bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& vs,
                                          std::vector<PendingCopy>& out) {
   const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(s.regs);
@@ -2245,9 +2260,11 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
     }
   }
   if (coherency) coherency->slot = 0xFF;
-  if (s.indexed && xenos::PrimitiveType(s.primitive) != xenos::PrimitiveType::kTriangleFan)
-    return RequestRange(s.index_address, s.count * (s.index_32bit ? 4u : 2u), true, out);
-  return true;
+  if (!s.indexed) return true;
+  const uint32_t index_bytes = s.count * (s.index_32bit ? 4u : 2u);
+  if (xenos::PrimitiveType(s.primitive) == xenos::PrimitiveType::kTriangleFan)
+    return InSharedMemory(s.index_address, index_bytes);
+  return RequestRange(s.index_address, index_bytes, true, out);
 }
 
 void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep,
@@ -2291,6 +2308,26 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
     }
   }
   profile::Mark(profile::kCapVertices);
+}
+
+void DrawRenderer::Impl::ShaderSlots::Assign(const DxbcShader& s) {
+  // The translator numbers bindless descriptors from 1 (it counts the new binding before
+  // assigning its index), so the table needs max index + 1 entries, not texture + sampler
+  // count: the last binding (often a fetch's signed SRV) was left out of the upload.
+  uint32_t entries = 1;
+  mask = 0;
+  for (const auto& tb : s.GetTextureBindingsAfterTranslation()) {
+    entries = std::max(entries, tb.bindless_descriptor_index + 1);
+    mask |= 1u << (tb.fetch_constant & 31);
+  }
+  for (const auto& sb : s.GetSamplerBindingsAfterTranslation()) {
+    entries = std::max(entries, sb.bindless_descriptor_index + 1);
+    mask |= 1u << (sb.fetch_constant & 31);
+  }
+  shader = &s;
+  count = uint32_t(std::popcount(mask));
+  n = std::min(entries, 64u);
+  last = nullptr;
 }
 
 void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
@@ -2839,25 +2876,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     const auto& tex = shader.GetTextureBindingsAfterTranslation();
     const auto& smp = shader.GetSamplerBindingsAfterTranslation();
     ShaderSlots& ss = shader_slots[(reinterpret_cast<uintptr_t>(&shader) >> 6) & 511];
-    if (ss.shader != &shader) {
-      // The translator numbers bindless descriptors from 1 (it counts the new binding before
-      // assigning its index), so the table needs max index + 1 entries, not texture + sampler
-      // count: the last binding (often a fetch's signed SRV) was left out of the upload.
-      uint32_t n = 1, mask = 0;
-      for (const auto& tb : tex) {
-        n = std::max(n, tb.bindless_descriptor_index + 1);
-        mask |= 1u << (tb.fetch_constant & 31);
-      }
-      for (const auto& sb : smp) {
-        n = std::max(n, sb.bindless_descriptor_index + 1);
-        mask |= 1u << (sb.fetch_constant & 31);
-      }
-      ss.shader = &shader;
-      ss.mask = mask;
-      ss.count = uint32_t(std::popcount(mask));
-      ss.n = std::min(n, 64u);
-      ss.last = nullptr;
-    }
+    if (ss.shader != &shader) ss.Assign(shader);
     const uint32_t n = ss.n;
     // The memo entry for (shader, the fetch constants it reads); null if not memoizable.
     BindMemo* bm = nullptr;
