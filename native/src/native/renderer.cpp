@@ -668,7 +668,7 @@ void NativeRenderer::TakeBack() {
 // Recording (render thread, or the guest thread without it).
 
 void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
-  const uint64_t t0 = NowNs();
+  const uint64_t t0 = Ticks();
   profile::Begin();
   BeginFrame();
   ++stats_.draws;
@@ -684,21 +684,21 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
   }
   draw_->OnDraw(state, prep);
   SubmitEarly();
-  stats_.draw_ns += NowNs() - t0;
+  draw_ticks_ += Ticks() - t0;
 }
 
 void NativeRenderer::ExecuteClear(const ClearCall& c) {
-  const uint64_t t0 = NowNs();
+  const uint64_t t0 = Ticks();
   BeginFrame();
   ++stats_.clears;
   if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyClear(c));
   draw_->LogClear(c);
   rt_->Clear(device_->command_list(), c.regs, c.bound_colors, c.depth_bound, c.height, c.p);
-  stats_.clear_ns += NowNs() - t0;
+  clear_ticks_ += Ticks() - t0;
 }
 
 void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
-  const uint64_t t0 = NowNs();
+  const uint64_t t0 = Ticks();
   BeginFrame();
   ++stats_.resolves;
   if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyResolve(p));
@@ -706,7 +706,7 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   // Sets its own compute root signature, pipeline and descriptor heap on the list.
   resolver_->Resolve(device_->command_list(), p);
   draw_->InvalidateListState();
-  stats_.resolve_ns += NowNs() - t0;
+  resolve_ticks_ += Ticks() - t0;
 }
 
 // With one submission per frame the GPU idles from the end of a frame until the render thread
@@ -810,6 +810,10 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   present_->AfterEndFrame();
   const uint64_t t1 = NowNs();
   stats_.swap_ns = t1 - t0;
+  stats_.draw_ns = TicksToNs(draw_ticks_);
+  stats_.clear_ns = TicksToNs(clear_ticks_);
+  stats_.resolve_ns = TicksToNs(resolve_ticks_);
+  draw_ticks_ = clear_ticks_ = resolve_ticks_ = 0;
   if (!queue_)
     stats_.hook_ns = stats_.draw_ns + stats_.clear_ns + stats_.resolve_ns + stats_.swap_ns;
   WriteCsv(stats_, t1 - frame_start_ns_);

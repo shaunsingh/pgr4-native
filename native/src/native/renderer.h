@@ -238,6 +238,8 @@ class NativeRenderer {
   uint64_t frame_index_ = 0;
   uint64_t frame_start_ns_ = 0;
   FrameStats stats_;
+  // Ticks inside ExecuteDraw, ExecuteClear and ExecuteResolve, into stats_ at the Swap.
+  uint64_t draw_ticks_ = 0, clear_ticks_ = 0, resolve_ticks_ = 0;
   uint64_t draws_submitted_ = 0;  // stats_.draws at the frame's last SubmitEarly
   struct Csv;
   std::unique_ptr<Csv> csv_;
