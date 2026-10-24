@@ -92,7 +92,8 @@ class TextureCache {
   };
   // Texture memory budget, by the resources' allocation sizes. Over soft_bytes, textures unused
   // for soft_lifetime_ms are evicted; over hard_bytes, the least recently used ones regardless.
-  // Either way only textures no frame in flight uses. Offline (texture_harness): unlimited.
+  // Either way only textures no frame in flight uses. Offline
+  // (retired/native/tools/texture_harness): unlimited.
   struct Budget {
     uint64_t soft_bytes = ~0ull, hard_bytes = ~0ull;
     uint64_t soft_lifetime_ms = 30000;
@@ -104,8 +105,8 @@ class TextureCache {
   // In the game: memory = rex::system::kernel_memory(); textures are read from its physical
   // memory and their pages watched through it.
   TextureCache(ID3D12Device* device, rex::memory::Memory* memory);
-  // Offline (tools/texture_harness): guest physical memory at physical_membase, no write
-  // tracking (a texture uploads once).
+  // Offline (retired/native/tools/texture_harness): guest physical memory at physical_membase, no
+  // write tracking (a texture uploads once).
   TextureCache(ID3D12Device* device, const uint8_t* physical_membase);
   ~TextureCache();
   TextureCache(const TextureCache&) = delete;

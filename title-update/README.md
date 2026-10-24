@@ -8,9 +8,10 @@ the update's files are the player's own: this folder holds only what the build d
 | File | What |
 |---|---|
 | `game-files.sha256` | The SHA-256 of the update's two game files, which the build checks |
-| `entrypoint.toml` | setjmp/longjmp and the function starts codegen needs for 0.0.2.1, in place of MTR-PGR4's |
-| `addresses.txt` | Base-to-0.0.2.1 addresses of MTR-PGR4's generated-code patches and manifest entries |
-| `apply_game_patches.patch` | The one MTR-PGR4 generated-code patch 0.0.2.1 needs rewritten beyond its addresses: the garage walking step count, which the update keeps in r29 |
+
+The codegen entries for 0.0.2.1 (setjmp/longjmp, function starts) are in
+`game/pgr4/pgr4recompiled_manifest.toml`. The base-to-0.0.2.1 address map of the former MTR-PGR4
+workflow is in `retired/title-update/`.
 
 The two game files, which this repository does not contain:
 
@@ -19,8 +20,8 @@ The two game files, which this repository does not contain:
 | `default.xexp` | The delta patch that turns the disc's `default.xex` into 0.0.2.1. Codegen applies it to a copy of the disc's file beside it, the runtime finds it on `update:\` |
 | `Pgr4TitleUpdate.bin` | The update's own data, read by the game from `update:\` |
 
-`build.sh --update <folder>` (`build.ps1 -Update <folder>`) names the folder that holds them;
-the default is `~/recomp/dumps/pgr4/title-update` (`C:\recomp\dumps\pgr4\title-update`). They
+`native/build.sh --update <folder>` names the folder that holds them; the default is
+`~/recomp/dumps/pgr4/title-update`. They
 come unchanged from the package `TU_16L61VP_0000004000000.00000000000G1` (LIVE, content type
 0x000B0000, title 4D5307F9; SHA-256
 `9980cf82c3bbbb32b35c841532c832b5598e99ce50daba8c658645213ab3d9b8`); every 4 KB block of each
@@ -36,7 +37,7 @@ image under it.
 At run time the install's `runtime/title-update/` holds the two game files. The runtime mounts
 that folder as `update:\` when no `--update_data_root` is given, applies `update:\default.xexp`
 to `game:\default.xex`, and refuses to start when the image it loaded is not the one the code
-was generated from (`native/rexglue-content.patch`).
+was generated from (`sdk/patches/0026` and `0028`).
 
 ## Downloadable content
 

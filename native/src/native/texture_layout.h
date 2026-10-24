@@ -1,7 +1,7 @@
 // pgr4-native PGR4 native renderer: the CPU side of guest textures.
 //
 // Pure functions with no D3D12 objects and no ReXGlue runtime state, so the standalone harness
-// (tools/texture_harness.cpp) can run them on guest-memory dumps:
+// (retired/native/tools/texture_harness) can run them on guest-memory dumps:
 //   - TextureKeyFromFetch: the storage-relevant part of a texture fetch constant (what the
 //     cache keys on), derived the same way as ReXGlue's TextureCache::BindingInfoFromFetchConstant.
 //   - GetHostFormat: Xenos format -> DXGI format and the per-block conversion, the same host
@@ -11,7 +11,7 @@
 //     util.h) -> host subresources in D3D12 order (level-major within each array slice).
 //
 // The texture_util helpers are not exported by rexgpu-xenos.dll; the SDK's util.cpp and
-// info_formats.cpp are compiled into the game (build.ps1) and into the harness.
+// info_formats.cpp are compiled into the game (game/pgr4/CMakeLists.txt) and into the harness.
 #pragma once
 
 #include <rex/graphics/pipeline/texture/util.h>

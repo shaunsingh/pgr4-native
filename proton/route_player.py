@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Replays a timed key script into the game under Proton on Linux, through a uinput keyboard.
 
-Linux counterpart of ../run/input-player.ps1, same script format and same log lines, so the
-Windows tools (co_run's mark wait, ab_compare.py, perf_fps.py) read its log unchanged:
+Script format (the run/*.keys routes); deck-run.sh, ab_compare.py and perf_fps.py read its log:
   <at_ms> <key> [hold_ms]   press <key> at <at_ms> after time zero, hold it hold_ms (default 250)
   +<ms>   <key> [hold_ms]   same, <ms> after the previous event's start time
   <at_ms> mark <label>      write "mark <label>" to the log

@@ -10,7 +10,8 @@ original design study (FM2-ReGPU, ReXGlue integration, the choice of design A).
 
 ## What it is
 
-PGR4 is statically recompiled by MissingThePixel/MTR-PGR4 on the ReXGlue SDK v0.10.0. Normally
+PGR4 is statically recompiled with ReXGlue (the commit `sdk/rexglue.lock` names, patched by
+`sdk/patches/`) from the game projects in `game/`. Normally
 the recompiled game's guest D3D library writes PM4 packets into a ring buffer, and ReXGlue's
 Xenos plugin (`rexgpu-xenos.dll`, Xenia's D3D12 backend) replays them on a `GPU Commands` thread.
 That thread emulates the Xbox 360 GPU (the Xenos).
@@ -26,7 +27,7 @@ Two modes:
 - `--pgr4_native`: the native renderer runs beside the Xenos plugin and presents into its own
   debug window. Both render every frame. This is the mode the image oracles compare.
 - `--pgr4_native_primary` (implies `--pgr4_native`): the native renderer presents into the
-  game's window. The SDK patch `rexglue-native-primary.patch` adds `--gpu_skip_draws`, which the
+  game's window. The SDK patch `sdk/patches/0031` adds `--gpu_skip_draws`, which the
   renderer sets at start-up. With it the Xenos command processor still parses the stream, runs
   fences, interrupts and `EVENT_WRITE_ZPD` (fake sample counts), but skips draws, copies, clears,
   shader loads and swaps. Its `GPU Commands` thread drops from ~98 % of a core to ~13 %.
@@ -198,10 +199,10 @@ scratch row.
 | `pgr4_native_luma_probe` | false | Front buffer row brightness per frame in the CSV (black-frame hunting) |
 | `pgr4_native_pipeline_cache` | true | `pipelines.bin` + prewarm + pipeline library |
 | `pgr4_native_dynamic_depth_bias` | true | `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` + `RSSetDepthBias` when `DynamicDepthBiasSupported`; PGR4 animates polygon offset, which made 821 of 1,088 pipelines depth-bias variants |
-| `pgr4_native_csv` | "" | Frame CSV path (`run.ps1 -Native` sets `<log base>-native.csv`) |
+| `pgr4_native_csv` | "" | Frame CSV path (`proton/deck-run.sh` sets `<run base>-frames.csv`) |
 | `pgr4_native_profile` | false | Stage timers and counters in the CSV and the log |
 | `pgr4_native_width`, `_height` | 1280, 720 | Debug window size |
-| `pgr4_native_capture_dir` | "" | Capture requests (`capture.request`, F12) and outputs, the debug mask file; empty: none polled (`run.ps1 -Native` sets `C:\recomp\logs\pgr4-native-captures`) |
+| `pgr4_native_capture_dir` | "" | Capture requests (`capture.request`, F12) and outputs, the debug mask file; empty: none polled (`proton/deck-run.sh` and `proton/play.sh` set one per run) |
 | `pgr4_native_capture_frame`, `_capture_hold_ms` | -1, 500 | Capture a given frame; hold the guest so Xenos readback completes |
 | `pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and write the PSNR (guest held); false: the native PNG only, written off the guest thread |
 | `pgr4_native_resolve_dump` | "" | Dump every resolve of one frame (render thread off) |

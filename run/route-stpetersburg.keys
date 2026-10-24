@@ -1,7 +1,8 @@
 # Boot -> Arcade Mode, chapter 1 "Catch Me If You Can", event 1: street race, St Petersburg
 # Palace Square, 4 laps, Ford Sierra Cosworth RS500, Silver -> 70 s of full throttle.
-# Format: input-player.ps1. Time zero = the game window appears. Needs a fresh save (bench.ps1
-# deletes it): with an existing profile the game skips the profile screens and this desyncs.
+# Format: proton/route_player.py. Time zero = the game window appears. Needs a fresh save
+# (deck-run.sh starts each run with one): with an existing profile the game skips the profile
+# screens and this desyncs.
 # Timed on the MTR-PGR4 source build with a warm shader cache, 2026-10-21: intro FMV from
 # ~12 s, main menu ~10 s after the profile save, race running ~14 s after Silver.
 30000 return          # skip the intro FMV ("Shadow" by the Prodigy)
@@ -20,4 +21,4 @@
 +20000 mark loaded
 +0 e 70000            # right trigger: full throttle for 70 s (the car ends on the barrier)
 +0 mark throttle
-+5000 mark race       # bench.ps1 measures from here
++5000 mark race       # deck-run.sh measures from here

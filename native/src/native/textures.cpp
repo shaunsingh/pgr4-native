@@ -7,7 +7,8 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #ifdef PGR4_TEXTURES_OFFLINE
-// Standalone harness build (tools/texture_harness): no ReXGlue runtime, no write tracking.
+// Standalone harness build (retired/native/tools/texture_harness): no ReXGlue runtime, no write
+// tracking.
 #include <fmt/format.h>
 #include <cstdio>
 #define TEXLOG(level, ...) std::fprintf(stderr, "%s: %s\n", level, fmt::format(__VA_ARGS__).c_str())

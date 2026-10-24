@@ -15,10 +15,10 @@ the two listings when the function changed.
   tu_address_map.py map BASE_GEN TU_GEN ADDR...     one line per address: base, TU, how
   tu_address_map.py retarget MAP FILE...
                                                    rewrites the base sub_/loc_/0x addresses in
-                                                   FILEs with MAP's (title-update/addresses.txt)
+                                                   FILEs with MAP's (retired/title-update/addresses.txt)
 
 BASE_GEN and TU_GEN are generated/default directories (codegen of each executable with the
-same manifest options; the TU's with title-update/entrypoint.toml). Their parsed listings are
+same manifest options; game/pgr4/pgr4recompiled_manifest.toml for the TU's). Their parsed listings are
 cached beside this script's output in $TMPDIR. `retarget` fails on an address MAP lacks.
 """
 import argparse, bisect, difflib, glob, hashlib, os, pickle, re, sys, tempfile

@@ -34,7 +34,7 @@
 #include <thread>
 #include <vector>
 
-// rexglue-native-primary.patch (xam_input.cpp): what user 0's XamInputGetState calls returned
+// sdk/patches/0025 (xam_input.cpp): what user 0's XamInputGetState calls returned
 // since the last call, merged (bit layout there).
 extern "C" uint64_t rex_xam_take_frame_pad();
 
@@ -43,7 +43,7 @@ REXCVAR_DEFINE_BOOL(pgr4_native, false, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_primary, false, "PGR4 native",
                     "The native renderer is the game's output: it presents into the game window "
                     "and the Xenos plugin skips all draws, resolves and swaps (gpu_skip_draws, "
-                    "native/rexglue-native-primary.patch); implies --pgr4_native");
+                    "sdk/patches/0031); implies --pgr4_native");
 REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");
 REXCVAR_DEFINE_INT32(pgr4_native_width, 1280, "PGR4 native", "Debug window width");
@@ -372,14 +372,14 @@ bool NativeRenderer::Initialize() {
   // command processor only runs fences, write-backs and interrupts.
   if (primary && !rex::cvar::SetFlagByName("gpu_skip_draws", "true"))
     REXLOG_ERROR(
-        "PGR4 native: could not set gpu_skip_draws (rexglue-native-primary.patch missing?); "
+        "PGR4 native: could not set gpu_skip_draws (sdk/patches/0031 missing?); "
         "Xenos keeps drawing");
   // A handheld has no keyboard for the replay name prompt; the title's default name is what
   // confirming the dialog unchanged returns.
   if (primary && !rex::cvar::SetFlagByName("xam_keyboard_accept_default", "true"))
     REXLOG_ERROR(
         "PGR4 native: could not set xam_keyboard_accept_default "
-        "(rexglue-native-primary.patch missing?)");
+        "(sdk/patches/0024 missing?)");
   if (primary && REXCVAR_GET(pgr4_native_renderer_switch)) {
     rex::ui::RegisterBind("bind_renderer_switch", "F9",
                           "PGR4 native: switch between the native renderer and the Xenos plugin",
