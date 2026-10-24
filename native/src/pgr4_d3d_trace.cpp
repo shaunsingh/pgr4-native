@@ -51,6 +51,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -1109,14 +1110,50 @@ constexpr bool HasFastPath(FnId id) { return IsPassThrough(id) && id != kFnResto
 
 using GuestFn = void (*)(PPCContext&, uint8_t*);
 
-// Runs a hooked guest D3D function. The outermost one is timed as profile::kGuestD3d (nested
-// hooked calls and their tracking are inside that time).
-template <GuestFn kFn>
+// profile::kGuestD3d by function (--pgr4_native_profile), on the thread that calls Swap.
+struct GuestD3dTimes {
+  uint64_t ticks[kFnCount];
+  uint64_t calls[kFnCount];
+  uint32_t frames;
+};
+thread_local GuestD3dTimes t_guest_d3d_times;
+
+// Every --pgr4_d3d_stats_frames Swaps: the functions with the most guest D3D time.
+[[gnu::noinline]] void LogGuestD3dTimes() {
+  GuestD3dTimes& t = t_guest_d3d_times;
+  const int32_t every = REXCVAR_GET(pgr4_d3d_stats_frames);
+  if (every <= 0 || ++t.frames < uint32_t(every)) return;
+  uint32_t order[kFnCount];
+  std::iota(order, order + kFnCount, 0u);
+  const uint32_t shown = std::min<uint32_t>(12, kFnCount);
+  std::partial_sort(order, order + shown, order + kFnCount,
+                    [&](uint32_t a, uint32_t b) { return t.ticks[a] > t.ticks[b]; });
+  const double n = t.frames;
+  std::string line;
+  char item[96];
+  for (uint32_t k = 0; k < shown && t.ticks[order[k]]; ++k) {
+    const uint32_t i = order[k];
+    std::snprintf(item, sizeof(item), " %s %.0f us %.0f calls,", kFns[i].name,
+                  double(pgr4::native::TicksToNs(t.ticks[i])) / 1e3 / n, double(t.calls[i]) / n);
+    line += item;
+  }
+  if (!line.empty()) line.pop_back();
+  REXLOG_INFO("PGR4 native guest D3D: per frame by outermost call:{}", line);
+  t = GuestD3dTimes{};
+}
+
+// Runs a hooked guest D3D function. The outermost one is timed as profile::kGuestD3d, with the
+// hooked calls it makes (Clear's ClearF and DrawIndx2Inline, for one) and their tracking.
+template <FnId kId, GuestFn kFn>
 inline void RunOriginal(PPCContext& c, uint8_t* b) {
   namespace nat = pgr4::native;
-  if (t_original_depth++ == 0 && nat::profile::g.on) {
-    nat::profile::Scope scope(nat::profile::kGuestD3d);
+  if (t_original_depth++ == 0 && nat::profile::g.on) [[unlikely]] {
+    const uint64_t start = nat::profile::Now();
     kFn(c, b);
+    const uint64_t ticks = nat::profile::Now() - start;
+    nat::profile::g.ticks[nat::profile::kGuestD3d] += ticks;
+    t_guest_d3d_times.ticks[kId] += ticks;
+    ++t_guest_d3d_times.calls[kId];
   } else {
     kFn(c, b);
   }
@@ -1176,7 +1213,7 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
     if (!g_tap.enabled) {
       if constexpr (!HasFastPath(kId))
         if (t_pending_vertices) QueuePendingVertices(nat::NativeRenderer::Live(), base);
-      RunOriginal<kOriginal>(ctx, base);
+      RunOriginal<kId, kOriginal>(ctx, base);
       return;
     }
   }
@@ -1193,14 +1230,14 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
           e = nat::ReadDirtyMasks(b, rr[0]);
           if constexpr (kId == kFnDrawIndexed) nat::PrefetchIndexBuffer(b, rr[0]);
         }
-        RunOriginal<Body<kId, kOriginal>>(c, b);
+        RunOriginal<kId, Body<kId, kOriginal>>(c, b);
         nat::profile::Scope scope(nat::profile::kTrack);
         ++nat::profile::g.track_calls;
         nat::GuestState().AfterCall(b, kAddr, e, rr, c.r3.u64);
         return;
       }
     }
-    RunOriginal<Body<kId, kOriginal>>(c, b);
+    RunOriginal<kId, Body<kId, kOriginal>>(c, b);
   };
   if (!r) {
     OnCall<kId>(ctx, base, run);
@@ -1244,6 +1281,7 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
       static_assert(kClass == kNatSwap);
       r->OnSwap(base, a);
       NoteFrameBegin();
+      if (nat::profile::g.on) LogGuestD3dTimes();
     }
   }
 }
