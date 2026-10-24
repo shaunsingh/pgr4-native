@@ -628,6 +628,16 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   td-157 against td-154: race 89.3 against 89.1 fps, 1 % low 59.4 against 59.2; 17 of 3449
   shown frames more than 1.5 times the median interval apart against 11, interval sd 0.79
   against 0.65 ms, within the spread between runs.
+- A guest clear waits on its host target until the target is next drawn to or read, and is
+  dropped when a later clear or EDRAM fill of the same planes covers it first. The resolves
+  that end each scene tile clear it, and the next frame's BeginTiling clears every tile again
+  before anything reads them; the post chain's last resolve clears the 1x surface, and the
+  EDRAM fills of the next frame's scene resolves overwrite it. Neighbouring rectangles of one value go in one clear
+  call. td-160 against td-158 (GPU timing, the same race frames): 8.72 against 8.98 ms of GPU
+  per frame, resolves 1.34 against 1.74 ms, clears 0 against 0.16 ms, draws 6.86 against 6.55
+  ms (BeginTiling's clears now run in the first draw's span). Clearing the whole target rather
+  than the guest's rectangles (td-159) saved nothing: 8.96 ms. td-161, the image check:
+  46.5-47.6 dB. td-162 against td-157: race 89.2 against 89.3 fps, 1 % low 59.5 against 59.4.
 
 ## Why a native renderer can beat emulation
 
