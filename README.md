@@ -9,7 +9,7 @@ GPU by replaying its command stream. This renderer hooks the game's own Xbox 360
 the recompiled code instead (197 functions: draws, clears, resolves, Swap and the state calls
 around them) and turns each one into D3D12 work.
 
-The goal is 1280x800 at 60 fps under Proton on a Steam Deck.
+The goal is a steady 90 fps at 1280x800 under Proton on a Steam Deck OLED, with every effect on.
 
 ![The Xenos plugin (left) and the native renderer (right) at the same moment of the same race](docs/race-xenos-vs-native.jpg)
 
@@ -44,9 +44,11 @@ the render thread takes 33 % less time per frame than the Xenos plugin (5.36 aga
 - The render thread (`--pgr4_native_render_thread`) is on by default. Its wrong-geometry bug is
   fixed: the game thread and the render thread shared one list of pending vertex copies, so
   copies could be lost or reordered. Nine race captures since the fix are all 30.8 to 32.7 dB.
-- Runs on a Steam Deck OLED under Proton at 68-74 fps; see [Steam Deck](#steam-deck-oled).
-- The game runs at 30 fps by default; MTR-PGR4's `--pgr4_60fps` makes it 60, which has not been
-  tried with this renderer yet. The uncapped numbers above measure how much headroom there is.
+- Runs on a Steam Deck OLED under Proton at 89.4 fps at 90 Hz (1 % low 59.6); see
+  [Steam Deck](#steam-deck-oled).
+- The game runs at 30 fps by default; MTR-PGR4's `--pgr4_60fps` lifts that limit, and on the
+  Deck the frames follow the display (90 Hz, or a Steam frame limit). The uncapped numbers above
+  measure how much headroom there is.
 
 ## Steam Deck (OLED)
 
@@ -56,15 +58,16 @@ runs at 1280x800 in a gamescope window on the Deck's panel at 90 Hz with MTR-PGR
 patch, so it presents at most once per 90 Hz vblank. `proton/deck-run.sh` drives the scripted
 race and reports frame times, GPU load and the APU's power split (`proton/deck_sampler.py`).
 
-St Petersburg race, 9-45 s after the start (2026-10-23, td-90; td-51, before the changes below
+St Petersburg race, 9-45 s after the start (2026-10-23, td-140; td-51, before the changes below
 from the Deck, in brackets):
 
 | | |
 |---|---|
-| Average | 87.0 fps (78.7) |
-| 1 % low | 56.8 fps (49.2) |
-| GPU | 86 % busy at 843 MHz (of 1600) (90 % at 705-870 MHz) |
-| APU power | 15 W cap reached in every sample: CPU 8.9 W, GPU 2.9 W, SoC 1.0 W (8.8, 2.7, 1.3) |
+| Average | 89.4 fps (78.7) |
+| 1 % low | 59.6 fps (49.2) |
+| Shown late | 21 of 3449 frames shown more than half an interval late; 99 % of the intervals within 12.01 ms |
+| GPU | 73 % busy at 922 MHz (of 1600) (90 % at 705-870 MHz) |
+| APU power | 14.1 W, at the 15 W limit in 75 % of the samples: CPU 7.6 W, GPU 2.9 W, SoC 0.9 W (15 W in every sample: 8.8, 2.7, 1.3) |
 
 The APU's 15 W limit is shared, and the CPU takes most of it, so the GPU runs at about half its
 top clock. CPU time saved on any thread becomes GPU clock; GPU work saved shortens the frame
@@ -527,7 +530,51 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   returns, one frame back; it matches the game's own delta time within 0.11 ms in the median,
   td-125). In the same race at 30 and 90 fps (td-127, td-128) the reprojection moved 2.95 times
   as far per frame at 30 fps, and the blur (motion times step) matched within 2 % in every 3 s
-  window. The pass costs 0.84 ms of GPU time a frame at 90 fps (td-126).## Why a native renderer can beat emulation
+  window. The pass costs 0.84 ms of GPU time a frame at 90 fps (td-126).
+- The game thread's D3D hooks take a fifth less time. Each hook's wrapper is a template on the
+  function it wraps, so it holds only that function's path (state flush, draw, clear, resolve,
+  Swap) instead of switching on the guest address per call. The state tracker appends its
+  register changes straight to the render queue's batch, compares the register blocks eight at a
+  time, and re-reads the bound shader objects only when a call loads a shader. The index buffer
+  object is prefetched as DrawIndexedVertices begins, and the shader memo has 256 entries (shader
+  loads 0.034 per draw before, 0.022 after). The hook timers and the profiler count time-stamp
+  counter ticks (`native/src/native/clock.h`) and convert them once a frame. Profiled race, same
+  window (td-130 before, td-133 after): hook time per draw 329 to 263 ns, game thread 12.5 to
+  12.2 ms in the median and 16.3 to 15.8 ms at p99, race 84.4 to 85.3 fps, 1 % low 49.3 to
+  52.9. td-134 compared 33.5 million draws with the guest's register shadow
+  (`--pgr4_native_track_verify`): none differed.
+- Fixes from a review of the renderer. Samplers are looked up by their exact 22-bit key (a 64-bit
+  mix of a 12-byte key could give two keys one sampler). A resolve to a mip level past the last
+  is rejected before it indexes the texture layout. A frame with more resolves than the
+  descriptor heap holds skips the excess instead of overwriting descriptors its earlier
+  dispatches still read. Events are owned handles, and the device does not start without its
+  fence event (given none, SetEventOnCompletion blocks the caller). The resolve self-test passes
+  (td-134).
+- The PGO profile is taken again from the current code (td-135; td-75's was stale in every
+  function changed since). Profiled race, same window (td-133 with the old profile, td-136 with
+  the new): race 85.3 to 87.5 fps, 1 % low 52.9 to 58.6, p99 16.7 to 15.1 ms, frames shown more
+  than half an interval late 118 of 3299 to 48 of 3449; game thread 12.2 to 11.6 ms in the
+  median and 15.8 to 14.8 ms at p99, render thread 9.8 to 9.0 ms; GPU clock 885 to 938 MHz,
+  with the APU at its power limit in 80 % of the samples (91 %). Against td-130, before the hook
+  changes: hook time per draw 329 to 242 ns, 1 % low 49.3 to 58.6.
+- `native/build.sh` installs by writing new files, so a running or sampled game keeps the
+  modules it loaded, and `deck-run.sh --perf` hard-links the modules it sampled next to the
+  profile (`<log>-perf-modules/`), so `perf_symbols.py` names the samples after a rebuild.
+- The render thread's command timers count time-stamp counter ticks and convert the sums once a
+  frame. NowNs, out of line behind a thread-safe static guard, was 1.6 % of the render thread's
+  samples at two calls per command (td-137). td-140: race 89.4 fps, 1 % low 59.6 (td-138: 89.3,
+  58.7), draw time 1931 ns per draw (1999).
+- The SSE2 paths (the register compare, the constant packing, the streaming constant upload and
+  its fence) use simde's names, which compile to the same instructions on x86-64 and to NEON on
+  ARM. td-140 ran the race on this build.
+- `--pgr4_native_anisotropy=<n>`: linearly filtered textures with mips get at least n-times
+  anisotropic filtering; render targets, lookup tables and point-sampled or single-level
+  textures keep the game's filtering. Off by default, so the image matches the console's. At 16
+  (td-141 against td-140): race 88.9 against 89.4 fps, 1 % low 59.7 against 59.6, game GPU time
+  86 % of the window against 84 % (fdinfo).
+
+## Why a native renderer can beat emulation
+
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
   makes about 3,300 draw calls per frame, and the Xenos plugin executes about 5,500 GPU draws
@@ -754,7 +801,9 @@ Under Proton the same Windows build runs as it is: start `pgr4_recompiled.exe` w
 | `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) |
 | `--pgr4_native_frame_latency=<n>` | 3 | Primary mode: the game thread begins a frame once the display showed the frame n before it (1-3; 0: the game's own vblank pacing) |
 | `--pgr4_native_low_latency` | true | With the frames paced on the display: begin each frame as late as the time recent frames waited for the display allows, so a frame limit lowers the latency |
-| `--pgr4_native_latency_margin_us=<n>` | 4000 | With `--pgr4_native_low_latency`: how long before the display shows a frame the GPU should have finished it || `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
+| `--pgr4_native_latency_margin_us=<n>` | 4000 | With `--pgr4_native_low_latency`: how long before the display shows a frame the GPU should have finished it |
+| `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
+| `--pgr4_native_anisotropy=<n>` | 1 | At least n-times anisotropic filtering (2, 4, 8, 16) for the game's linearly filtered textures with mips; 1: the game's own |
 | `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
 | `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
 | `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
@@ -785,7 +834,8 @@ It also has a texture untiling harness and an offline shader translation test. `
 Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads and
 other processes), `pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls
 and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
---server-trace`: wineserver requests per thread and second, by request).
+--server-trace`: wineserver requests per thread and second, by request). `deck-run.sh --perf`
+keeps the sampled modules in `<log>-perf-modules/` for `perf_symbols.py`.
 
 ## What's next
 
@@ -798,9 +848,11 @@ and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
   with the pad column to tell them from look-backs.
 - Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
 - Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
-  work per frame. Most frames shown late at 90 Hz now come in one stretch of the route where the
-  game thread takes 12-15 ms a frame under the power limit, the rest from single GPU spikes
-  (td-119, td-125 to td-128).
+  work per frame. Most frames shown late at 90 Hz now come in one stretch of the route (frames
+  19735-20074 of td-138) where the game thread takes 12.5-15.4 ms a frame under the power limit,
+  the rest from single GPU spikes. On the game thread the D3D state tracker's AfterCall (6.6 % of
+  its samples), the draw's Prepare (4.0 %) and the game's own SetTexture and SetStreamSource
+  (1.8 % each) lead (td-137).
 - Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
   pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
   compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
