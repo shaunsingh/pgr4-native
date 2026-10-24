@@ -668,6 +668,12 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   (profiled): the guest thread's p99 1675 against 2516 µs, max 2464 against 7600 µs, frames over
   16 ms 9 against 18. td-182 against td-176: race 89.5 against 89.4 fps, 1 % low 61.3 against
   59.2, 0.1 % low 45.3 against 45.3, p99 frame 14.08 against 14.67 ms.
+- The texture cache asks for 4 KB placement only for textures within D3D12's size rule (the
+  most detailed slice at most 64 KB, the estimate vkd3d-proton applies too). Outside it the
+  query only failed, and vkd3d-proton logged it twice: 343 textures in a race run, none now
+  (td-183). The PGO profile was retaken on this build: 0 stale profile warnings against 9.
+  td-184: race 89.5 fps, 1 % low 60.7, 0.1 % low 40.1, p99 frame 14.25 ms; its worst frames
+  wait about 16 ms on the swap fence, the GPU's time. td-185, the image check: 46.5-47.9 dB.
 ## Why a native renderer can beat emulation
 
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
