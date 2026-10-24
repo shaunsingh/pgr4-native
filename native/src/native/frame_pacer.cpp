@@ -9,14 +9,15 @@
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 
 namespace pgr4::native {
 
-FramePacer::FramePacer(const Options& options)
+FramePacer::FramePacer(Options options)
     : latency_(std::min(options.frame_latency, kMaxFrameLatency)),
       low_latency_(options.low_latency),
       margin_ns_(int64_t(options.latency_margin_ns)),
-      log_(options.log),
+      log_(std::move(options.log)),
       thread_stop_(CreateAutoResetEvent()),
       fence_event_(CreateAutoResetEvent()) {
   lag_ns_.fill(kNoLag);
@@ -27,13 +28,12 @@ FramePacer::FramePacer(const Options& options)
   if (!delay_execution_)
     sleep_timer_.reset(CreateWaitableTimerExW(
         nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS));
-  if (log_) std::fprintf(log_, "present,frame,ready_ms,shown_ms,delay_ms\n");
+  if (log_) log_->Append("present,frame,ready_ms,shown_ms,delay_ms\n");
 }
 
 FramePacer::~FramePacer() {
   Stop();
   Detach();
-  if (log_) std::fclose(log_);
 }
 
 void FramePacer::Attach(HANDLE waitable, ID3D12Fence* fence) {
@@ -101,11 +101,9 @@ void FramePacer::Run() {
     const int64_t delay = delay_ns_;
     lock.unlock();
     retired_cv_.notify_one();
-    if (log_) {
-      std::fprintf(log_, "%llu,%llu,%.3f,%.3f,%.3f\n", (unsigned long long)present,
+    if (log_)
+      log_->Printf("%llu,%llu,%.3f,%.3f,%.3f\n", (unsigned long long)present,
                    (unsigned long long)p.frame, p.ready_ns / 1e6, now / 1e6, delay / 1e6);
-      std::fflush(log_);
-    }
   }
 }
 

@@ -63,10 +63,11 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
-#include <cstdio>
+#include <memory>
 #include <mutex>
 #include <thread>
 
+#include "async_file.h"
 #include "win_handle.h"
 
 namespace pgr4::native {
@@ -82,11 +83,11 @@ class FramePacer {
     bool low_latency = true;  // the delay D above
     uint64_t latency_margin_ns = 4'000'000;
     // When not null: one "present,frame,ready_ms,shown_ms,delay_ms" row per present the display
-    // showed (NowNs clock), the pacer's own (closed with it).
-    std::FILE* log = nullptr;
+    // showed (NowNs clock).
+    std::unique_ptr<AsyncFile> log;
   };
 
-  explicit FramePacer(const Options& options);
+  explicit FramePacer(Options options);
   ~FramePacer();
   FramePacer(const FramePacer&) = delete;
   FramePacer& operator=(const FramePacer&) = delete;
@@ -152,7 +153,7 @@ class FramePacer {
   const uint32_t latency_;
   const bool low_latency_;
   const int64_t margin_ns_;
-  std::FILE* const log_;
+  const std::unique_ptr<AsyncFile> log_;
   UniqueHandle waitable_;           // render thread: the attached swapchain's
   ID3D12Fence* fence_ = nullptr;    // render thread: with waitable_
   const UniqueHandle thread_stop_;  // Detach ends the waiting thread with it
