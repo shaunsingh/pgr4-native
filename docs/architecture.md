@@ -49,8 +49,10 @@ window. Both render every frame, and captures compare the two front buffers by P
 
 With `--pgr4_native_primary` (which implies `--pgr4_native`), the native renderer presents into
 the game window. It sets `--gpu_skip_draws` (`patches/0031`), so the Xenos command processor
-still parses the stream and runs fences, interrupts and `EVENT_WRITE_ZPD`, but skips draws,
-copies, clears, shader loads and swaps.
+still parses the stream and runs fences and interrupts, but skips draws, copies, clears, shader
+loads and swaps. The renderer counts the game's occlusion queries itself (`occlusion`), and
+`occlusion_query_external` (`patches/0049`) keeps the command processor from writing fake
+counts into the query reports.
 
 The swapchain belongs to the game's top-level window, and `NativeRenderer::OwnGameWindow`
 disconnects ReXGlue's presenter from that window before creating it. Gamescope flips only a
@@ -150,6 +152,7 @@ Anything the render thread reads late must not change under it.
 | `pipeline_store` | The stored pipeline list and prewarm |
 | `present` | Front buffer to window (aspect fit, the display controller's gamma ramp, HDR10 output) and captures. `present_debug` holds the PNG writer, the glitch catcher and the luma probe |
 | `frame_pacer` | Frame pacing on the display |
+| `occlusion` | The game's occlusion queries (the light flares): host queries around each draw inside one, ZPass and pre-test coverage, written into the guest's reports at GetData |
 | `gpu_timer` | GPU time per pass (`--pgr4_native_gpu_timing`) |
 | `profile.h`, `clock` | TSC stage timers and counters (`--pgr4_native_profile`), and the CPU clock |
 | `async_file`, `log.h`, `win_handle.h`, `guest_memory.h` | Buffered file writer, bounded warnings, owned Win32 handles, and guest address translation with big-endian loads |
@@ -203,7 +206,9 @@ work in a cached scratch row and copy whole rows out.
 
 ## Known gaps
 
-- In primary mode the Xenos command processor answers occlusion queries (`EVENT_WRITE_ZPD`) with
-  a fake sample count, so everything the game tests for visibility counts as visible.
+- With the Xenos plugin (F9, or beside the native renderer) occlusion queries still report a fake
+  sample count: the SDK's D3D12 backend waits for no result, and the flares show through walls.
+- A draw inside an occlusion query that writes nothing and tests neither depth nor stencil is
+  skipped, so the query does not count its samples.
 - The game renders at 1280x720 and is shown letterboxed on a 1280x800 panel, never stretched.
   Native 16:10 needs a game patch, described in [development.md](development.md#native-1610).

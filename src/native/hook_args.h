@@ -26,6 +26,10 @@ enum class HookFn : uint32_t {
   // one per dirty mask +0..+32; shader load included), then writes the packets of the object's
   // chunk list (+116) into the push buffer. [INFERENCE: the XDK's D3DDevice_RunCommandBuffer.]
   kRunCommandBuffer = 0x826D6610,
+  // QueryIssue(query, flags) and QueryGetData(query, data, size, flags): the guest D3D's
+  // Direct3DQuery Issue and GetData (occlusion.h).
+  kQueryIssue = 0x826D2F00,
+  kQueryGetData = 0x826D3188,
 };
 
 // The guest D3D's predicated tiling calls a hooked call can be nested in. BeginTiling

@@ -8,6 +8,8 @@
 #include "draw.h"
 #include "frame_pacer.h"
 #include "gpu_timer.h"
+#include "guest_memory.h"
+#include "occlusion.h"
 #include "present.h"
 #include "profile.h"
 #include "render_targets.h"
@@ -73,6 +75,11 @@ REXCVAR_DEFINE_INT32(pgr4_native_submit_draws, 256, "PGR4 native",
                      "Submit the frame's commands every this many draws, so the GPU starts on them "
                      "while the rest of the frame is recorded (0: one submission per frame, at the "
                      "Swap)");
+REXCVAR_DEFINE_BOOL(pgr4_native_occlusion, true, "PGR4 native",
+                    "With --pgr4_native_primary: count the samples of the game's occlusion "
+                    "queries (the light flares) on the host, so lights behind walls and cars stay "
+                    "hidden; off, every query reports its whole draw visible")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(pgr4_native_renderer_switch, true, "PGR4 native",
                     "With --pgr4_native_primary, the key bind_renderer_switch (F9) switches "
                     "between the native renderer and the Xenos plugin at the next Swap");
@@ -224,7 +231,7 @@ struct NativeRenderer::Queue {
   // hand-over can wake the render thread (a syscall), so batches are large.
   static constexpr size_t kBatchCommands = 256;
 
-  enum Kind : uint8_t { kDraw, kClear, kResolve, kSwap };
+  enum Kind : uint8_t { kDraw, kClear, kResolve, kSwap, kQuery };
   struct Cmd {
     Kind kind;
     uint32_t index;    // into the batch's vector of that kind
@@ -255,6 +262,7 @@ struct NativeRenderer::Queue {
     std::vector<ClearCall> clears;
     std::vector<ResolveParams> resolves;
     std::vector<SwapCmd> swaps;
+    std::vector<QueryCall> queries;
     void Clear() {
       cmds.clear();
       regs.clear();
@@ -265,6 +273,7 @@ struct NativeRenderer::Queue {
       clears.clear();
       resolves.clear();
       swaps.clear();
+      queries.clear();
     }
   };
 
@@ -394,6 +403,17 @@ bool NativeRenderer::Initialize() {
   if (!draw_->Initialize()) return false;
   present_ = std::make_unique<Presenter>(*this);
   if (!present_->Initialize()) return false;
+  // Beside the Xenos plugin (debug window) the plugin's fake counts are the game's.
+  if (primary && REXCVAR_GET(pgr4_native_occlusion)) {
+    occlusion_ = std::make_unique<OcclusionQueries>();
+    if (!occlusion_->Initialize(device_->device()) ||
+        !rex::cvar::SetFlagByName("occlusion_query_external", "true")) {
+      REXLOG_ERROR(
+          "PGR4 native: occlusion queries unavailable (patches/0049 missing?); every query "
+          "reports its draw visible");
+      occlusion_.reset();
+    }
+  }
   // Only once native is up: from here the Xenos plugin does no draw, copy or swap work, and its
   // command processor only runs fences, write-backs and interrupts.
   if (primary && !rex::cvar::SetFlagByName("gpu_skip_draws", "true"))
@@ -514,6 +534,9 @@ void NativeRenderer::RenderThreadMain() {
           break;
         case Queue::kResolve:
           ExecuteResolve(b->resolves[c.index]);
+          break;
+        case Queue::kQuery:
+          ExecuteQuery(b->queries[c.index]);
           break;
         case Queue::kSwap: {
           const Queue::SwapCmd& s = b->swaps[c.index];
@@ -716,6 +739,25 @@ void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
   if (swap.hand_over || g_failed) HandOver(base, args.device);
 }
 
+void NativeRenderer::OnQueryIssue(const uint8_t* base, const HookArgs& args) {
+  // D3DQUERYTYPE_OCCLUSION at query+4, and D3DISSUE_END / D3DISSUE_BEGIN; QueryIssue takes BEGIN
+  // when both are set.
+  constexpr uint32_t kTypeOcclusion = 9, kIssueEnd = 1, kIssueBegin = 2;
+  if (!occlusion_ || g_failed) return;
+  const uint32_t query = args.r[0], flags = args.r[1];
+  if (!query || Load32(base, query + 4) != kTypeOcclusion || !(flags & (kIssueBegin | kIssueEnd)))
+    return;
+  const QueryCall c = {query, !(flags & kIssueBegin)};
+  if (!queue_) return ExecuteQuery(c);
+  Queue::Batch& b = *queue_->current;
+  b.queries.push_back(c);
+  queue_->Push(Queue::kQuery, uint32_t(b.queries.size() - 1));
+}
+
+void NativeRenderer::OnQueryGetData(uint8_t* base, const HookArgs& args) {
+  if (occlusion_) occlusion_->WriteResult(base, args.r[0]);
+}
+
 void NativeRenderer::OnSwapSuspended() {
   if (SwitchRequested()) TakeBack();
 }
@@ -731,6 +773,7 @@ void NativeRenderer::HandOver(uint8_t* base, uint32_t device) {
   // of it.
   MarkAllDirty(base, device);
   rex::cvar::SetFlagByName("gpu_skip_draws", "false");
+  if (occlusion_) rex::cvar::SetFlagByName("occlusion_query_external", "false");
   // The plugin presents on its own: the game waits for its vblanks again.
   paces_frames_.store(false, std::memory_order_relaxed);
   live_.store(nullptr, std::memory_order_relaxed);
@@ -745,6 +788,7 @@ void NativeRenderer::TakeBack() {
   // takes the game window back (OwnGameWindow), and the pacing with it.
   GuestState().Resync();
   rex::cvar::SetFlagByName("gpu_skip_draws", "true");
+  if (occlusion_) rex::cvar::SetFlagByName("occlusion_query_external", "true");
   live_.store(this, std::memory_order_release);
   REXLOG_INFO("PGR4 native: renderer switch: native draws");
 }
@@ -792,6 +836,13 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   resolver_->Resolve(device_->command_list(), p);
   draw_->InvalidateListState();
   resolve_ticks_ += Ticks() - t0;
+}
+
+void NativeRenderer::ExecuteQuery(const QueryCall& q) {
+  if (q.end)
+    occlusion_->End(q.query, device_->frame_fence());
+  else
+    occlusion_->Begin(q.query);
 }
 
 // With one submission per frame the GPU idles from the end of a frame until the render thread
@@ -885,6 +936,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_untile_ns = NowNs() - u0;
   draw_->BeforeSubmit();
   const uint64_t fence = d.frame_fence();
+  if (occlusion_) occlusion_->Resolve(d.command_list(), fence);
   if (!CloseUploadLists() || !d.EndFrame(shown, upload_lists_)) return Fail();
   const D3D12Device::EndFrameTimes& et = d.end_frame_times();
   stats_.swap_submit_ns = et.submit_ns;
@@ -909,6 +961,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
     }
   }
   textures_->Retire(completed);
+  if (occlusion_) occlusion_->Retire(completed);
   draw_->EndFrame(completed);
   resolver_->AfterSwap();
   present_->AfterEndFrame();

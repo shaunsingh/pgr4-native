@@ -49,6 +49,7 @@ class D3D12Device;
 class DrawRenderer;
 class FramePacer;
 class GpuTimer;
+class OcclusionQueries;
 class Presenter;
 class RenderTargets;
 class Resolver;
@@ -112,6 +113,10 @@ class NativeRenderer {
   void OnClear(const uint8_t* base, const HookArgs& args);
   void OnResolve(const uint8_t* base, const HookArgs& args);
   void OnSwap(uint8_t* base, const HookArgs& args);
+  // Occlusion queries (occlusion.h), primary mode: after QueryIssue returned, and at the entry
+  // of GetData.
+  void OnQueryIssue(const uint8_t* base, const HookArgs& args);
+  void OnQueryGetData(uint8_t* base, const HookArgs& args);
   // A Swap while the Xenos plugin draws (Live() is null): the renderer switch takes the game
   // back.
   void OnSwapSuspended();
@@ -132,6 +137,8 @@ class NativeRenderer {
   TextureCache& textures() { return *textures_; }
   RenderTargets& render_targets() { return *rt_; }
   Resolver& resolver() { return *resolver_; }
+  // The game's occlusion queries, counted by the draws; nullptr when they are not.
+  OcclusionQueries* occlusion() { return occlusion_.get(); }
 
   ~NativeRenderer();
 
@@ -159,6 +166,11 @@ class NativeRenderer {
   void ExecuteClear(const ClearCall& clear);
   void ExecuteResolve(const ResolveParams& p);
   void ExecuteSwap(const SwapCall& swap);
+  struct QueryCall {
+    uint32_t query;
+    bool end;
+  };
+  void ExecuteQuery(const QueryCall& q);
   // After a draw: submits the frame so far once --pgr4_native_submit_draws draws were recorded
   // since the last submission.
   void SubmitEarly();
@@ -213,6 +225,7 @@ class NativeRenderer {
   std::unique_ptr<TextureCache> textures_;
   std::unique_ptr<DrawRenderer> draw_;
   std::unique_ptr<Presenter> present_;
+  std::unique_ptr<OcclusionQueries> occlusion_;  // primary mode with --pgr4_native_occlusion
   // Primary mode with --pgr4_native_frame_latency > 0, or observing only with --pgr4_native_csv.
   std::unique_ptr<FramePacer> pacer_;
   GpuTimer* gpu_timer_ = nullptr;  // device_'s, with --pgr4_native_gpu_timing

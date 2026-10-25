@@ -12,6 +12,7 @@
 
 #include "geometry_shader.h"
 #include "log.h"
+#include "occlusion.h"
 #include "pipeline_store.h"
 #include "profile.h"
 #include "render_targets.h"
@@ -1160,6 +1161,11 @@ struct DrawRenderer::Impl {
   Pipeline* GetPipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
                         const DxbcShader::Translation* ps, uint32_t variant,
                         bool background = false);
+  // `key`'s pipeline with the depth and stencil tests off and nothing written, for the coverage
+  // of a draw inside an occlusion query (occlusion.h). Compiles in the background; nullptr until
+  // it is ready.
+  ID3D12PipelineState* CoveragePipeline(const PipelineKey& key, const DxbcShader::Translation& vs,
+                                        const DxbcShader::Translation* ps);
   // Moves a pipeline's prewarm job, if no worker has taken it yet, to the draw queue: a draw
   // waits for it now.
   void PromotePipeline(Pipeline* p);
@@ -2870,6 +2876,23 @@ void DrawRenderer::Impl::LogDraw(const DrawState& s, const RegisterFile& regs, u
   }
 }
 
+ID3D12PipelineState* DrawRenderer::Impl::CoveragePipeline(const PipelineKey& key,
+                                                          const DxbcShader::Translation& vs,
+                                                          const DxbcShader::Translation* ps) {
+  PipelineKey c = key;
+  c.depth_enable = 1;
+  c.depth_write = 0;
+  c.depth_func = D3D12_COMPARISON_FUNC_ALWAYS;
+  c.stencil_enable = 0;
+  c.stencil_read_mask = c.stencil_write_mask = 0;
+  std::memset(c.front, 0, sizeof(c.front));
+  std::memset(c.back, 0, sizeof(c.back));
+  for (PipelineKey::Rt& rt : c.rt) rt = PipelineKey::Rt{};
+  const uint64_t hash = XXH3_64bits(&c, sizeof(c));
+  Pipeline* const p = GetPipeline(hash, c, vs, ps, 0, /*background=*/true);
+  return p->state.load(std::memory_order_acquire) == kReady ? p->pso.Get() : nullptr;
+}
+
 ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
     const PipelineKey& key, const DxbcShader::Translation& vst, const DxbcShader::Translation* pst,
     DxbcShader*& vs, DxbcShader*& ps, DxbcShader* vs_generic, DxbcShader* ps_generic,
@@ -3411,7 +3434,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   for (uint32_t i = 0; i < 4; ++i)
     if ((color_mask >> (4 * i)) & 0xF) rt_mask |= 1u << i;
   if (!rt_mask && !depth_used) {
-    ++stats.skipped;  // nothing to write (no occlusion query emulation yet)
+    ++stats.skipped;  // nothing to write or test, so an occlusion query does not count it
     return;
   }
   Scissor scissor;
@@ -3472,6 +3495,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     key.slope_scaled_depth_bias = 0;
   }
   const DxbcShader* const vs_selected = vs;
+  const DxbcShader* const ps_selected = ps;
   ID3D12PipelineState* const pso = SelectPipeline(key, *vst, pst, vs, ps, vs_generic, ps_generic,
                                                   mods.pixel, generic_pixel_mod, sdr, prim);
   if (draw_log)
@@ -3622,6 +3646,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     bound_rt_count = key.num_rts;
   }
 
+  uint32_t draw_count = count, first_index = 0;
+  bool draw_indexed = true;
   if (fan) {
     if (count < 3) {
       ++stats.skipped;
@@ -3639,7 +3665,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     ibv.Format = f.wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     list->IASetIndexBuffer(&ibv);
     bound_ibv = ibv;
-    list->DrawIndexedInstanced(f.count, 1, 0, 0, 0);
+    draw_count = f.count;
   } else if (s.indexed) {
     // The whole shared memory buffer is the index buffer and the draw starts at the guest
     // address, so consecutive draws only rebind it when the index format changes.
@@ -3653,9 +3679,39 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       list->IASetIndexBuffer(&ibv);
       bound_ibv = ibv;
     }
-    list->DrawIndexedInstanced(count, 1, aligned ? s.index_address / index_size : 0, 0, 0);
+    first_index = aligned ? s.index_address / index_size : 0;
   } else {
-    list->DrawInstanced(count, 1, 0, 0);
+    draw_indexed = false;
+  }
+  auto issue = [&] {
+    if (draw_indexed)
+      list->DrawIndexedInstanced(draw_count, 1, first_index, 0, 0);
+    else
+      list->DrawInstanced(draw_count, 1, 0, 0);
+  };
+  OcclusionQueries* const occlusion = r.occlusion();
+  const uint32_t pair =
+      occlusion && occlusion->counting() ? occlusion->Acquire() : OcclusionQueries::kNoPair;
+  if (pair == OcclusionQueries::kNoPair) {
+    issue();
+  } else {
+    occlusion->BeginPass(list, pair);
+    issue();
+    occlusion->EndPass(list, pair);
+    // Without a depth target nothing is tested, and every sample passes. A generic pipeline's
+    // shaders differ from the key's, which the bindings were made for.
+    ID3D12PipelineState* const cover =
+        key.dsv != DXGI_FORMAT_UNKNOWN && vs == vs_selected && ps == ps_selected
+            ? CoveragePipeline(key, *vst, pst)
+            : nullptr;
+    occlusion->BeginCoverage(list, pair);
+    if (cover) {
+      list->SetPipelineState(cover);
+      bound_pso = cover;
+      if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
+      issue();
+    }
+    occlusion->EndCoverage(list, pair, cover != nullptr);
   }
   ++stats.draws;
   ++diag.draws;

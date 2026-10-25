@@ -130,7 +130,8 @@ constexpr FnId kFnSwap = kFn_826CB148, kFnResolve = kFn_826CBEE0, kFnCreateDevic
                kFnMakeSpace = kFn_826CE8C0, kFnBeginVertices = kFn_826CFA60,
                kFnRestorePush = kFn_826CFF00, kFnDrawVerticesUP = kFn_826CFF10,
                kFnDrawVertices = kFn_826CFF58, kFnDrawIndexed = kFn_826D0340,
-               kFnClear = kFn_826D1A08, kFnBeginTiling = kFn_826D1C38, kFnEndTiling = kFn_826D20D0;
+               kFnClear = kFn_826D1A08, kFnBeginTiling = kFn_826D1C38, kFnEndTiling = kFn_826D20D0,
+               kFnQueryIssue = kFn_826D2F00, kFnQueryGetData = kFn_826D3188;
 
 // The five draw builders, which every game draw goes through.
 constexpr FnId kDrawCounterFns[] = {kFnBeginVertices, kFnDrawVertices, kFnDrawIndexed, kFn_826D0798,
@@ -1075,7 +1076,8 @@ inline void OnCall(PPCContext& ctx, uint8_t* base, Run run) {
 // clears through a nested ClearF, which must reach OnClear). A top-level BeginVertices only
 // reserves space: the game writes the vertices after it returns, so its OnDraw is held until
 // the entry of RestorePush (EndVertices) or of the next hooked call that is not a pass-through.
-enum NativeClass : uint8_t { kNatNone, kNatDraw, kNatClear, kNatResolve, kNatSwap };
+// The query calls reach it at every depth (native/occlusion.h).
+enum NativeClass : uint8_t { kNatNone, kNatDraw, kNatClear, kNatResolve, kNatSwap, kNatQuery };
 
 constexpr NativeClass NativeClassOf(Cat c) {
   switch (c) {
@@ -1087,6 +1089,8 @@ constexpr NativeClass NativeClassOf(Cat c) {
       return kNatResolve;
     case kSwap:
       return kNatSwap;
+    case kQuery:
+      return kNatQuery;
     default:
       return kNatNone;
   }
@@ -1261,7 +1265,15 @@ inline void OnHook(PPCContext& ctx, uint8_t* base) {
     return;
   }
   if constexpr (!HasFastPath(kId)) QueuePendingVertices(r, base);
-  if constexpr (kClass == kNatNone) {
+  if constexpr (kClass == kNatQuery) {
+    // GetData reads the result the renderer writes at its entry; an Issue reaches the renderer
+    // once the guest D3D has recorded it.
+    static_assert(kId == kFnQueryIssue || kId == kFnQueryGetData);
+    const nat::HookArgs a = EntryArgs(kAddr, ctx);
+    if constexpr (kId == kFnQueryGetData) r->OnQueryGetData(base, a);
+    OnCall<kId>(ctx, base, run);
+    if constexpr (kId == kFnQueryIssue) r->OnQueryIssue(base, a);
+  } else if constexpr (kClass == kNatNone) {
     if constexpr (kId == kFnBeginTiling || kId == kFnEndTiling) {
       const nat::TilingCall outer = t_tiling_call;
       t_tiling_call = kId == kFnBeginTiling ? nat::TilingCall::kBegin : nat::TilingCall::kEnd;

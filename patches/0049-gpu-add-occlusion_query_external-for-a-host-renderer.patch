@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sun, 25 Oct 2026 17:02:15 -0400
+Subject: [PATCH 49/49] feat(gpu): add occlusion_query_external for a host renderer
+ that counts samples itself
+
+A host renderer that draws the guest's frames outside the command
+processor (gpu_skip_draws) can count the samples of the title's occlusion
+queries itself, but EVENT_WRITE_ZPD overwrote its reports: at END the
+command processor replaces the D3D's 0xFFFFFEED marker with a fake count
+(query_occlusion_fake_sample_count, or 1000 with gpu_skip_draws), so every
+query reported its whole draw visible, and PGR4 drew its light flares
+through walls and cars.
+
+With occlusion_query_external, EVENT_WRITE_ZPD only writes back its
+initiator and leaves the reports to the host renderer, in the base command
+processor and in the D3D12 and Vulkan backends. The cvar is
+hot-reloadable, so the renderer can hand the queries back when it hands
+the game to the backend. It defaults to false.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -31,6 +31,7 @@
+ REXCVAR_DECLARE(bool, readback_memexport_fast);
+ REXCVAR_DECLARE(bool, occlusion_query_enable);
+ REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
++REXCVAR_DECLARE(bool, occlusion_query_external);
+ 
+ // GPU Depth / Render Target Behavior
+ REXCVAR_DECLARE(bool, depth_float24_round);
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -110,6 +110,12 @@
+                     "memory write-backs and interrupts still run")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(occlusion_query_external, false, "GPU",
++                    "A host renderer that draws the guest's frames itself writes the results of "
++                    "its occlusion queries: EVENT_WRITE_ZPD leaves the guest's sample count "
++                    "reports alone")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(gpu_stream_stats, false, "GPU",
+                     "Write PM4 draw path statistics (draws by indirect buffer depth, reused "
+                     "indirect buffers, predication and tiles, resolves) to gpu_stream_stats_file "
+@@ -1632,6 +1638,10 @@
+   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+   // Writeback initiator.
+   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
++  // The reports, and the D3D's 0xFFFFFEED marking an unfinished one, are the host renderer's.
++  if (REXCVAR_GET(occlusion_query_external)) {
++    return true;
++  }
+ 
+   // Occlusion queries:
+   // This command is send on query begin and end.
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -155,7 +155,7 @@
+ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                uint32_t packet, uint32_t count) {
+   if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
+-      REXCVAR_GET(gpu_skip_draws)) {
++      REXCVAR_GET(gpu_skip_draws) || REXCVAR_GET(occlusion_query_external)) {
+     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+   }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -648,7 +648,8 @@
+ 
+ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
+                                                                 uint32_t packet, uint32_t count) {
+-  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_) {
++  if (!REXCVAR_GET(occlusion_query_enable) || !occlusion_query_resources_available_ ||
++      REXCVAR_GET(occlusion_query_external)) {
+     return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+   }
+ 
+-- 
+2.47.0
+
