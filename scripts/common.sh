@@ -61,6 +61,17 @@ signal_prefix_games() {
   (( ${#pids[@]} == 0 )) || kill "-$1" "${pids[@]}" 2>/dev/null || true
 }
 
+# Kills every process Proton started in the Wine prefix $1, its wineserver included. A
+# winedevice.exe can outlive its wineserver (gamescope's reaper keeps it) and then spins a core
+# until killed. Proton sets WINEPREFIX for what it starts, so the scripts' own helpers, which
+# carry only STEAM_COMPAT_DATA_PATH, are left alone.
+kill_prefix() {
+  local pids
+  mapfile -t pids < <(grep -lxzF -e "WINEPREFIX=$1/pfx" -e "WINEPREFIX=$1/pfx/" \
+    /proc/[0-9]*/environ 2>/dev/null | cut -d/ -f3)
+  (( ${#pids[@]} == 0 )) || kill -KILL "${pids[@]}" 2>/dev/null || true
+}
+
 # A fresh save: user data directory $1 emptied but for cache/ (the shader caches).
 fresh_save() { find "$1" -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} +; }
 

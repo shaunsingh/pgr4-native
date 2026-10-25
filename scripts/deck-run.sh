@@ -209,6 +209,7 @@ stop_game() {
   WINEPREFIX=$top/prefix/pfx "$proton/files/bin/wineserver" -k 2>/dev/null || true
   sleep 2
   signal_prefix_games KILL "$top/prefix"
+  kill_prefix "$top/prefix"
   # gamescope exits by itself once the game is gone, and ignores SIGTERM when it does not.
   if [[ -n ${gamescope:-} ]] && kill -0 "$gamescope" 2>/dev/null; then
     kill "$gamescope" 2>/dev/null || true

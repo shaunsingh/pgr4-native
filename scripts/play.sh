@@ -82,6 +82,13 @@ runtime=$top/runtime
 [[ -f $game/default.xex ]] || { echo "no game files in $game (set PGR4_GAME)" >&2; exit 1; }
 check_no_game
 find_proton
+# The prefix's processes once no title runs in it: an earlier session's that outlived it.
+end_prefix() {
+  [[ -z $(prefix_title_pids "$top/prefix") ]] || return 0
+  WINEPREFIX=$top/prefix/pfx "$proton/files/bin/wineserver" -k 2>/dev/null || true
+  kill_prefix "$top/prefix"
+}
+end_prefix
 
 mkdir -p "$top/logs" "$top/prefix" "$top/userdata" "$top/cache" "$top/captures"
 stamp=$(date +%Y%m%d-%H%M%S)
@@ -180,5 +187,6 @@ if [[ $debug != 0 ]]; then
       > "${data%.data}.txt" 2>&1 || true
   done
 fi
+end_prefix
 echo "game exited with $status at $(date +%T)" >> "$base-stdout.log"
 exit "$status"
