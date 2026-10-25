@@ -9,7 +9,7 @@ programs come from its run/runtime, the libraries' license texts from its ReXGlu
 repository), holds one folder of that name with the programs, their settings
 (native/release/*.toml), the player README (native/release/README.md), the licenses, and
 LICENSES/SOURCE.txt: the commits the program was built from, which the LGPL of FFmpeg and
-libmspack asks for. The player adds game/ and title-update/ (README.md).
+libmspack asks for. The player adds game/, with the title update in game/Content/ (README.md).
 
 The package refuses game data and anything else outside the list, an instrumented (PGO --pgo
 gen) build, and a runtime DLL linked with a library LICENSES below does not cover. Entries are

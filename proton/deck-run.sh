@@ -72,8 +72,9 @@
 # both and captures their front buffers 5, 10 and 15 s after the race mark, or at
 # the seconds after the mark that --captures lists (ascending, fractions allowed).
 # --mode release runs an unpacked release (native/tools/package_release.py) as a player starts
-# it: its own pgr4_recompiled.toml, and game/, title-update/ and userdata/ beside the exe (a
-# fresh save), with only the route's keyboard input and the measurement flags added.
+# it: its own pgr4_recompiled.toml, and game/ (the title update as a package in game/Content/,
+# or extracted in title-update/) and userdata/ beside the exe (a fresh save), with only the
+# route's keyboard input and the measurement flags added.
 # --stretch scales every delay of the route, for a machine that loads slower than the PC it was
 # timed on. --cpus pins the game with taskset. Logs: ~/pgr4-proton/logs/.
 set -euo pipefail

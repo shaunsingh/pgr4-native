@@ -3,7 +3,7 @@
 # Steam Deck), cross-compiled for Windows x64 with clang-cl and lld-link against an xwin splat of
 # the MSVC CRT and Windows SDK. The result runs under Proton, or on Windows.
 #
-#   native/build.sh [--stage sdk,game,install] [--dest DIR] [--game DIR] [--update DIR]
+#   native/build.sh [--stage sdk,game,install] [--dest DIR] [--game DIR] [--update PATH]
 #                   [--jobs N] [--march x86-64-v3] [--mtune znver2] [--pgo gen|off|FILE] [--force]
 #
 # Stages, in order (default: all):
@@ -19,9 +19,10 @@
 #   install  $dest/run/runtime: both executables, rexruntime.dll, rexgpu-xenos.dll, and
 #            title-update/ (the runtime's update:\ when no --update_data_root is given).
 #
-# --update DIR holds the player's copy of Title Update #2's two files, default.xexp and
-# Pgr4TitleUpdate.bin, which title-update/game-files.sha256 identifies: the generated code
-# matches only that update.
+# --update PATH is the player's copy of Title Update #2: its package as downloaded
+# (TU_16L61VP_0000004000000.00000000000G1), extracted into $dest/title-update with the SDK's
+# `rexglue vfs-dump`, or a folder that holds its two files, default.xexp and Pgr4TitleUpdate.bin.
+# title-update/game-files.sha256 identifies the two: the generated code matches only that update.
 #
 # --march / --mtune set the target CPU of the SDK and the game. The default is the Steam Deck's
 # Zen 2: x86-64-v3 brings FMA (the recompiled code's thousands of std::fma calls become one
@@ -137,7 +138,15 @@ step() {
 }
 need() { local f; for f in "$@"; do [[ -e $f ]] || { echo "missing $f" >&2; exit 1; }; done; }
 # The player's Title Update #2 files in $update, checked against the ones the code is generated for.
+# A package is extracted first, every time: it takes no time, and its files reach the game data
+# and the install only when they differ.
 need_update() {
+  if [[ -f $update ]]; then
+    need "$host_rexglue"
+    rm -rf "$dest/title-update"
+    "$host_rexglue" vfs-dump "$update" "$dest/title-update"
+    update=$dest/title-update
+  fi
   (cd "$update" && sha256sum --quiet -c "$title_update/game-files.sha256") ||
     { echo "$update: not Title Update #2's files (title-update/README.md)" >&2; exit 1; }
 }

@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Sat, 24 Oct 2026 20:45:48 -0400
+Subject: [PATCH 33/34] system: install title update packages and apply the
+ installed title update
+
+A title update comes as an STFS package of content type 0x000B0000
+(kInstaller), like the console's TU_* files. ReXApp's content_root
+installs only marketplace packages, ContentManager::InstallContent files
+every package as marketplace content of the running title, and nothing
+applies an installed update: UserModule::LoadFromFile finds an XEX patch
+only beside the XEX or in an update data folder of extracted files.
+
+Port Xenia Canary's model. Like Canary's InstallContentPackage,
+InstallContent takes the title and content type from the package header,
+so a title update lands in <xuid 0>/<title>/000B0000/ where
+ListContent(kInstaller) finds it. ReXApp installs DLC and title update
+packages from content_root before the executable loads (the header names
+each package's title, so no title ID is needed yet). When the module has
+no sibling patch and no update: folder is mounted, LoadFromFile opens the
+title update installed for the module's title as UPDATE: and looks for
+the patch there, as Canary's KernelState::FindTitleUpdate and
+LoadTitleUpdate do; the mount stays, since titles read their update data
+files from update:. An update data folder keeps precedence. Canary's
+apply_title_update cvar (default true) turns all of it off, for a title
+recompiled from the base image.
+
+OpenContent read the license mask from the header path of the running
+title, which the executable defines; it now uses the content's own title,
+which is the same for every caller so far and is known before the
+executable is set.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+ include/rex/system/user_module.h         |  3 +++
+ include/rex/system/xam/content_manager.h |  4 +--
+ src/system/user_module.cpp               | 31 +++++++++++++++++++++---
+ src/system/xam/content_manager.cpp       | 17 +++++++------
+ src/ui/rex_app.cpp                       | 27 +++++++++++----------
+ 5 files changed, 56 insertions(+), 26 deletions(-)
+
+diff --git a/include/rex/system/user_module.h b/include/rex/system/user_module.h
+index 49c7696..bd451af 100644
+--- a/include/rex/system/user_module.h
++++ b/include/rex/system/user_module.h
+@@ -12,6 +12,7 @@
+ 
+ #include <string>
+ 
++#include <rex/cvar.h>
+ #include <rex/system/util/xex2_info.h>
+ #include <rex/system/xex_module.h>
+ #include <rex/system/xmodule.h>
+@@ -27,6 +28,8 @@ class XThread;
+ }  // namespace system
+ }  // namespace rex
+ 
++REXCVAR_DECLARE(bool, apply_title_update);
++
+ namespace rex::system {
+ 
+ class UserModule : public XModule {
+diff --git a/include/rex/system/xam/content_manager.h b/include/rex/system/xam/content_manager.h
+index 949d185..b865787 100644
+--- a/include/rex/system/xam/content_manager.h
++++ b/include/rex/system/xam/content_manager.h
+@@ -178,8 +178,8 @@ class ContentManager {
+   std::filesystem::path GetOpenPackagePath(const std::string_view root_name) const;
+ 
+   // Installs an STFS content package from an arbitrary host path.
+-  // Extracts the package into root_path_/0000000000000000/{title_id}/00000002/{filename}/
+-  // and writes a .header file for XAM enumeration.
++  // Extracts the package into root_path_/0000000000000000/{title_id}/{content_type}/{filename}/,
++  // the title and content type its header names, and writes a .header file for XAM enumeration.
+   X_RESULT InstallContent(const std::filesystem::path& package_path);
+ 
+  private:
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 523ac0c..7173023 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -20,12 +20,31 @@
+ #include <rex/system/function_dispatcher.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
++#include <rex/system/xam/content_manager.h>
+ #include <rex/system/xex_module.h>
+ #include <rex/system/xfile.h>
+ #include <rex/system/xthread.h>
+ 
++REXCVAR_DEFINE_BOOL(apply_title_update, true, "Kernel", "Apply title updates.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::system {
+ 
++namespace {
++
++// Mounts the title update installed for title_id as update:, as Xenia Canary's
++// KernelState::FindTitleUpdate and LoadTitleUpdate do. It stays mounted: the title reads its
++// data files there too.
++bool OpenTitleUpdate(KernelState* kernel_state, uint32_t title_id) {
++  auto* content = kernel_state->content_manager();
++  const auto updates = content->ListContent(1, 0, XContentType::kInstaller, title_id);
++  uint32_t license = 0;
++  return !updates.empty() &&
++         content->OpenContent("UPDATE", 0, updates.front(), license) == X_ERROR_SUCCESS;
++}
++
++}  // namespace
++
+ UserModule::UserModule(KernelState* kernel_state)
+     : XModule(kernel_state, ModuleType::kUserModule) {}
+ 
+@@ -104,13 +123,17 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+   }
+ 
+   // Search for sibling XEX patch file, then, as Xenia loads title updates, for the module's path
+-  // within game: under update:.
++  // within game: under update:, which is the update data folder or, without one, the title update
++  // installed for the module's title.
+   auto* file_system = kernel_state_->file_system();
+   auto patch_entry = file_system->ResolvePath(path_ + "p");
+   std::string game_mount, update_mount;
+-  if (!patch_entry && file_system->FindSymbolicLink("game:", game_mount) &&
+-      file_system->FindSymbolicLink("update:", update_mount) &&
+-      rex::string::utf8_starts_with_case(path_, game_mount)) {
++  if (!patch_entry && REXCVAR_GET(apply_title_update) &&
++      file_system->FindSymbolicLink("game:", game_mount) &&
++      rex::string::utf8_starts_with_case(path_, game_mount) &&
++      (file_system->FindSymbolicLink("update:", update_mount) ||
++       (OpenTitleUpdate(kernel_state_, title_id()) &&
++        file_system->FindSymbolicLink("update:", update_mount)))) {
+     std::string_view relative_path = std::string_view(path_).substr(game_mount.size());
+     while (!relative_path.empty() && relative_path.front() == '\\') {
+       relative_path.remove_prefix(1);
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index d0c7bfd..8bf2d4d 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -300,8 +300,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+   }
+   auto package = ResolvePackage(root_name, xuid, data);
+   assert_not_null(package);
+-  package->LoadPackageLicenseMask(ResolvePackageHeaderPath(
+-      data.file_name(), xuid, kernel_state_->title_id(), data.content_type));
++  // data's title, not the running one: a title update opens before the executable is set.
++  package->LoadPackageLicenseMask(
++      ResolvePackageHeaderPath(data.file_name(), xuid, data.title_id, data.content_type));
+   content_license = package->GetPackageLicense();
+ 
+   {
+@@ -582,19 +583,21 @@ X_RESULT ContentManager::InstallContent(const std::filesystem::path& package_pat
+     return X_ERROR_ACCESS_DENIED;
+   }
+ 
+-  // Derive install destination:
+-  // root_path_/0000000000000000/{title_id}/00000002/{filename}/
++  // Install destination, from the package's own title and content type, as Xenia Canary's
++  // InstallContentPackage takes them: DLC and a title update go where the title enumerates each.
++  // root_path_/0000000000000000/{title_id}/{content_type}/{filename}/
+   auto file_name = rex::path_to_utf8(package_path.filename());
++  const auto& metadata = device->header().metadata;
+ 
+   XCONTENT_AGGREGATE_DATA content_data;
+   content_data.device_id = static_cast<uint32_t>(DummyDeviceId::HDD);
+-  content_data.content_type = XContentType::kMarketplaceContent;
+-  content_data.title_id = kernel_state_->title_id();
++  content_data.content_type = metadata.content_type;
++  content_data.title_id = metadata.execution_info.title_id;
+   content_data.xuid = 0;
+   content_data.set_file_name(file_name);
+ 
+   // Read display name from STFS metadata
+-  auto display_name = device->header().metadata.display_name(rex::system::XLanguage::kEnglish);
++  auto display_name = metadata.display_name(rex::system::XLanguage::kEnglish);
+   if (!display_name.empty()) {
+     content_data.set_display_name(display_name);
+   } else {
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index a212087..f09d09b 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -59,17 +59,18 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_STRING(content_root, "", "Content",
+-                      "Folder of content packages (DLC as copied off a console) installed for the "
+-                      "title at startup; default: <game_data_root>/Content")
++                      "Folder of content packages (DLC and title updates as copied off a console) "
++                      "installed at startup; default: <game_data_root>/Content")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex {
+ 
+ namespace {
+ 
+-// Installs the title's marketplace packages (DLC) found in content_root that are not installed
+-// yet. A package counts as installed once its .header is written, the last step of
+-// InstallContent, so an interrupted install is redone.
++// Installs the packages of DLC and title updates found in content_root that are not installed
++// yet, each for the title its header names. It runs before the executable loads, which applies an
++// installed title update. A package counts as installed once its .header is written, the last
++// step of InstallContent, so an interrupted install is redone.
+ void InstallContentPackages(system::KernelState& kernel_state,
+                             const std::filesystem::path& game_data_root) {
+   const std::string root_cvar = REXCVAR_GET(content_root);
+@@ -80,7 +81,6 @@ void InstallContentPackages(system::KernelState& kernel_state,
+     return;
+   }
+   auto* content = kernel_state.content_manager();
+-  const uint32_t title_id = kernel_state.title_id();
+   for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+     if (!entry.is_regular_file(ec)) {
+       continue;
+@@ -90,14 +90,14 @@ void InstallContentPackages(system::KernelState& kernel_state,
+       continue;
+     }
+     const auto& metadata = package.header().metadata;
+-    if (metadata.content_type != system::XContentType::kMarketplaceContent ||
+-        metadata.execution_info.title_id != title_id) {
++    const system::XContentType content_type = metadata.content_type;
++    if (content_type != system::XContentType::kMarketplaceContent &&
++        content_type != system::XContentType::kInstaller) {
+       continue;
+     }
+     const auto file_name = path_to_utf8(entry.path().filename());
+     system::xam::XCONTENT_AGGREGATE_DATA installed;
+-    if (content->ReadContentHeaderFile(file_name, 0, title_id,
+-                                       system::XContentType::kMarketplaceContent,
++    if (content->ReadContentHeaderFile(file_name, 0, metadata.execution_info.title_id, content_type,
+                                        installed) == X_ERROR_SUCCESS) {
+       continue;
+     }
+@@ -352,6 +352,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     }
+   }
+ 
++  InstallContentPackages(*runtime_->kernel_state(), paths.game_data_root);
++
+   status = runtime_->LoadXexImage(xex_image);
+   if (XFAILED(status)) {
+     auto msg = fmt::format("Failed to load XEX ({}): {:08X}", xex_image, status);
+@@ -367,7 +369,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+       module->xex_module()->image_size() != ppc_info_.image_size) {
+     auto msg = fmt::format(
+         "{} loads as a {:#x}-byte image, but the code was recompiled from a {:#x}-byte one. "
+-        "Is the title update it was generated with in place (update data: '{}')?",
++        "Is the title update it was generated with in place, as a package in the content folder "
++        "or extracted in the update data folder ('{}')?",
+         xex_image, module->xex_module()->image_size(), ppc_info_.image_size,
+         update_data_root_.string());
+     REXLOG_ERROR("{}", msg);
+@@ -375,8 +378,6 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+     return false;
+   }
+ 
+-  InstallContentPackages(*runtime_->kernel_state(), paths.game_data_root);
+-
+   OnPostLoadXexImage();
+ 
+   if (ppc_info_.rexcrt_heap) {
+-- 
+2.50.1
+
