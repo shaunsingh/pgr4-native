@@ -5,8 +5,7 @@ Update #2), built on the [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK w
 [Xenia Canary](https://github.com/xenia-canary/xenia-canary). It builds on the core work of
 [safzanpirani/pgr4-native](https://github.com/safzanpirani/pgr4-native), which grew out of
 [MTR-PGR4](https://github.com/MissingThePixel/MTR-PGR4) and, before it,
-[PGR4-Recomp](https://github.com/beatrixzy/PGR4-Recomp). The game projects (`games/`) and the
-SDK patches (`patches/`) are maintained here.
+[PGR4-Recomp](https://github.com/beatrixzy/PGR4-Recomp)
 
 ## Building and running
 
@@ -27,11 +26,6 @@ scripts/deck-run.sh deck <tag> --refresh 90 --hold 45 --output eDP-1   # scripte
 After `play.sh --install`, Steam's "Add a Non-Steam Game" lists "PGR4 (native renderer)". Add it
 without a compatibility tool, since the script starts Proton itself. DLC copied off a console as
 STFS packages goes in the game folder's `Content\`, next to the title update's package.
-
-Pushing a `v*` tag builds a release package, and `scripts/release/README.md` tells players where
-their game files go. [docs/development.md](docs/development.md) covers the build options,
-debugging, measuring and the SDK patches, and [docs/architecture.md](docs/architecture.md)
-explains how the renderer works.
 
 ## Flags
 
