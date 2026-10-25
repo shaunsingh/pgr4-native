@@ -39,7 +39,10 @@ if [[ ${1:-} == --install ]]; then
   [[ -f $src/pgr4_recompiled.exe ]] || { echo "no exe in $src" >&2; exit 1; }
   check_no_game "the game is running; quit it first"
   mkdir -p "$top/runtime" "$top/userdata/cache" "$top/cache" "$top/logs" "$top/captures"
-  rsync -a --delete "$src/" "$top/runtime/"
+  rsync -a --delete --exclude='*.profraw' "$src/" "$top/runtime/"
+  # The release's settings beside the executables, as a player's package has them; the flags
+  # below override the few that differ.
+  cp "$repo"/native/release/{pgr4,gw}_recompiled.toml "$top/runtime/"
   # Start from the bench's prefix and caches: no Proton first-run setup, and the pipelines the
   # bench runs already compiled.
   [[ -d $top/prefix || ! -d $bench/prefix ]] || cp -a "$bench/prefix" "$top/prefix"
@@ -86,7 +89,7 @@ for ((i = 0; i + keep_sessions <= ${#sessions[@]}; i++)); do
   rm -f "$old".* "$old"-*
 done
 
-# The release's runtime settings with the frame rate unlocked, the guest's vblank at the Deck OLED
+# The release's runtime settings (also in runtime/*.toml) with the frame rate unlocked, the guest's vblank at the Deck OLED
 # panel's 90 Hz (PGR4_REFRESH=60 for an LCD Deck) and the native renderer as the presenter.
 game_args "$game" "$top/userdata" 60fps
 args+=(--window_width=1280 --window_height=800 "--video_mode_refresh_rate=${PGR4_REFRESH:-90}"
