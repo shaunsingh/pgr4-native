@@ -8,7 +8,7 @@
 #                              with the native renderer's statistics and GPU pass breakdown every
 #                              150 frames, the per-frame CSV (frame_times.py, scripts/analysis/),
 #                              deck_sampler.py's GPU load and clock, APU power, CPU load per
-#                              thread and memory every 0.5 s, marks (F12) and the glitch catcher,
+#                              thread and memory every second, marks (F12) and the glitch catcher,
 #                              and a CPU profile of every PGR4 and Geometry Wars process
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
 #                              the build to play, so later rebuilds do not change it, and write
@@ -24,10 +24,12 @@
 # the frames around each whole-image glitch the renderer saw (scripts/analysis/flicker.py and
 # marks.py show them). A mark also logs the next 3 frames' draws to captures/draws-f<frame>.txt
 # and checks them against guest memory (--pgr4_native_mark_audit; the findings go to the game
-# log). The profile: logs/<stamp>-perf-<exe>-<pid>.{data,maps,txt} per process, the modules as
-# they ran in logs/<stamp>-perf-modules/, and logs/<stamp>-perf.clock, the wall clock and
-# CLOCK_MONOTONIC (perf's clock here) at one instant, for perf_symbols.py --window. In Steam, add the "PGR4 (native renderer)" shortcut without a
-# compatibility tool: this script starts Proton itself.
+# log). The profile: logs/<stamp>-perf.data for the whole session, the maps of each title
+# process and its profile in logs/<stamp>-perf-<exe>-<pid>.{maps,txt}, the modules as they ran
+# in logs/<stamp>-perf-modules/, and logs/<stamp>-perf.clock, the wall clock and CLOCK_MONOTONIC
+# (perf's clock here) at one instant, for perf_symbols.py --pid and --window. In Steam, add the
+# "PGR4 (native renderer)" shortcut without a compatibility tool: this script starts Proton
+# itself.
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -120,7 +122,8 @@ if [[ $debug != 0 ]]; then
     "--pgr4_native_capture_dir=$(win "$top/captures")" --pgr4_native_capture_xenos=false
     "--pgr4_native_glitch_catch=$(win "$base-")" --guest_frame_stats --pgr4_native_mark_audit=3
     --log_level=info)
-  export WINEDEBUG=${WINEDEBUG:-fixme-all} VKD3D_DEBUG=${VKD3D_DEBUG:-warn}
+  # err-hid: Wine logs every output report Steam's virtual pad gets (about 30 a second).
+  export WINEDEBUG=${WINEDEBUG:-fixme-all,err-hid} VKD3D_DEBUG=${VKD3D_DEBUG:-warn}
 else
   args+=(--log_level=warn)
   export WINEDEBUG=${WINEDEBUG:--all} VKD3D_DEBUG=${VKD3D_DEBUG:-none}
@@ -138,29 +141,23 @@ export VKD3D_SHADER_CACHE_PATH=$top/cache
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 { cat "$runtime/INSTALLED.txt" 2>/dev/null; echo "${cmd[*]}"; } > "$base-cmdline.txt"
 
-# Debugging sessions: perf record on each title process as it appears (a title launch starts a
-# new one), 249 Hz so a whole session stays small; its maps, refreshed while it runs, place the
-# PE modules for perf_symbols.py.
-profile_titles() {
-  local p name seen=" "
-  # Stopped (TERM) once no title runs: the recorders end with their process, then write out.
-  trap 'wait; exit 0' TERM
+# Debugging sessions: each title process's maps, which place its PE modules for perf_symbols.py,
+# copied as it runs (a title launch starts a new process). A copy of an exited process's maps is
+# empty and leaves the last one.
+snapshot_maps() {
+  local p name
   while :; do
     for p in $(prefix_title_pids "$top/prefix"); do
       name=$(grep -oEm1 '(pgr4|gw)_recompiled' "/proc/$p/maps" 2>/dev/null) || continue
-      if [[ $seen != *" $p "* ]]; then
-        seen+="$p "
-        perf record -q -k CLOCK_MONOTONIC -e cycles:u -F 249 -p "$p" \
-          -o "$base-perf-$name-$p.data" > "$base-perf-$name-$p.out" 2>&1 &
-      fi
-      cat "/proc/$p/maps" > "$base-perf.tmp" 2>/dev/null && mv "$base-perf.tmp" "$base-perf-$name-$p.maps"
+      cat "/proc/$p/maps" > "$base-perf.tmp" 2>/dev/null && [[ -s $base-perf.tmp ]] &&
+        mv "$base-perf.tmp" "$base-perf-$name-$p.maps"
     done
-    nap 2
+    nap 10
   done
 }
 
 if [[ $debug != 0 ]]; then
-  python3 "$here/deck_sampler.py" record "$base-sampler.csv" &
+  python3 "$here/deck_sampler.py" record "$base-sampler.csv" --interval 1 &
   sampler=$!
   mkdir -p "$base-perf-modules"
   for module in "$runtime"/*.{exe,dll,map}; do
@@ -168,23 +165,32 @@ if [[ $debug != 0 ]]; then
   done
   python3 -c 'import time; print(f"{time.time():.6f} {time.clock_gettime(time.CLOCK_MONOTONIC):.6f}")' \
     > "$base-perf.clock"
-  profile_titles &
-  profiler=$!
-  trap 'kill "$sampler" "$profiler" 2>/dev/null || true' EXIT
+  snapshot_maps &
+  snapshotter=$!
+  trap 'kill "$sampler" "$snapshotter" 2>/dev/null || true' EXIT
+  # The session under perf, 249 Hz so hours stay small: the launcher, then, since a title the
+  # last process launched outlives Proton's launcher, until no title runs. Every process the
+  # session starts inherits the sampling, a title launch's and Wine's own. perf record -p would
+  # spin a core once a thread it attached to exits (perf 7.1). -B skips the build-id pass at
+  # the end, so a session Steam stops still closes its file at once.
+  export PGR4_PREFIX=$top/prefix
+  cmd=(perf record -q -B -k CLOCK_MONOTONIC -e cycles:u -F 249 -o "$base-perf.data" --
+    bash -c 'source "$1"; shift; s=0; "$@" || s=$?
+      while [[ -n $(prefix_title_pids "$PGR4_PREFIX") ]]; do sleep 1; done; exit "$s"' \
+    session "$here/common.sh" "${cmd[@]}")
 fi
 echo "session $stamp$([[ $debug != 0 ]] && echo ' (debug)'): $base-*"
 cd "$runtime"
 status=0
 "${cmd[@]}" > "$base-stdout.log" 2>&1 || status=$?
 if [[ $debug != 0 ]]; then
-  # A title the session's last process launched outlives Proton's launcher.
-  while [[ -n $(prefix_title_pids "$top/prefix") ]]; do nap 1; done
-  kill "$sampler" "$profiler" 2>/dev/null || true
-  wait "$sampler" "$profiler" 2>/dev/null || true
-  for data in "$base"-perf-*.data; do
-    [[ -s $data ]] || continue
-    python3 "$repo/scripts/analysis/perf_symbols.py" "$data" "${data%.data}.maps" "$base-perf-modules"/*.map \
-      > "${data%.data}.txt" 2>&1 || true
+  kill "$sampler" "$snapshotter" 2>/dev/null || true
+  wait "$sampler" "$snapshotter" 2>/dev/null || true
+  for maps in "$base"-perf-*.maps; do
+    [[ -s $maps ]] || continue
+    pid=${maps%.maps}; pid=${pid##*-}
+    python3 "$repo/scripts/analysis/perf_symbols.py" "$base-perf.data" "$maps" "$base-perf-modules"/*.map \
+      --pid "$pid" > "${maps%.maps}.txt" 2>&1 || true
   done
 fi
 end_prefix

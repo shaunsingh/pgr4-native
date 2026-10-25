@@ -8,7 +8,10 @@ images (Wine's ucrtbase, ntdll, d3d12core...) go to the nearest export at or bel
 as "name+". Samples elsewhere (Wine's Unix side, Mesa, libc) keep perf's own symbols.
 
   perf_symbols.py <perf.data> <maps> <module.map>... [--top 25] [--threads 6] [--undname CMD]
-                  [--window HH:MM:SS SECONDS [--clock FILE]]
+                  [--pid PID] [--window HH:MM:SS SECONDS [--clock FILE]]
+
+--pid keeps the samples of one process, the one the maps are of, from a recording of several
+(play.sh --debug records the whole session).
 
 --window keeps the SECONDS from wall-clock time HH:MM:SS (local, as the game log stamps it), for
 a recording made with -k CLOCK_MONOTONIC (play.sh --debug): --clock names the file with the wall
@@ -198,13 +201,14 @@ def main() -> None:
     ap.add_argument("--annotate", metavar="TEXT",
                     help="also list the busiest instructions (RVA, offset in the function) of the "
                          "mapped functions whose name contains TEXT, for llvm-objdump")
+    ap.add_argument("--pid", type=int)
     ap.add_argument("--window", nargs=2, metavar=("HH:MM:SS", "SECONDS"))
     ap.add_argument("--clock")
     args = ap.parse_args()
-    time_filter = []
+    filters = ["--pid", str(args.pid)] if args.pid else []
     if args.window:
-        clock = args.clock or re.sub(r"-perf-[^/]*$", "-perf.clock", args.data)
-        time_filter = ["--time", monotonic_window(clock, args.window[0], float(args.window[1]))]
+        clock = args.clock or re.sub(r"-perf[-.][^/]*$", "-perf.clock", args.data)
+        filters += ["--time", monotonic_window(clock, args.window[0], float(args.window[1]))]
 
     modules = [Module(p) for p in args.module_maps]
     load_bases(args.maps, modules)
@@ -216,7 +220,7 @@ def main() -> None:
     exports = {}
 
     script = subprocess.run(["perf", "script", "-i", args.data, "-F", "comm,tid,ip,sym,dso",
-                             *time_filter], capture_output=True, text=True, errors="replace")
+                             *filters], capture_output=True, text=True, errors="replace")
     if script.returncode:
         sys.exit(script.stderr.strip())
     # "  comm  tid  ip sym (dso)"; comm may contain spaces, so split on the tid.
