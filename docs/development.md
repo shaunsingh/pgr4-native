@@ -249,6 +249,48 @@ never stretched. Rendering at 1280x800 needs a game patch rather than a renderer
   UnleashedRecomp's `aspect_ratio_patches.cpp` does, and photo mode, replays and the garage may
   create their own targets.
 
+## Gearbox
+
+What the game does with the shift buttons and where its automatic decides, for a future smarter
+automatic. Offsets are from the base of each object. All of it was read from Title Update #2's
+generated code. Probes on a St Petersburg race confirmed the pad, the bindings and the controls,
+and that `sub_822F9D70` and `sub_822FB680` never run for the player's car.
+
+- **Pad.** The state of player N is at `0x82A90694 + 1888 * N`, refreshed once per frame by
+  `sub_82310F60` through `XInputGetState`. Held buttons are at +1692 (bits 0 to 15 are the
+  raw XInput buttons, bits 16 to 25 trigger and stick thresholds), the previous update's at
+  +1696, and this update's presses at +1700. Each action has two bindings, button indices at
+  +492 + 8a and +496 + 8a (26 means none). `sub_8230FC50` writes the menu bindings, and a race
+  installs the driving layout from the manual. In that layout action 12 is shift up (Y), 13 is
+  shift down (X), 10 is the handbrake (A) and 18 is the taunt (B). `sub_822DC9E0` reads an
+  action's press, `sub_822DC978` its hold and `sub_822DC910` its analog value.
+- **Controls.** The player's driver (`sub_822E2880`, called through its vtable) fills the
+  controls at [driver + 808] in `sub_822DC420`. Throttle is at +4, brake at +8, steering at +12,
+  the shift up and shift down presses at +16 and +17, and the handbrake at +18.
+  `sub_822F9D70` and its gearbox `sub_822FB680` are similar code that the player's car does not
+  use.
+- **Update.** `sub_822DE628` updates the gearbox `gb` of the car at [gb + 36] once per
+  simulation step. A car whose +20 is 2 is driven to the gear at car + 2804. For every other
+  car the step runs the automatic, `sub_822DE250`, and then, once per update (the latch at
+  gb + 29), shifts up on controls +16 or down on +17. The current gear is the signed byte at
+  gb + 30 (-1 is reverse, 0 is neutral), and the time left in a shift is at gb + 16.
+- **Automatic.** `sub_822DE250` decides only when car + 61 is set (the automatic transmission)
+  or car + 20 is 1. It shifts up once gb + 16 has fallen below a constant, the gear is below the
+  top gear (car data at [car + 804] + 412), the value at gb + 0 times a constant exceeds the
+  upshift point at car data + 408, and gb + 31 is set. It shifts down while the next lower gear, estimated from the wheel
+  speeds, the gear ratios (car data + 472), the final drive (+468) and the wheel radius (+416),
+  stays under the upshift point. It also handles reverse when stopped.
+- **Shifts.** `sub_822DDBE8` shifts up (from neutral to 1st, never past the top gear) and
+  `sub_822DE150` shifts down (to 1st at walking speed, and on to reverse). Both set gb + 28 and
+  extend gb + 16 to the car's shift time, car data + 436.
+
+A smarter automatic is a mid-asm hook at `0x822DE250` with `return_on_true`. When the hook
+returns true it skips the game's automatic. Its decision is then a press of controls +16 or +17,
+so the game's own `sub_822DDBE8` and `sub_822DE150` shift with their clutch timing in the same
+step. Like the game's automatic, it should decide only for cars with +61 set. To test without the menus, give a fresh profile
+the manual transmission by setting `XPROFILE_GAMER_RACE_TRANSMISSION` (0x10040026) to 1 in the
+SDK's `user_profile.cpp`.
+
 ## Releases
 
 Pushing a `v*` tag builds on GitHub Actions (`.github/workflows/release.yml`, with the game files
