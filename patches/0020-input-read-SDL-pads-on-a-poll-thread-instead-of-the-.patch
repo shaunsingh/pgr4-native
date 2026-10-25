@@ -1,8 +1,8 @@
-From 44971ead808bd3784641312538ba1023ce0deb7e Mon Sep 17 00:00:00 2001
+From 7b32062f027e38b791d21f76e997471119a04769 Mon Sep 17 00:00:00 2001
 From: shaurizard <contact@nyoom.engineering>
 Date: Sat, 24 Oct 2026 12:35:33 -0400
-Subject: [PATCH 20/32] input: read SDL pads on a timer thread instead of the
- guest's XInput calls
+Subject: [PATCH 20/32] input: read SDL pads on a poll thread instead of the guest's
+ XInput calls
 
 Every XInputGetState, GetCapabilities, SetState and GetKeystroke call of
 the guest queued SDL_PumpEvents on the UI thread, and an event watch
@@ -13,49 +13,66 @@ Wine each HID read and rumble report is several wineserver and
 winedevice round trips, so the UI thread and the guest thread that polls
 the pad both paid for device I/O.
 
-Read the pads on an SDL timer every 4 ms instead (SDL_UpdateJoysticks,
-then each pad's buttons and axes through its mapping), and keep the
-result; the guest's calls copy it under the lock and never call into
-SDL. SDL_HINT_AUTO_UPDATE_JOYSTICKS is off, since the timer updates the
-pads, and the per-sample joystick, gamepad and sensor events are
-disabled, so SDL no longer builds and dispatches an event per report.
-An event filter takes only the device add and remove events, which the
-timer handles: it alone opens, closes, reads and rumbles the pads, and
-it sends the latest motor speeds outside the lock. Capabilities are
-read on the timer too, so the wireless flag still follows power
-information that arrives after the pad connects.
+Read the pads on a thread of their own every 4 ms instead
+(SDL_UpdateJoysticks, then each pad's buttons and axes through its
+mapping), and keep the result; the guest's calls copy it under the lock
+and never call into SDL. SDL_HINT_AUTO_UPDATE_JOYSTICKS is off, since
+the poll thread updates the pads, and the per-sample joystick, gamepad
+and sensor events are disabled, so SDL no longer builds and dispatches
+an event per report. An event filter takes only the device add and
+remove events, which the poll thread handles: it alone opens, closes,
+reads and rumbles the pads, and it sends the latest motor speeds outside
+the lock. Capabilities are read there too, so the wireless flag still
+follows power information that arrives after the pad connects.
+
+The thread waits on an event with a whole-millisecond timeout. An SDL
+timer would not do: on Windows SDL's timer thread waits through
+SDL_WaitSemaphoreTimeoutNS, which passes WaitOnAddress the time left
+truncated to whole milliseconds, so in the last millisecond before each
+callback it waits with a zero timeout and spins.
 
 The joystick-added log, the XInput subtype and the hotplug logging from
 development are kept; the subtype, name and GUID are read when the pad
 is opened, so EnumerateDevices needs no SDL call either.
 
 Measured on the Steam Deck under Proton, against the previous build: the
-UI thread took 1.4 % of a core (9.0 %), the guest thread that polls the
-pad 14.4 % (19.9 %) and the timer 5.3 %; a later race ran at 80.8 fps,
-1 % low 49.7 (80.0, 51.2).
+UI thread took 1.4 % of a core (9.0 %) and the guest thread that polls
+the pad 14.4 % (19.9 %); a later race ran at 80.8 fps, 1 % low 49.7
+(80.0, 51.2). Over a whole run, from boot through a race, the poll
+thread took 0.5 % of a core where SDL's timer thread, polling at the
+same rate, took 23 %; in the race, with the GPU power-limited, the CPU
+drew 7.9 W (8.7 W), the GPU ran at 1009 MHz (969 MHz) and the race ran
+at 88.1 fps, 1 % low 66.6 (87.3, 61.9).
 
 Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
 ---
- include/rex/input/sdl/sdl_input_driver.h |  50 ++-
- src/input/sdl/sdl_input_driver.cpp       | 513 ++++++++++-------------
- 2 files changed, 260 insertions(+), 303 deletions(-)
+ include/rex/input/sdl/sdl_input_driver.h |  54 ++-
+ src/input/sdl/sdl_input_driver.cpp       | 519 ++++++++++-------------
+ 2 files changed, 269 insertions(+), 304 deletions(-)
 
 diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
-index be1f9b8..c733c0a 100644
+index be1f9b8..4d49e9a 100644
 --- a/include/rex/input/sdl/sdl_input_driver.h
 +++ b/include/rex/input/sdl/sdl_input_driver.h
-@@ -11,9 +11,8 @@
+@@ -11,12 +11,15 @@
  
  #pragma once
  
 -#include <atomic>
++#include <chrono>
++#include <memory>
  #include <mutex>
 -#include <optional>
 +#include <string>
++#include <thread>
  #include <vector>
  
  #include <rex/input/input_driver.h>
-@@ -60,6 +59,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
++#include <rex/thread.h>
+ 
+ #include <SDL3/SDL.h>
+ 
+@@ -60,6 +63,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
  
    struct ControllerState {
      SDL_Gamepad* sdl;
@@ -66,7 +83,7 @@ index be1f9b8..c733c0a 100644
      X_INPUT_CAPABILITIES caps;
      X_INPUT_STATE state;
      bool state_changed;
-@@ -67,6 +70,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+@@ -67,6 +74,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
      DeviceId id;
      // Per pad rather than per guest user, so it survives reassignment.
      KeystrokeState keystroke;
@@ -82,7 +99,7 @@ index be1f9b8..c733c0a 100644
    };
  
    // WindowListener
-@@ -75,33 +87,39 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+@@ -75,33 +91,39 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
    void OnGotFocus(rex::ui::UISetupEvent& e) override;
  
    void HandleEvent(const SDL_Event& event);
@@ -93,9 +110,10 @@ index be1f9b8..c733c0a 100644
 -  void OnControllerDeviceRemovedLocked(const SDL_Event& event);
 -  void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
 -  void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
-+  // Every kPollIntervalMs on SDL's timer thread, which alone opens, closes, reads and rumbles
-+  // the pads once the subsystems are up.
-+  static Uint32 SDLCALL PollTimer(void* userdata, SDL_TimerID timer, Uint32 interval);
++  // Every kPollInterval on poll_thread_, which alone opens, closes, reads and rumbles the
++  // pads once the subsystems are up.
++  void PollThreadMain();
++  void StopPolling();
 +  void Poll();
 +  void LogJoystickAdded(SDL_JoystickID instance_id);
 +  void AddController(SDL_JoystickID instance_id);
@@ -111,17 +129,16 @@ index be1f9b8..c733c0a 100644
 -  void UpdateXCapabilities(ControllerState& state);
 -  void QueueControllerUpdate();
 +
-+  // A pad's state reaches the guest at most this late.
-+  static constexpr Uint32 kPollIntervalMs = 4;
++  // A pad's state reaches the guest at most this, and one Poll, late.
++  static constexpr std::chrono::milliseconds kPollInterval{4};
  
    rex::ui::Window* attached_window_ = nullptr;
    bool sdl_events_initialized_;
    bool SDL_Gamepad_initialized_;
 -  std::atomic<int> sdl_events_unflushed_;
 -  std::atomic<bool> sdl_pumpevents_queued_;
-+  SDL_TimerID poll_timer_ = 0;
-+  std::mutex poll_mutex_;         // held by PollTimer
-+  bool polling_stopped_ = false;  // poll_mutex_
++  std::thread poll_thread_;
++  std::unique_ptr<rex::thread::Event> poll_stop_;
    // Appended in connection order, never re-sorted, and unbounded: the
 -  // assignment decides how many the guest sees.
 +  // assignment decides how many the guest sees. Changed by Poll alone, under
@@ -137,7 +154,7 @@ index be1f9b8..c733c0a 100644
    uint64_t next_device_id_ = 1;
  };
 diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
-index 57f65c4..3de5c17 100644
+index 57f65c4..b694c27 100644
 --- a/src/input/sdl/sdl_input_driver.cpp
 +++ b/src/input/sdl/sdl_input_driver.cpp
 @@ -12,6 +12,7 @@
@@ -148,12 +165,21 @@ index 57f65c4..3de5c17 100644
  #include <filesystem>
  #include <string_view>
  
-@@ -152,6 +153,51 @@ uint8_t GamepadSubType(SDL_Gamepad* gamepad) {
+@@ -21,6 +22,7 @@
+ #include <rex/input/flags.h>
+ #include <rex/input/sdl/sdl_input_driver.h>
+ #include <rex/logging.h>
++#include <rex/thread.h>
+ #include <rex/ui/virtual_key.h>
+ 
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+@@ -152,6 +154,52 @@ uint8_t GamepadSubType(SDL_Gamepad* gamepad) {
    return SdlTypeToXInputSubType(SDL_GetJoystickType(SDL_GetGamepadJoystick(gamepad)),
                                  SDL_GetGamepadName(gamepad));
  }
 +// The XInput button of each SDL_GamepadButton up to the touchpad.
-+constexpr std::array<std::underlying_type_t<X_INPUT_GAMEPAD_BUTTON>, SDL_GAMEPAD_BUTTON_TOUCHPAD + 1>
++constexpr std::array<std::underlying_type_t<X_INPUT_GAMEPAD_BUTTON>,
++                     SDL_GAMEPAD_BUTTON_TOUCHPAD + 1>
 +    kButtons = {
 +        // Standard buttons:
 +        X_INPUT_GAMEPAD_A,
@@ -200,7 +226,7 @@ index 57f65c4..3de5c17 100644
  
  }  // namespace
  
-@@ -159,8 +205,6 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
+@@ -159,12 +207,12 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
      : InputDriver(window, window_z_order),
        sdl_events_initialized_(false),
        SDL_Gamepad_initialized_(false),
@@ -209,7 +235,14 @@ index 57f65c4..3de5c17 100644
        controllers_(),
        controllers_mutex_() {}
  
-@@ -187,36 +231,32 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+-SDLInputDriver::~SDLInputDriver() {}
++SDLInputDriver::~SDLInputDriver() {
++  StopPolling();
++}
+ 
+ X_STATUS SDLInputDriver::Setup() {
+   if (!TestSDLVersion()) {
+@@ -187,36 +235,32 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
        sdl_events_initialized_ = true;
        pending_events_.reserve(64);
  
@@ -243,7 +276,7 @@ index 57f65c4..3de5c17 100644
            this);
  
 +      // SDL's event loop would wake every millisecond to poll the open pads, under Wine a
-+      // handful of wineserver round trips each; PollTimer updates them instead.
++      // handful of wineserver round trips each; Poll updates them instead.
 +      SDL_SetHint(SDL_HINT_AUTO_UPDATE_JOYSTICKS, "0");
 +
        // Initialize game controller subsystem
@@ -258,33 +291,29 @@ index 57f65c4..3de5c17 100644
  
        // Load custom controller mappings if available
        if (!REXCVAR_GET(hid_mappings_file).empty()) {
-@@ -235,6 +275,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+@@ -235,6 +279,11 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
            }
          }
        }
-+      poll_timer_ = SDL_AddTimer(kPollIntervalMs, PollTimer, this);
-+      if (!poll_timer_) {
-+        REXLOG_ERROR("SDL: Failed to start the controller poll timer: {}", SDL_GetError());
-+      }
++      // Not an SDL timer: SDL's timer thread waits on Windows with the time left truncated to
++      // whole milliseconds, so it spins through the last one before every callback, about a
++      // fifth of a core at this interval under Proton.
++      poll_stop_ = rex::thread::Event::CreateManualResetEvent(false);
++      poll_thread_ = std::thread([this]() { PollThreadMain(); });
        REXLOG_INFO("SDL input driver initialized successfully");
      });
    }
-@@ -243,19 +287,26 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+@@ -243,19 +292,20 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
  void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
    if (attached_window_) {
      attached_window_->RemoveListener(this);
 -    if (sdl_pumpevents_queued_) {
 -      attached_window_->app_context().CallInUIThreadSynchronous(
 -          [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
-+    if (poll_timer_) {
-+      SDL_RemoveTimer(poll_timer_);
-+      poll_timer_ = 0;
-+      // A callback SDL had already started finishes before the pads close.
-+      std::lock_guard<std::mutex> guard(poll_mutex_);
-+      polling_stopped_ = true;
-     }
+-    }
 -    for (auto& controller : controllers_) {
 -      SDL_CloseGamepad(controller.sdl);
++    StopPolling();
 +    {
 +      std::lock_guard<std::mutex> guard(controllers_mutex_);
 +      for (auto& controller : controllers_) {
@@ -302,7 +331,7 @@ index 57f65c4..3de5c17 100644
        SDL_QuitSubSystem(SDL_INIT_EVENTS);
        sdl_events_initialized_ = false;
      }
-@@ -273,18 +324,14 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+@@ -273,18 +323,14 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
      return;
    }
  
@@ -325,7 +354,7 @@ index 57f65c4..3de5c17 100644
      info.synthetic = false;
      out.push_back(info);
    }
-@@ -297,19 +344,13 @@ X_RESULT SDLInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
+@@ -297,19 +343,13 @@ X_RESULT SDLInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
      return X_ERROR_BAD_ARGUMENTS;
    }
  
@@ -346,7 +375,7 @@ index 57f65c4..3de5c17 100644
    std::memcpy(out_caps, &controller->caps, sizeof(*out_caps));
  
    return X_ERROR_SUCCESS;
-@@ -320,11 +361,7 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+@@ -320,11 +360,7 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
  
    auto is_active = this->is_active();
  
@@ -359,7 +388,7 @@ index 57f65c4..3de5c17 100644
  
    auto controller = FindController(id);
    if (!controller) {
-@@ -351,22 +388,19 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+@@ -351,22 +387,19 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
  X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
    assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
  
@@ -391,7 +420,7 @@ index 57f65c4..3de5c17 100644
  }
  
  X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
-@@ -424,11 +458,7 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+@@ -424,11 +457,7 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
  
    auto is_active = this->is_active();
  
@@ -404,48 +433,52 @@ index 57f65c4..3de5c17 100644
  
    auto controller = FindController(id);
    if (!controller) {
-@@ -512,65 +542,73 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+@@ -512,65 +541,78 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
  }
  
  void SDLInputDriver::HandleEvent(const SDL_Event& event) {
 -  // This callback will likely run on the thread that posts the event, which
 -  // may be a dedicated thread SDL has created for the joystick subsystem.
--
++  // On the thread that sends the event, with SDL's joystick lock held: poll_thread_ (Poll),
++  // or the UI thread while the subsystems start. Opening a pad here would take
++  // controllers_mutex_ under that lock, the reverse of Poll's order.
++  std::lock_guard<std::mutex> guard(event_queue_mutex_);
++  pending_events_.push_back(event);
++}
+ 
 -  // Event queue should never be (this) full
 -  assert(SDL_PeepEvents(nullptr, 0, SDL_PEEKEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) < 0xFFFF);
--
++void SDLInputDriver::PollThreadMain() {
++  rex::thread::set_current_thread_name("SDL pad poll");
++  do {
++    Poll();
++  } while (rex::thread::Wait(poll_stop_.get(), false, kPollInterval) ==
++           rex::thread::WaitResult::kTimeout);
++}
+ 
 -  // The queue could grow up to 3.5MB since it is never polled.
 -  if (++sdl_events_unflushed_ > 64) {
 -    SDL_FlushEvents(SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_FINGER_DOWN - 1);
 -    sdl_events_unflushed_ = 0;
--  }
++void SDLInputDriver::StopPolling() {
++  if (poll_thread_.joinable()) {
++    poll_stop_->Set();
++    poll_thread_.join();
+   }
 -
 -  // Buffer only - no controllers_mutex_ acquisition here.
 -  // This breaks the lock ordering inversion between controllers_mutex_ and
 -  // SDL's internal joystick lock that caused deadlocks.
-+  // On the thread that sends the event, with SDL's joystick lock held: SDL's timer thread
-+  // (Poll), or the UI thread while the subsystems start. Opening a pad here would take
-+  // controllers_mutex_ under that lock, the reverse of Poll's order.
-   std::lock_guard<std::mutex> guard(event_queue_mutex_);
-   pending_events_.push_back(event);
+-  std::lock_guard<std::mutex> guard(event_queue_mutex_);
+-  pending_events_.push_back(event);
  }
  
 -std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
 -  std::vector<SDL_Event> events;
-+Uint32 SDLCALL SDLInputDriver::PollTimer(void* userdata, SDL_TimerID, Uint32 interval) {
-+  auto* driver = static_cast<SDLInputDriver*>(userdata);
-+  std::lock_guard<std::mutex> guard(driver->poll_mutex_);
-+  if (driver->polling_stopped_) {
-+    return 0;
-+  }
-+  driver->Poll();
-+  return interval;
-+}
-+
 +void SDLInputDriver::Poll() {
 +  // Reading a pad can be slow device I/O (under Wine a HID read is several wineserver and
 +  // winedevice round trips, ~0.7 ms in all for the Deck's own controller), which the guest
-+  // thread must not wait on: its reads take the state this left, at most kPollIntervalMs old.
++  // thread must not wait on: its reads take the state this left, at most kPollInterval old.
 +  SDL_UpdateJoysticks();
 +
    {
@@ -524,7 +557,7 @@ index 57f65c4..3de5c17 100644
    const char* name = SDL_GetJoystickNameForID(id);
    char guid_text[33] = {};
    SDL_GUIDToString(SDL_GetJoystickGUIDForID(id), guid_text, static_cast<int>(sizeof(guid_text)));
-@@ -588,17 +626,25 @@ void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
+@@ -588,17 +630,25 @@ void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
    }
  }
  
@@ -559,7 +592,7 @@ index 57f65c4..3de5c17 100644
    REXLOG_INFO(
        "SDL OnControllerDeviceAdded: \"{}\", "
        "JoystickType({}), "
-@@ -607,165 +653,81 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+@@ -607,165 +657,81 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
        "VendorID(0x{:04X}), "
        "ProductID(0x{:04X}), "
        "GUID({})",
@@ -782,7 +815,7 @@ index 57f65c4..3de5c17 100644
  }
  
  SDLInputDriver::ControllerState* SDLInputDriver::FindController(DeviceId id) {
-@@ -780,28 +742,16 @@ SDLInputDriver::ControllerState* SDLInputDriver::FindController(DeviceId id) {
+@@ -780,28 +746,16 @@ SDLInputDriver::ControllerState* SDLInputDriver::FindController(DeviceId id) {
    return nullptr;
  }
  
@@ -813,7 +846,7 @@ index 57f65c4..3de5c17 100644
    if (SDL_GetJoystickConnectionState(joystick) == SDL_JOYSTICK_CONNECTION_WIRELESS) {
      cap_flags |= X_INPUT_CAPS_WIRELESS;
    } else {
-@@ -818,16 +768,16 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+@@ -818,16 +772,16 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
        SDL_GAMEPAD_BUTTON_START,     SDL_GAMEPAD_BUTTON_BACK,      SDL_GAMEPAD_BUTTON_DPAD_UP,
        SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
    };
@@ -834,7 +867,7 @@ index 57f65c4..3de5c17 100644
    c.flags = cap_flags;
    c.gamepad.buttons = 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
    c.gamepad.left_trigger = 0xFF;
-@@ -838,18 +788,7 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+@@ -838,18 +792,7 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
    c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
    c.vibration.left_motor_speed = 0xFFFFu;
    c.vibration.right_motor_speed = 0xFFFFu;
@@ -855,5 +888,5 @@ index 57f65c4..3de5c17 100644
  
  // Check if the analog inputs exceed their thresholds to become a button press
 -- 
-2.50.1
+2.55.0
 
