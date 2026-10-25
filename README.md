@@ -7,6 +7,8 @@ Update #2), built on the [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK w
 [MTR-PGR4](https://github.com/MissingThePixel/MTR-PGR4) and, before it,
 [PGR4-Recomp](https://github.com/beatrixzy/PGR4-Recomp)
 
+![St Petersburg on a Steam Deck OLED](docs/images/st-petersburg.jpg)
+
 ## Building and running
 
 The build runs on Linux and cross-compiles the Windows executables with clang-cl. They run under
