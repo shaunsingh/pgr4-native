@@ -85,7 +85,8 @@ class D3D12Device {
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
   // The swapchain presents HDR10 (kHdrBackBufferFormat): --pgr4_native_hdr is on and the display
-  // takes it (under Proton: gamescope with HDR on and DXVK_HDR=1, as in Steam's Game Mode).
+  // is in HDR mode (Windows' HDR setting; under Proton, gamescope with HDR on and DXVK_HDR=1, as
+  // in Steam's Game Mode).
   bool hdr() const { return hdr_; }
   // With hdr(): the luminance, in nits, that the presented image peaks at (the HDR10 metadata).
   float hdr_peak_nits() const { return hdr_peak_nits_; }

@@ -18,9 +18,10 @@
 REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize, false, "PGR4 native",
                     "Debug: wait for the GPU at the end of every frame, so no frame is in flight "
                     "while the next one is recorded (slow)");
-REXCVAR_DEFINE_BOOL(pgr4_native_hdr, true, "PGR4 native",
-                    "HDR10 output when the display takes it: the highlights the game renders above "
-                    "SDR white, which its front buffer clips, reach the screen");
+REXCVAR_DEFINE_BOOL(
+    pgr4_native_hdr, true, "PGR4 native",
+    "HDR10 output when the display is in HDR mode: the highlights the game renders above "
+    "SDR white, which its front buffer clips, reach the screen");
 REXCVAR_DEFINE_INT32(pgr4_native_hdr_peak_nits, 0, "PGR4 native",
                      "HDR output: the peak luminance in nits the image is fitted to; 0: the "
                      "display's, or 1000 when it reports none");
@@ -256,24 +257,27 @@ bool D3D12Device::CreateSwapchain(HWND hwnd) {
 bool D3D12Device::SetUpColorSpace() {
   constexpr DXGI_COLOR_SPACE_TYPE kHdr10 = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
   const bool wanted = REXCVAR_GET(pgr4_native_hdr);
+  ComPtr<IDXGIOutput> output;
+  ComPtr<IDXGIOutput6> output6;
+  DXGI_OUTPUT_DESC1 od = {};
+  const bool described = SUCCEEDED(swapchain_->GetContainingOutput(&output)) &&
+                         SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&od));
+  // HDR10 only while the display is in HDR mode, which its output's color space tells (as in
+  // Microsoft's D3D12HDR sample). Windows offers HDR10 to any 10-bit swapchain and shows it on
+  // an SDR display clipped at SDR white. DXVK reports HDR10 there with DXVK_HDR=1, and its
+  // swapchain offers it only for a surface that takes it, as gamescope's in HDR mode.
   UINT support = 0;
-  // DXVK's DXGI offers HDR10 only with DXVK_HDR=1 and a surface that takes it.
-  hdr_ = wanted && SUCCEEDED(swapchain_->CheckColorSpaceSupport(kHdr10, &support)) &&
+  hdr_ = wanted && described && od.ColorSpace == kHdr10 &&
+         SUCCEEDED(swapchain_->CheckColorSpaceSupport(kHdr10, &support)) &&
          (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
          !Failed(swapchain_->SetColorSpace1(kHdr10), "SetColorSpace1(HDR10)");
   if (!hdr_) {
-    REXLOG_INFO("PGR4 native: SDR output{}", wanted ? " (the display takes no HDR10)" : "");
+    REXLOG_INFO("PGR4 native: SDR output{}", wanted ? " (the display is not in HDR mode)" : "");
     return !wanted || !Failed(swapchain_->ResizeBuffers(kBackBuffers, width_, height_,
                                                         kBackBufferFormat, swapchain_flags_),
                               "ResizeBuffers(SDR)");
   }
-  float display_peak = 0.0f;
-  ComPtr<IDXGIOutput> output;
-  ComPtr<IDXGIOutput6> output6;
-  DXGI_OUTPUT_DESC1 od = {};
-  if (SUCCEEDED(swapchain_->GetContainingOutput(&output)) && SUCCEEDED(output.As(&output6)) &&
-      SUCCEEDED(output6->GetDesc1(&od)))
-    display_peak = od.MaxLuminance;
+  const float display_peak = od.MaxLuminance;
   const int32_t peak = REXCVAR_GET(pgr4_native_hdr_peak_nits);
   hdr_peak_nits_ = peak > 0 ? float(peak) : display_peak > 0.0f ? display_peak : 1000.0f;
   // The image is fitted to the peak already, so the display has nothing left to tone map.
