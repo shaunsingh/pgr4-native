@@ -11,6 +11,9 @@ Update #2), built on the [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK w
 
 ## Building and running
 
+Most people should grab the latest release from https://github.com/shaunsingh/pgr4-native/releases,
+the instructions below are for active development of the latest changes etc
+
 The build runs on Linux and cross-compiles the Windows executables with clang-cl. They run under
 Proton, or on Windows. You need your own PGR4 disc, extracted, and Title Update #2, either as its
 package or as its two files. This repository contains no game data, and the C++ that the build
