@@ -99,8 +99,8 @@ void Restore(rex::Runtime* runtime) {
   loader.launch_flags = uint32_t(flags);
   loader.launch_data_present = !hex.empty();
   loader.launch_data = std::move(data);
-  REXLOG_INFO("Title launch: {} bytes of launch data, flags {:#x}", loader.launch_data.size(),
-              loader.launch_flags);
+  REXLOG_INFO("Title launch: {} bytes of launch data, flags {:#x}: {}", loader.launch_data.size(),
+              loader.launch_flags, hex);
 }
 
 void Continue(rex::Runtime* runtime) {
@@ -108,11 +108,13 @@ void Continue(rex::Runtime* runtime) {
   if (!xam) return;
   const auto& loader = xam->loader_data();
   std::string target = loader.launch_path;
-  std::ranges::transform(target, target.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+  std::ranges::transform(target, target.begin(),
+                         [](unsigned char c) { return char(std::tolower(c)); });
   const auto title = std::ranges::find(kTitles, std::string_view(target), &Title::guest_path);
   if (title == std::end(kTitles)) return;
   if (loader.launch_data.size() > kMaxLaunchData) {
-    REXLOG_ERROR("Title launch: {} bytes of launch data, more than XAM allows", loader.launch_data.size());
+    REXLOG_ERROR("Title launch: {} bytes of launch data, more than XAM allows",
+                 loader.launch_data.size());
     return;
   }
 
@@ -130,23 +132,22 @@ void Continue(rex::Runtime* runtime) {
       if (!IsLaunchArg(argv[i])) AppendQuoted(line, argv[i]);
     LocalFree(argv);
   }
-  line += L" --launch_flags=" + std::to_wstring(int32_t(loader.launch_flags));
-  if (loader.launch_data_present) {
-    std::wstring hex;
-    constexpr wchar_t kDigits[] = L"0123456789abcdef";
-    for (uint8_t byte : loader.launch_data) {
-      hex += kDigits[byte >> 4];
-      hex += kDigits[byte & 15];
-    }
-    line += L" --launch_data=" + (hex.empty() ? std::wstring(L"-") : hex);
+  std::string hex;
+  constexpr char kDigits[] = "0123456789abcdef";
+  for (uint8_t byte : loader.launch_data) {
+    hex += kDigits[byte >> 4];
+    hex += kDigits[byte & 15];
   }
+  if (loader.launch_data_present && hex.empty()) hex = "-";
+  line += L" --launch_flags=" + std::to_wstring(int32_t(loader.launch_flags));
+  if (loader.launch_data_present) line += L" --launch_data=" + std::wstring(hex.begin(), hex.end());
 
-  REXLOG_INFO("Title launch: {} ({} bytes of launch data, flags {:#x})", loader.launch_path,
-              loader.launch_data.size(), loader.launch_flags);
+  REXLOG_INFO("Title launch: {} ({} bytes of launch data, flags {:#x}): {}", loader.launch_path,
+              loader.launch_data.size(), loader.launch_flags, hex);
   STARTUPINFOW startup{.cb = sizeof(startup)};
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(executable.c_str(), line.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                      nullptr, &startup, &process)) {
+  if (!CreateProcessW(executable.c_str(), line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                      &startup, &process)) {
     REXLOG_ERROR("Title launch: starting {} failed ({})", loader.launch_path, GetLastError());
     return;
   }

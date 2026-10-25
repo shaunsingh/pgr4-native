@@ -29,8 +29,10 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -90,6 +92,13 @@ REXCVAR_DEFINE_INT32(pgr4_native_latency_margin_us, 4000, "PGR4 native",
                      "With --pgr4_native_low_latency: how long before the display shows a frame "
                      "the GPU should have finished it, in microseconds")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(
+    pgr4_native_mark_audit, 0, "PGR4 native",
+    "Debug, render thread mode: a mark (F12 or <capture dir>/capture.request) also "
+    "logs the draws of the next this many frames to <capture dir>/draws-f<frame>.txt "
+    "and audits them: each shader against the guest's ucode, the render thread's "
+    "registers against the game thread's, and the shared memory each draw reads "
+    "against guest memory as it was when the draw was queued (0: off)");
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 
@@ -122,6 +131,19 @@ rex::ui::Presenter* SdkPresenter() {
   rex::Runtime* runtime = rex::Runtime::instance();
   rex::system::IGraphicsSystem* graphics = runtime ? runtime->graphics_system() : nullptr;
   return graphics ? graphics->presenter() : nullptr;
+}
+
+// `path`, or the first of <stem>.1<ext>, <stem>.2<ext>... that does not exist: a title launched
+// from this one gets this process's arguments (game/common/title_launch.cpp), and PGR4 started
+// again after Geometry Wars must not overwrite the first run's files.
+std::string UnusedPath(const std::string& path) {
+  std::filesystem::path p(path);
+  std::error_code ec;
+  for (int i = 1; std::filesystem::exists(p, ec); ++i) {
+    p = path;
+    p.replace_filename(p.stem().string() + "." + std::to_string(i) + p.extension().string());
+  }
+  return p.string();
 }
 
 bool FlagOn(const char* name) {
@@ -211,7 +233,8 @@ struct NativeRenderer::Queue {
   struct DrawCmd {
     DrawState state;  // regs and immediate ucode pointers are filled in on the render thread
     DrawPrep prep;
-    uint32_t copy_begin, copy_end;  // Batch::copies
+    uint32_t copy_begin, copy_end;    // Batch::copies
+    uint32_t audit_begin, audit_end;  // Batch::audits
   };
   struct SwapCmd {
     SwapCall call;
@@ -220,12 +243,14 @@ struct NativeRenderer::Queue {
     uint64_t guest_begin_ns, guest_swap_ns, pace_wait_ns;
     DrawRenderer::PrepareCounters prep;
     uint64_t ticks[profile::kStageCount];
+    uint32_t log_frames;  // a marked Swap with --pgr4_native_mark_audit: the frames to log
   };
   struct Batch {
     std::vector<Cmd> cmds;
     RegLog regs;
     std::vector<VertexCopy> copies;
     std::vector<uint32_t> segments;  // indices into copies where a copy segment starts
+    std::vector<AuditRange> audits;
     std::vector<DrawCmd> draws;
     std::vector<ClearCall> clears;
     std::vector<ResolveParams> resolves;
@@ -235,6 +260,7 @@ struct NativeRenderer::Queue {
       regs.clear();
       copies.clear();
       segments.clear();
+      audits.clear();
       draws.clear();
       clears.clear();
       resolves.clear();
@@ -388,7 +414,9 @@ bool NativeRenderer::Initialize() {
   }
   csv_ = std::make_unique<Csv>();
   profile::enabled.store(REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
-  const std::string& path = REXCVAR_GET(pgr4_native_csv);
+  const std::string path = REXCVAR_GET(pgr4_native_csv).empty()
+                               ? std::string()
+                               : UnusedPath(REXCVAR_GET(pgr4_native_csv));
   if (!path.empty()) {
     csv_->file = AsyncFile::Create(path);
     if (csv_->file) {
@@ -475,6 +503,8 @@ void NativeRenderer::RenderThreadMain() {
           }
           d.prep.copies = b->copies.data() + copies_issued;
           d.prep.copy_count = to - copies_issued;
+          d.prep.audit = b->audits.data() + d.audit_begin;
+          d.prep.audit_count = d.audit_end - d.audit_begin;
           copies_issued = to;
           ExecuteDraw(d.state, &d.prep);
           break;
@@ -497,6 +527,7 @@ void NativeRenderer::RenderThreadMain() {
             stats_.pace_wait_ns = s.pace_wait_ns;
             stats_.state_fail += s.state_fail;
             draw_->AddPrepareCounters(s.prep);
+            if (s.log_frames) draw_->LogFrames(s.log_frames);
             if (profile::On()) {
               for (uint32_t i = 0; i < profile::kStageCount; ++i) profile::g.ticks[i] += s.ticks[i];
               profile::g.track_calls += s.track_calls;
@@ -538,9 +569,11 @@ void NativeRenderer::QueueDraw(const uint8_t* base, const HookArgs& args) {
     // a copy segment.
     if (b.draws.size() == 1) draw_->BeginCopySegment();
     d.copy_begin = uint32_t(b.copies.size());
+    d.audit_begin = uint32_t(b.audits.size());
     // Upload memory of frame F is tagged F + 1: free once F's fence completed.
-    draw_->Prepare(d.state, q.frame + 1, &d.prep, &b.copies);
+    draw_->Prepare(d.state, q.frame + 1, &d.prep, &b.copies, &b.audits);
     d.copy_end = uint32_t(b.copies.size());
+    d.audit_end = uint32_t(b.audits.size());
     if (d.prep.copy_segment) b.segments.push_back(d.copy_begin);
     d.state.regs = nullptr;
     d.state.vs.immediate = d.state.ps.immediate = nullptr;  // Prepare loaded the shaders
@@ -591,15 +624,17 @@ void NativeRenderer::QueueSwap(uint8_t* base, const HookArgs& args) {
   // Captures with the Xenos copy: from the Swap that arms one (HoldFullReadback) to the one
   // captured, the next shown (DrawRenderer::FrameIncomplete holds frames back), every Swap runs
   // before the guest continues, as without the render thread.
-  bool sync = q.capture_armed;
+  bool sync = q.capture_armed, requested = false;
   if (sync) {
     s.call.capture_request = 0;
   } else {
-    const bool requested = present_->CaptureRequested(q.frame);
+    requested = present_->CaptureRequested(q.frame);
     s.call.capture_request = requested ? 1 : 0;
     sync = requested && present_->capture_holds_guest();
   }
   s.prep = draw_->EndFramePrepare(q.gpu_frames_done.load(std::memory_order_acquire));
+  s.log_frames = requested ? uint32_t(std::max(0, REXCVAR_GET(pgr4_native_mark_audit))) : 0;
+  if (s.log_frames) draw_->StartAudit(s.log_frames);
   // At most one frame ahead: frame F is queued once the render thread finished F - 1.
   const uint64_t wait = q.WaitFrames(q.frame);
   q.hook_wait_ns += wait;

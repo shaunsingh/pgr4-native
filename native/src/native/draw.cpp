@@ -55,6 +55,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_async_pipelines, true, "PGR4 native",
@@ -1096,7 +1097,8 @@ struct DrawRenderer::Impl {
                          xenos::ShaderType type);
   // Copies go to the end of `out`.
   bool RequestVertices(const DrawState& s, const DxbcShader& vs, std::vector<VertexCopy>& out);
-  void Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep, std::vector<VertexCopy>* out);
+  void Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep, std::vector<VertexCopy>* out,
+               std::vector<AuditRange>* audit);
   // A triangle fan as a host triangle list (v1, v2, v0), (v2, v3, v0)... like the plugin's
   // primitive processor; guest indices are copied raw (the VS still swaps them). The guest
   // indices are in physical memory (RequestVertices checked them); `count` >= 3. Out of line:
@@ -1355,6 +1357,33 @@ struct DrawRenderer::Impl {
   std::deque<std::shared_ptr<CoherencyJob>> coherency_inflight;
   std::vector<ComPtr<ID3D12Resource>> coherency_readbacks;  // free, kCoherencyReadback each
   void CheckCoherencyJobs(uint64_t completed_fence);
+
+  // --pgr4_native_mark_audit. Guest thread: the frames still to audit, the ranges taken this
+  // frame (once each: key AuditKey), and the frame's counts.
+  static constexpr uint32_t kAuditReadback = 64u << 20;  // bytes read back per audited frame
+  uint32_t audit_left = 0;
+  std::unordered_set<uint64_t> audit_seen;
+  uint64_t audit_draws = 0, audit_ranges = 0, audit_bytes = 0, audit_over = 0, audit_shaders = 0;
+  static uint64_t AuditKey(const AuditRange& a) { return XXH3_64bits(&a, sizeof(a)); }
+  void AuditShader(const ShaderRef& ref, const DxbcShader* shader, const char* type);
+  // Render thread: the frame's read back, recorded after each audited draw's copies, and the
+  // frames waiting for their fence.
+  struct AuditJob {
+    struct Entry {
+      AuditRange range;
+      uint32_t offset;  // in the read back
+      uint32_t draw;    // frame_draws when it was recorded (the draw log's index of the draw)
+    };
+    uint64_t frame = 0, fence = 0;
+    ComPtr<ID3D12Resource> readback;
+    std::vector<Entry> entries;
+    uint32_t used = 0, over = 0;
+  };
+  std::unique_ptr<AuditJob> audit_job;
+  std::deque<std::unique_ptr<AuditJob>> audit_inflight;
+  std::vector<ComPtr<ID3D12Resource>> audit_readbacks;  // free, kAuditReadback each
+  void AuditDraw(ID3D12GraphicsCommandList* list, const DrawPrep& prep);
+  void CheckAuditJobs(uint64_t completed_fence);
 };
 
 // --pgr4_native_coherency_check: one frame's copied shared memory ranges, the bytes they should
@@ -1918,6 +1947,106 @@ void DrawRenderer::Impl::CheckCoherencyJobs(uint64_t completed_fence) {
   }
 }
 
+void DrawRenderer::Impl::AuditShader(const ShaderRef& ref, const DxbcShader* shader,
+                                     const char* type) {
+  if (!shader) return;
+  const uint32_t* ucode =
+      ref.immediate ? ref.immediate : reinterpret_cast<const uint32_t*>(membase + ref.ucode);
+  const uint64_t hash = XXH3_64bits(ucode, size_t(ref.dwords) * sizeof(uint32_t));
+  if (hash == shader->ucode_data_hash()) return;
+  ++audit_shaders;
+  PGR4_LOG_FIRST(100, WARN,
+                 "PGR4 native audit: frame {} {} shader {:08X} ({} dwords{}) hashes {:016X} in "
+                 "guest memory, the shader memo gave {:016X}",
+                 watch_frame.load(std::memory_order_relaxed), type, ref.ucode, ref.dwords,
+                 ref.immediate ? ", immediate" : "", hash, shader->ucode_data_hash());
+}
+
+void DrawRenderer::Impl::AuditDraw(ID3D12GraphicsCommandList* list, const DrawPrep& prep) {
+  if (!audit_job) {
+    audit_job = std::make_unique<AuditJob>();
+    audit_job->frame = r.frame_index();
+    if (!audit_readbacks.empty()) {
+      audit_job->readback = std::move(audit_readbacks.back());
+      audit_readbacks.pop_back();
+    } else {
+      CreateBuffer(device, D3D12_HEAP_TYPE_READBACK, kAuditReadback, D3D12_RESOURCE_STATE_COPY_DEST,
+                   "audit readback", &audit_job->readback);
+    }
+  }
+  AuditJob& job = *audit_job;
+  if (!job.readback) return;
+  TransitionShared(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  for (uint32_t i = 0; i < prep.audit_count; ++i) {
+    const AuditRange& a = prep.audit[i];
+    if (job.used + a.size > kAuditReadback) {
+      ++job.over;
+      continue;
+    }
+    list->CopyBufferRegion(job.readback.Get(), job.used, shared.Get(), a.start, a.size);
+    job.entries.push_back({a, job.used, frame_draws});
+    job.used += a.size;
+  }
+}
+
+void DrawRenderer::Impl::CheckAuditJobs(uint64_t completed_fence) {
+  while (!audit_inflight.empty() && audit_inflight.front()->fence <= completed_fence) {
+    std::unique_ptr<AuditJob> job = std::move(audit_inflight.front());
+    audit_inflight.pop_front();
+    void* data = nullptr;
+    const D3D12_RANGE range = {0, job->used};
+    if (!job->readback || FAILED(job->readback->Map(0, &range, &data))) {
+      REXLOG_WARN("PGR4 native audit: frame {}: no read back", job->frame);
+      continue;
+    }
+    const uint8_t* got = static_cast<const uint8_t*>(data);
+    uint64_t differ = 0, newer = 0;
+    for (const AuditJob::Entry& e : job->entries) {
+      const uint8_t* bytes = got + e.offset;
+      if (XXH3_64bits(bytes, e.range.size) == e.range.hash) continue;
+      ++differ;
+      // Shared memory may hold what the game wrote after the draw was queued (a copy recorded
+      // too early) or something older (a write the page watch or the hashes missed).
+      const bool now = !std::memcmp(bytes, membase + e.range.start, e.range.size);
+      newer += now;
+      uint32_t pages = 0, first = UINT32_MAX;
+      for (uint32_t off = 0; off < e.range.size;) {
+        const uint32_t addr = e.range.start + off;
+        const uint32_t n =
+            std::min(e.range.size - off, (((addr >> kPageShift) + 1) << kPageShift) - addr);
+        if (std::memcmp(bytes + off, membase + addr, n)) {
+          ++pages;
+          first = std::min(first, addr >> kPageShift);
+        }
+        off += n;
+      }
+      const uint32_t p = first == UINT32_MAX ? e.range.start >> kPageShift : first;
+      const uint64_t bit = 1ull << (p & 63);
+      PGR4_LOG_FIRST(
+          200, WARN,
+          "PGR4 native audit: frame {} draw {}: shared memory {:08X}+{:X} differs from guest "
+          "memory when the draw was queued; {}: {} pages differ from it, first {:05X} (valid {}, "
+          "hot {}, pending {}, armed at frame {}, written at frame {})",
+          job->frame, e.draw, e.range.start, e.range.size,
+          now ? "it holds guest memory as it is now" : "and from guest memory now", pages, p,
+          (valid[p >> 6].load(std::memory_order_relaxed) & bit) != 0,
+          (hot[p >> 6].load(std::memory_order_relaxed) & bit) != 0,
+          (pending[p >> 6].load(std::memory_order_relaxed) & bit) != 0,
+          armed_frame[p].load(std::memory_order_relaxed),
+          int64_t(write_frame[p].load(std::memory_order_relaxed)) - 1);
+    }
+    const D3D12_RANGE none = {0, 0};
+    job->readback->Unmap(0, &none);
+    REXLOG_INFO(
+        "PGR4 native audit: frame {}: {} ranges ({:.1f} MB) read back{}, {} differ from guest "
+        "memory when their draw was queued ({} hold it as it is now)",
+        job->frame, job->entries.size(), double(job->used) / (1 << 20),
+        job->over ? fmt::format(", {} not (read back full)", job->over) : std::string(), differ,
+        newer);
+    audit_readbacks.push_back(std::move(job->readback));
+  }
+}
+
 void DrawRenderer::Impl::CheckLateWrites() {
   Coherency& c = *coherency;
   const uint32_t stamp = watch_frame.load(std::memory_order_relaxed) + 1;
@@ -2460,14 +2589,19 @@ bool DrawRenderer::Impl::RequestVertices(const DrawState& s, const DxbcShader& v
 }
 
 void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* prep,
-                                 std::vector<VertexCopy>* out) {
+                                 std::vector<VertexCopy>* out, std::vector<AuditRange>* audit) {
   prep->captured = r.textures().MarkCapture();
   if (!s.vs.ucode || !s.vs.dwords) return;
   prep->vs = LoadShader(vs_memo, vs_last, s.vs, xenos::ShaderType::kVertex);
   prep->ps = LoadShader(ps_memo, ps_last, s.ps, xenos::ShaderType::kPixel);
   profile::Mark(profile::kCapShaders);
+  if (audit_left) {
+    ++audit_draws;
+    AuditShader(s.vs, prep->vs, "vertex");
+    AuditShader(s.ps, prep->ps, "pixel");
+  }
   if (!prep->vs) return;
-  if (coherency) HashRegisterBlocks(s.regs, prep->regs_hash);
+  if (coherency || audit_left) HashRegisterBlocks(s.regs, prep->regs_hash);
   upload_fence = tag;
   const bool indexed_ok = !s.indexed || s.index_address;
   // Straight into the batch: copies made before a failed range still go out (their pages
@@ -2482,6 +2616,20 @@ void DrawRenderer::Impl::Prepare(const DrawState& s, uint64_t tag, DrawPrep* pre
     prep->copy_segment = true;
   }
   for (const Read& read : draw_reads) SegmentAdd(read);
+  if (audit_left) {
+    for (const Read& read : draw_reads) {
+      const AuditRange a = {read.begin, read.end - read.begin,
+                            XXH3_64bits(membase + read.begin, read.end - read.begin)};
+      if (!audit_seen.insert(AuditKey(a)).second) continue;
+      if (audit_bytes + a.size > kAuditReadback) {
+        ++audit_over;
+        continue;
+      }
+      audit->push_back(a);
+      ++audit_ranges;
+      audit_bytes += a.size;
+    }
+  }
   if (coherency)
     for (const Read& read : draw_reads) coherency->segment_reads.push_back({read.begin, read.end});
   // Triangle fans: host indices from the guest's now (Draw reads them from here).
@@ -3095,6 +3243,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         list->CopyBufferRegion(shared.Get(), c.dst, c.src, c.src_offset, c.size);
       }
     }
+    if (prep->audit_count) AuditDraw(list, *prep);
     if (!prep->upload_ok) {
       ++stats.failed;
       return;
@@ -3322,8 +3471,14 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     key.depth_bias = 0;
     key.slope_scaled_depth_bias = 0;
   }
+  const DxbcShader* const vs_selected = vs;
   ID3D12PipelineState* const pso = SelectPipeline(key, *vst, pst, vs, ps, vs_generic, ps_generic,
                                                   mods.pixel, generic_pixel_mod, sdr, prim);
+  if (draw_log)
+    std::fprintf(draw_log, "  pso=%s\n",
+                 !pso                ? "pending"
+                 : vs != vs_selected ? "generic"
+                                     : "ready");
   if (!pso) return;
   profile::Mark(profile::kPipeline);
 
@@ -3586,8 +3741,14 @@ void DrawRenderer::OnDraw(const DrawState& state, const DrawPrep* prep) {
 }
 
 void DrawRenderer::Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep* prep,
-                           std::vector<VertexCopy>* copies) {
-  impl_->Prepare(state, upload_tag, prep, copies);
+                           std::vector<VertexCopy>* copies, std::vector<AuditRange>* audit) {
+  impl_->Prepare(state, upload_tag, prep, copies, audit);
+}
+
+void DrawRenderer::StartAudit(uint32_t frames) { impl_->audit_left = frames; }
+
+void DrawRenderer::LogFrames(uint32_t frames) {
+  impl_->draw_log_left = std::max(impl_->draw_log_left, frames);
 }
 
 void DrawRenderer::BeginCopySegment() { impl_->NewSegment(); }
@@ -3600,6 +3761,18 @@ DrawRenderer::PrepareCounters DrawRenderer::EndFramePrepare(uint64_t done) {
     c.stale_pages = std::exchange(m.coherency->stale, 0);
     c.late_pages = std::exchange(m.coherency->late, 0);
     c.job = m.MakeCoherencyJob();
+  }
+  if (m.audit_left) {
+    --m.audit_left;
+    REXLOG_INFO(
+        "PGR4 native audit: frame {} queued: {} draws, {} ranges ({:.1f} MB) to read back{}, {} "
+        "shaders differ from the guest's ucode",
+        m.watch_frame.load(std::memory_order_relaxed), m.audit_draws, m.audit_ranges,
+        double(m.audit_bytes) / (1 << 20),
+        m.audit_over ? fmt::format(", {} not (read back full)", m.audit_over) : std::string(),
+        m.audit_shaders);
+    m.audit_seen.clear();
+    m.audit_draws = m.audit_ranges = m.audit_bytes = m.audit_over = m.audit_shaders = 0;
   }
   m.watch_frame.fetch_add(1, std::memory_order_relaxed);
   m.vertex_upload.EndFrame(done);
@@ -3626,6 +3799,10 @@ void DrawRenderer::AddPrepareCounters(const PrepareCounters& c) {
 
 void DrawRenderer::BeforeSubmit() {
   Impl& m = *impl_;
+  if (m.audit_job) {
+    m.audit_job->fence = m.r.frame_fence();
+    m.audit_inflight.push_back(std::move(m.audit_job));
+  }
   if (!m.coherency_next) return;
   std::shared_ptr<CoherencyJob> job = std::move(m.coherency_next);
   if (!m.coherency_readbacks.empty()) {
@@ -3725,6 +3902,7 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   if (!impl_->threaded) impl_->vertex_upload.EndFrame(completed_fence);
   impl_->constant_upload.EndFrame(completed_fence);
   if (!impl_->coherency_inflight.empty()) impl_->CheckCoherencyJobs(completed_fence);
+  if (!impl_->audit_inflight.empty()) impl_->CheckAuditJobs(completed_fence);
   impl_->Prewarm();
   impl_->store.Flush();
   impl_->frame_draws = 0;

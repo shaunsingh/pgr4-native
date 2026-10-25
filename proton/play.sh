@@ -8,7 +8,8 @@
 #                              with the native renderer's statistics and GPU pass breakdown every
 #                              150 frames, the per-frame CSV (frame_times.py, native/tools/),
 #                              deck_sampler.py's GPU load and clock, APU power, CPU load per
-#                              thread and memory every 0.5 s, marks (F12) and the glitch catcher
+#                              thread and memory every 0.5 s, marks (F12) and the glitch catcher,
+#                              and a CPU profile of every PGR4 and Geometry Wars process
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
 #                              the build to play, so later rebuilds do not change it, and write
 #                              the desktop entries Steam's "Add a Non-Steam Game" lists (one of
@@ -21,7 +22,11 @@
 # writes the native front buffer to captures/f<frame>-native.png (the frame number matches the
 # CSV) and the 5 s before it to logs/<stamp>-mark-<frame>.rec; <stamp>-glitch-<frame>.rec holds
 # the frames around each whole-image glitch the renderer saw (native/tools/flicker.py and
-# marks.py show them). In Steam, add the "PGR4 (native renderer)" shortcut without a
+# marks.py show them). A mark also logs the next 3 frames' draws to captures/draws-f<frame>.txt
+# and checks them against guest memory (--pgr4_native_mark_audit; the findings go to the game
+# log). The profile: logs/<stamp>-perf-<exe>-<pid>.{data,maps,txt} per process, the modules as
+# they ran in logs/<stamp>-perf-modules/, and logs/<stamp>-perf.clock, the wall clock and
+# CLOCK_MONOTONIC (perf's clock here) at one instant, for perf_symbols.py --window. In Steam, add the "PGR4 (native renderer)" shortcut without a
 # compatibility tool: this script starts Proton itself.
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
@@ -101,11 +106,13 @@ else
   args+=(--fullscreen=false)
 fi
 if [[ $debug != 0 ]]; then
-  # The session record. A mark (F12) writes the native image alone, off the guest thread: the
-  # Xenos copy only matters in oracle runs.
+  # The session record, its log at info (the release settings log errors only). A mark (F12)
+  # writes the native image alone, off the guest thread: the Xenos copy only matters in oracle
+  # runs.
   args+=(--pgr4_native_gpu_timing "--pgr4_native_csv=$(win "$base-frames.csv")"
     "--pgr4_native_capture_dir=$(win "$top/captures")" --pgr4_native_capture_xenos=false
-    "--pgr4_native_glitch_catch=$(win "$base-")" --guest_frame_stats)
+    "--pgr4_native_glitch_catch=$(win "$base-")" --guest_frame_stats --pgr4_native_mark_audit=3
+    --log_level=info)
   export WINEDEBUG=${WINEDEBUG:-fixme-all} VKD3D_DEBUG=${VKD3D_DEBUG:-warn}
 else
   args+=(--log_level=warn)
@@ -124,14 +131,54 @@ export VKD3D_SHADER_CACHE_PATH=$top/cache
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 { cat "$runtime/INSTALLED.txt" 2>/dev/null; echo "${cmd[*]}"; } > "$base-cmdline.txt"
 
+# Debugging sessions: perf record on each title process as it appears (a title launch starts a
+# new one), 249 Hz so a whole session stays small; its maps, refreshed while it runs, place the
+# PE modules for perf_symbols.py.
+profile_titles() {
+  local p name seen=" "
+  # Stopped (TERM) once no title runs: the recorders end with their process, then write out.
+  trap 'wait; exit 0' TERM
+  while :; do
+    for p in $(prefix_title_pids "$top/prefix"); do
+      name=$(grep -oEm1 '(pgr4|gw)_recompiled' "/proc/$p/maps" 2>/dev/null) || continue
+      if [[ $seen != *" $p "* ]]; then
+        seen+="$p "
+        perf record -q -k CLOCK_MONOTONIC -e cycles:u -F 249 -p "$p" \
+          -o "$base-perf-$name-$p.data" > "$base-perf-$name-$p.out" 2>&1 &
+      fi
+      cat "/proc/$p/maps" > "$base-perf.tmp" 2>/dev/null && mv "$base-perf.tmp" "$base-perf-$name-$p.maps"
+    done
+    nap 2
+  done
+}
+
 if [[ $debug != 0 ]]; then
   python3 "$here/deck_sampler.py" record "$base-sampler.csv" &
   sampler=$!
-  trap 'kill "$sampler" 2>/dev/null || true' EXIT
+  mkdir -p "$base-perf-modules"
+  for module in "$runtime"/*.{exe,dll,map}; do
+    [[ -e $module ]] && { ln -f "$module" "$base-perf-modules/" 2>/dev/null || cp "$module" "$base-perf-modules/"; }
+  done
+  python3 -c 'import time; print(f"{time.time():.6f} {time.clock_gettime(time.CLOCK_MONOTONIC):.6f}")' \
+    > "$base-perf.clock"
+  profile_titles &
+  profiler=$!
+  trap 'kill "$sampler" "$profiler" 2>/dev/null || true' EXIT
 fi
 echo "session $stamp$([[ $debug != 0 ]] && echo ' (debug)'): $base-*"
 cd "$runtime"
 status=0
 "${cmd[@]}" > "$base-stdout.log" 2>&1 || status=$?
+if [[ $debug != 0 ]]; then
+  # A title the session's last process launched outlives Proton's launcher.
+  while [[ -n $(prefix_title_pids "$top/prefix") ]]; do nap 1; done
+  kill "$sampler" "$profiler" 2>/dev/null || true
+  wait "$sampler" "$profiler" 2>/dev/null || true
+  for data in "$base"-perf-*.data; do
+    [[ -s $data ]] || continue
+    python3 "$repo/native/tools/perf_symbols.py" "$data" "${data%.data}.maps" "$base-perf-modules"/*.map \
+      > "${data%.data}.txt" 2>&1 || true
+  done
+fi
 echo "game exited with $status at $(date +%T)" >> "$base-stdout.log"
 exit "$status"

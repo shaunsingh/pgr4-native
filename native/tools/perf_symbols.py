@@ -8,6 +8,11 @@ images (Wine's ucrtbase, ntdll, d3d12core...) go to the nearest export at or bel
 as "name+". Samples elsewhere (Wine's Unix side, Mesa, libc) keep perf's own symbols.
 
   perf_symbols.py <perf.data> <maps> <module.map>... [--top 25] [--threads 6] [--undname CMD]
+                  [--window HH:MM:SS SECONDS [--clock FILE]]
+
+--window keeps the SECONDS from wall-clock time HH:MM:SS (local, as the game log stamps it), for
+a recording made with -k CLOCK_MONOTONIC (play.sh --debug): --clock names the file with the wall
+clock and CLOCK_MONOTONIC at one instant (default: <stamp>-perf.clock beside the data).
 
 Prints the share of samples per module, the hottest functions over all threads, then the
 hottest functions of the busiest threads (named by SetThreadDescription, truncated to 15
@@ -16,6 +21,7 @@ characters by Linux). --undname demangles MSVC names (default: llvm-undname when
 import argparse
 import bisect
 import collections
+import datetime
 import os
 import re
 import shutil
@@ -152,6 +158,18 @@ def load_bases(maps_path: str, modules) -> None:
             mod.end = max(mod.end, mod.base + mod.size)
 
 
+def monotonic_window(clock_path: str, at: str, seconds: float) -> str:
+    """perf script --time for SECONDS from local time AT, the day of the clock reference or, for
+    a time more than 12 h before it, the next (a session past midnight)."""
+    wall, mono = (float(x) for x in open(clock_path).read().split())
+    ref = datetime.datetime.fromtimestamp(wall)
+    start = datetime.datetime.combine(ref.date(), datetime.time.fromisoformat(at))
+    if (ref - start).total_seconds() > 12 * 3600:
+        start += datetime.timedelta(days=1)
+    begin = start.timestamp() - wall + mono
+    return f"{begin:.6f},{begin + seconds:.6f}"
+
+
 def undname(names, command):
     if not command or not names:
         return {n: n for n in names}
@@ -180,7 +198,13 @@ def main() -> None:
     ap.add_argument("--annotate", metavar="TEXT",
                     help="also list the busiest instructions (RVA, offset in the function) of the "
                          "mapped functions whose name contains TEXT, for llvm-objdump")
+    ap.add_argument("--window", nargs=2, metavar=("HH:MM:SS", "SECONDS"))
+    ap.add_argument("--clock")
     args = ap.parse_args()
+    time_filter = []
+    if args.window:
+        clock = args.clock or re.sub(r"-perf-[^/]*$", "-perf.clock", args.data)
+        time_filter = ["--time", monotonic_window(clock, args.window[0], float(args.window[1]))]
 
     modules = [Module(p) for p in args.module_maps]
     load_bases(args.maps, modules)
@@ -191,8 +215,8 @@ def main() -> None:
     bases = pe_bases(args.maps)
     exports = {}
 
-    script = subprocess.run(["perf", "script", "-i", args.data, "-F", "comm,tid,ip,sym,dso"],
-                            capture_output=True, text=True, errors="replace")
+    script = subprocess.run(["perf", "script", "-i", args.data, "-F", "comm,tid,ip,sym,dso",
+                             *time_filter], capture_output=True, text=True, errors="replace")
     if script.returncode:
         sys.exit(script.stderr.strip())
     # "  comm  tid  ip sym (dso)"; comm may contain spaces, so split on the tid.

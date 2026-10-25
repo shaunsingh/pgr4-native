@@ -64,6 +64,13 @@ struct VertexCopy {
   uint32_t dst, size;
 };
 
+// --pgr4_native_mark_audit: a guest range a draw reads, with the XXH3 of its bytes when the draw
+// was prepared, which shared memory must hold when the GPU reaches the draw.
+struct AuditRange {
+  uint32_t start, size;
+  uint64_t hash;
+};
+
 // The guest-thread half of one draw (DrawRenderer::Prepare).
 struct DrawPrep {
   rex::graphics::DxbcShader* vs = nullptr;  // nullptr: no vertex shader (the draw is dropped)
@@ -80,6 +87,9 @@ struct DrawPrep {
   // --pgr4_native_coherency_check: XXH3 of the register file's blocks as Prepare saw them
   // (render state, float constants VS and PS, fetch and bool/loop constants), 0: not taken.
   uint64_t regs_hash[5] = {};
+  // --pgr4_native_mark_audit: the ranges to check, set by the render side like `copies`.
+  const AuditRange* audit = nullptr;
+  uint32_t audit_count = 0;
 };
 
 class DrawRenderer {
@@ -151,9 +161,20 @@ class DrawRenderer {
   // of one pair per uploading draw. A draw starts a new segment (prep->copy_segment) when one
   // of its copies would overwrite a page an earlier draw of the segment reads: that draw must
   // still see the old bytes. BeginCopySegment starts one unconditionally (a new batch).
+  //
+  // While a mark audit runs (StartAudit), Prepare also checks the loaded shaders against the
+  // whole guest ucode, hashes the register blocks for Draw to compare, and appends the ranges
+  // the draw reads to `audit` (each range once per frame).
   void Prepare(const DrawState& state, uint64_t upload_tag, DrawPrep* prep,
-               std::vector<VertexCopy>* copies);
+               std::vector<VertexCopy>* copies, std::vector<AuditRange>* audit);
   void BeginCopySegment();
+  // Guest thread, at a marked Swap: audit the draws of the next `frames` frames. The render
+  // thread logs those frames (LogFrames), reads back the shared memory each audited draw reads
+  // and logs every range that differs from guest memory as the draw was prepared.
+  void StartAudit(uint32_t frames);
+  // Render thread, at a Swap: log the next `frames` frames' draws (<capture
+  // dir>/draws-f<frame>.txt).
+  void LogFrames(uint32_t frames);
   // Guest thread, once per Swap: recycles vertex upload memory with tags <= `done`. Returns
   // Prepare's counters since the previous call.
   PrepareCounters EndFramePrepare(uint64_t done);

@@ -42,6 +42,18 @@ prefix_game_pids() {
   return 0
 }
 
+# The processes of the Wine prefix $1 that run a title (pgr4_recompiled.exe, gw_recompiled.exe:
+# one starts the other, game/common/title_launch.cpp): those that map the image itself, not
+# Proton's launcher or steam.exe, whose command lines name it too.
+prefix_title_pids() {
+  local p
+  for p in $(pgrep -f '(pgr4|gw)_recompiled\.exe'); do
+    grep -qxzF "STEAM_COMPAT_DATA_PATH=$1" "/proc/$p/environ" 2>/dev/null &&
+      grep -qE '(pgr4|gw)_recompiled\.exe$' "/proc/$p/maps" 2>/dev/null && echo "$p"
+  done
+  return 0
+}
+
 # Sends signal $1 to prefix_game_pids $2.
 signal_prefix_games() {
   local pids
