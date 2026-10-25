@@ -2,13 +2,13 @@
 *.xex
 *.xexp
 Pgr4TitleUpdate.bin
+/build/
 out/
 generated/
 *.log
 *.csv
 __pycache__/
-# lab CLI: dependencies and files copied back from the build host
-node_modules/
-.cache/
-# Source archives of other ports, read for prior art
-references/
+# Local only: game packages, other ports' sources read for prior art, the retired workflow.
+/attachments/
+/references/
+/retired/

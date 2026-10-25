@@ -1,0 +1,4 @@
+# The ReXGlue SDK scripts/build.sh builds: upstream's development branch at this commit, with the
+# patches in patches/ applied in order. Sourced by scripts/build.sh and CI.
+REXGLUE_URL=https://github.com/rexglue/rexglue-sdk.git
+REXGLUE_COMMIT=bd833a2ab69d305f99ddf57418fc38ffec8af93d

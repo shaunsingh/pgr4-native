@@ -1,3 +1,0 @@
-# The worklog is append-only, one section per agent at the end: when two branches both append,
-# keep both sections instead of stopping on a conflict.
-notes/worklog.md merge=union

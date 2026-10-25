@@ -37,21 +37,21 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/xwin
-          key: xwin-${{ hashFiles('build/fetch-xwin.sh') }}
+          key: xwin-${{ hashFiles('scripts/fetch-xwin.sh') }}
 
       - name: MSVC CRT and Windows SDK
-        run: build/fetch-xwin.sh "$RUNNER_TEMP/xwin"
+        run: scripts/fetch-xwin.sh "$RUNNER_TEMP/xwin"
 
       - name: Build
         env:
           XWIN_DIR: ${{ runner.temp }}/xwin
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          native/build.sh --dest "$RUNNER_TEMP/build" --game ci-inputs/game \
+          scripts/build.sh --dest "$RUNNER_TEMP/build" --game ci-inputs/game \
             --update ci-inputs/title-update --pgo ci-inputs/pgo/default.profdata --jobs "$(nproc)"
 
       - name: Package
-        run: native/tools/package_release.py --dest "$RUNNER_TEMP/build" --version "$GITHUB_REF_NAME" --out out
+        run: scripts/release/package_release.py --dest "$RUNNER_TEMP/build" --version "$GITHUB_REF_NAME" --out out
 
       - name: Artifact
         if: github.ref_type != 'tag'
@@ -68,4 +68,4 @@ jobs:
         run: |
           pacman -S --noconfirm --needed github-cli
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
-            --notes-file native/release/README.md out/*.zip out/*.zip.sha256
+            --notes-file scripts/release/README.md out/*.zip out/*.zip.sha256

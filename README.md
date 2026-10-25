@@ -2,1056 +2,129 @@
 
 A native Direct3D 12 renderer for a static recompilation of Project Gotham Racing 4 (Title
 Update #2), built on the [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK with fixes from
-[Xenia Canary](https://github.com/xenia-canary/xenia-canary). It began on
-[MissingThePixel/MTR-PGR4](https://github.com/MissingThePixel/MTR-PGR4); the game projects and
-SDK patches are now this repository's own (`game/`, `sdk/`).
+[Xenia Canary](https://github.com/xenia-canary/xenia-canary). It builds on the core work of
+[safzanpirani/pgr4-native](https://github.com/safzanpirani/pgr4-native), which grew out of
+[MTR-PGR4](https://github.com/MissingThePixel/MTR-PGR4) and, before it,
+[PGR4-Recomp](https://github.com/beatrixzy/PGR4-Recomp). The game projects (`games/`) and the
+SDK patches (`patches/`) are maintained here.
 
-The recompiled game normally draws through ReXGlue's Xenos plugin, which emulates the Xbox 360
-GPU by replaying its command stream. This renderer hooks the game's own Xbox 360 D3D calls in
-the recompiled code instead (197 functions: draws, clears, resolves, Swap and the state calls
-around them) and turns each one into D3D12 work.
+## Building and running
 
-The goal is a steady 90 fps at 1280x800 under Proton on a Steam Deck OLED, with every effect on.
-
-![The Xenos plugin (left) and the native renderer (right) at the same moment of the same race](docs/race-xenos-vs-native.jpg)
-
-Two runs of the same scripted race, 18 seconds in. The cars take slightly different lines
-because the physics is not identical between runs. The native side is missing the car's rear
-spoiler, a known bug.
-
-## Summary (2026-10-22)
-
-Measured on an i9-13900K with an RTX 3090, St Petersburg street race, uncapped. Within each row
-both columns come from the same build, except the first row's Xenos number, which comes from the
-previous build of the same night (the change between them only affects the native path). The
-other rows were measured on 2026-10-21 before the recompiler changes below.
-
-| | Native renderer | Xenos plugin |
-|---|---|---|
-| Windows, release flags | **186 fps** with the render thread | 125 fps |
-| Windows, release flags, 2026-10-21 build | 143 fps with the render thread | 126 fps |
-| Windows, debug decoder on | 129 fps with the render thread, 96 fps without | 126 fps |
-| Linux, Proton, debug decoder on | 112-116 fps with the render thread, 91-92 fps without | 113-114 fps |
-| Proton, 8 efficiency cores, debug decoder on | 80 fps with the render thread, 57 fps without | 72 fps |
-| CPU cores kept busy (Windows) | about 1.4 with the render thread | about 2 |
-| Race image against the Xenos plugin | 31-33 dB PSNR | reference |
-
-The debug decoder is `--pgr4_d3d_tap`, which decodes the game's command buffer at every D3D call
-for traces and checks. It costs the native path about 0.8 ms per frame. With it off, native with
-the render thread takes 33 % less time per frame than the Xenos plugin (5.36 against 8.02 ms, see
-[Windows](#windows)).
-
-- Title screen, menus and the St Petersburg race render. That route is the only one tested.
-- The car's rear spoiler is missing.
-- The render thread (`--pgr4_native_render_thread`) is on by default. Its wrong-geometry bug is
-  fixed: the game thread and the render thread shared one list of pending vertex copies, so
-  copies could be lost or reordered. Nine race captures since the fix are all 30.8 to 32.7 dB.
-- Runs on a Steam Deck OLED under Proton at 89.4 fps at 90 Hz (1 % low 59.6); see
-  [Steam Deck](#steam-deck-oled).
-- The game runs at 30 fps by default; MTR-PGR4's `--pgr4_60fps` lifts that limit, and on the
-  Deck the frames follow the display (90 Hz, or a Steam frame limit). The uncapped numbers above
-  measure how much headroom there is.
-
-## Steam Deck (OLED)
-
-Steam Deck OLED in SteamOS desktop mode, GE-Proton 11-5 (vkd3d-proton on RADV), the same Windows
-build cross-compiled on Linux (`native/build.sh`: clang-cl and xwin in a distrobox). The game
-runs at 1280x800 in a gamescope window on the Deck's panel at 90 Hz with MTR-PGR4's frame-rate
-patch, so it presents at most once per 90 Hz vblank. `proton/deck-run.sh` drives the scripted
-race and reports frame times, GPU load and the APU's power split (`proton/deck_sampler.py`).
-
-St Petersburg race, 9-45 s after the start (2026-10-23, td-140; td-51, before the changes below
-from the Deck, in brackets):
-
-| | |
-|---|---|
-| Average | 89.4 fps (78.7) |
-| 1 % low | 59.6 fps (49.2) |
-| Shown late | 21 of 3449 frames shown more than half an interval late; 99 % of the intervals within 12.01 ms |
-| GPU | 73 % busy at 922 MHz (of 1600) (90 % at 705-870 MHz) |
-| APU power | 14.1 W, at the 15 W limit in 75 % of the samples: CPU 7.6 W, GPU 2.9 W, SoC 0.9 W (15 W in every sample: 8.8, 2.7, 1.3) |
-
-The APU's 15 W limit is shared, and the CPU takes most of it, so the GPU runs at about half its
-top clock. CPU time saved on any thread becomes GPU clock; GPU work saved shortens the frame
-directly. The target is a steady 90 fps with no loss of image quality (MSAA, motion blur and
-every other effect stay on, and the frame rate is not capped).
-
-Changes made on the Deck, in order. Each was checked in a race run on the Deck.
-
-- Depth around the car: shaders that write depth no longer scale it into the Xenos plugin's
-  float24 range (0...0.5), which halved the depth that depth-restoring passes wrote.
-- EDRAM clears: resolve clears cover the stencil plane and land at the right EDRAM offset.
-- Per-pass and per-shader GPU timing (`--pgr4_native_gpu_timing`,
-  `--pgr4_native_gpu_timing_shaders`, `gpu_timer`).
-- The Xenos command processor's thread blocks when its ring is empty instead of yielding in a
-  loop, and the timer queue sleeps until its next timer (`native/rexglue-runtime-perf.patch`).
-- Guest memory: physical memory is committed with its section, so a page protection change no
-  longer costs a commit through wineserver.
-- State tracking copies only the register blocks the guest marked dirty.
-- Copy segments: vertex copies are recorded ahead of the segment of draws that reads them, one
-  pair of barriers per segment instead of one per uploading draw.
-- Hot vertex pages: pages the game rewrites every frame are hashed and copied when changed
-  instead of being watched and refaulted.
-- The frame clock reads the TSC instead of calling QueryPerformanceCounter.
-- Resolves copy through compute shaders specialized for each kind of resolve (formats, layout,
-  flags, exponent bias compiled in, built on a worker while the generic shader stands in), and
-  each resolve phase is timed.
-- The display controller's gamma ramp (PWL or table) is applied at present; the image was too
-  light without it.
-- Pixel shaders are specialized for the textures they sample: when a texture's fetch constant
-  is unsigned, or signed in a format whose host view is the same for signed and unsigned, the
-  translated shader drops the per-sample sign handling. The motion blur pass went from 1.6 to
-  1.0 ms and GPU time per race frame from 13.7 to 10.8 ms.
-- `sample_b` (sampling with a LOD bias) translates to a biased sample with implicit gradients
-  instead of explicit gradient math.
-- `--pgr4_native_shader_dump_dir` writes every translated shader (DXBC) for inspection.
-- Shaders are specialized for the guest's bool constants: branches on a bool constant are
-  resolved when the shader is translated, so the GPU no longer evaluates them per pixel (about
-  2 % of GPU time per race frame; `--pgr4_native_bool_specialize`).
-- Pipelines compile on up to four worker threads, and pipelines from the on-disk store are
-  built ahead of use and moved to the front of the queue when a draw needs one. When a frame
-  brings a burst of new pipelines (the race load brings 150-250), the renderer waits for them
-  (at most 500 ms per frame) and does not present a frame with draws still missing, so cars and
-  scenery no longer appear late or flicker at the start of a race. One loading pause replaces
-  a run of hitches: from a cold store the race's 1 % low went from 26 to 42 fps.
-- The pipeline store is safe to use from several threads.
-- `--pgr4_native_luma_probe` reads three rows of each presented frame back and logs the
-  brightness of each quarter of them in the frame CSV, which finds black or flickering frames
-  (or one flashing object) in a run without a capture.
-- Textures keep the data their draw was queued with. The render thread reads a texture up to a
-  frame after the game queued the draw, and in primary mode the game's fences signal at once,
-  so the game may already have streamed new data into that memory. Each draw is stamped when it
-  is queued; the first write to an uploaded texture records the latest stamp, and the draws
-  queued before it bind the texture as it was. In a race, 100-280 texture bindings per frame
-  keep their older data during stretches of the lap (`tex_stale` in the frame CSV,
-  `--pgr4_native_texture_capture_order`). Nearly all of them read two textures the game
-  rewrites hundreds of times a race (256x512 RGB565 and 512x512 8-bit, read by about 100
-  scenery draws a frame); without this, those draws could pick up the next update early, a
-  likely cause of buildings flashing dark or bright for a frame.
-- Floating point: the Linux build compiles with `-ffp-model=precise -fno-math-errno` instead of
-  `strict`. clang-cl ignored the `strict` flag in the Windows builds, so all builds now use the
-  same model. Generated code spells out fused multiply-adds with `std::fma`, so contraction does
-  not change guest results. No change in frame rate was measured.
-- `frame_times.py` also reports a fixed race window (9-45 s after the pre-race grid shot, the
-  same span of game frames in every run) and checks the route against a reference
-  (`run/route-stpetersburg.draws`, draws per frame each second): a run whose car takes another
-  line, or stops against a barrier, reports where it diverged. Runs part ways only from about
-  46 s after the grid shot.
-- `perf_symbols.py` names samples in Wine DLLs by their nearest export.
-- Frame recorder: `--pgr4_native_record` writes the frames shown, at half size and after the
-  gamma ramp, from a given frame and optionally in files of N frames (`deck-run.sh --record`).
-  `flicker.py` finds what flashed in a recording: blocks that depart from the frames on either
-  side for 1-4 frames, or whole-image jumps that come back (`--jumps`), and writes PNG sheets
-  of them with the frame CSV's counters for those frames.
-- Glitch catcher: `--pgr4_native_glitch_catch` keeps the last 2 s of frames in memory, finds
-  the whole-image jumps as they happen and writes the frames around each one; a capture
-  request (F12) writes all 2 s. About 5 % of one core. `play.sh` sessions run it and record
-  every frame, in files of 5 minutes, so a glitch seen in play can be found afterwards.
-- `play.sh` runs the guest's vblank at the OLED panel's 90 Hz (it was 60) and starts Proton
-  without xalia, as `deck-run.sh` does.
-- `--pgr4_native_coherency_check` (debug, the race runs at about 44 fps with it) keeps a CPU
-  copy of what shared memory should hold and checks, per draw, that the vertex and index
-  ranges it reads match guest memory, that no copy overwrites a range read earlier in its
-  copy segment, which ranges the game rewrites after a draw of the frame read them, that
-  shared memory read back after the frame holds what the frame's copies carried, and that the
-  render thread's register file matches the one the game thread prepared the draw with. Two
-  race runs with it found no stale page, no segment overwrite and no read-back mismatch; the
-  only late rewrite is in the front end (6 pages of one vertex fetch range, once).
-- Logs: each new pipeline with its compile time, and each 4 MB chunk of shared memory with the
-  frame it was mapped at.
-- Texture memory is bounded. The texture cache never destroyed a texture: in a 15-minute play
-  session it grew to 3.4 GB in 24 heaps of 128 MB (a race uses about 85 MB in 1,000 textures),
-  the kernel moved about 3 GB of it from VRAM to GTT, and after 65,000 frames the shader view
-  heap (65,536 descriptors) was full and the track stopped drawing. Textures are now held by
-  slot and generation handles on a least-recently-used list (touched once per frame) and
-  destroyed once no frame in flight uses them: past 512 MB those unused for 30 s, past 1 GB the
-  least recently used (`--pgr4_native_texture_memory_soft_mb`, `_soft_lifetime_s`,
-  `_hard_mb`). Their ranges in the placed heaps go back to a best-fit free list that merges
-  neighbours, and their shader views to a free list. With a 64/128 MB budget a race run
-  evicted 5,346 textures with a correct image, at most 1.2 ms per frame. The frame CSV has
-  `tex_mb`, `tex_count`, `tex_evicted`, `tex_evict_us` and `views`.
-- No frame is shown with draws missing. A draw whose pipeline is still compiling is skipped;
-  the frame is then held (the previous one stays on screen) and waits after its last draw for
-  all of its pipelines at once, at most 0.5 s, compiled on all but two hardware threads
-  (`--pgr4_native_pipeline_wait`, which replaces `--pgr4_native_pipeline_burst`). Before,
-  frames with fewer than 8 new pipelines were shown without their draws for 2-5 frames (207
-  race frames in a cold-cache run: objects flickered and buildings turned black or white), and
-  in a burst each draw waited for its own pipeline, so the pipelines compiled one after
-  another (30-40 ms each in the play session, several frames at the 500 ms limit). In a
-  cold-cache run (no vkd3d, Mesa or native pipeline cache, frames recorded) no frame was shown
-  with a draw missing; the race's 79 new pipelines held 48 frames for 2.4 s in total, 70-80 ms
-  each (1 % low 13.5 fps, against 26.9 when the frames were shown incomplete). With warm caches
-  nothing changes.
-- Marks: clicking both sticks (L3+R3) on any pad marks the moment as F12 does (the glitch
-  catcher's last 2 s, a PNG of the frame and a log line with the frame), so a back grip can mark
-  through a Steam Input binding that sends both. F12 is now read as the key's state: R4 bound
-  to F12 had marked once in a whole play session, as GetAsyncKeyState's "pressed since the last
-  call" bit was missing for most presses under Proton.
-- `deck-run.sh` keeps a `VKD3D_SHADER_CACHE_PATH` set by the caller (0: none), for
-  cold-cache runs with `MESA_SHADER_CACHE_DISABLE=true` and
-  `--pgr4_native_pipeline_cache=false`.
-- A held frame is not drawn to the back buffer and not recorded, so recordings, the glitch
-  catcher and the luma probe see only what the screen showed. 58 of the play session's 86
-  glitch dumps were held frames nobody saw (frame 23024, where the Shanghai buildings were
-  missing, was one); in a cold run's recording exactly the 39 held frames are missing.
-- New bool and texture-sign specializations of known shaders no longer hold frames. A draw
-  whose specialization is new uses the pipeline of its unspecialized shaders when that one is
-  ready, and the specialization compiles behind the pipelines frames wait for
-  (`--pgr4_native_generic_pipelines`, CSV `pso_generic`). The first draw of a shader pair and
-  state still waits, for its specialization (it has less code and compiles faster), and queues
-  the unspecialized pipeline. The play session's overtake race brought about 3,500 new
-  pipelines, most of them new bool/sign combinations of known shaders, and held frames for
-  5-8.5 s per 30 s. Waiting for the unspecialized pipeline instead, as a first version did,
-  held fewer frames in a cold race (15 against 40) but each for twice as long (100-190 ms).
-  Now, cold (td-18 against td-15): the race window held 16 frames for 0.85 s in total (40 for
-  2.0 s), the whole run waited 6.0 s (8.1), and the race's 1 % low was 15.3 fps (13.5). The
-  intro frames drawn partly on unspecialized pipelines look like those of the run without.
-  Cold runs leave the route after 15 s, so their averages are not comparable.
-- Marks in play sessions write the native image alone, from a thread, once the frame's fence
-  has passed (`--pgr4_native_capture_xenos=false` in `play.sh`). A mark had held the game
-  thread for two Swaps, switched the Xenos plugin to full readback and written two PNGs on the
-  game thread, for a Xenos copy that is meaningless in primary mode: a frame of 104-749 ms per
-  mark in the play session. A capture mid-race now made the next four frames 18-26 ms.
-- `marks.py` shows what the screen showed in the 5 s before each mark of a play session (a
-  mark comes a few seconds after what it marks): from the session recording, the slow frames
-  with their causes, the blocks that flashed and the whole-image jumps, each with its time
-  before the mark, as PNG sheets. With a recording running, a mark no longer writes the glitch
-  catcher's 2 s as well. In the play session's 19 marks it found geometry exploding into
-  screen-wide triangles and shards for single frames (a cockpit replay, AI cars, the garage),
-  with clean frame counters: the next bug to fix.
-- Most of those frames are PGR4's look-back camera, which R3 (the right stick clicked) shows
-  while it is held: in the chase view the camera turns round to face the car's headlights, in
-  the cockpit it looks out of the rear window past the driver's arm. The mark chord L3+R3
-  reached the game too, so each mark, and each press too short for both buttons to show in one
-  frame, looked back for 1-6 frames; marks 25767, 41499, 91103 and 92537 each have one at the
-  mark itself. In a scripted race, R3 held for 300 ms and for 1.5 s looks back as long (td-19).
-  Marks are F12 alone now, a key the game has no binding for. The frame CSV has the pad as the
-  game read it (`pad_buttons` in hex, `pad_lt`/`pad_rt`, `pad_lx`..`pad_ry` as signed high
-  bytes; from XamInputGetState, buttons OR'd over a frame's reads and each axis at its largest
-  deflection), so a flash can be checked against the input.
-- The snow race's flashing frames (Quebec, Subaru 22B): for one or two frames the scenery
-  broke into grey slabs, stripes and smears, or turned black, while the car and HUD stayed
-  right; Xenos drew the same frames correctly (td-34). Neither serializing the GPU, recording
-  on the game thread, unlimited texture memory nor turning off stand-in pipelines stopped it
-  (td-35). A draw log of 3,265 race frames caught one (td-38, frame 23252): against its
-  neighbours, the only change was the vertex shader of 240 draws, with the same address, size,
-  buffers, textures and state. When the D3D binds a vertex shader variant with another vertex
-  declaration and the GPU has finished the frames that loaded it, it patches the variant's
-  vertex fetches in place (sub_826A9718 -> sub_826A8C20) instead of loading a patched copy
-  through the push buffer. The renderer's shader memo, keyed by address and size and checked
-  against the first and last eight dwords, kept the shader translated before the patch, and
-  the draws read their vertices in the wrong layout. Whether the D3D patches in place depends
-  on how far the GPU is behind, so the frames came and went with timing. The state tracker now
-  reads the variant's binding record (declaration id and stream layout) into the shader
-  reference, and the memo misses when it changes. Each run logs its first eight in-place
-  rebinds (`rebound in place at frame N`); td-40 had its eight before the race started. Its
-  130 s of the snow race (driven by hand once the scripted route had left the road) caught no
-  flashing frame, at 85 fps average and a 1 % low of 48 fps.
-- Debug switches used to find it: `--pgr4_native_gpu_serialize`, `--pgr4_native_draw_log_from`
-  and `_draw_log_frames` (draw logs of N frames, with each draw's index and vertex buffers and
-  a hash of the float constants each shader reads; resolves, EDRAM fills and render target
-  creation are logged between the draws), `--pgr4_d3d_tap_check`. `deck-run.sh --draw-log N`
-  logs N frames from the race start; `--race-draws` sets the median draws per frame that
-  shows the race is on (3000, St Petersburg's; the snow route runs with 1000).
-- Title Update #2 (0.0.2.1, the game's last version): the build recompiles the disc's
-  executable with the update applied, so World Challenge mode is in the Single Player menu and
-  the game reads downloadable content (`title-update/README.md`). The update, free on Xbox Live,
-  ships in `title-update/`; codegen applies its `default.xexp` to a copy of the disc's
-  `default.xex`, and the runtime mounts the folder as `update:\` and refuses an image other than
-  the one the code was generated from. MTR-PGR4's patches to the generated code name base
-  addresses: `native/tools/tu_address_map.py` matched the two executables' functions
-  instruction by instruction (`title-update/addresses.txt`), the build rewrites MTR's patches
-  and manifest entries with that table, and the garage step-count patch is rewritten for the
-  register the update keeps the count in. The renderer's own hooks into the D3D library moved
-  by the same map. DLC copied off a console as STFS packages goes in the game folder's
-  `Content\` (or `--content_root`); the runtime installs each new package into the user data's
-  content store at startup (td-41: Vehicle Pack 1 installed, World Challenge in the menu).
-- Play sessions are lean by default. The 15-minute play session (195,000 frames) had 70 stalls
-  over 100 ms, up to 2.3 s, spaced at multiples of 5 s: `play.sh` recorded every frame shown
-  (about 50 MB/s, 112 GB in the session), and the kernel's writeback paused the game's writing
-  threads (the frame CSV and the log among them). The scripted snow race without a recording
-  (td-39) had none. `play.sh` now starts the game alone, as a console would: no frame CSV, GPU
-  pass timing, sampler, glitch catcher or marks, and the game log, Wine and vkd3d-proton keep
-  warnings and errors only. `play.sh --debug` (or `PGR4_DEBUG=1`, and a second desktop entry) is
-  a debugging session with all of them; `PGR4_RECORD=1` adds the recording. The glitch catcher
-  keeps 5 s (it was 2 s), since a mark comes a few seconds after what it marks.
-- Capture requests are polled only when `--pgr4_native_capture_dir` is set; it has no default
-  folder now. Every frame had queried `capture.request` through Wine's path translation and
-  read the F12 key, and every 15 frames opened `draw-debug.txt`. The request file is now read
-  every 16th frame (td-44 took its 13 captures). `run.ps1 -Native` passes the Windows lab's
-  folder.
-- The title screen's Ferrari (its diffuser on the white floor, where play showed white
-  shimmering): 13 oracle captures of the slide-in (td-44) differ from Xenos by more than 48
-  levels in 2-19 pixels each (PSNR 45-49 dB). In a recording of 1,800 frames (td-45) the
-  diffuser's edge holds still from frame to frame (mean luma change 0.14, p99 2); the white that
-  comes and goes there is the title screen's rain, streaks of one or two frames that Xenos draws
-  too.
-- Pass-through D3D hooks jump straight to the game's function. Of the D3D library functions the
-  renderer hooks, the ones neither it nor the state tracker needs (`IsPassThrough`) still went
-  through `OnHook` on every call to be counted. They now return through the original unless the
-  tap or the profiler is on; `RestorePush` keeps the full path, since a held `BeginVertices`
-  draw is queued at its entry. `OnHook` was 3.4 % of the game thread (td-46) and is gone from
-  td-47's profile. The frame rate did not move (race 69.1 fps against 68.8): the APU is at its
-  15 W limit in every sample, the CPU takes 9.1 W of it and the GPU runs at 600-685 MHz, 86 %
-  busy. The frame waits on the GPU, and the CPU's savings are power the GPU can clock up with.
-- The XMA decoder's worker no longer wakes after every kick. A kick (the game setting a
-  context's kick bit) decodes the kicked contexts at once on the game's audio thread (MTR's
-  change), and `Work` takes the context's enable, so the worker woken behind it walked all 320
-  contexts, about 18 KB apart and a cache miss each, and found nothing: 71 % of its 8.6 % of a
-  core sat on the load of the enable flag (td-47). The kick no longer sets the worker's event
-  (`rexglue-runtime-perf.patch`); pause and shutdown still do. td-48: the thread is idle, the
-  game's threads take 260 % of a core (277 %), the audio thread 47 % (52 %); race 70.6 fps
-  (69.1), 1 % low 41.9 (36.3), p99 20.8 ms (23.6), GFX clock 716 MHz (685).
-- `deck-run.sh --pmu` (with `--perf`) counts the front end per thread over the perf window
-  (`proton/pmu_summary.py`). td-48: the game thread retires 1.16 instructions per cycle and
-  refills its instruction cache 26 times per 1000 instructions (22 from L2, 3.8 from memory);
-  the render thread 63 times (58 from L2). The recompiled code does not fit the caches, so its
-  layout is worth more than any one function.
-- The game is built with profile-guided optimization. 90 % of the executable's samples fall in
-  677 functions spread over 35 MB of its 38 MB, and of their 2.9 MB only 480 KB of cache lines
-  run. With a profile, clang puts each function's hot blocks together, its cold ones after
-  them, and inlines by call counts. `native/build.sh --pgo gen` builds the game instrumented and
-  `--pgo FILE` with a profile; a build without `--pgo` uses `<dest>/pgo/default.profdata` when
-  it exists. The Linux LLVM packages have no Windows profile runtime, so `build.sh` compiles
-  compiler-rt's for the clang-cl in use, and as the run scripts kill the game, the instrumented
-  build writes its counters every 5 s (`src/native/pgo_counters.cpp`). The profile is one
-  scripted race run (td-49, 63 fps while counting). td-50 against td-48: race 75.7 fps (70.6),
-  1 % low 44.7 (41.9), p99 19.7 ms (20.8), GFX clock 772 MHz (716); the game thread refills its
-  instruction cache from L2 16.5 times per 1000 instructions (22.1) at 1.21 instructions per
-  cycle (1.16), the render thread 50 times (58).
-- A new XMA stream no longer reopens its decoder. When the game frees or clears an XMA context,
-  MTR's fix for a sound's tail bleeding into the next one cleared the decoder's cached format,
-  so the stream's first frame freed the FFmpeg context and opened another: about 450 KB
-  zeroed and MDCT tables for seven block sizes (up to 8192 points) rebuilt, about 55 times a
-  second in a race. FFmpeg's xmaframes decoder now has a flush that puts each channel back as
-  `decode_init` leaves it (overlap tail, previous block length, scale factor history), and a
-  reset calls it (`rexglue-runtime-perf.patch`). td-52 decoded each new stream's first 64
-  frames through both the flushed and a reopened decoder: 105,000 frames from 3,128 streams,
-  menus and race, and not one sample differed. `ff_mdct_init` and `split_radix_permutation`,
-  2.5 % of the audio thread in td-50, are gone from td-53's profile. The frame rate cannot
-  show a change this small: td-54 ran the race at 74.9 fps (td-51: 78.7) at a lower GPU clock
-  (774 MHz against 870, 2.5 W against 2.7), with one burst of 11 slow frames after the car left
-  the scripted line, and its audio thread took 44.5 % of a core (44.2).
-- Wineserver requests per thread. Under Proton, many calls that Windows handles in its kernel
-  are requests to wineserver, a separate process: two context switches and a CPU wakeup each,
-  paid for out of the APU's power budget. `deck-run.sh --server-trace` runs wineserver with its
-  request trace and `proton/server_requests.py` counts each thread's requests per second over
-  the race window. td-60: 17,700 requests a second. The game thread made 1,100 of them: 380
-  `ResumeThread` calls on worker threads that were not suspended, 77 `GetThreadPriority`
-  queries, and a rumble report (an event, a HID ioctl and a close) every frame. Without the
-  frame-rate cap (`--uncapped`, td-55/56) the race ran no faster, with the GPU 93 % busy: the
-  frame waits on the GPU, and the GPU's clock waits on the power the CPU leaves it.
-- The game thread no longer makes those calls (`rexglue-runtime-perf.patch`). Resuming a guest
-  thread that is not suspended does nothing, as on the console; the count had also wrapped
-  below zero, which lost the thread's next suspend. A thread's priority is read from the value
-  last set. The guest's motor speeds are stored and sent by the UI thread with its next pump,
-  and SDL sends nothing when they did not change. td-61: the game thread made 167 requests a
-  second (1,103), and the race ran at 78.0 fps (77.1). `--kernel_wait_stats` logs, per guest
-  thread every 5 s, how long its kernel waits blocked and which guest code called them.
-- Mid-frame submission. The render thread submitted each frame as one command list at the
-  Swap, so the GPU sat idle from the end of one frame until all of the next was recorded
-  (2.2-2.9 ms per frame in td-62), and the render thread then waited in Present. Now every 256
-  draws (`--pgr4_native_submit_draws`, 0: once per frame) the frame so far is submitted, once
-  the untile workers have filled the upload memory its texture copies read, and recording goes
-  on in a fresh list. td-65 against the same build with it off (td-66), race: 80.0 fps against
-  76.1, 1 % low 51.2 against 39.5, no hitches against 6, Present 0.9 ms per frame against 3.2,
-  the game thread waiting for the render thread 0.06 ms against 1.07, 12 submissions per frame.
-  The game thread is now the limit (92 % of a core), and the GPU still waits 1.0-1.6 ms per
-  frame for the next list.
-- The pad is read on a thread of its own. ReXGlue's SDL driver had every XInput call of the game
-  ask the UI thread to pump SDL's events, and an event watch copied every joystick and gamepad
-  event (each axis of each HID report) into a queue that the game's next call replayed under the
-  driver's lock. Now an SDL timer reads each pad's buttons and axes every 4 ms and keeps the
-  result, the game's calls copy it under the lock, SDL no longer queues the per-report events,
-  and the event filter keeps only connects and disconnects; rumble goes out from the timer
-  thread, outside the lock (`rexglue-runtime-perf.patch`). A first version filtered out the
-  joystick events from which SDL's gamepad layer builds its own state, so a connected pad read
-  as idle; the timer now asks the pad for its state instead of relying on events. td-70 against
-  td-65: the UI thread took 1.4 % of a core (9.0), the game thread that polls the pad 14.4 %
-  (19.9), the timer 5.3 %. td-73 (wineserver trace): race 80.8 fps, 1 % low 49.7 (td-65: 80.0,
-  51.2). Of its 16,400 wineserver requests a second, 13,000 are the pad's: winedevice's HID
-  threads (9,200), SDL's reads (2,300) and Wine's own XInput reader (1,700), which reads the
-  same pad as SDL; winedevice takes 21 % of a core.
-- The state tracker hands the render thread its register changes as a list. Each write that
-  changes a register's value is appended as it happens, and `TakeChanges` copies the list in
-  order; before, each write set a bit in a two-level bitmap, and `TakeChanges` walked the bitmap
-  and read every marked register back. The register blocks keep their group count instead of
-  dividing for it at every draw, and the texture cache's capture stamp, which only the game
-  thread writes (once per draw), is a plain store on a cache line of its own instead of a
-  locked add beside members the render thread reads for every texture it binds. td-73 runs
-  both; no run measures them on their own.
-- The continuous recorder is gone (`--pgr4_native_record`, `play.sh`'s `PGR4_RECORD`,
-  `deck-run.sh --record`). It wrote every frame shown to disk at half size, about 50 MB/s,
-  which stalled the game, while the glitch catcher already keeps the last 5 s in memory and
-  writes them out at each whole-image jump and each F12 mark; `marks.py` and `flicker.py` read
-  those dumps.
-- `deck_sampler.py` snapshots every process's CPU time every 5 s, and its summary lists the
-  busiest processes besides the game: what else draws on the APU's 15 W. td-72 ran the same
-  build as td-73 while this session's agents worked beside it: race 78.2 fps, 1 % low 40.6, 6
-  hitches, GPU clock 737 MHz, against 80.8, 49.7, 4 and 771 MHz; the session took about a
-  quarter of a core. `perf_symbols.py --annotate TEXT` lists the busiest instructions of the
-  functions whose name contains TEXT, by offset, for `llvm-objdump`.
-- A cleanup pass over the renderer's C++, with no change in what it draws. Dead code went: draw
-  state fields and device offsets nothing read, the render targets' and resolver's own
-  `OnClear`/`OnResolve` paths and counters, coherency counters nothing reported, unused `base`
-  parameters (and the renderer's copy of the guest memory base, stored at every hook call for
-  one debug dump), and the viewport math of draws dropped before they use it. Guest memory
-  reads go through one header (`guest_memory.h`: the SDK's host address translation and
-  byte-swapped loads) instead of four copies, and barriers, buffer descriptions, committed
-  buffers and the D3DCompile loader through helpers in `d3d12_device.h` instead of a dozen
-  hand-written copies. The glitch catcher's parts lost the removed recorder's names, the PNG
-  CRC table is built at compile time, arrays come from `make_unique` (the 512 MB coherency
-  shadow from `make_unique_for_overwrite`), and the debug toggle the game thread reads is an
-  atomic. td-74: race 82.4 fps, 1 % low 56.6, 0 hitches, GPU clock 816 MHz (td-65, the last
-  run without a server trace: 80.0, 51.2, 0). It is also the first run of the input and
-  tracker changes without the trace, so no run measures the cleanup on its own. The PGO
-  profile is stale in the changed functions, which clang compiles without it, until it is
-  taken again.
-- `native/src` is formatted by `native/.clang-format`: ReXGlue SDK's (Google style, 100
-  columns) with Google's own short functions, if statements and loops on one line. Run
-  `clang-format -i` on the files a change touches (the distrobox has it). The formatting
-  commit is in `.git-blame-ignore-revs`.
-- The profile-guided optimization profile is taken again (td-75: one scripted race of the
-  instrumented build, 68.5 fps while counting). The functions the cleanup changed had been
-  compiled without a profile, among them the game and render threads' busiest (`OnDraw`,
-  `AfterCall`, `TakeChanges`, `ReadDrawState`). td-77 against td-74: race 83.2 fps (82.4), 1 %
-  low 54.6 (56.6), no hitches in either. td-76, the same build run while this session's agent
-  worked beside it, had 12: in each the render thread waited 8-34 ms for the GPU.
-- The Xenos command processor's register waits (`--gpu_wait_reg_mem_high_res`) sleep 0.5 ms at
-  a time on a high-resolution waitable timer. Under Wine a waitable timer is a wineserver
-  object, so every sleep was a `set_timer` request and a server wakeup, 987 a second in td-73.
-  Under Wine they now sleep through `NtDelayExecution`, which Wine runs in the process (a
-  `select` with a microsecond timeout); Windows keeps the timer (`rexglue-runtime-perf.patch`).
-  td-78 (wineserver trace): the GPU command thread makes no requests. td-79 against td-77: race
-  83.4 fps (83.2), 1 % low 55.5 (54.6), no hitches in either, a difference within run-to-run
-  noise.
-- `deck-run.sh` hides the Deck's own controller (28de:1205) from the game
-  (`SDL_GAMECONTROLLER_IGNORE_DEVICES`), as Steam does for the games it launches, which get its
-  virtual pad instead. Without it winebus read the controller's HID interfaces at about 22 % of
-  a core; with it the device driver process takes 2.3 %. The route types on the keyboard.
-- The Xenon's `db16cyc` (a 16-cycle delay hint, which the game's spin-wait loops issue) becomes
-  the host's spin-wait hint, `simde_mm_pause()` (PAUSE on x86, ISB on ARM), instead of nothing
-  (`rexglue-runtime-perf.patch`): a spinning thread draws less power and leaves its core to the
-  SMT sibling. td-81 against td-79: race 84.8 fps (83.4), 1 % low 55.7 (55.5), one hitch (none).
-- `native/build.sh` regenerates the game code when the codegen tool is newer than the codegen
-  stamp: codegen skips a module whose inputs it fingerprinted before, and the fingerprint leaves
-  out the tool itself, so a rebuilt tool regenerated nothing. `--force` does the same.
-- Constant buffer uploads write with streaming stores: `CachedCbv` keeps the current bytes in
-  its own memory and `CommitCbv` copies them to the upload ring with `_mm_stream_si128`, so the
-  ring is never read back and the copy goes around the cache instead of evicting the game's code
-  and data. The submit
-  issues an `sfence` before `ExecuteCommandLists`. The hot command and register vectors are
-  filled with `emplace_back`. td-82 against td-81: race 86.3 fps (84.8), 1 % low 58.2 (55.7),
-  0.1 % low 49.7, no hitches (one); the render thread took 61 % of a core (66 %).
-- A key switches between the native renderer and the Xenos plugin at the next Swap, for comparing
-  the two on the same scene: `bind_renderer_switch`, F9 by default, an SDK key bind that the
-  settings overlay and the config can change (`--pgr4_native_renderer_switch`, on with
-  `--pgr4_native_primary`). On the Deck a Steam Input binding sends it from a back grip (R5). It
-  is a key and not a pad combination because the game reads every button of the pad: td-86 tried
-  LB + RB + B, and the camera changed at every switch (in a race LB changes the camera, RB toggles
-  the driver names and B taunts). Handing over marks all of the guest D3D's state dirty, so the
-  plugin's next draw writes all of it, and clears `gpu_skip_draws`; the native window hides and
-  the plugin presents in the game window. Taking back resyncs the state tracker and sets
-  `gpu_skip_draws` again, and the next native frame shows the window. Until a switch, the cost is
-  a flag check per hooked call and one at each Swap. The SDK's key binds now ignore a held key's
-  auto-repeats (`rexglue-native-primary.patch`), which would switch back and forth. td-85 (with
-  the pad combination): three switches in a race, each window change within 50 ms of the switch,
-  the plugin at 36-46 fps; switching back compiled about 25 pipelines (36-76 ms each, on the
-  workers). td-87 (the pad combination, its buttons then kept from the game): four switches with
-  the car on the grid, the same camera throughout, the native and Xenos frames alike. td-89 (F9):
-  four switches, one of them a 1.5 s hold, each switching once. td-90 (no switch) against td-82:
-  race 87.0 fps (86.3), 1 % low 56.8 (58.2), one hitch (none), within run-to-run noise.
-- `deck-run.sh`: a route line `<at> mark shot <name>` saves a screenshot as `<name>.png` when
-  the player reaches it, and each `gamescopectl` screenshot gives up after 10 s (td-85's
-  periodic shots stopped for good after 24 s).
-- The native renderer presents from the game's own window. Its swapchain was on a child window
-  laid over the game window, and gamescope flips only a top-level window's surface: every
-  native frame went through Xwayland's copy instead, which ignores FIFO and frame limits
-  (td-100 to td-106: gamescope logged `flip: false`, and the frames' present feedback came 22-35
-  ms after the present). Now `NativeRenderer::OwnGameWindow` disconnects ReXGlue's presenter
-  from the game window before creating the swapchain on it, and releases the swapchain and
-  reconnects the presenter while a XAM dialog is up (the presenter draws them) or after F9.
-- Frames are paced on the display (`frame_pacer.h`). The game paced itself on ReXGlue's vblank
-  timer, a clock of its own beside the display's: the two drift apart, and a frame that misses a
-  tick by a little waits a whole tick. Now the guest presents immediately
-  (`Pgr4PresentationInterval`, from `title-update/apply_game_patches.patch`) and the game thread
-  begins a frame once the display has shown the frame `--pgr4_native_frame_latency` (3) before
-  it, counted on the swapchain's frame latency waitable (vkd3d-proton releases it when
-  `vkWaitForPresentKHR` returns, in FIFO only, so the paced swapchain presents with vsync). The
-  game's time steps then follow the intervals the display shows its frames at, whatever the
-  refresh rate or frame limit. td-107 (90 Hz): every swapchain flips, shown interval median
-  11.11 ms (sd 0.82), 18 frames shown late in the race, time step minus shown interval sd 1.04
-  ms, a frame's start to its display 33.3 ms; race 88.0 fps, 1 % low 56.1 (td-97: 86.3, 52.8).
-  With 2 frames (td-108) the latency was 22.2 ms but 79 frames were late (race 86.6, 1 % low
-  48.1).
-- `deck-run.sh --limit <fps>` sets gamescope's frame limit with `gamescopectl
-  debug_set_fps_limit`, as Steam's limiter does; `--framerate-limit` and the
-  `GAMESCOPE_FPS_LIMIT` property are overwritten by the app's refresh cycle at every paint
-  (td-109/110). td-111 (limit 45, 3 frames): 45.0 fps, shown interval sd 0.33 ms, no frame late,
-  APU 7.7 W, but 66.6 ms from a frame's start to its display. td-112 (2 frames): sd 0.57 ms, one
-  frame late, 44.4 ms, 7.5 W. A fixed frame count is the wrong unit: the pipeline takes about
-  the same time at any frame rate.
-  `native/tools/pacing.py` reports the time steps, the shown intervals, the latency and the
-  mismatch; `deck-run.sh` runs it after each race.
-- The latency follows the pipeline's time instead of the frame count
-  (`--pgr4_native_low_latency`, `frame_pacer.h`). Each frame begins a delay after its gate
-  opens: the time recent frames waited between the GPU finishing them (the frame fence, which
-  the pacer thread now waits on beside the waitable) and the display showing them, less
-  `--pgr4_native_latency_margin_us` (4 ms). This is DXVK's latency sleep measured against the
-  display, since under gamescope's limiter the game cannot know the frame interval. The
-  estimate drops at once on a slower frame and rises 1 ms a second, because the slowest frames
-  come seconds apart (td-114: a delay from the last 64 frames made 55 frames late at 90 Hz). A
-  frame shown more than 3 slots late (a loading screen) starts the estimate over (td-117: the
-  delay climbed back for seconds after each one). Every 10 s the delay eases down by half an
-  interval for a few frames, so a pace the delay set itself (frames just late enough to fill
-  every other slot) is told from a frame limit. td-118 (limit 45): 31 ms from a frame's start
-  to its display (66.6 ms, td-111), no frame late, time step minus shown interval sd 0.46 ms,
-  APU 7.2 W. td-119 (90 Hz): 26.6 ms (33.3, td-107), race 87.8 fps, 1 % low 57.9 (88.0, 56.1);
-  of its 28 late frames, 25 came in a stretch of 12-17 ms game-thread frames under the power
-  limit (no delay applied: the frames began late without sleeping), 3 had finished on the GPU
-  two intervals before they were shown. `pacing.py` adds the wait and the delay.
-- The pacer's headroom estimate is the least headroom of the last 10 s, in one-second buckets,
-  instead of a minimum released by 1 ms a second. At 30 fps the headroom spans three 33 ms
-  intervals, and after one hitch the released estimate took about 75 s to come back (td-121).
-  The probe for a faster pace backs off: 10 s after the pace was set, then twice the period
-  before, up to 80 s; and at once when a frame is shown sooner than the pace allows, as the first
-  frames are after a limit is lifted. td-122 (limit 30): 22-32 ms from a frame's start to its
-  display, 45 ms for a moment at each probe; time step minus shown interval 0.08 ms in the
-  median and 1.9 ms in 99 % of the frames, so 30 fps is as even as the display allows. td-123
-  (limit 30 lifted 196 s after the launch, `deck-run.sh --limit-at`): the pace followed within about 2 s. At
-  90 Hz the estimate is more cautious than before: 30.7-33.3 ms (26.6 in td-119), with the delay
-  at 0-2.6 ms in the median (5.9). The frames shown late at 90 Hz (td-125, td-126, td-128: 55,
-  36 and 51 of 3450; td-119: 28) are not the pacer's: nearly all come in the same stretch of the
-  route (frames 19290-19600), where the game thread takes 12-15 ms a frame and the render thread
-  8-10 ms. Only less CPU time per frame shows those on time.
-- The motion blur is as long at 90 fps as on the console at 30 FPS. The blur pass (sub_82859FC0)
-  smears each pixel along its reprojection to the previous frame, so it spans one frame's
-  motion, and its per-sample step was tuned for 30 FPS: at 90 fps the blur was a third as long.
-  `title-update/apply_game_patches.patch` now passes the step through `Pgr4MotionBlurStep`,
-  which scales it by 1/30 s over the step of the frame being drawn (the time between two Swap
-  returns, one frame back; it matches the game's own delta time within 0.11 ms in the median,
-  td-125). In the same race at 30 and 90 fps (td-127, td-128) the reprojection moved 2.95 times
-  as far per frame at 30 fps, and the blur (motion times step) matched within 2 % in every 3 s
-  window. The pass costs 0.84 ms of GPU time a frame at 90 fps (td-126).
-- The game thread's D3D hooks take a fifth less time. Each hook's wrapper is a template on the
-  function it wraps, so it holds only that function's path (state flush, draw, clear, resolve,
-  Swap) instead of switching on the guest address per call. The state tracker appends its
-  register changes straight to the render queue's batch, compares the register blocks eight at a
-  time, and re-reads the bound shader objects only when a call loads a shader. The index buffer
-  object is prefetched as DrawIndexedVertices begins, and the shader memo has 256 entries (shader
-  loads 0.034 per draw before, 0.022 after). The hook timers and the profiler count time-stamp
-  counter ticks (`native/src/native/clock.h`) and convert them once a frame. Profiled race, same
-  window (td-130 before, td-133 after): hook time per draw 329 to 263 ns, game thread 12.5 to
-  12.2 ms in the median and 16.3 to 15.8 ms at p99, race 84.4 to 85.3 fps, 1 % low 49.3 to
-  52.9. td-134 compared 33.5 million draws with the guest's register shadow
-  (`--pgr4_native_track_verify`): none differed.
-- Fixes from a review of the renderer. Samplers are looked up by their exact 22-bit key (a 64-bit
-  mix of a 12-byte key could give two keys one sampler). A resolve to a mip level past the last
-  is rejected before it indexes the texture layout. A frame with more resolves than the
-  descriptor heap holds skips the excess instead of overwriting descriptors its earlier
-  dispatches still read. Events are owned handles, and the device does not start without its
-  fence event (given none, SetEventOnCompletion blocks the caller). The resolve self-test passes
-  (td-134).
-- The PGO profile is taken again from the current code (td-135; td-75's was stale in every
-  function changed since). Profiled race, same window (td-133 with the old profile, td-136 with
-  the new): race 85.3 to 87.5 fps, 1 % low 52.9 to 58.6, p99 16.7 to 15.1 ms, frames shown more
-  than half an interval late 118 of 3299 to 48 of 3449; game thread 12.2 to 11.6 ms in the
-  median and 15.8 to 14.8 ms at p99, render thread 9.8 to 9.0 ms; GPU clock 885 to 938 MHz,
-  with the APU at its power limit in 80 % of the samples (91 %). Against td-130, before the hook
-  changes: hook time per draw 329 to 242 ns, 1 % low 49.3 to 58.6.
-- `native/build.sh` installs by writing new files, so a running or sampled game keeps the
-  modules it loaded, and `deck-run.sh --perf` hard-links the modules it sampled next to the
-  profile (`<log>-perf-modules/`), so `perf_symbols.py` names the samples after a rebuild.
-- The render thread's command timers count time-stamp counter ticks and convert the sums once a
-  frame. NowNs, out of line behind a thread-safe static guard, was 1.6 % of the render thread's
-  samples at two calls per command (td-137). td-140: race 89.4 fps, 1 % low 59.6 (td-138: 89.3,
-  58.7), draw time 1931 ns per draw (1999).
-- The SSE2 paths (the register compare, the constant packing, the streaming constant upload and
-  its fence) use simde's names, which compile to the same instructions on x86-64 and to NEON on
-  ARM. td-140 ran the race on this build.
-- `--pgr4_native_anisotropy=<n>`: linearly filtered textures with mips get at least n-times
-  anisotropic filtering; render targets, lookup tables and point-sampled or single-level
-  textures keep the game's filtering. Off by default, so the image matches the console's. At 16
-  (td-141 against td-140): race 88.9 against 89.4 fps, 1 % low 59.7 against 59.6, game GPU time
-  86 % of the window against 84 % (fdinfo).
-- The state tracker walks one table of flushed blocks (the float constants and the register
-  blocks) once per call and compares and records each group inline, 128 bits at a time (SSE2
-  through simde), with the register log reserved once per flush. AfterCall shrinks from 15 KB to
-  4.9 KB of code. td-142 and td-146 each compared 33.5 million draws with the guest's register
-  shadow: none differed. The tracker went from 6.7 % of the game thread's perf samples (td-145)
-  to 5.4 % (td-147).
-- No 256-bit vector code on the hot threads. The Deck's microcode (0x8901007) has no Zenbleed
-  fix, so the kernel sets the DE_CFG chicken bit, and VZEROUPPER, which the compiler runs before
-  every call and return of a function that wrote a 256-bit register, gets slow: the instruction
-  after one took 4.2 % of the game thread's samples and 4.3 % of the render thread's (td-145).
-  `native/build.sh` builds with -mprefer-vector-width=128 and without the Zen tuning that copies
-  and fills with 256-bit moves (allow-light-256-bit), and the constant packing, the fan index
-  writer, the shader slot fill and the bool specializer no longer make 256-bit code. td-150:
-  0.00 % of the render thread's samples after a VZEROUPPER, 1.2 % of the game thread's. td-148
-  checked 33.5 million draws against the register shadow: none differed.
-- `--pgr4_native_profile` also times each hooked guest D3D function's outermost call, logged
-  per frame for the twelve that take longest. td-144: about 1 ms of guest D3D in a normal frame
-  and 1.4 ms in a heavy one, at 25-50 ns per call, spread over SetStreamSource, SetTexture,
-  DrawIndexed and the constant setters, so no single setter is worth replacing natively.
-- The hooks' check for a live renderer is one atomic load (it was a function-local static guard
-  and two settings reads per call), and the profiler's switch is one process-wide atomic flag.
-  The draw debug mask has named bits; settings such as the anisotropy and the texture trace
-  address are parsed once. The game builds with no warnings.
-- The PGO profile is taken again from the current code (td-152). Race against td-140, before
-  the tracker and vector changes (td-153): 89.2 against 89.4 fps, 1 % low 54.6 against 59.6;
-  hook time 258 against 241 ns per draw, render thread 2004 against 1947 ns per draw; game
-  thread 9.48 against 9.47 ms in the median and 13.6 against 13.8 ms at p99. That is within the
-  spread between runs (td-140 and td-141, one build with anisotropic filtering on in the
-  second, differ by 6 % in draw time), so these changes show in the perf samples, not yet in
-  the frame times. Of td-153's nine frames over 20 ms, six waited a whole interval in Present
-  (the GPU finished late), two created about 80 textures each, and one is the frame CSV: the
-  render thread stalled 27 ms between writing a row and finishing the frame (the row is flushed
-  on that thread).
-- The frame CSV and the pacer's log go through a buffer that a background thread writes out
-  every 250 ms, so the render and pacer threads only format a row into memory. td-154 against
-  td-153: race 89.1 against 89.2 fps, 1 % low 59.2 against 54.6; shown frames more than 1.5
-  times the median interval apart, 11 of 3449 against 28, interval sd 0.65 against 1.02 ms. The
-  render thread takes 32 µs in the median and 44 µs at most from writing a row to finishing the
-  frame (78 µs and 27 ms). Of the race's frames over 20 ms, three waited in Present for the GPU
-  and one uploaded 2 MB of textures.
-- A pass over the renderer's code for correctness and clarity. Resolve clears the whole source
-  rectangle even where the copy is clipped or fails, as the guest D3D does; a frame that fails
-  in primary mode hands the game to the Xenos plugin at the next Swap and the window back to
-  ReXGlue's presenter, instead of leaving it black; a failed vertex copy no longer leaves its
-  pages marked valid. The pipeline library's names carry the root signature's hash, so a
-  changed root signature never loads a stale pipeline (td-155 started from an empty library:
-  1161 pipelines queued in the menus, no compile waits in the race). Repeated warnings are
-  limited per call site (`log.h`), the hooked functions are one list (`hook_args.h`), the
-  presenter's and the resolver's debug tools are files of their own, and dead code (the
-  bindful root signature, the raw resolve path, unused settings and statistics) is gone. The
-  render thread's queue entries are prefetched for writing with PREFETCHW (`-mprfchw`). The
-  Proton scripts share `proton/common.sh` and stop only their own prefix's game. The PGO profile
-  is taken again (td-155). td-156, the image check: 45.3-46.2 dB against the Xenos plugin.
-  td-157 against td-154: race 89.3 against 89.1 fps, 1 % low 59.4 against 59.2; 17 of 3449
-  shown frames more than 1.5 times the median interval apart against 11, interval sd 0.79
-  against 0.65 ms, within the spread between runs.
-- A guest clear waits on its host target until the target is next drawn to or read, and is
-  dropped when a later clear or EDRAM fill of the same planes covers it first. The resolves
-  that end each scene tile clear it, and the next frame's BeginTiling clears every tile again
-  before anything reads them; the post chain's last resolve clears the 1x surface, and the
-  EDRAM fills of the next frame's scene resolves overwrite it. Neighbouring rectangles of one value go in one clear
-  call. td-160 against td-158 (GPU timing, the same race frames): 8.72 against 8.98 ms of GPU
-  per frame, resolves 1.34 against 1.74 ms, clears 0 against 0.16 ms, draws 6.86 against 6.55
-  ms (BeginTiling's clears now run in the first draw's span). Clearing the whole target rather
-  than the guest's rectangles (td-159) saved nothing: 8.96 ms. td-161, the image check:
-  46.5-47.6 dB. td-162 against td-157: race 89.2 against 89.3 fps, 1 % low 59.5 against 59.4.
-- The upload of a texture the frame has not bound yet goes into a list that runs ahead of the
-  frame's list, in the same submission, with its barriers batched: on the frame's list each
-  upload ended a vkd3d render pass. DXVK moves transfers out of order under the same condition
-  (`prepareOutOfOrderTransfer`). Every upload in the race qualifies (td-170: 9462 of 9462). The
-  untile job arms its texture's page watches just before it reads, so those protection changes
-  (about 20 µs each under Wine) leave the render thread, and a texture whose mips follow its
-  base takes one change for both. td-169 against td-167 (profiled): race 89.1 against 88.2 fps,
-  1 % low 58.9 against 54.0, 14 frames over 16 ms against 27; the textures stage of the worst
-  burst frame 5.1 against 9.9 ms. The upload list itself costs about 31 µs per texture
-  (td-170), the copies in vkd3d and RADV. td-171, the coherency check: clean. td-172, the image
-  check: 45.9-47.2 dB. td-173 against td-162: race 89.2 against 89.2 fps, 1 % low 58.1 against
-  59.5, 0.1 % low 44.6 against 43.5, within the spread between runs.
-- The untile worker that untiles a first-bound texture records its barriers and copies too, on
-  an upload list of its own, so recording them (about 31 µs per texture in vkd3d-proton and
-  RADV) leaves the render thread. Each worker's command allocators are pooled by frame fence, as
-  Xenia's D3D12 command processor pools its own; the lists recorded since the last submission
-  run ahead of the frame's list in the same `ExecuteCommandLists`. td-175 against td-170
-  (profiled): the render thread's upload list work 34.5 against 291 ms over the race window,
-  0.14 against 3.9 ms in the worst frame; the workers take about 49 µs per upload. td-174, the
-  image check: 45.1-47.3 dB. td-176 against td-173: race 89.4 against 89.2 fps, 1 % low 59.2
-  against 58.1, 0.1 % low 45.3 against 44.6.
-- Vertex and index page watches are armed on a thread of their own. A protection change takes
-  about 20 µs under Wine, and geometry streamed in during the race armed 130-420 pages in a
-  burst frame, 1.6-6.5 ms of the guest D3D thread (td-177, watch trace). A run is now hashed
-  just before its copy and stays pending, hashed by every request, until the watch thread arms
-  it; a page whose hash changed in between stays invalid. td-178, the coherency check: clean,
-  12 pages caught by the hash. td-179, the image check: 45.6-47.8 dB. td-180 against td-175
-  (profiled): the guest thread's p99 1675 against 2516 µs, max 2464 against 7600 µs, frames over
-  16 ms 9 against 18. td-182 against td-176: race 89.5 against 89.4 fps, 1 % low 61.3 against
-  59.2, 0.1 % low 45.3 against 45.3, p99 frame 14.08 against 14.67 ms.
-- The texture cache asks for 4 KB placement only for textures within D3D12's size rule (the
-  most detailed slice at most 64 KB, the estimate vkd3d-proton applies too). Outside it the
-  query only failed, and vkd3d-proton logged it twice: 343 textures in a race run, none now
-  (td-183). The PGO profile was retaken on this build: 0 stale profile warnings against 9.
-  td-184: race 89.5 fps, 1 % low 60.7, 0.1 % low 40.1, p99 frame 14.25 ms; its worst frames
-  wait about 16 ms on the swap fence, the GPU's time. td-185, the image check: 46.5-47.9 dB.
-- Title Update #2's two game files left the repository: like the disc and DLC they are the
-  player's own. `build.sh --update` (`build.ps1 -Update`) names the folder that holds them,
-  and the build checks them against `title-update/game-files.sha256`, the update the code is
-  generated for. The files stay in the repository's history.
-- A release package (`native/tools/package_release.py`): the program, its settings
-  (`native/release/pgr4_recompiled.toml`), a player README and the licenses, from an explicit
-  file list, refusing anything else and an instrumented build. With no path flags the runtime
-  now takes `game/` and `userdata/` beside the executable, so the package runs as it is from a
-  Steam shortcut. The settings leave the guest vblank at 60 Hz: the pacer paces on the display.
-  `deck-run.sh --mode release` runs an unpacked package as a player starts it. td-186: the
-  package found `game/` and created its save in `userdata/`. td-188: race 89.4 fps, 1 % low
-  66.1, 0.1 % low 56.9, p99 frame 14.16 ms.
-- The build no longer starts from an MTR-PGR4 checkout. `native/build.sh` clones ReXGlue at
-  the commit `sdk/rexglue.lock` names and applies `sdk/patches/` (from ReXGlue `development`,
-  Xenia Canary or this project, as each header says), then generates and builds this
-  repository's game projects (`game/pgr4`, `game/gw`). The Windows workflow on MTR-PGR4 moved
-  to `retired/`. td-192: race 89.4 fps, 1 % low 65.1; td-193, the image check: 45.3-47.8 dB.
-  td-190 lost the device once in a race (amdgpu rejected a command submission, -2, in
-  ReXGlue's D3D12 device thread); no run since repeated it.
-- Geometry Wars in the garage draws: `gw_recompiled.toml` names the Xenos plugin, which the
-  SDK does not load by default (td-204).
-- The release settings turn on 16x anisotropic filtering (`pgr4_native_anisotropy = 16`).
-  td-205: race 89.2 fps, 1 % low 59.5; td-207: 88.9, 55.0; td-214: 89.4, 62.2. 8x (td-206):
-  87.5, 51.9.
-- HDR10 output (`--pgr4_native_hdr`, on). The game renders its scene and tone map pass into
-  a float target and resolves it into a 10-bit front buffer that clips at 1 (td-208's draw
-  log: the last pass applies exposure, bloom, vignette and dither and no tone curve). On a
-  display that takes HDR10 (under Proton, `DXVK_HDR=1`: `play.sh` sets it) the resolver also
-  keeps an FP16 copy of that resolve and the present blit shows it: up to 1 as in SDR, with
-  SDR white at `--pgr4_native_hdr_paper_white` (400 nits), above it linear, with a shoulder
-  under the display's peak, in BT.2020 and PQ. `deck-run.sh --hdr` runs it in an HDR
-  gamescope and saves HDR10 AVIFs with `--shots`, which `native/tools/hdr_shot.py` measures.
-  td-221's race shot: p50 10 nits, p99 483, max 637; 2.5 % of pixels above SDR white. GPU
-  time: the resolve 0.107 ms SDR against 0.188 HDR, the blit 0.371 against 0.408 (td-218,
-  td-219). td-215, HDR in a nested gamescope that tone maps it back to SDR on the same GPU:
-  race 88.5 fps, 1 % low 58.8.
-- The present blit clears only the bars around the image: 0.398 to 0.371 ms (td-216, td-218).
-  td-218: race 89.4 fps, 1 % low 64.1, 0.1 % low 49.8, p99 frame 14.43 ms.
-- Title Update #2 can stay the package players download (`TU_16L61VP_...`), in `game/Content/`
-  beside the DLC, as Xenia Canary takes it. The runtime installs every DLC and title update
-  package there under the title and content type its header names, before the executable
-  loads, and mounts the installed update as `update:\` when no `title-update/` folder is there
-  (`sdk/patches/0033`, Canary's `FindTitleUpdate`/`LoadTitleUpdate` and `apply_title_update`,
-  which `gw_recompiled.exe` turns off: the package patches `gw.xex` too). `build.sh --update`
-  takes the package as well and extracts it with `rexglue vfs-dump` (`0034`, Xenia's
-  `xenia-vfs-dump`). A release with only `game/` (td-225): race 89.2 fps, 1 % low 64.0, 0.1 % low
-  54.2; the dev tree with `title-update/` (td-226): 89.5, 65.4, 54.5.
-
-## Why a native renderer can beat emulation
-- PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
-  splits each frame into screen tiles that the GPU replays the draws for. In the race the game
-  makes about 3,300 draw calls per frame, and the Xenos plugin executes about 5,500 GPU draws
-  because it runs them for two tiles plus an untiled pass. The native renderer sees each D3D
-  call once and draws it once at full size.
-- With the Xenos plugin, the game thread and the plugin's command-processing thread keep about
-  two cores busy. The native renderer starts from the D3D calls and costs about 0.9 µs of CPU
-  per draw. With the render thread, that work moves off the game thread onto a second thread
-  that is about 43 % busy.
-- The game's own code sets the floor for both renderers. Turning on ReXGlue's register-as-local
-  codegen options (`cr`, `ctr`, `xer`, `non_volatile` and `reserved_as_local`) keeps guest
-  registers in C++ locals instead of the context struct in memory. That took the native race
-  from 7.02 to 5.74 ms per frame, 17.9 % less (paired A/B, 95 % interval 14.2 to 21.6 %). The
-  Xenos plugin did not get faster, because its command-processing thread is the limit there
-  (98 % of a core). `native/build.ps1` explains why `skip_lr`, `skip_msr` and
-  `non_argument_as_local` stay off for this game.
-- Part of that floor is the game's D3D library. Each hook calls the original D3D function
-  first, and that function still builds the command buffer the Xenos plugin would read.
-  UnleashedRecomp and MarathonRecomp replace those functions instead of calling them. The first
-  piece of that is here, `--pgr4_native_replace_draws` (on by default since 2026-10-22): in
-  primary mode DrawIndexedVertices, 91-98 % of the game's draws, no longer builds command packets.
-  On the same exe it took frame time from 6.08 to 5.55 ms, 8.5 % less (95 % interval 2.5 to
-  14.4 %), and a recorded race next to the Xenos plugin showed no image difference beyond the
-  known spoiler bug.
-
-## Performance
-
-### How it is measured
-
-- A key script drives the game from boot through a new profile to the St Petersburg street race
-  (Arcade, chapter 1, event 1) and holds the throttle.
-- Frame time is the average over the 40 seconds after the race starts, taken from the game's own
-  log (`native/tools/perf_fps.py`). Runs are uncapped (`--vsync=false
-  --d3d12_present_vsync=false`), which does not change PGR4's game speed.
-- Unless a table says otherwise, runs have the debug decoder (`--pgr4_d3d_tap`) on.
-- Two runs of the same build differed by 8 % in one test, because the scene at a given second
-  changes a little from run to run. To compare two builds or two flag sets, runs alternate
-  (A, B, B, A, ...) and `native/tools/ab_compare.py` compares them in 4-second bins at the same
-  point of the race. One pair of runs gave a 95 % interval of about ±3 %.
-
-### Windows
-
-| Configuration | ms per frame | fps |
-|---|---|---|
-| Native, render thread on, debug decoder off | 6.99 | 143 |
-| Xenos plugin, debug decoder off | 7.94 | 126 |
-| Native, render thread on | 7.76 | 129 |
-| Xenos plugin | 7.95 | 126 |
-| Native, render thread off | 10.46 | 96 |
-
-Paired comparisons on the same build:
-
-- Release flags (decoder off), Xenos against native with the render thread: native takes
-  12.6 % less time per frame (95 % interval 3.5 to 21.8 %, one pair of runs). The gap is 2 to
-  2.5 ms in the busy stretches of the race and close to zero in the light ones, where the game's
-  own code sets the frame time for both.
-- Turning the render thread on (decoder on) takes frame time from 11.09 to 8.16 ms, -26.3 %
-  (95 % interval -29.3 to -23.2 %).
-
-How the native frame rate got there, with the Xenos plugin on the same build for reference:
-
-| Change | Native fps | Xenos fps |
-|---|---|---|
-| First build where the native renderer is the game's output | 46 | 130 |
-| Texture conversions stop reading write-combined upload memory (14 ms per frame); textures placed in heaps; untiling and pipeline compiles on worker threads | 92 | 123 |
-| Texture binding memo, draw-path memos, cached constant buffer memory, persistent pipelines | 100 | 130 |
-| Render thread | 129 | 126 |
-
-Per-draw CPU cost in steady race frames, before the render thread: textures 218 ns, constant
-buffers 175 ns, vertices 120 ns, state tracking 115 ns, command recording 113 ns.
-
-### Linux and Proton
-
-GE-Proton 11-11 (vkd3d-proton) in a Hyprland session on the same PC, running the same Windows
-build.
-
-| Configuration | ms per frame | fps |
-|---|---|---|
-| Native, render thread on | 8.65-8.94 | 112-116 |
-| Xenos plugin | 8.77-8.86 | 113-114 |
-| Native, render thread off | 10.88-10.99 | 91-92 |
-| Native, render thread on, 1280x800 window | 8.72 | 115 |
-
-- With the render thread on, native and Xenos are level under Proton: -3.3 % (95 % interval
-  -10.1 to +3.5 %). With it off, Xenos takes 17.5 % less time per frame than native.
-- Against Windows, Proton makes the Xenos plugin about 11 % slower and native with the render
-  thread 8-13 % slower. Native without the render thread is within 5 %.
-- The race image check gives 31.5-31.7 dB, the same as on Windows, and vkd3d-proton logged no
-  errors.
-- The 1280x800 window runs at the same speed as 1280x720.
-
-### A slower CPU
-
-There is no Steam Deck to test on yet. As a rough stand-in, the game was pinned to eight of the
-13900K's efficiency cores (eight threads, no SMT) under Proton. The GPU is still an RTX 3090, so
-this only says something about the CPU side. A Deck's Zen 2 cores are slower again.
-
-| Configuration | ms per frame | fps |
-|---|---|---|
-| Native, render thread on | 12.50 | 80 |
-| Xenos plugin | 13.96 | 72 |
-| Native, render thread off | 17.69 | 57 |
-
-On these cores native with the render thread takes 14.7 % less time per frame than Xenos (95 %
-interval 5.9 to 23.6 %), and the render thread cuts native frame time by 30.8 %.
-
-### Hitches
-
-- The frame where the race starts went from 357 ms to 76 ms with cold caches and 84 ms with warm
-  ones.
-- A run from boot to the race has 3 frames of 50 ms or more, down from 9. Two of the three are
-  start-up and a loading screen.
-- What fixed it: texture conversions no longer read back write-combined memory (98 to 2.8 ms for
-  a 1280x720 depth upload); textures are placed in heaps instead of created one by one (138 to
-  9.5 ms for 627 textures); untiling and pipeline compiles run on worker threads; upload blocks
-  are reserved at start-up; polygon offset is dynamic state instead of part of each pipeline
-  (957 to 316 pipelines in a cold run); pipelines persist across runs.
-- Still left at race start: first vertex copies (14-26 ms), untiling work the first submit waits
-  for (about 48 ms), and shader translation in a cold run.
-
-## Image accuracy
-
-The image check runs both renderers side by side (`--pgr4_native`, `--readback_resolve=fast`),
-captures both front buffers at three race frames and compares them. A capture passes at 30 dB
-PSNR or more. Race frames score 31-33 dB and menus 34-40 dB.
-
-![Native (left), Xenos (middle) and their difference x8 (right) for one race frame](docs/race-difference.jpg)
-
-`native/tools/oracle_diff.py` makes images like this one and scores each 80x80 tile and each
-40-row band. What it shows:
-
-- The worst tiles are around the player's car (17-19 dB, against a median tile of about 46 dB),
-  where the spoiler is missing.
-- The difference jumps at row 480. In the six race captures checked (three on Windows, three
-  under Proton), the mean difference per pixel is at most 1.1 (out of 255) in each 40-row band
-  above row 440, and 3.3 to 8.2 in each band from row 480 down. The game renders two screen
-  tiles plus an untiled pass per frame, and a first tile of about 480 rows would fit in the
-  EDRAM, so this may be the tile boundary. Not verified yet.
-- With the render thread on, one capture in three drops to 29.5 dB. In one it is an extra dark
-  polygon in the sky, in another a bright band along the far barriers. Both are wrong geometry,
-  so the likely cause is vertex or register data reaching the render thread late or out of
-  order.
-
-## Bugs found on the way
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| Car garbled, crowd missing | The game writes a patched copy of each vertex shader (matched to the vertex declaration) into the command buffer; the renderer used the original microcode | Copy the patched microcode in a hook |
-| Frame turns white after tone mapping | ReXGlue's shader translator numbers texture and sampler slots from 1; the binding table was filled from 0 | Size the table to the highest slot plus one |
-| Image check stuck near 25 dB | Fast readback returns the previous resolve | Hold a full readback for the compared frame |
-| One cube map face at 5 dB | The Xenos plugin packs each 7e3 float sample (flushing values below 2^-9) before averaging MSAA samples; the renderer averaged first | Pack each sample before averaging |
-| Lost frames at the title screen | The game creates a second D3D device | Follow the device that Swap and the draws use |
-| Clip plane mismatches | The clip-plane register block is 8 registers and the planes flush from a different device field | Map the block correctly |
-| 14 ms per frame lost | Texture untiling wrote into write-combined upload memory and the format conversion read it back (about 55 ns per byte) | Convert in a cached scratch row, then copy whole rows out |
-| Depth bias missing on some draws (found by reading the code, not seen in the image check) | `SetPipelineState` loads the pipeline's depth bias even when the pipeline uses dynamic depth bias, and the renderer kept its cached value across pipeline changes | Reset the cached bias after each pipeline change |
-
-## How it works
-
-- `native/src/pgr4_d3d_trace.cpp` hooks the guest D3D functions listed in
-  `native/src/d3d_surface.inc`. Each hook calls the original guest function first, so the guest
-  D3D state and the Xenos plugin stay correct, then passes the call to the renderer.
-- `d3d_state` tracks the Xenos register state the guest D3D device writes for each draw.
-- Shaders: Xenos microcode goes through ReXGlue's DXBC shader translator
-  (`shader_translate`, `shader_cache`).
-- Textures (`textures`, `texture_layout`): guest textures are untiled on CPU worker threads into
-  upload memory and copied into placed resources. Guest writes are caught with page watches.
-- Render targets and resolves (`render_targets`, `resolve`): the 360's EDRAM targets become host
-  render targets; resolves copy them into host textures that later draws sample.
-- Pipelines (`draw`, `pipeline_store`): pipeline states compile on a worker thread and persist
-  across runs in an `ID3D12PipelineLibrary` under the runtime's cache folder.
-- With `--pgr4_native_render_thread` (the default), the game thread only captures each call and
-  its state; a render thread records and submits the D3D12 work.
-- `present` presents the guest's front buffer into the game window or a debug window.
-
-Several files port Xenia/ReXGlue code (BSD-3-Clause), among them `draw`, `render_targets`,
-`resolve`, `geometry_shader` and the texture code. Their headers name the ported functions.
-
-## Building
-
-The build runs on Linux (it is developed on a Steam Deck under SteamOS) and cross-compiles the
-Windows x64 executables with clang-cl and lld-link; the result runs under Proton. You need
-clang, lld and the llvm tools, CMake, Ninja, Python 3 and Git. When `clang-cl` is not on `PATH`,
-`native/build.sh` runs itself in a distrobox container (default `pgr4dev`; the Deck's has Arch's
-clang 23.1.3 and cmake 4.4.4, the versions the release build pins). You also need the files from
-your own PGR4 disc, extracted to a folder (`default.xex`, `gw.xex`, `Game\`, `UI\` and so on),
-and Title Update #2, as its package or its two files `default.xexp` and `Pgr4TitleUpdate.bin`
-in another folder (`title-update/README.md`). This repository contains no game data, and the C++ that the build
+The build runs on Linux and cross-compiles the Windows executables with clang-cl. They run under
+Proton, or on Windows. You need your own PGR4 disc, extracted, and Title Update #2, either as its
+package or as its two files. This repository contains no game data, and the C++ that the build
 generates from the game's executables must not be published.
 
-1. The MSVC CRT and Windows SDK, at pinned versions: `build/fetch-xwin.sh` (into `~/recomp/xwin`;
-   running it accepts Microsoft's license terms for those files).
-2. Build: `native/build.sh --game <disc folder> --update <title update package or folder>`. It clones ReXGlue
-   at the commit `sdk/rexglue.lock` names, applies `sdk/patches/` in order, builds the codegen
-   tool and the SDK, generates and builds the game projects in `game/` (PGR4 with the renderer,
-   and the garage's Geometry Wars) and installs them into
-   `~/recomp/builds/pgr4/native-deck/run/runtime`. Its header lists the options (`--dest`,
-   `--pgo`, `--march`, `--stage`).
-3. Play: `proton/play.sh --install` installs that build as the one to play and writes the desktop
-   entry Steam's "Add a Non-Steam Game" lists ("PGR4 (native renderer)"); `proton/play.sh`
-   starts it. `proton/deck-run.sh <tree> <tag>` runs the measured race instead.
+```sh
+scripts/fetch-xwin.sh          # MSVC CRT and Windows SDK (accepts Microsoft's license)
+scripts/build.sh --game <disc folder> --update <title update package or folder>
+scripts/play.sh --install      # install the build and write the Steam desktop entries
+scripts/play.sh                # play
+scripts/play.sh --debug        # play with logs, the frame CSV, marks (F12) and a CPU profile
+scripts/deck-run.sh deck <tag> --refresh 90 --hold 45 --output eDP-1   # scripted race with timings
+```
 
-Pushing a `v*` tag builds the same way on GitHub Actions (`.github/workflows/release.yml`, with the
-game files from a private repository) and publishes a release ZIP for players, made by
-`native/tools/package_release.py`; its `README.md` (`native/release/README.md`) says where the
-game files go. The ZIP holds no game data or generated code: the executables, the ReXGlue DLLs,
-the default configuration and the licenses.
+After `play.sh --install`, Steam's "Add a Non-Steam Game" lists "PGR4 (native renderer)". Add it
+without a compatibility tool, since the script starts Proton itself. DLC copied off a console as
+STFS packages goes in the game folder's `Content\`, next to the title update's package.
+
+Pushing a `v*` tag builds a release package, and `scripts/release/README.md` tells players where
+their game files go. [docs/development.md](docs/development.md) covers the build options,
+debugging, measuring and the SDK patches, and [docs/architecture.md](docs/architecture.md)
+explains how the renderer works.
+
 ## Flags
+
+Settings go on the command line (`--name=value`) or in `pgr4_recompiled.toml` next to the
+executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings.
 
 | Flag | Default | Effect |
 |---|---|---|
 | `--pgr4_native` | false | Run the native renderer beside the Xenos plugin, in a debug window |
-| `--pgr4_native_primary` | false | The native renderer is the game's output; implies `--pgr4_native` |
-| `--pgr4_native_render_thread` | true | Record and submit on a render thread; the game thread only captures each call |
-| `--pgr4_native_async_pipelines` | true | Compile new pipelines on worker threads; the draws that need them are skipped |
-| `--pgr4_native_pipeline_wait` | true | A frame that skipped draws is not shown and waits for their pipelines (at most 0.5 s) |
-| `--pgr4_native_generic_pipelines` | true | A draw whose bool/sign specialization is still compiling uses its unspecialized shaders' pipeline when that one is ready |
-| `--pgr4_native_pipeline_cache` | true | Keep pipelines across runs |
+| `--pgr4_native_primary` | false | Make the native renderer the game's output (implies `--pgr4_native`, sets `--gpu_skip_draws`) |
+| `--pgr4_native_renderer_switch` | true | In primary mode, F9 (`bind_renderer_switch`) switches between the native renderer and the Xenos plugin |
+| `--pgr4_native_replace_draws` | true | In primary mode, the guest D3D's DrawIndexedVertices builds no command packets |
+| `--pgr4_native_render_thread` | true | Record and submit on a render thread, so the game thread only captures each call |
+| `--pgr4_native_submit_draws=<n>` | 256 | Submit the frame so far every n draws (0 submits once per frame) |
+| `--pgr4_native_async_pipelines` | true | Compile new pipelines on worker threads and skip the draws that need them |
+| `--pgr4_native_pipeline_threads=<n>` | 0 | Number of pipeline compile threads (0 uses a quarter of the hardware threads, 1 to 4) |
+| `--pgr4_native_pipeline_wait` | true | Hold back a frame that skipped draws and wait for their pipelines, up to 0.5 s |
+| `--pgr4_native_generic_pipelines` | true | Let a draw whose specialized pipeline is still compiling use the unspecialized one if it is ready |
+| `--pgr4_native_pipeline_cache` | true | Keep shaders and pipelines across runs and compile them at start-up |
+| `--pgr4_native_bool_specialize` | true | Translate shaders for each draw's bool constants, without the branches |
+| `--pgr4_native_resolve_specialize` | true | Compile a copy shader for each kind of resolve |
 | `--pgr4_native_dynamic_depth_bias` | true | Set polygon offset per draw instead of per pipeline |
-| `--pgr4_native_submit_draws=<n>` | 256 | Submit the frame so far every n draws, so the GPU starts on it while the rest is recorded (0: once per frame) |
-| `--pgr4_native_csv=<file>` | off | Per-frame counters and CPU times |
-| `--pgr4_native_profile` | false | Per-stage CPU time of the draw path, added to the CSV |
-| `--pgr4_native_capture_dir=<dir>` | off | Where image-check captures go (native and Xenos PNGs, `captures.csv` with PSNR); a `capture.request` file there or F12 takes one, and `draw-debug.txt` there is read. Off, none of them is polled (`deck-run.sh` and `play.sh --debug` set one) |
-| `--pgr4_native_capture_frame=<n>` | -1 (off) | Capture the front buffers at this native frame |
-| `--pgr4_native_capture_xenos` | true | Captures also read the Xenos copy and its PSNR, holding the game thread; false: the native PNG alone, written from a thread |
-| `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 5 s of frames; write whole-image jumps and F12's 5 s (with a capture folder) to `<prefix>glitch-<frame>.rec` / `mark-<frame>.rec` |
-| `--pgr4_native_coherency_check` | false | Debug: check vertex/index data and registers against guest memory (slow) |
-| `--pgr4_native_gpu_serialize` | false | Debug: wait for the GPU at the end of every frame (slow) |
-| `--pgr4_native_draw_log_from=<n>` | -1 (off) | Debug: log every draw of `_draw_log_frames` (1) frames from native frame n to `<capture dir>/draws-f<frame>.txt`; bit 16 of `<capture dir>/draw-debug.txt` does the same from the next frame |
-| `--pgr4_d3d_tap_check` | false | Debug, with `--pgr4_d3d_tap`: compare the tracked state with the decoded push buffer at every draw and log the frames that differ (slow) |
-| `--pgr4_native_frame_latency=<n>` | 3 | Primary mode: the game thread begins a frame once the display showed the frame n before it (1-3; 0: the game's own vblank pacing) |
-| `--pgr4_native_low_latency` | true | With the frames paced on the display: begin each frame as late as the time recent frames waited for the display allows, so a frame limit lowers the latency |
-| `--pgr4_native_latency_margin_us=<n>` | 4000 | With `--pgr4_native_low_latency`: how long before the display shows a frame the GPU should have finished it |
-| `--pgr4_native_renderer_switch` | true | With `--pgr4_native_primary`, the key `bind_renderer_switch` (F9) switches between the native renderer and the Xenos plugin |
-| `--pgr4_native_anisotropy=<n>` | 1 | At least n-times anisotropic filtering (2, 4, 8, 16) for the game's linearly filtered textures with mips; 1: the game's own (the release settings: 16) |
-| `--pgr4_native_hdr` | true | HDR10 output when the display takes it (under Proton, `DXVK_HDR=1`): the scene's highlights above SDR white reach the screen; false or no HDR display: the console's SDR image |
-| `--pgr4_native_hdr_peak_nits=<n>` | 0 | HDR: the peak the highlights are fitted to (0: the display's, 1000 when it reports none) |
-| `--pgr4_native_hdr_paper_white=<n>` | 400 | HDR: the luminance of SDR white (the HUD, the game's 1.0) in nits; 400 matches gamescope's SDR content |
-| `--pgr4_native_texture_memory_soft_mb` | 512 | Above this, textures unused for `_soft_lifetime_s` (30) are destroyed (0: no limit) |
-| `--pgr4_native_texture_memory_hard_mb` | 1024 | Above this, the least recently used textures are destroyed (0: no limit) |
-| `--content_root=<dir>` | `<game>\Content` | Content packages (DLC as STFS files off a console) installed at startup |
+| `--pgr4_native_texture_capture_order` | true | Bind textures as they were when the game queued the draw |
+| `--pgr4_native_texture_memory_soft_mb=<n>` | 512 | Above this much texture memory, destroy textures unused for `_soft_lifetime_s` (30) seconds (0 means no limit) |
+| `--pgr4_native_texture_memory_hard_mb=<n>` | 1024 | Above this much texture memory, destroy the least recently used textures (0 means no limit) |
+| `--pgr4_native_anisotropy=<n>` | 1 | Minimum anisotropic filtering (2, 4, 8 or 16) for linearly filtered textures with mips. 1 keeps the game's own, and the release settings use 16 |
+| `--pgr4_native_frame_latency=<n>` | 3 | In primary mode, begin a frame once the display has shown the frame n before it (1 to 3, or 0 for the game's own vblank pacing) |
+| `--pgr4_native_low_latency` | true | Begin each frame as late as the time recent frames waited for the display allows |
+| `--pgr4_native_latency_margin_us=<n>` | 4000 | With low latency on, how long before its display slot the GPU should finish a frame |
+| `--pgr4_native_hdr` | true | Output HDR10 when the display supports it (under Proton, set `DXVK_HDR=1`) |
+| `--pgr4_native_hdr_peak_nits=<n>` | 0 | Peak luminance the HDR highlights are fitted to (0 uses the display's, or 1000 if it reports none) |
+| `--pgr4_native_hdr_paper_white=<n>` | 400 | Luminance of SDR white in HDR output, in nits |
+| `--pgr4_60fps` | false | Present every vblank instead of at the game's 30 FPS interval, when the native renderer does not pace the frames |
+| `--content_root=<dir>` | `<game>\Content` | Folder of content packages (title update, DLC) installed at startup |
+| `--pgr4_native_csv=<file>` | off | Write per-frame counters and CPU times to this file |
+| `--pgr4_native_profile` | false | Add the draw path's CPU time per stage to the CSV |
+| `--pgr4_native_gpu_timing` | false | Log GPU time per pass (`_shaders` times per shader pair instead) |
+| `--pgr4_native_capture_dir=<dir>` | off | Folder for captures, marks and draw logs. A `capture.request` file there or F12 takes a capture, and `draw-debug.txt` there is read |
+| `--pgr4_native_capture_xenos` | true | Also capture the Xenos plugin's frame and the PSNR between the two, holding the game thread. When false, only the native PNG is written, from another thread |
+| `--pgr4_native_glitch_catch=<prefix>` | off | Keep the last 5 s of frames and write whole-image jumps and marks to `<prefix>glitch-<frame>.rec` and `mark-<frame>.rec` |
+| `--pgr4_native_mark_audit=<n>` | 0 | With each mark, log the next n frames' draws and check their shaders, registers and shared memory against the guest's |
+| `--pgr4_native_draw_log_from=<n>` | -1 (off) | Log every draw of `_draw_log_frames` (1) frames, starting at native frame n |
+| `--pgr4_native_coherency_check` | false | Check vertex and index data and registers against guest memory (slow) |
+| `--pgr4_native_track_verify` | false | Check the state tracker against the guest's register shadow after each draw (slow) |
+| `--pgr4_native_gpu_serialize` | false | Wait for the GPU at the end of every frame (slow) |
 
-With `--pgr4_native_primary`, the Xenos plugin only runs fences and interrupts
-(`--gpu_skip_draws`, added by `sdk/patches/0031`). The debug flags not in
-the table (resolve dumps and self-test, the watch, texture and state tracker checks, the tap's
-trace, frame CSV and draw skips, the debug window's size) are described where they are defined,
-in the `REXCVAR_DEFINE_*` lines of `native/src`.
+The `REXCVAR_DEFINE_*` lines in `src/` and `patches/` describe the rest.
 
-## Tools
+## Changes
 
-`native/tools/` has the scripts used to measure and check the renderer:
+Renderer:
 
-| Script | What it does |
-|---|---|
-| `perf_fps.py` | Frame time from the game log over a time window |
-| `ab_compare.py` | Two builds or flag sets compared in matched 4-second bins of the same route, with a 95 % interval |
-| `oracle_diff.py` | Side-by-side, heatmap, per-tile and per-row scores for native and Xenos captures of the same frame |
-| `perf_stats.py` | Stage costs per draw from the CSV |
-| `perf_hitch.py` | Slow frames and their causes |
-| `compare_resolves.py` | Resolve outputs against the Xenos plugin's |
-| `flicker.py` | Flashing blocks or whole-image jumps in a glitch catcher dump, as PNG sheets |
-| `marks.py` | The seconds before each mark of a play session: slow frames, flashes and jumps, as PNG sheets |
-| `pacing.py` | Frame pacing from the CSV and the pacer's present log: time steps, shown intervals, start-to-display latency, their mismatch |
+- Draws from the game's own Xbox 360 D3D calls instead of emulating the GPU, so each draw runs
+  once at full size, without the console's EDRAM tiling. The Xenos plugin stays in the binary
+  for comparison, one key away.
+- The game thread captures each call and a render thread records it. The frame is submitted in
+  parts as it is recorded.
+- Shaders go through ReXGlue's DXBC translator and are specialized for bool constants and
+  texture signs. Pipelines compile on worker threads and are stored and prewarmed across runs.
+  No frame is shown with draws missing.
+- Textures are untiled on worker threads, which also record their uploads ahead of the frame's
+  render passes. Texture memory is bounded, and each draw binds textures as they were when it
+  was queued.
+- Resolves run through compute shaders specialized for each kind. Guest clears are deferred and
+  merged.
+- The renderer presents from the game's own window, so gamescope flips it directly. It applies
+  the display controller's gamma ramp, outputs HDR10, and can add anisotropic filtering.
+- Frames are paced on the display with a latency sleep. Motion blur is scaled to the frame time,
+  so it is as long as at 30 FPS.
 
-It also has an offline shader translation test (`shader_xlate_test`). `proton/` has the
-Deck's: `deck_sampler.py` (GPU load and clock, the APU's power split, the busiest threads and
-other processes), `pmu_summary.py` (`deck-run.sh --pmu`: instructions per cycle, fetch stalls
-and instruction cache refills per thread) and `server_requests.py` (`deck-run.sh
---server-trace`: wineserver requests per thread and second, by request). `deck-run.sh --perf`
-keeps the sampled modules in `<log>-perf-modules/` for `perf_symbols.py`.
+Game (`games/`):
 
-## What's next
+- Title Update #2 and DLC work as the packages players have, installed and applied at startup
+  the way Xenia Canary does it.
+- Register-as-local code generation, profile-guided optimization and a Zen 2 target.
+- Garage walking works at high frame rates, the car preview no longer freezes in its search, and
+  the garage's Geometry Wars cabinet starts its own game and returns to PGR4.
 
-- Check the other single-frame geometry glitches against the in-place rebind fix: about 10 s
-  into the St Petersburg race, in about one run in three, the sky turned red and the far
-  buildings broke into shards while near geometry stayed right. The single frames of play
-  where the cockpit turned white and broke up were the look-back camera; whether its view of
-  the rear interior is right is still to be compared with Xenos (the chase view's look-back
-  matches it at 45-47 dB, td-21). Shards near AI cars and in the garage need a play session
-  with the pad column to tell them from look-backs.
-- Find out whether the row-480 jump is the tile boundary, and whether it explains the spoiler.
-- Steam Deck: a steady 90 fps. Less CPU time per frame (it takes most of the 15 W) and less GPU
-  work per frame. Most frames shown late at 90 Hz waited a whole interval in Present for the GPU
-  (td-153). Of the game thread's perf samples outside the game's own code, the state tracker's
-  CopyFlushed takes 3.9 %, OnDraw 1.5 %, Prepare 1.2 % and the guest heap's AllocRange 1.1 %
-  (td-150). On the render thread the drivers take about 40 % (RADV 28 %, vkd3d-proton 11 %) and
-  Draw 30 %. Ideas: fewer D3D12 calls per draw; resolves that share the draws' descriptor heaps,
-  so a resolve no longer resets the list's state.
-- Steam Deck: one instrumented run (td-151) lost the device at 116 s. RADV's submission was
-  rejected with ENOENT (`The CS has been rejected (-2)`) and the kernel logged nothing, which
-  rules out a missing synchronization object (that path logs) and leaves a buffer handle the
-  kernel no longer knew. vkd3d-proton issue 2881 reports the same failure in another game. The
-  rerun (td-152) and the ~150 runs before had none; watch for it.
-- Steam Deck: one run (td-181) aborted at 130 s, before the race, with glibc's
-  `free(): invalid pointer` on Wine's Unix side (RADV, winevulkan or Wine itself) and no kernel
-  or GPU fault. The core was not kept and a review of the renderer's object lifetimes found
-  nothing; the rerun (td-182) was clean. Watch for it.
-- Steam Deck: shorter stalls on content seen for the first time. A frame whose draws need a new
-  pipeline waits for it: with every cache cold, 14 waits of 35-112 ms in the race window (median
-  compile 38 ms, 1 % low 21.8 fps, td-93). With the caches warm the same race has none (td-90),
-  and neither has a Quebec snow race the bench never ran (td-91: 90.0 fps, 1 % low 67.7); a play
-  session's store (7862 pipelines) prewarms in the menus in about 100 s (td-92). During a wait the
-  GPU idles and its clock falls to 200-500 MHz while the compile threads take 10-13 W, so the next
-  two or three frames take 23-39 ms on the GPU (td-96, 10 ms clock samples). The compile time is
-  Mesa's (57 %) and vkd3d-proton's (43 %, td-94); Steam's Fossilize layer, which records the
-  shortcut's pipelines, adds nothing measurable (td-95). Ideas: smaller DXBC from the translator,
-  fewer compile threads once the frame is shown.
-- Cut the remaining race-start work: first vertex copies, untiling the first submit waits for.
+SDK (`patches/`):
 
+- Less CPU time and fewer wineserver requests under Proton. The command processor and timer
+  threads block instead of polling, high-resolution waits stay in the process, resuming a running
+  thread and querying a priority no longer reach the server, guest physical memory is committed
+  with its section, the pad is read on a timer thread, and `db16cyc` becomes a spin-wait hint.
+- Code generation unpacks `vupkd3d128` NORMPACKED64 correctly. The shader translator samples
+  computed-LOD fetches with `sample_b` and drops sign handling for textures known to be unsigned.
+- Presenting on the display's vblank, and statistics for guest frames and the command stream.
+- XMA decoding fixes, and a decoder flush instead of a reopen for each stream. Canary's XMP music
+  player, with the game's own music volume read from the save.
+- Keyboard prompts with default text, key binds that fire once per press, installation of title
+  update and content packages, and a check that the loaded image is the one the code was
+  generated from.
 
-## Tooling and agents
+## License
 
-The renderer was built and tuned by coding agents. It started on a Windows PC with a lab of
-PowerShell scripts driven over SSH (now in `retired/`, see `retired/README.md`) and moved to the
-Steam Deck, which builds, runs and measures it on its own:
-
-- `native/build.sh` and `build/`: the cross build and its toolchain.
-- `proton/`: `deck-run.sh` (one measured race: route, frame times, GPU load and APU power,
-  oracle captures, perf samples), `play.sh` (play sessions and debugging sessions) and
-  `route_player.py`, which plays the scripted routes in `run/`.
-- `native/tools/`: the analysis scripts above, and `package_release.py`.
-- `docs/`: how the renderer works, the design, the perf plan and research notes.
-- `AGENTS.md` and `skills/pgr4-native/`: what an agent reads first, and the renderer
-  performance rules taken from other Xbox 360 ports.
-## About this repository
-
-The code, tooling and docs are developed in a private repository and published here
-automatically. History starts at the first public commit. Code comments and docs sometimes
-point to development notes that are not published.
-
-License: MIT ([LICENSE](LICENSE)). Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+MIT ([LICENSE](LICENSE)). Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

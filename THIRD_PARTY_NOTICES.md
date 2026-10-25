@@ -4,14 +4,14 @@ What this repository and its release packages contain from other projects, with 
 A release package also carries the license files of the libraries built into it (`LICENSES/`)
 and the commits it was built from (`LICENSES/SOURCE.txt`).
 
-- `native/src` ports code from the ReXGlue SDK and, through it, from Xenia (BSD-3-Clause, below).
+- `src/` ports code from the ReXGlue SDK and, through it, from Xenia (BSD-3-Clause, below).
   The files name the ported functions in their headers.
-- `sdk/patches/` modify the ReXGlue SDK. Several port code from Xenia Canary (BSD-3-Clause, below);
+- `patches/` modify the ReXGlue SDK. Several port code from Xenia Canary (BSD-3-Clause, below);
   each such patch names the Canary commit and files.
-- `game/pgr4/pgr4recompiled_manifest.toml` takes its setjmp/longjmp addresses and part of its
+- `games/pgr4/pgr4recompiled_manifest.toml` takes its setjmp/longjmp addresses and part of its
   function list from PGR4-Recomp's manifest (MIT, below).
-- `game/pgr4/src/pgr4_hooks.cpp`, `game/pgr4/pgr4recompiled_manifest.toml` and
-  `sdk/patches/0048-*` reimplement fixes MTR-PGR4 found: the frame rate unlock, the garage walking
+- `games/pgr4/src/pgr4_hooks.cpp`, `games/pgr4/pgr4recompiled_manifest.toml` and
+  `patches/0048-*` reimplement fixes MTR-PGR4 found: the frame rate unlock, the garage walking
   step count, the bounds of the car preview's visibility search, and song names from the
   soundtrack's file names. No MTR-PGR4 code is included; its license follows for the credit.
 

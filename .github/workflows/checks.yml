@@ -36,18 +36,18 @@ jobs:
 
       - name: SDK series applies to the pinned ReXGlue
         run: |
-          source sdk/rexglue.lock
+          source patches/rexglue.lock
           git clone -q --no-checkout --filter=blob:none "$REXGLUE_URL" "$RUNNER_TEMP/rexglue"
           cd "$RUNNER_TEMP/rexglue"
           git checkout -q "$REXGLUE_COMMIT"
           # Only the submodules a patch touches.
           subs=$(git config -f .gitmodules --get-regexp 'submodule\..*\.path' | cut -d' ' -f2)
           for sub in $subs; do
-            if grep -qh "^+++ b/$sub/" "$GITHUB_WORKSPACE"/sdk/patches/*.patch; then
+            if grep -qh "^+++ b/$sub/" "$GITHUB_WORKSPACE"/patches/*.patch; then
               git submodule update -q --init --depth 1 "$sub"
             fi
           done
-          for p in "$GITHUB_WORKSPACE"/sdk/patches/*.patch; do
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
             git apply --whitespace=nowarn "$p"
             echo "applied $(basename "$p")"
           done

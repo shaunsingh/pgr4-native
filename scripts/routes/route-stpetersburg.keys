@@ -1,0 +1,24 @@
+# Boot -> Arcade Mode, chapter 1 "Catch Me If You Can", event 1: street race, St Petersburg
+# Palace Square, 4 laps, Ford Sierra Cosworth RS500, Silver -> 70 s of full throttle.
+# Format: scripts/route_player.py. Time zero = the game window appears. Needs a fresh save
+# (deck-run.sh starts each run with one): with an existing profile the game skips the profile
+# screens and this desyncs.
+# Timed on the MTR-PGR4 source build with a warm shader cache, 2026-10-21: intro FMV from
+# ~12 s, main menu ~10 s after the profile save, race running ~14 s after Silver.
+30000 return          # skip the intro FMV ("Shadow" by the Prodigy)
++12000 return         # title: PRESS START -> Gamer Profiles "Welcome to PGR4!"
++8000 space           # Next -> Select Driver
++8000 d 300           # right-hand driver
++1800 space           # -> Select Nationality (United States)
++8000 space           # -> Driver customisation
++8000 space           # Continue -> "Saving content", then Main Menu
++20000 space          # Single Player -> Arcade Mode
++8000 space           # Arcade Mode -> Choose Chapter
++8000 space           # Catch Me If You Can -> Choose Event
++8000 space           # Event 1 Street Race -> car (Sierra Cosworth RS500)
++8000 space           # car -> Choose Difficulty (Silver)
++8000 space           # Silver -> loading, race starts on its own
++20000 mark loaded
++0 e 70000            # right trigger: full throttle for 70 s (the car ends on the barrier)
++0 mark throttle
++5000 mark race       # deck-run.sh measures from here
