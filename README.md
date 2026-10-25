@@ -713,8 +713,18 @@ Changes made on the Deck, in order. Each was checked in a race run on the Deck.
   td-219). td-215, HDR in a nested gamescope that tone maps it back to SDR on the same GPU:
   race 88.5 fps, 1 % low 58.8.
 - The present blit clears only the bars around the image: 0.398 to 0.371 ms (td-216, td-218).
-  td-218: race 89.4 fps, 1 % low 64.1, 0.1 % low 49.8, p99 frame 14.43 ms.## Why a native renderer can beat emulation
+  td-218: race 89.4 fps, 1 % low 64.1, 0.1 % low 49.8, p99 frame 14.43 ms.
+- Title Update #2 can stay the package players download (`TU_16L61VP_...`), in `game/Content/`
+  beside the DLC, as Xenia Canary takes it. The runtime installs every DLC and title update
+  package there under the title and content type its header names, before the executable
+  loads, and mounts the installed update as `update:\` when no `title-update/` folder is there
+  (`sdk/patches/0033`, Canary's `FindTitleUpdate`/`LoadTitleUpdate` and `apply_title_update`,
+  which `gw_recompiled.exe` turns off: the package patches `gw.xex` too). `build.sh --update`
+  takes the package as well and extracts it with `rexglue vfs-dump` (`0034`, Xenia's
+  `xenia-vfs-dump`). A release with only `game/` (td-225): race 89.2 fps, 1 % low 64.0, 0.1 % low
+  54.2; the dev tree with `title-update/` (td-226): 89.5, 65.4, 54.5.
 
+## Why a native renderer can beat emulation
 - PGR4 renders with predicated tiling. The Xbox 360 GPU draws into 10 MB of EDRAM, and the game
   splits each frame into screen tiles that the GPU replays the draws for. In the race the game
   makes about 3,300 draw calls per frame, and the Xenos plugin executes about 5,500 GPU draws
@@ -900,13 +910,13 @@ clang, lld and the llvm tools, CMake, Ninja, Python 3 and Git. When `clang-cl` i
 `native/build.sh` runs itself in a distrobox container (default `pgr4dev`; the Deck's has Arch's
 clang 23.1.3 and cmake 4.4.4, the versions the release build pins). You also need the files from
 your own PGR4 disc, extracted to a folder (`default.xex`, `gw.xex`, `Game\`, `UI\` and so on),
-and Title Update #2's `default.xexp` and `Pgr4TitleUpdate.bin` in another
-(`title-update/README.md`). This repository contains no game data, and the C++ that the build
+and Title Update #2, as its package or its two files `default.xexp` and `Pgr4TitleUpdate.bin`
+in another folder (`title-update/README.md`). This repository contains no game data, and the C++ that the build
 generates from the game's executables must not be published.
 
 1. The MSVC CRT and Windows SDK, at pinned versions: `build/fetch-xwin.sh` (into `~/recomp/xwin`;
    running it accepts Microsoft's license terms for those files).
-2. Build: `native/build.sh --game <disc folder> --update <title update folder>`. It clones ReXGlue
+2. Build: `native/build.sh --game <disc folder> --update <title update package or folder>`. It clones ReXGlue
    at the commit `sdk/rexglue.lock` names, applies `sdk/patches/` in order, builds the codegen
    tool and the SDK, generates and builds the game projects in `game/` (PGR4 with the renderer,
    and the garage's Geometry Wars) and installs them into
