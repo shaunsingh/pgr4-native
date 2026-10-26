@@ -15,8 +15,9 @@
 // the previous frame's constants, DxbcShaderTranslator's motion_vectors), and the first resolve out
 // of it in a frame (EndTiling's depth resolve, before its color resolves clear the surface)
 // upscales its color, depth and motion into the output, which the color resolves copy from instead
-// of the target. The output then takes the scene's alpha, which FSR does not upscale: the motion
-// blur's mask, which keeps the player's car sharp.
+// of the target. FSR reads the color clamped to the range of its 7e3 EDRAM format, as the resolves
+// do, and the output then takes the scene's alpha, which FSR does not upscale: the motion blur's
+// mask, which keeps the player's car sharp.
 //
 // Threading: everything on the thread that records the frames (NativeRenderer::Execute*).
 #pragma once
@@ -110,10 +111,15 @@ class Upscaler {
   // The render size, LOD bias and jitter phases of a DynamicResolution level; false (logged)
   // without a phase count.
   bool SetLevel(uint32_t level);
-  // The pass that gives the upscaled color the scene's alpha (kAlphaHlsl); without typed UAV
-  // loads of the output it is left out (logged). False (logged) on failure.
-  bool CreateAlphaPass();
-  void CopyAlpha(ID3D12GraphicsCommandList* list, const RenderTarget& color);
+  // The compute passes around FSR: the clamp of its input (kInputHlsl), and the alpha of the
+  // output (kAlphaHlsl), left out (logged) without typed UAV loads of the output. False (logged)
+  // on failure.
+  bool CreatePasses();
+  // Records a pass that reads `src` and writes `dst` over a width x height grid, with the views in
+  // the frame's slot `slot` (of kViewsPerFrame / 2).
+  void RunPass(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, ID3D12Resource* src,
+               ID3D12Resource* dst, uint32_t slot, float scale_x, float scale_y, uint32_t width,
+               uint32_t height);
 
   ID3D12Device* device_ = nullptr;
   const Api* api_ = nullptr;
@@ -125,10 +131,14 @@ class Upscaler {
   ComPtr<ID3D12DescriptorHeap> motion_rtv_;
   D3D12_RESOURCE_STATES motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
   uint64_t motion_frame_ = UINT64_MAX;  // the frame motion_ was cleared for
-  ComPtr<ID3D12RootSignature> alpha_signature_;
+  // FSR's color input: the scene's color clamped, at the largest render size.
+  ComPtr<ID3D12Resource> input_;
+  D3D12_RESOURCE_STATES input_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  ComPtr<ID3D12RootSignature> pass_signature_;
+  ComPtr<ID3D12PipelineState> input_pso_;
   ComPtr<ID3D12PipelineState> alpha_pso_;  // null without typed UAV loads
-  ComPtr<ID3D12DescriptorHeap> alpha_heap_;
-  uint32_t alpha_stride_ = 0;
+  ComPtr<ID3D12DescriptorHeap> pass_heap_;
+  uint32_t pass_stride_ = 0;
   uint32_t max_width_ = kSceneWidth, max_height_ = kSceneHeight;
   uint32_t render_width_ = kSceneWidth, render_height_ = kSceneHeight;
   std::optional<DynamicResolution> dynamic_;  // with --pgr4_native_upscaler_target_fps

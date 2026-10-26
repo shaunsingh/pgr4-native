@@ -66,25 +66,44 @@ void Message(uint32_t type, const wchar_t* message) {
     PGR4_LOG_FIRST(16, WARN, "PGR4 native upscaler: {}", s);
 }
 
-// The scene's alpha into the upscaled color, which FSR leaves without it (the motion blur pass,
-// pixel shader 27A3898925DDCAF7, masks the player's car by it): nearest to each output pixel.
-constexpr char kAlphaHlsl[] = R"(
-Texture2D<float4> scene : register(t0);
-RWTexture2D<float4> output : register(u0);
+// The compute passes around FSR share a root signature: the source's SRV and the destination's UAV
+// in a table, then PassConstants.
+constexpr char kPassBindings[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
 cbuffer Constants : register(b0) { float2 scale; uint2 size; };
+)";
+struct PassConstants {
+  float scale[2];  // source pixels per destination pixel
+  uint32_t size[2];
+};
+// Per frame in flight: the views of the input pass, then of the alpha pass.
+constexpr uint32_t kViewsPerFrame = 4;
+
+// The scene's color for FSR in the range of the 7e3 EDRAM format, as the resolves read it: RGB in
+// [0, 31.875], alpha in [0, 1], NaN 0 (resolve.cpp's Quantize7e3, Xenia's UnclampedFloat32To7e3).
+// The host target is R16G16B16A16_FLOAT and keeps what the shaders write beyond that, such as
+// the start lights' emissive colors above 31.875.
+constexpr char kInputHlsl[] = R"(
 [numthreads(8, 8, 1)]
 void main(uint2 p : SV_DispatchThreadID) {
   if (any(p >= size)) return;
-  float4 c = output[p];
-  c.a = scene.Load(int3(uint2((float2(p) + 0.5) * scale), 0)).a;
-  output[p] = c;
+  float4 c = src.Load(int3(p, 0));
+  dst[p] = float4(clamp(c.rgb, 0.0, 31.875), saturate(c.a));
 }
 )";
-struct AlphaConstants {
-  float scale[2];
-  uint32_t size[2];
-};
-constexpr uint32_t kAlphaViews = 2;  // per frame in flight: the scene's SRV, the output's UAV
+
+// The scene's alpha into the upscaled color, which FSR leaves without it (the motion blur pass,
+// pixel shader 27A3898925DDCAF7, masks the player's car by it): nearest to each output pixel.
+constexpr char kAlphaHlsl[] = R"(
+[numthreads(8, 8, 1)]
+void main(uint2 p : SV_DispatchThreadID) {
+  if (any(p >= size)) return;
+  float4 c = dst[p];
+  c.a = src.Load(int3(uint2((float2(p) + 0.5) * scale), 0)).a;
+  dst[p] = c;
+}
+)";
 
 // The render size of one axis from its setting, at least a quarter of the scene's.
 uint32_t RenderExtent(int32_t setting, uint32_t scene) {
@@ -139,27 +158,10 @@ bool Upscaler::Initialize(ID3D12Device* device) {
   if (api_->query(&context_, &provider.header) == FFX_API_RETURN_OK && provider.versionName)
     REXLOG_INFO("PGR4 native upscaler: {} from {}x{}{} to {}x{}", provider.versionName, max_width_,
                 max_height_, dynamic_ ? " or less" : "", kSceneWidth, kSceneHeight);
-  return SetLevel(DynamicResolution::kSteps) && CreateTargets() && CreateAlphaPass();
+  return SetLevel(DynamicResolution::kSteps) && CreateTargets() && CreatePasses();
 }
 
-bool Upscaler::CreateAlphaPass() {
-  D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {kOutputFormat};
-  if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
-      !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) {
-    REXLOG_WARN(
-        "PGR4 native upscaler: no typed UAV loads of the output; the motion blur loses "
-        "its mask");
-    return true;
-  }
-  const pD3DCompile compile = D3DCompiler();
-  ComPtr<ID3DBlob> code, err;
-  if (!compile ||
-      FAILED(compile(kAlphaHlsl, sizeof(kAlphaHlsl) - 1, "pgr4_upscaler_alpha.hlsl", nullptr,
-                     nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
-    REXLOG_ERROR("PGR4 native upscaler: alpha shader: {}",
-                 err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
-    return false;
-  }
+bool Upscaler::CreatePasses() {
   const D3D12_DESCRIPTOR_RANGE ranges[2] = {
       {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1},
@@ -168,64 +170,80 @@ bool Upscaler::CreateAlphaPass() {
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   params[0].DescriptorTable = {2, ranges};
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  params[1].Constants = {0, 0, sizeof(AlphaConstants) / 4};
+  params[1].Constants = {0, 0, sizeof(PassConstants) / 4};
   const D3D12_ROOT_SIGNATURE_DESC rs = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-  ComPtr<ID3DBlob> blob;
-  if (Failed(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
-             "upscaler alpha root signature serialize") ||
-      Failed(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                          IID_PPV_ARGS(&alpha_signature_)),
-             "upscaler alpha root signature"))
-    return false;
-  D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
-  pd.pRootSignature = alpha_signature_.Get();
-  pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+  ComPtr<ID3DBlob> blob, err;
   const D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                                         kAlphaViews * D3D12Device::kFramesInFlight,
+                                         kViewsPerFrame * D3D12Device::kFramesInFlight,
                                          D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
-  if (Failed(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&alpha_pso_)),
-             "upscaler alpha pipeline") ||
-      Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&alpha_heap_)), "upscaler alpha heap"))
+  if (Failed(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err),
+             "upscaler pass root signature serialize") ||
+      Failed(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                          IID_PPV_ARGS(&pass_signature_)),
+             "upscaler pass root signature") ||
+      Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&pass_heap_)), "upscaler pass heap"))
     return false;
-  alpha_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-  return true;
+  pass_stride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+  const pD3DCompile compile = D3DCompiler();
+  auto create = [&](const char* body, const char* name, ComPtr<ID3D12PipelineState>* pso) {
+    const std::string hlsl = std::string(kPassBindings) + body;
+    ComPtr<ID3DBlob> code, error;
+    if (!compile || FAILED(compile(hlsl.data(), hlsl.size(), name, nullptr, nullptr, "main",
+                                   "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error))) {
+      REXLOG_ERROR("PGR4 native upscaler: {}: {}", name,
+                   error ? static_cast<const char*>(error->GetBufferPointer()) : "?");
+      return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+    pd.pRootSignature = pass_signature_.Get();
+    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+    return !Failed(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(pso->GetAddressOf())),
+                   name);
+  };
+  if (!create(kInputHlsl, "pgr4_upscaler_input.hlsl", &input_pso_)) return false;
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {kOutputFormat};
+  if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) ||
+      !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) {
+    REXLOG_WARN(
+        "PGR4 native upscaler: no typed UAV loads of the output; the motion blur loses "
+        "its mask");
+    return true;
+  }
+  return create(kAlphaHlsl, "pgr4_upscaler_alpha.hlsl", &alpha_pso_);
 }
 
-void Upscaler::CopyAlpha(ID3D12GraphicsCommandList* list, const RenderTarget& color) {
-  if (!alpha_pso_) return;
-  // The slot of a frame kFramesInFlight back, whose fence the device waited for.
-  const uint32_t first = uint32_t(frame_ % D3D12Device::kFramesInFlight) * kAlphaViews;
-  D3D12_CPU_DESCRIPTOR_HANDLE cpu = alpha_heap_->GetCPUDescriptorHandleForHeapStart();
-  cpu.ptr += size_t(first) * alpha_stride_;
+void Upscaler::RunPass(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso,
+                       ID3D12Resource* src, ID3D12Resource* dst, uint32_t slot, float scale_x,
+                       float scale_y, uint32_t width, uint32_t height) {
+  // In the frame's own views: those of a frame kFramesInFlight back, whose fence the device
+  // waited for, are free.
+  const uint32_t first =
+      uint32_t(frame_ % D3D12Device::kFramesInFlight) * kViewsPerFrame + 2 * slot;
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu = pass_heap_->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += size_t(first) * pass_stride_;
   D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
   sd.Format = kOutputFormat;
   sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   sd.Texture2D.MipLevels = 1;
-  device_->CreateShaderResourceView(color.resource.Get(), &sd, cpu);
-  cpu.ptr += alpha_stride_;
+  device_->CreateShaderResourceView(src, &sd, cpu);
+  cpu.ptr += pass_stride_;
   D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
   ud.Format = kOutputFormat;
   ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  device_->CreateUnorderedAccessView(output_.resource.Get(), nullptr, &ud, cpu);
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu = alpha_heap_->GetGPUDescriptorHandleForHeapStart();
-  gpu.ptr += uint64_t(first) * alpha_stride_;
+  device_->CreateUnorderedAccessView(dst, nullptr, &ud, cpu);
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu = pass_heap_->GetGPUDescriptorHandleForHeapStart();
+  gpu.ptr += uint64_t(first) * pass_stride_;
 
-  // After the upscaler's writes to the output.
-  D3D12_RESOURCE_BARRIER b = {};
-  b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-  b.UAV.pResource = output_.resource.Get();
-  list->ResourceBarrier(1, &b);
-  const AlphaConstants c = {
-      {float(render_width_) / float(kSceneWidth), float(render_height_) / float(kSceneHeight)},
-      {kSceneWidth, kSceneHeight}};
-  ID3D12DescriptorHeap* heaps[] = {alpha_heap_.Get()};
+  const PassConstants c = {{scale_x, scale_y}, {width, height}};
+  ID3D12DescriptorHeap* heaps[] = {pass_heap_.Get()};
   list->SetDescriptorHeaps(1, heaps);
-  list->SetComputeRootSignature(alpha_signature_.Get());
-  list->SetPipelineState(alpha_pso_.Get());
+  list->SetComputeRootSignature(pass_signature_.Get());
+  list->SetPipelineState(pso);
   list->SetComputeRootDescriptorTable(0, gpu);
   list->SetComputeRoot32BitConstants(1, sizeof(c) / 4, &c, 0);
-  list->Dispatch((kSceneWidth + 7) / 8, (kSceneHeight + 7) / 8, 1);
+  list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 }
 
 bool Upscaler::SetLevel(uint32_t level) {
@@ -312,6 +330,11 @@ bool Upscaler::CreateTargets() {
 
   d.Width = max_width_;
   d.Height = max_height_;
+  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, input_state_, nullptr,
+                                              IID_PPV_ARGS(&input_)),
+             "upscaler input"))
+    return false;
+
   d.Format = kMotionFormat;
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   D3D12_CLEAR_VALUE zero = {};
@@ -393,7 +416,7 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   targets.PrepareRead(list, color, all);
   targets.PrepareRead(list, depth, all);
 
-  D3D12_RESOURCE_BARRIER bs[4];
+  D3D12_RESOURCE_BARRIER bs[5];
   uint32_t nb = 0;
   auto to = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES* state, D3D12_RESOURCE_STATES after) {
     if (*state == after) return;
@@ -404,13 +427,19 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   to(color->resource.Get(), &color->state, kInputState);
   to(depth->resource.Get(), &depth->state, kInputState);
   to(motion_.Get(), &motion_state_, kInputState);
+  to(input_.Get(), &input_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   to(output_.resource.Get(), &output_.state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   if (nb) list->ResourceBarrier(nb, bs);
+  RunPass(list, input_pso_.Get(), color->resource.Get(), input_.Get(), 0, 1.0f, 1.0f, render_width_,
+          render_height_);
+  nb = 0;
+  to(input_.Get(), &input_state_, kInputState);
+  list->ResourceBarrier(nb, bs);
 
   ffxDispatchDescUpscale d = {};
   d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
   d.commandList = list;
-  d.color = ffxApiGetResourceDX12(color->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  d.color = ffxApiGetResourceDX12(input_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
   d.depth = ffxApiGetResourceDX12(depth->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
   d.motionVectors = ffxApiGetResourceDX12(motion_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
   d.output = ffxApiGetResourceDX12(output_.resource.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -431,7 +460,15 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
     PGR4_WARN_ONCE("PGR4 native upscaler: ffxDispatch failed ({})", rc);
     return nullptr;
   }
-  CopyAlpha(list, *color);
+  if (alpha_pso_) {
+    D3D12_RESOURCE_BARRIER b = {};  // after FSR's writes to the output
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    b.UAV.pResource = output_.resource.Get();
+    list->ResourceBarrier(1, &b);
+    RunPass(list, alpha_pso_.Get(), color->resource.Get(), output_.resource.Get(), 1,
+            float(render_width_) / float(kSceneWidth), float(render_height_) / float(kSceneHeight),
+            kSceneWidth, kSceneHeight);
+  }
   reset_ = false;
   upscaled_ = true;
   output_.guest_format = color->guest_format;
