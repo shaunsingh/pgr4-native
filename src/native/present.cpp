@@ -594,8 +594,10 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
       list->RSSetScissorRects(1, &sc);
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       list->DrawInstanced(3, 1, 0, 0);
-      if (glitch.on() && !hdr)
+      if (glitch.on()) {
+        if (hdr) list->SetPipelineState(pso.Get());  // the catcher keeps SDR frames
         glitch.Record(device, list, ramp_slot, iw, ih, constants.ramp_mode, r.frame_index());
+      }
     }
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
     list->ResourceBarrier(1, &b);
