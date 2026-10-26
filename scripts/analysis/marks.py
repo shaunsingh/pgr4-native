@@ -35,11 +35,15 @@ CAUSES = ["held", "pso_created", "pso_wait_us", "swap_fence_us", "hook_wait_us",
 def window(recs, mark, before, after, held):
     """Rows (header and pixels), frame indices and times of the frames shown around the mark."""
     rows, frames, times = [], [], []
-    t_mark = None
+    # The dump is written as the mark is taken, so it may end a frame or two before the mark: the
+    # last frame shown up to it stands in.
+    t_mark, best = None, -1
     for mm, w, h, fr, tm in recs:
-        hit = np.nonzero(fr == mark)[0]
+        hit = np.nonzero(fr <= mark)[0]
         if hit.size:
-            t_mark = int(tm[hit[0]])
+            i = hit[np.argmax(fr[hit])]
+            if int(fr[i]) > best:
+                best, t_mark = int(fr[i]), int(tm[i])
     if t_mark is None:
         return None
     for mm, w, h, fr, tm in recs:
