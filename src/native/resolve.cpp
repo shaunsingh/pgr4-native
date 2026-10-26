@@ -21,6 +21,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -176,8 +177,8 @@ cbuffer Params : register(b0) {
   uint2 dest_origin;    // destination point in the image
   uint cb_dest_format;  // xenos::TextureFormat
   uint cb_src_format;   // xenos::ColorRenderTargetFormat, or the depth format
-  uint cb_flags;        // 1: swap, 4-6: sample select, 8-10: samples, 12-14: number,
-                        // 15: also the converted color into dst_float
+  uint cb_flags;        // 1: swap, 4-6: sample select, 8-9: log2 of the samples, 10: the host's
+                        // own samples, 12-14: number, 15: also the converted color into dst_float
   int cb_exp_bias;
   uint cb_dest_layout;  // DestLayout of dst
   uint pad;
@@ -219,7 +220,10 @@ RWTexture2D<uint4> dst : register(u0);
 RWTexture2D<float4> dst_float : register(u1);
 
 uint SampleSelect() { return (flags >> 4) & 7; }
-uint SampleCount() { return (flags >> 8) & 7; }
+uint SampleCount() { return 1u << ((flags >> 8) & 3u); }
+// The target's samples are the host's own (--pgr4_native_msaa), not the guest's: a one-sample
+// copy takes sample 0, and an averaging one all of them.
+bool OwnSamples() { return (flags & 0x400u) != 0u; }
 // Host sample of a guest sample s (0..3). SanitizeCopySampleSelect: 2x k2/k3 -> k0/k1, 1x -> 0.
 // GetD3D10SampleIndexForGuest2xMSAA (native 2x): Xenos 2x sample 0 is the top one, which is
 // sample 1 in Direct3D 10.1+; 4x samples map 1:1.
@@ -277,6 +281,12 @@ float4 EdramSample(float4 c) {
 float4 LoadColor(int2 p) {
 #if MSAA
   uint n = SampleCount(), s = SampleSelect();
+  if (OwnSamples()) {
+    if (s <= 3u) return EdramSample(src.Load(p, 0));
+    float4 sum = 0.0;
+    for (uint i = 0u; i < n; ++i) sum += EdramSample(src.Load(p, i));
+    return sum / (float)n;
+  }
   if (s <= 3u) return EdramSample(src.Load(p, HostSample(s)));
   if (n == 4u) {
     if (s == 6u)
@@ -329,7 +339,7 @@ uint4 PackPixel(int2 p, out float4 floats) {
 #if MSAA
   // Depth is never averaged (ReXGlue SanitizeCopySampleSelect): 4x k23 -> sample 2, else 0.
   uint sel = SampleSelect();
-  uint s = HostSample(sel <= 3u ? sel : (sel == 5u && SampleCount() == 4u ? 2u : 0u));
+  uint s = OwnSamples() ? 0u : HostSample(sel <= 3u ? sel : (sel == 5u && SampleCount() == 4u ? 2u : 0u));
   float d = src_depth.Load(p, s);
   uint stencil = src_stencil.Load(p, s).g;
 #else
@@ -997,7 +1007,9 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   c.dest_origin[1] = uint32_t(dy);
   c.dest_format = p.dest_format;
   c.src_format = rt->guest_format;
-  c.flags = (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) | (rt->samples << 8) |
+  c.flags = (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) |
+            (uint32_t(std::countr_zero(rt->samples)) << 8) |
+            (rt->samples > 1 && rt->samples != rt->edram_samples ? 0x400u : 0u) |
             (p.dest_number << 12) | (linear ? 0x8000u : 0u);
   c.exp_bias = p.exp_bias;
   c.dest_layout = storage->layout;

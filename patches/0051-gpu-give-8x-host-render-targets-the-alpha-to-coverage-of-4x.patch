@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Mon, 26 Oct 2026 17:00:00 -0400
+Subject: [PATCH 51/51] feat(gpu): give 8x host render targets the alpha to
+ coverage of 4x
+
+Xenos MSAA is at most 4x, but a host renderer may draw a guest surface
+into a render target of more samples than the guest's, such as 8x for
+better antialiasing. Such a renderer sets sample_count_log2 to 4x's, and
+on the RTV path the alpha to coverage mask of the 4x case covers only
+samples 0:3 of the eight.
+
+On the RTV path, the 4x case now also copies the coverage of samples 0:3
+to 4:7, so that each of the four dithered thresholds covers two of the
+eight samples and a coverage of n/4 of the pixel stays n/4. Direct3D
+ignores the output coverage bits of samples a render target does not
+have, so 4x targets are unaffected. The ROV path, which keeps its own
+coverage and deferred depth/stencil bits, is unchanged.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+--- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+@@ -1786,6 +1786,13 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
+                                           coverage_temp_component, temp, 1);
+     CompletePixelShader_AlphaToMaskSample(false, 3, 1.0f, temp_x_src, 1.0f / 16.0f, coverage_temp,
+                                           coverage_temp_component, temp, 1);
++    if (!edram_rov_used_) {
++      // For a host target of 8 samples (more than the guest's 4), each threshold covers two:
++      // samples 4:7 get the coverage of 0:3. A 4-sample target ignores the bits above 3.
++      a_.OpBFI(dxbc::Dest::R(coverage_temp, 1 << coverage_temp_component), dxbc::Src::LU(4),
++               dxbc::Src::LU(4), dxbc::Src::R(coverage_temp).Select(coverage_temp_component),
++               dxbc::Src::R(coverage_temp).Select(coverage_temp_component));
++    }
+     // 2x MSAA.
+     // With ROV, using guest sample indices.
+     // Without ROV:
+-- 
+2.47.0

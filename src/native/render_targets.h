@@ -80,7 +80,7 @@ constexpr uint32_t kDevTileOrigins = 12984;
 constexpr uint32_t kMaxTiles = 15;
 
 // Host pixels per guest pixel of a target, per axis, as num / den (1 / 1: the guest's size).
-// Only the upscaler's scene renders at another size (RenderTargets::Upscaled); everything
+// Only the upscaler's scene renders at another size (RenderTargets::OverrideScene); everything
 // outside the host resources (guest rectangles, heights, the EDRAM) stays in guest pixels.
 struct RenderScale {
   uint32_t num[2] = {1, 1}, den[2] = {1, 1};
@@ -123,8 +123,8 @@ struct RenderTarget {
   bool depth = false;
   uint32_t edram_base = 0;         // tiles
   uint32_t pitch = 0;              // pixels (RB_SURFACE_INFO surface_pitch)
-  uint32_t samples = 1;            // 1, 2 or 4
-  uint32_t edram_samples = 1;      // the guest surface's (RenderTargets::Upscaled)
+  uint32_t samples = 1;            // 1, 2, 4 or 8
+  uint32_t edram_samples = 1;      // the guest surface's (RenderTargets::OverrideScene)
   uint32_t width = 0, height = 0;  // guest pixels; the resource is scale.Extent of them
   RenderScale scale;
   uint32_t guest_format = 0;  // last xenos::ColorRenderTargetFormat / DepthRenderTargetFormat
@@ -221,13 +221,18 @@ class RenderTargets {
   // Frees replaced targets the GPU is done with and drops targets unused for kMaxAge frames.
   void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
 
-  // Host targets of the surfaces whose RB_SURFACE_INFO has `value` under `mask` (the upscaler's
-  // scene) have one sample, whatever the guest's MSAA, and `scale`'s size; mask 0: none. They
-  // are other targets than the surfaces' guest-sized ones. Between frames.
-  void Upscaled(uint32_t mask, uint32_t value, const RenderScale& scale) {
-    upscaled_mask_ = mask;
-    upscaled_value_ = value;
-    upscaled_scale_ = scale;
+  // Host targets of the surfaces whose RB_SURFACE_INFO has `value` under `mask` (the 3D scene)
+  // have `samples` samples whatever the guest's MSAA (1 for the upscaler, --pgr4_native_msaa's
+  // otherwise) and `scale`'s size; mask 0: none. They are other targets than the surfaces' guest
+  // ones. Between frames.
+  // The most samples, up to `want` (a power of 2), that the host formats of every target allow.
+  uint32_t SupportedSamples(uint32_t want) const;
+
+  void OverrideScene(uint32_t mask, uint32_t value, uint32_t samples, const RenderScale& scale) {
+    scene_mask_ = mask;
+    scene_value_ = value;
+    scene_samples_ = samples;
+    scene_scale_ = scale;
   }
 
   // Forgets every recorded EDRAM fill, for clears that are not guest content (the resolve self
@@ -274,11 +279,11 @@ class RenderTargets {
   void Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt);
 
   RenderTarget* Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height);
-  bool IsUpscaled(uint32_t surface_info) const {
-    return upscaled_mask_ && (surface_info & upscaled_mask_) == upscaled_value_;
+  bool IsOverridden(uint32_t surface_info) const {
+    return scene_mask_ && (surface_info & scene_mask_) == scene_value_;
   }
   uint32_t HostSamples(uint32_t surface_info) const {
-    return IsUpscaled(surface_info) ? 1 : SurfaceSamples(surface_info);
+    return IsOverridden(surface_info) ? scene_samples_ : SurfaceSamples(surface_info);
   }
   void Retire(ComPtr<ID3D12Resource> resource);
   bool Create(RenderTarget* rt, uint32_t height);
@@ -306,8 +311,8 @@ class RenderTargets {
   std::vector<EdramFill> fills_;  // oldest first
   uint64_t fill_seq_ = 0;
   std::FILE* log_ = nullptr;
-  uint32_t upscaled_mask_ = 0, upscaled_value_ = 0;
-  RenderScale upscaled_scale_;
+  uint32_t scene_mask_ = 0, scene_value_ = 0, scene_samples_ = 1;
+  RenderScale scene_scale_;
 };
 
 }  // namespace pgr4::native

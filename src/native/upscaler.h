@@ -6,10 +6,10 @@
 // The scene is PGR4's 1280x720 2x MSAA surface: RB_SURFACE_INFO pitch 1280 with 2x MSAA, the
 // only surface of that pitch and MSAA in the race and the menus (draw logs of td-265). With
 // --pgr4_native_upscaler its host targets are single-sampled and of the render size
-// (--pgr4_native_upscaler_width/height, RenderTargets::Upscaled: the draws' viewports, scissors
-// and clears scale with them), every draw into it is offset by the frame's sub-pixel jitter and
-// samples its mipmapped textures with AMD's LOD bias for the render size (DrawRenderer, the
-// jitter through the system constants' NDC offset), the draws that write depth also write their
+// (--pgr4_native_upscaler_width/height, RenderTargets::OverrideScene: the draws' viewports,
+// scissors and clears scale with them), every draw into it is offset by the frame's sub-pixel
+// jitter and samples its mipmapped textures with AMD's LOD bias for the render size (DrawRenderer,
+// the jitter through the system constants' NDC offset), the draws that write depth also write their
 // motion into MotionTarget
 // (vertex shaders that run again with the previous frame's constants, DxbcShaderTranslator's
 // motion_vectors), and the first resolve out of it in a frame (EndTiling's depth resolve, before

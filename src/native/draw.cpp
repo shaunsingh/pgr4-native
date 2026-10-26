@@ -3305,7 +3305,8 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
       if ((f[4] >> 12) & 0x3FF) ++diag.fetch_classes[6];
     }
   }
-  // The host targets' (one sample for the upscaler's scene, whatever the guest's MSAA).
+  // The host targets' (the scene's own with the upscaler or --pgr4_native_msaa). 8x takes 4x's:
+  // the translator's alpha to coverage gives samples 4:7 the coverage of 0:3 (patches/0051).
   sys.sample_count_log2[0] = targets.samples >= 4 ? 1 : 0;
   sys.sample_count_log2[1] = targets.samples >= 2 ? 1 : 0;
   sys.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);

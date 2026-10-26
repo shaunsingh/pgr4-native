@@ -19,7 +19,7 @@ namespace {
 namespace xenos = rex::graphics::xenos;
 
 constexpr uint32_t kMaxViews = 256;     // RTVs and DSVs each; PGR4 uses ~20 surfaces per frame
-constexpr uint32_t kNullRtvs = 3;       // null RTVs for 1, 2 and 4 samples, at the heap's start
+constexpr uint32_t kNullRtvs = 2;       // null RTVs for 1 and more samples, at the heap's start
 constexpr uint32_t kEdramTiles = 2048;  // 10 MiB of 80x16-sample tiles
 constexpr uint32_t kMaxHeight = 2048;
 
@@ -226,6 +226,25 @@ bool RenderTargets::Initialize(ID3D12Device* device) {
   return true;
 }
 
+uint32_t RenderTargets::SupportedSamples(uint32_t want) const {
+  std::vector<DXGI_FORMAT> formats = {DXGI_FORMAT_D24_UNORM_S8_UINT,
+                                      DXGI_FORMAT_D32_FLOAT_S8X24_UINT};
+  for (uint32_t f = 0; f < 16; ++f)
+    if (const DXGI_FORMAT d = ColorFormat(f); d != DXGI_FORMAT_UNKNOWN) formats.push_back(d);
+  for (uint32_t n = want; n > 1; n >>= 1) {
+    if (std::all_of(formats.begin(), formats.end(), [&](DXGI_FORMAT f) {
+          D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q = {};
+          q.Format = f;
+          q.SampleCount = n;
+          return SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                        &q, sizeof(q))) &&
+                 q.NumQualityLevels > 0;
+        }))
+      return n;
+  }
+  return 1;
+}
+
 uint32_t RenderTargets::AllocView(bool depth) {
   auto& list = depth ? free_dsv_ : free_rtv_;
   if (list.empty()) return UINT32_MAX;
@@ -303,8 +322,8 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
                                  uint32_t height) {
   const uint32_t pitch = surface_info & 0x3FFF;
   const uint32_t edram_samples = SurfaceSamples(surface_info);
-  const bool upscaled = IsUpscaled(surface_info);
-  const uint32_t samples = upscaled ? 1 : edram_samples;
+  const bool overridden = IsOverridden(surface_info);
+  const uint32_t samples = HostSamples(surface_info);
   const uint32_t base = info & 0xFFF;
   DXGI_FORMAT resource, view, srv, stencil_srv = DXGI_FORMAT_UNKNOWN;
   uint32_t guest_format;
@@ -333,9 +352,9 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     wide = Is64bpp(guest_format);
   }
   if (pitch == 0) return nullptr;
-  // An upscaled target is not the guest-sized one-sample target of the same surface's pitch.
+  // An overridden target is not the guest one of the same surface's pitch and sample count.
   const uint64_t key = (uint64_t(depth) << 63) | (uint64_t(samples >> 1) << 60) |
-                       (uint64_t(upscaled) << 56) | (uint64_t(base) << 44) |
+                       (uint64_t(overridden) << 56) | (uint64_t(base) << 44) |
                        (uint64_t(pitch) << 30) | uint64_t(view);
   GetMemo& memo = get_memo_[(key ^ (key >> 30) ^ (key >> 44) ^ (key >> 60)) & 15];
   if (memo.rt && memo.key == key && std::min(height, kMaxHeight) <= memo.rt->height) {
@@ -356,7 +375,7 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     rt->pitch = pitch;
     rt->samples = samples;
     rt->edram_samples = edram_samples;
-    if (upscaled) rt->scale = upscaled_scale_;
+    if (overridden) rt->scale = scene_scale_;
     rt->resource_format = resource;
     rt->view_format = view;
     rt->srv_format = srv;
@@ -407,7 +426,7 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
   out->width = UINT32_MAX;
   out->height = UINT32_MAX;
   D3D12_CPU_DESCRIPTOR_HANDLE null_rtv = rtv_start_;
-  null_rtv.ptr += size_t(samples == 4 ? 2 : samples == 2 ? 1 : 0) * rtv_stride_;
+  null_rtv.ptr += size_t(samples > 1) * rtv_stride_;
   for (uint32_t i = 0; i < 4; ++i) {
     out->rtv[i] = null_rtv;
     if (!(color_mask >> i & 1)) continue;

@@ -19,7 +19,11 @@ pgr4_60fps = true
 # At least 16x anisotropic filtering on the game's mipmapped, linearly filtered textures.
 pgr4_native_anisotropy = 16
 
-# The 3D scene with the game's 2x MSAA, or (true) antialiased and upscaled to 1280x720 by AMD's
+# Samples per pixel of the 3D scene's MSAA: 1 (none), 2 (the game's own), 4 or 8. More samples
+# give smoother edges for more GPU time.
+pgr4_native_msaa = 2
+
+# The 3D scene with MSAA, or (true) antialiased and upscaled to 1280x720 by AMD's
 # FidelityFX Super Resolution, or what OptiScaler puts behind it (README.md, "Upscaling"). The
 # upscaler renders the scene at width x height: 1280x720 is antialiasing only, 853x480 FSR's
 # Quality, 640x360 its Performance.

@@ -49,6 +49,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_primary, false, "PGR4 native",
                     "The native renderer is the game's output: it presents into the game window "
                     "and the Xenos plugin skips all draws, resolves and swaps (gpu_skip_draws, "
                     "patches/0031); implies --pgr4_native");
+REXCVAR_DEFINE_INT32(pgr4_native_msaa, 2, "PGR4 native",
+                     "Samples of the 3D scene's MSAA without the upscaler: 1, 2 (the game's), 4 "
+                     "or 8 (fewer if the GPU lacks them)");
 REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");
 REXCVAR_DEFINE_INT32(pgr4_native_width, 1280, "PGR4 native", "Debug window width");
@@ -397,10 +400,18 @@ bool NativeRenderer::Initialize() {
   }
   rt_ = std::make_unique<RenderTargets>();
   if (!rt_->Initialize(device_->device())) return false;
+  if (const int32_t msaa = REXCVAR_GET(pgr4_native_msaa);
+      msaa == 1 || msaa == 2 || msaa == 4 || msaa == 8) {
+    scene_msaa_ = rt_->SupportedSamples(uint32_t(msaa));
+    if (scene_msaa_ != uint32_t(msaa))
+      REXLOG_WARN("PGR4 native: {}x MSAA unsupported; the scene takes {}x", msaa, scene_msaa_);
+  } else {
+    REXLOG_ERROR("PGR4 native: --pgr4_native_msaa={} is not 1, 2, 4 or 8", msaa);
+  }
   resolver_ = std::make_unique<Resolver>();
   if (!resolver_->Initialize(device_->device(), rt_.get(), device_->command_queue())) return false;
   resolver_->set_gpu_timer(gpu_timer_);
-  if (Upscaler::Requested()) SwitchUpscaler(true);
+  SwitchUpscaler(Upscaler::Requested());
   textures_ = std::make_unique<TextureCache>(device_->device(), rex::system::kernel_memory());
   textures_->SetResolvedLookup([this](uint32_t a) { return resolver_->Find(a); });
   textures_->SetCaptureOrder(REXCVAR_GET(pgr4_native_texture_capture_order));
@@ -513,13 +524,18 @@ void NativeRenderer::SwitchUpscaler(bool on) {
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
   // and the unused ones age out (RenderTargets::BeginFrame).
   if (on) {
-    rt_->Upscaled(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, upscaler_->scale());
+    rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, 1, upscaler_->scale());
     upscaler_->Reset();
+  } else if (scene_msaa_ != 2) {
+    rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, scene_msaa_, {});
   } else {
-    rt_->Upscaled(0, 0, {});
+    rt_->OverrideScene(0, 0, 1, {});
   }
   resolver_->set_upscaler(upscaler());
-  REXLOG_INFO("PGR4 native: the scene {}", on ? "upscaled by FidelityFX" : "with MSAA");
+  if (on)
+    REXLOG_INFO("PGR4 native: the scene upscaled by FidelityFX");
+  else
+    REXLOG_INFO("PGR4 native: the scene with {}x MSAA", scene_msaa_);
 }
 
 void NativeRenderer::BeginFrameModules() {

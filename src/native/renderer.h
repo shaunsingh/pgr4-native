@@ -220,6 +220,7 @@ class NativeRenderer {
   std::atomic<bool> upscaler_switch_requested_{false}, upscaler_debug_requested_{false};
   bool upscaler_bound_ = false;  // primary mode
   bool upscaler_on_ = false;
+  uint32_t scene_msaa_ = 2;  // --pgr4_native_msaa, as far as the GPU has it
 
   static inline std::atomic<bool> paces_frames_{false};       // pacer_->pacing(), for any thread
   static inline std::atomic<NativeRenderer*> live_{nullptr};  // Live()
