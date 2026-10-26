@@ -20,8 +20,8 @@ pgr4_60fps = true
 pgr4_native_anisotropy = 16
 
 # Samples per pixel of the 3D scene's MSAA: 1 (none), 2 (the game's own), 4 or 8. More samples
-# give smoother edges for more GPU time.
-pgr4_native_msaa = 2
+# give smoother edges for more GPU time; 4x holds 90 fps on a Steam Deck OLED.
+pgr4_native_msaa = 4
 
 # The 3D scene with MSAA, or (true) antialiased and upscaled to 1280x720 by AMD's
 # FidelityFX Super Resolution, or what OptiScaler puts behind it (README.md, "Upscaling"). The
@@ -31,8 +31,9 @@ pgr4_native_upscaler = false
 pgr4_native_upscaler_width = 1280
 pgr4_native_upscaler_height = 720
 
-# F7 switches the scene between MSAA and the upscaler, and F8 shows the upscaler's debug view, so
-# the achievements overlay moves to F6.
+# With true, F7 switches the scene between MSAA and the upscaler and F8 shows the upscaler's debug
+# view. The achievements overlay is on F6 either way.
+pgr4_native_upscaler_keys = false
 bind_achievements = "F6"
 
 # Runtime settings.
