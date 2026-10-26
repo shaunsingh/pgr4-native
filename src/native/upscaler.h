@@ -15,7 +15,8 @@
 // the previous frame's constants, DxbcShaderTranslator's motion_vectors), and the first resolve out
 // of it in a frame (EndTiling's depth resolve, before its color resolves clear the surface)
 // upscales its color, depth and motion into the output, which the color resolves copy from instead
-// of the target.
+// of the target. The output then takes the scene's alpha, which FSR does not upscale: the motion
+// blur's mask, which keeps the player's car sharp.
 //
 // Threading: everything on the thread that records the frames (NativeRenderer::Execute*).
 #pragma once
@@ -109,6 +110,10 @@ class Upscaler {
   // The render size, LOD bias and jitter phases of a DynamicResolution level; false (logged)
   // without a phase count.
   bool SetLevel(uint32_t level);
+  // The pass that gives the upscaled color the scene's alpha (kAlphaHlsl); without typed UAV
+  // loads of the output it is left out (logged). False (logged) on failure.
+  bool CreateAlphaPass();
+  void CopyAlpha(ID3D12GraphicsCommandList* list, const RenderTarget& color);
 
   ID3D12Device* device_ = nullptr;
   const Api* api_ = nullptr;
@@ -120,6 +125,10 @@ class Upscaler {
   ComPtr<ID3D12DescriptorHeap> motion_rtv_;
   D3D12_RESOURCE_STATES motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
   uint64_t motion_frame_ = UINT64_MAX;  // the frame motion_ was cleared for
+  ComPtr<ID3D12RootSignature> alpha_signature_;
+  ComPtr<ID3D12PipelineState> alpha_pso_;  // null without typed UAV loads
+  ComPtr<ID3D12DescriptorHeap> alpha_heap_;
+  uint32_t alpha_stride_ = 0;
   uint32_t max_width_ = kSceneWidth, max_height_ = kSceneHeight;
   uint32_t render_width_ = kSceneWidth, render_height_ = kSceneHeight;
   std::optional<DynamicResolution> dynamic_;  // with --pgr4_native_upscaler_target_fps
