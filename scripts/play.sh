@@ -57,17 +57,7 @@ if [[ ${1:-} == --install ]]; then
   # The release's settings beside the executables, as a player's package has them; the flags
   # below override the few that differ.
   cp "$repo"/games/pgr4/pgr4_recompiled.toml "$repo"/games/gw/gw_recompiled.toml "$top/runtime/"
-  # The --fgmod copy, where fgmod adds OptiScaler at each start and keeps the OptiScaler.ini it
-  # finds: ~/fgmod's with fsr4-optiscaler.ini's settings.
-  rsync -a --delete "$top/runtime/" "$top/runtime-fgmod/"
-  [[ -f $fsr4/amdxcffx64.dll ]] && cp "$fsr4/amdxcffx64.dll" "$top/runtime-fgmod/"
-  if [[ -f $HOME/fgmod/OptiScaler.ini ]]; then
-    ini=$top/runtime-fgmod/OptiScaler.ini
-    cp "$HOME/fgmod/OptiScaler.ini" "$ini"
-    while IFS='=' read -r key value; do
-      [[ $key =~ ^[A-Za-z0-9]+$ ]] && sed -i "s|^$key=.*|$key=$value|" "$ini"
-    done < "$here/fsr4-optiscaler.ini"
-  fi
+
   # Start from the bench's prefix and caches: no Proton first-run setup, and the pipelines the
   # bench runs already compiled.
   [[ -d $top/prefix || ! -d $bench/prefix ]] || cp -a "$bench/prefix" "$top/prefix"
@@ -92,6 +82,17 @@ DESKTOP
   entry pgr4-native-fsr4 'PGR4 (native renderer, FSR 4 Lite)' ' --fgmod'
   git -C "$repo" log -1 --format='installed %h %s' > "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   git -C "$repo" status --short >> "$top/runtime/INSTALLED.txt" 2>/dev/null || true
+  # The --fgmod copy, where fgmod adds OptiScaler at each start and keeps the OptiScaler.ini it
+  # finds: ~/fgmod's with fsr4-optiscaler.ini's settings.
+  rsync -a --delete "$top/runtime/" "$top/runtime-fgmod/"
+  [[ -f $fsr4/amdxcffx64.dll ]] && cp "$fsr4/amdxcffx64.dll" "$top/runtime-fgmod/"
+  if [[ -f $HOME/fgmod/OptiScaler.ini ]]; then
+    ini=$top/runtime-fgmod/OptiScaler.ini
+    cp "$HOME/fgmod/OptiScaler.ini" "$ini"
+    while IFS='=' read -r key value; do
+      [[ $key =~ ^[A-Za-z0-9]+$ ]] && sed -i "s|^$key=.*|$key=$value|" "$ini"
+    done < "$here/fsr4-optiscaler.ini"
+  fi
   echo "installed $src -> $top/runtime (and runtime-fgmod); desktop entries pgr4-native-play," \
     "pgr4-native-debug, pgr4-native-fsr4 in $apps"
   exit 0
@@ -175,7 +176,7 @@ cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 # fgmod copies OptiScaler in as dxgi.dll beside the executable it finds in the command, adds
 # dxgi=n,b to WINEDLLOVERRIDES and runs the command.
 [[ $fgmod != 0 ]] && cmd=("$HOME/fgmod/fgmod" "${cmd[@]}")
-{ cat "$runtime/INSTALLED.txt" 2>/dev/null; echo "${cmd[*]}"; } > "$base-cmdline.txt"
+{ cat "$runtime/INSTALLED.txt" 2>/dev/null || true; echo "${cmd[*]}"; } > "$base-cmdline.txt"
 
 # Debugging sessions: each title process's maps, which place its PE modules for perf_symbols.py,
 # copied as it runs (a title launch starts a new process). A copy of an exited process's maps is
