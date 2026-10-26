@@ -25,11 +25,11 @@
 # marks.py show them). A mark also logs the next 3 frames' draws to captures/draws-f<frame>.txt
 # and checks them against guest memory (--pgr4_native_mark_audit; the findings go to the game
 # log). The profile: logs/<stamp>-perf.data for the whole session, the maps of each title
-# process and its profile in logs/<stamp>-perf-<exe>-<pid>.{maps,txt}, the modules as they ran
-# in logs/<stamp>-perf-modules/, and logs/<stamp>-perf.clock, the wall clock and CLOCK_MONOTONIC
-# (perf's clock here) at one instant, for perf_symbols.py --pid and --window. In Steam, add the
-# "PGR4 (native renderer)" shortcut without a compatibility tool: this script starts Proton
-# itself.
+# process and its profile in logs/<stamp>-perf-<exe>-<pid>.{maps,txt} (the .txt a minute or so
+# after a long session), the modules as they ran in logs/<stamp>-perf-modules/, and
+# logs/<stamp>-perf.clock, the wall clock and CLOCK_MONOTONIC (perf's clock here) at one instant,
+# for perf_symbols.py --pid and --window. In Steam, add the "PGR4 (native renderer)" shortcut
+# without a compatibility tool: this script starts Proton itself.
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -186,12 +186,17 @@ status=0
 if [[ $debug != 0 ]]; then
   kill "$sampler" "$snapshotter" 2>/dev/null || true
   wait "$sampler" "$snapshotter" 2>/dev/null || true
-  for maps in "$base"-perf-*.maps; do
-    [[ -s $maps ]] || continue
-    pid=${maps%.maps}; pid=${pid##*-}
-    python3 "$repo/scripts/analysis/perf_symbols.py" "$base-perf.data" "$maps" "$base-perf-modules"/*.map \
-      --pid "$pid" > "${maps%.maps}.txt" 2>&1 || true
-  done
+  # Steam ends a session by signalling everything it started, this script too, so the profiles
+  # are made in a unit of the user's systemd, outside the session, where there is one (systemd
+  # expands $ in the command, and $$ is a $).
+  report='for maps in "$1"-perf-*.maps; do
+      [[ -s $maps ]] || continue
+      pid=${maps%.maps}; pid=${pid##*-}
+      python3 "$2/scripts/analysis/perf_symbols.py" "$1-perf.data" "$maps" "$1-perf-modules"/*.map \
+        --pid "$pid" > "${maps%.maps}.txt" 2>&1
+    done'
+  systemd-run --user --collect --quiet -- bash -c "${report//\$/\$\$}" report "$base" "$repo" 2>/dev/null ||
+    bash -c "$report" report "$base" "$repo" || true
 fi
 end_prefix
 echo "game exited with $status at $(date +%T)" >> "$base-stdout.log"
