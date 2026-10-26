@@ -19,9 +19,16 @@ pgr4_60fps = true
 # At least 16x anisotropic filtering on the game's mipmapped, linearly filtered textures.
 pgr4_native_anisotropy = 16
 
-# F7 switches the 3D scene between the game's MSAA and FidelityFX Super Resolution
-# (pgr4_native_upscaler sets which one it starts with) and F8 shows the upscaler's debug view,
-# so the achievements overlay moves to F6.
+# The 3D scene with the game's 2x MSAA, or (true) antialiased and upscaled to 1280x720 by AMD's
+# FidelityFX Super Resolution, or what OptiScaler puts behind it (README.md, "Upscaling"). The
+# upscaler renders the scene at width x height: 1280x720 is antialiasing only, 853x480 FSR's
+# Quality, 640x360 its Performance.
+pgr4_native_upscaler = false
+pgr4_native_upscaler_width = 1280
+pgr4_native_upscaler_height = 720
+
+# F7 switches the scene between MSAA and the upscaler, and F8 shows the upscaler's debug view, so
+# the achievements overlay moves to F6.
 bind_achievements = "F6"
 
 # Runtime settings.

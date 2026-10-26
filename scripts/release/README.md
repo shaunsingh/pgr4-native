@@ -60,6 +60,74 @@ Windows' display settings the game outputs HDR.
 `pgr4_recompiled.toml` beside the executable holds the settings, one per line. A flag on the
 command line overrides it: in Steam's launch options, `%command% --fullscreen=false` for one.
 
+## Upscaling
+
+The 3D scene uses the game's own 2x MSAA by default. With `pgr4_native_upscaler = true` in
+`pgr4_recompiled.toml`, AMD's FidelityFX Super Resolution antialiases the scene instead and
+upscales it to 1280x720. The scene renders at `pgr4_native_upscaler_width` x
+`pgr4_native_upscaler_height`:
+
+| Size | FSR's name for it |
+|---|---|
+| 1280x720 (default) | Native AA: antialiasing only |
+| 853x480 | Quality |
+| 752x423 | Balanced |
+| 640x360 | Performance |
+
+F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view.
+The interface always stays at full resolution, and no sharpening is added.
+
+On a Steam Deck OLED, MSAA is still the fastest at 90 fps. In a St Petersburg race, MSAA averaged
+89.6 fps, FSR at 1280x720 84.0 and FSR at 853x480 86.9. The upscaler is there for its image, and
+for FSR 4.
+
+Out of the box this is FSR 3.1, from AMD's signed `amd_fidelityfx_loader_dx12.dll` and
+`amd_fidelityfx_upscaler_dx12.dll` beside the executable. The game calls only AMD's FidelityFX
+API, so the tools below can put a newer upscaler behind it. They are not part of this package,
+and none of them is tested with PGR4 yet. To see which upscaler runs, start the game once with
+`%command% --log_level=info` and look for `PGR4 native upscaler:` in `logs/`: it names the
+upscaler's version (`3.1.5` for the packaged FSR 3.1) and the render size.
+
+### FSR 4 on a Steam Deck (Proton)
+
+AMD's FSR 4.1.2 has a Lite model for handheld GPUs. Under Proton it falls back to FSR 3 because
+it asks the Windows driver for the GPU family, and Wine has no answer.
+[FSR4Injector](https://github.com/Rayekkk/FSR4Injector)'s `amdxc64.dll` supplies the answer.
+Its Decky plugin sets up only Steam games, so for this one do it by hand:
+
+1. Put two files beside `pgr4_recompiled.exe`:
+   - `amdxc64.dll` from FSR4Injector's release (its `bin/`, LGPL).
+   - AMD's `amdxcffx64.dll`, FidelityFX 2.4.0.4370 (FSR 4.1.2), from AMD's Adrenalin 26.10.1
+     driver package. FSR4Injector's plugin downloads it from AMD into the games it sets up.
+2. Set the launch options to
+   `WINEDLLOVERRIDES=amdxc64=n,b FSR4I_FAMILY=150 FSR4I_REV=1 PROTON_USE_XALIA=0 DXVK_HDR=1 %command%`.
+   The shim knows only the Legion Go 2's GPU by itself. Family 150 with revision 1 is the answer
+   for which AMD's library picks the Lite model (FSR4Injector's `shim/src/fsr4i.c`), and the one
+   OptiScaler gives for Lite. Add `FSR_WATERMARK=1` to have AMD's library show the model it runs.
+3. Set `pgr4_native_upscaler = true`.
+
+FSR4Injector lists the Steam Deck as untested.
+
+### OptiScaler
+
+[OptiScaler](https://github.com/optiscaler/OptiScaler) hooks the same FidelityFX calls and can
+put FSR 4, XeSS or DLSS behind them.
+
+- **Steam Deck, with fgmod** (Decky Framegen): set the launch options to
+  `PROTON_USE_XALIA=0 DXVK_HDR=1 ~/fgmod/fgmod %command%`. fgmod copies OptiScaler in as
+  `dxgi.dll` and replaces the package's `amd_fidelityfx_upscaler_dx12.dll` with its own, keeping
+  the original as `amd_fidelityfx_upscaler_dx12.dll.b`. fgmod 0.7.9 brings OptiScaler 0.7.9 and
+  AMD's FSR 4.0.2 upscaler, neither of which has the Lite model.
+- **Windows**: put `OptiScaler.dll`, renamed to `dxgi.dll`, and `OptiScaler.ini` beside the
+  executable.
+
+In `OptiScaler.ini`, `Dx12Upscaler` picks the upscaler (`ffx` for FSR 3.1 and 4, `xess`,
+`dlss`). For FSR 4's Lite model, put AMD's `amdxcffx64.dll` 4.1.2 beside the executable and use
+an OptiScaler that knows the Lite model (its current source does) with `Fsr4GpuSupport=4`.
+OptiScaler then answers AMD's GPU query itself, without FSR4Injector's shim. Keep the render
+size in `pgr4_native_upscaler_width` and `_height`: the game renders at that size whatever
+OptiScaler's own ratio settings say.
+
 ## Geometry Wars
 
 The arcade cabinet in the garage starts `gw_recompiled.exe`, which must stay beside
