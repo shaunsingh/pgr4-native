@@ -10,10 +10,16 @@
 #                              deck_sampler.py's GPU load and clock, APU power, CPU load per
 #                              thread and memory every second, marks (F12) and the glitch catcher,
 #                              and a CPU profile of every PGR4 and Geometry Wars process
+#   play.sh --fgmod            play with the scene upscaled by FSR 4's Lite model, through
+#                              OptiScaler as fgmod (Decky Framegen's ~/fgmod) installs it, from
+#                              runtime-fgmod/: a copy of the build with AMD's amdxcffx64.dll 4.1.2
+#                              ($fsr4/amdxcffx64.dll) and fsr4-optiscaler.ini's settings in its
+#                              OptiScaler.ini. fgmod needs an OptiScaler that has the Lite model
+#                              (master fd3a45a6 or later); --debug works with it
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
 #                              the build to play, so later rebuilds do not change it, and write
 #                              the desktop entries Steam's "Add a Non-Steam Game" lists (one of
-#                              them for debugging sessions)
+#                              them for debugging sessions, one for --fgmod)
 #
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own: deck-run.sh stops only its own prefix's processes, so never a game being
@@ -38,6 +44,7 @@ source "$here/common.sh"
 top=$HOME/pgr4-proton/play
 bench=$HOME/pgr4-proton
 game=${PGR4_GAME:-$HOME/recomp/dumps/pgr4/game}
+fsr4=$bench/fsr4
 keep_sessions=30
 
 if [[ ${1:-} == --install ]]; then
@@ -50,6 +57,17 @@ if [[ ${1:-} == --install ]]; then
   # The release's settings beside the executables, as a player's package has them; the flags
   # below override the few that differ.
   cp "$repo"/games/pgr4/pgr4_recompiled.toml "$repo"/games/gw/gw_recompiled.toml "$top/runtime/"
+  # The --fgmod copy, where fgmod adds OptiScaler at each start and keeps the OptiScaler.ini it
+  # finds: ~/fgmod's with fsr4-optiscaler.ini's settings.
+  rsync -a --delete "$top/runtime/" "$top/runtime-fgmod/"
+  [[ -f $fsr4/amdxcffx64.dll ]] && cp "$fsr4/amdxcffx64.dll" "$top/runtime-fgmod/"
+  if [[ -f $HOME/fgmod/OptiScaler.ini ]]; then
+    ini=$top/runtime-fgmod/OptiScaler.ini
+    cp "$HOME/fgmod/OptiScaler.ini" "$ini"
+    while IFS='=' read -r key value; do
+      [[ $key =~ ^[A-Za-z0-9]+$ ]] && sed -i "s|^$key=.*|$key=$value|" "$ini"
+    done < "$here/fsr4-optiscaler.ini"
+  fi
   # Start from the bench's prefix and caches: no Proton first-run setup, and the pipelines the
   # bench runs already compiled.
   [[ -d $top/prefix || ! -d $bench/prefix ]] || cp -a "$bench/prefix" "$top/prefix"
@@ -71,15 +89,26 @@ DESKTOP
   }
   entry pgr4-native-play 'PGR4 (native renderer)' ''
   entry pgr4-native-debug 'PGR4 (native renderer, debug)' ' --debug'
+  entry pgr4-native-fsr4 'PGR4 (native renderer, FSR 4 Lite)' ' --fgmod'
   git -C "$repo" log -1 --format='installed %h %s' > "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   git -C "$repo" status --short >> "$top/runtime/INSTALLED.txt" 2>/dev/null || true
-  echo "installed $src -> $top/runtime; desktop entries pgr4-native-play, pgr4-native-debug in $apps"
+  echo "installed $src -> $top/runtime (and runtime-fgmod); desktop entries pgr4-native-play," \
+    "pgr4-native-debug, pgr4-native-fsr4 in $apps"
   exit 0
 fi
 debug=${PGR4_DEBUG:-0}
-if [[ ${1:-} == --debug ]]; then debug=1; shift; fi
+fgmod=0
+while [[ ${1:-} == --debug || ${1:-} == --fgmod ]]; do
+  [[ $1 == --debug ]] && debug=1 || fgmod=1
+  shift
+done
 
 runtime=$top/runtime
+if [[ $fgmod != 0 ]]; then
+  runtime=$top/runtime-fgmod
+  [[ -x $HOME/fgmod/fgmod ]] || { echo "no fgmod in ~/fgmod (Decky Framegen installs it)" >&2; exit 1; }
+  [[ -f $runtime/amdxcffx64.dll ]] || echo "no amdxcffx64.dll in $runtime: FSR 4 falls back" >&2
+fi
 [[ -f $runtime/pgr4_recompiled.exe ]] || { echo "nothing installed: play.sh --install [tree]" >&2; exit 1; }
 [[ -f $game/default.xex ]] || { echo "no game files in $game (set PGR4_GAME)" >&2; exit 1; }
 check_no_game
@@ -129,6 +158,10 @@ else
   export WINEDEBUG=${WINEDEBUG:--all} VKD3D_DEBUG=${VKD3D_DEBUG:-none}
   export VKD3D_SHADER_DEBUG=${VKD3D_SHADER_DEBUG:-none}
 fi
+# FSR 4 Lite costs the Deck's GPU more than MSAA: the scene rendered at 960x540 by default (about
+# 60 fps on the Deck); the launch options can set another size.
+[[ $fgmod != 0 ]] && args+=(--pgr4_native_upscaler --pgr4_native_upscaler_width=960
+  --pgr4_native_upscaler_height=540)
 args+=("$@")
 
 export STEAM_COMPAT_DATA_PATH=$top/prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=$HOME/.local/share/Steam
@@ -139,6 +172,9 @@ export PROTON_USE_XALIA=0
 export DXVK_HDR=${DXVK_HDR:-1}
 export VKD3D_SHADER_CACHE_PATH=$top/cache
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
+# fgmod copies OptiScaler in as dxgi.dll beside the executable it finds in the command, adds
+# dxgi=n,b to WINEDLLOVERRIDES and runs the command.
+[[ $fgmod != 0 ]] && cmd=("$HOME/fgmod/fgmod" "${cmd[@]}")
 { cat "$runtime/INSTALLED.txt" 2>/dev/null; echo "${cmd[*]}"; } > "$base-cmdline.txt"
 
 # Debugging sessions: each title process's maps, which place its PE modules for perf_symbols.py,
