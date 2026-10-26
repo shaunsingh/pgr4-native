@@ -192,7 +192,6 @@ TextureCache::TextureCache(ID3D12Device* device, rex::memory::Memory* memory)
   upload_lists_.resize(n);
   for (uint32_t i = 0; i < n; ++i) {
     workers_.emplace_back([this, uploads = &upload_lists_[i]] { WorkerMain(uploads); });
-    SetThreadDescription(workers_.back().native_handle(), L"PGR4 native untile");
   }
 }
 #endif
@@ -211,6 +210,7 @@ TextureCache::~TextureCache() {
 }
 
 void TextureCache::WorkerMain(UploadList* uploads) {
+  SetThreadDescription(GetCurrentThread(), L"PGR4 native untile");
   std::vector<uint8_t> scratch;
   std::unique_lock<std::mutex> lock(jobs_mutex_);
   for (;;) {

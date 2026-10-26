@@ -1463,7 +1463,6 @@ bool DrawRenderer::Impl::Initialize() {
   }
   invalidation_handle = memory->RegisterPhysicalMemoryInvalidationCallback(InvalidationThunk, this);
   arm_thread = std::thread([this] { WatchThread(); });
-  SetThreadDescription(arm_thread.native_handle(), L"PGR4 native watches");
 
   D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kViewHeapSize,
                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -1551,10 +1550,14 @@ bool DrawRenderer::Impl::Initialize() {
     // While a frame waits for its pipelines, the game threads wait as well.
     const int total = std::max(threads, std::min(int(std::thread::hardware_concurrency()) - 2, 8));
     for (int i = 0; i < total; ++i) {
-      pso_threads.emplace_back([this, i, threads] { PipelineWorker(i == 0, i >= threads); });
-      wchar_t name[32];
-      std::swprintf(name, 32, L"PGR4 native pipelines %d", i);
-      SetThreadDescription(pso_threads.back().native_handle(), name);
+      pso_threads.emplace_back([this, i, threads] {
+        // Each thread names itself: Wine gives the Linux thread a name only once that thread has
+        // started (set_native_thread_name), so a name its creator sets at once can be lost.
+        wchar_t name[32];
+        std::swprintf(name, 32, L"PGR4 native pipelines %d", i);
+        SetThreadDescription(GetCurrentThread(), name);
+        PipelineWorker(i == 0, i >= threads);
+      });
     }
   }
   Prewarm();  // the first slice before the first frame, which needs some of them
@@ -1778,6 +1781,7 @@ void DrawRenderer::Impl::QueueArm(uint32_t first, uint32_t end, uint32_t request
 }
 
 void DrawRenderer::Impl::WatchThread() {
+  SetThreadDescription(GetCurrentThread(), L"PGR4 native watches");
   std::vector<ArmRun> runs;
   for (;;) {
     {

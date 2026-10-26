@@ -339,7 +339,6 @@ bool GlitchCatch::State::Start(ID3D12Device* device, uint32_t w, uint32_t h) {
   device->CreateRenderTargetView(target.Get(), nullptr,
                                  rtv_heap->GetCPUDescriptorHandleForHeapStart());
   writer = std::thread([this] { Write(); });
-  SetThreadDescription(writer.native_handle(), L"PGR4 native glitch catch");
   REXLOG_INFO(
       "PGR4 native glitch catch: the last {} frames at {}x{} kept, jumps written to "
       "{}glitch-<frame>.rec",
@@ -379,6 +378,7 @@ void GlitchCatch::State::Push(const Slot& s, uint32_t slot) {
 }
 
 void GlitchCatch::State::Write() {
+  SetThreadDescription(GetCurrentThread(), L"PGR4 native glitch catch");
   std::unique_lock<std::mutex> lock(mutex);
   for (;;) {
     cv.wait(lock, [this] { return stopping || !queue.empty(); });

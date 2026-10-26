@@ -669,7 +669,6 @@ struct Resolver::Pipelines {
         }
         if (!worker.joinable()) {
           worker = std::thread([this] { Work(); });
-          SetThreadDescription(worker.native_handle(), L"PGR4 native resolve shaders");
         }
         cv.notify_one();
       }
@@ -679,6 +678,7 @@ struct Resolver::Pipelines {
   }
 
   void Work() {
+    SetThreadDescription(GetCurrentThread(), L"PGR4 native resolve shaders");
     for (;;) {
       std::pair<PipelineSpec, Variant*> job;
       {
