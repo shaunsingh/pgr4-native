@@ -22,6 +22,7 @@ constexpr uint32_t kMaxViews = 256;     // RTVs and DSVs each; PGR4 uses ~20 sur
 constexpr uint32_t kNullRtvs = 2;       // null RTVs for 1 and more samples, at the heap's start
 constexpr uint32_t kEdramTiles = 2048;  // 10 MiB of 80x16-sample tiles
 constexpr uint32_t kMaxHeight = 2048;
+constexpr uint32_t kOverriddenKeyBit = 56;  // of RenderTargets::Get's target keys
 
 bool Is64bpp(uint32_t color_format) {
   return xenos::IsColorRenderTargetFormat64bpp(xenos::ColorRenderTargetFormat(color_format));
@@ -226,6 +227,12 @@ bool RenderTargets::Initialize(ID3D12Device* device) {
   return true;
 }
 
+void RenderTargets::SetSceneScale(const RenderScale& scale) {
+  scene_scale_ = scale;
+  for (auto& [key, rt] : targets_)
+    if (key >> kOverriddenKeyBit & 1) rt->scale = scale;
+}
+
 uint32_t RenderTargets::SupportedSamples(uint32_t want) const {
   std::vector<DXGI_FORMAT> formats = {DXGI_FORMAT_D24_UNORM_S8_UINT,
                                       DXGI_FORMAT_D32_FLOAT_S8X24_UINT};
@@ -260,8 +267,8 @@ void RenderTargets::Retire(ComPtr<ID3D12Resource> resource) {
 bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   D3D12_RESOURCE_DESC d = {};
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  d.Width = rt->scale.Extent(std::max(1u, rt->pitch), 0);
-  d.Height = rt->scale.Extent(height, 1);
+  d.Width = rt->size_scale.Extent(std::max(1u, rt->pitch), 0);
+  d.Height = rt->size_scale.Extent(height, 1);
   d.DepthOrArraySize = 1;
   d.MipLevels = 1;
   d.Format = rt->resource_format;
@@ -354,7 +361,7 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
   if (pitch == 0) return nullptr;
   // An overridden target is not the guest one of the same surface's pitch and sample count.
   const uint64_t key = (uint64_t(depth) << 63) | (uint64_t(samples >> 1) << 60) |
-                       (uint64_t(overridden) << 56) | (uint64_t(base) << 44) |
+                       (uint64_t(overridden) << kOverriddenKeyBit) | (uint64_t(base) << 44) |
                        (uint64_t(pitch) << 30) | uint64_t(view);
   GetMemo& memo = get_memo_[(key ^ (key >> 30) ^ (key >> 44) ^ (key >> 60)) & 15];
   if (memo.rt && memo.key == key && std::min(height, kMaxHeight) <= memo.rt->height) {
@@ -375,7 +382,10 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     rt->pitch = pitch;
     rt->samples = samples;
     rt->edram_samples = edram_samples;
-    if (overridden) rt->scale = scene_scale_;
+    if (overridden) {
+      rt->scale = scene_scale_;
+      rt->size_scale = scene_size_scale_;
+    }
     rt->resource_format = resource;
     rt->view_format = view;
     rt->srv_format = srv;

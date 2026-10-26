@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cwchar>
 #include <mutex>
+#include <utility>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize, false, "PGR4 native",
                     "Debug: wait for the GPU at the end of every frame, so no frame is in flight "
@@ -207,6 +208,8 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
              "CreateCommandList"))
     return false;
   list_->SetName(L"pgr4 native frame");
+  if (!CreateBusyTimer()) return false;
+  StampBusy();
 
   BOOL tearing = FALSE;
   factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
@@ -381,13 +384,49 @@ bool D3D12Device::EnableGpuTimer() {
   return true;
 }
 
+bool D3D12Device::CreateBusyTimer() {
+  UINT64 frequency = 0;
+  if (Failed(queue_->GetTimestampFrequency(&frequency), "GetTimestampFrequency") || !frequency)
+    return false;
+  busy_ns_per_tick_ = 1e9 / double(frequency);
+  D3D12_QUERY_HEAP_DESC qd = {};
+  qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  qd.Count = kFramesInFlight * kBusySpans * 2;
+  return !Failed(device_->CreateQueryHeap(&qd, IID_PPV_ARGS(busy_heap_.GetAddressOf())),
+                 "CreateQueryHeap(busy)") &&
+         CreateBuffer(device_.Get(), D3D12_HEAP_TYPE_READBACK, uint64_t(qd.Count) * 8,
+                      D3D12_RESOURCE_STATE_COPY_DEST, "busy timestamp readback", &busy_readback_);
+}
+
+void D3D12Device::StampBusy() {
+  list_->EndQuery(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                  slot_ * kBusySpans * 2 + busy_stamps_[slot_]++);
+}
+
+void D3D12Device::ReadBusy() {
+  const uint32_t n = std::exchange(busy_stamps_[slot_], 0);
+  if (n < 2) return;
+  const size_t first = size_t(slot_) * kBusySpans * 2;
+  const D3D12_RANGE range = {first * 8, (first + n) * 8};
+  void* data = nullptr;
+  if (FAILED(busy_readback_->Map(0, &range, &data))) return;
+  const uint64_t* ts = static_cast<const uint64_t*>(data) + first;
+  uint64_t ticks = 0;
+  for (uint32_t i = 0; i + 1 < n; i += 2) ticks += ts[i + 1] > ts[i] ? ts[i + 1] - ts[i] : 0;
+  const D3D12_RANGE none = {};
+  busy_readback_->Unmap(0, &none);
+  gpu_busy_ns_ = uint64_t(double(ticks) * busy_ns_per_tick_);
+}
+
 bool D3D12Device::OpenList() {
   const uint64_t t0 = NowNs();
   WaitFence(slot_fence_[slot_]);
   end_frame_times_.fence_ns = NowNs() - t0;
+  ReadBusy();
   if (Failed(allocators_[slot_]->Reset(), "CommandAllocator::Reset") ||
       Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
     return false;
+  StampBusy();
   if (gpu_timer_) gpu_timer_->BeginFrame(list_.Get(), slot_);
   return true;
 }
@@ -405,15 +444,25 @@ bool D3D12Device::CloseAndExecute(std::span<ID3D12CommandList* const> first) {
 
 bool D3D12Device::Submit(std::span<ID3D12CommandList* const> first) {
   if (gpu_timer_) gpu_timer_->Pass(list_.Get(), GpuTimer::KeySubmit());
+  // Room for this submission's end, the next one's start and the frame's end.
+  const bool timed = busy_stamps_[slot_] + 3 <= kBusySpans * 2;
+  if (timed) StampBusy();
   // A list may be reset while its submission runs; the allocator only once the frame's fence
   // completed (OpenList).
-  return CloseAndExecute(first) &&
-         !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
+  if (!CloseAndExecute(first) ||
+      Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
+    return false;
+  if (timed) StampBusy();
+  return true;
 }
 
 bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
   const uint64_t t0 = NowNs();
   if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
+  StampBusy();
+  list_->ResolveQueryData(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * kBusySpans * 2,
+                          busy_stamps_[slot_], busy_readback_.Get(),
+                          uint64_t(slot_) * kBusySpans * 2 * 8);
   if (!CloseAndExecute(first)) return false;
   const uint64_t t1 = NowNs();
   const bool shown = swapchain_ && present;

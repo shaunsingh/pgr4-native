@@ -134,6 +134,11 @@ class D3D12Device {
   // frame being recorded keeps its frame_fence.
   void WaitIdle();
 
+  // The GPU's time on the last frame it completed (kFramesInFlight frames back): the time from
+  // the start to the end of each of the frame's submissions, summed, so not the time it waited
+  // for the CPU between them; in ns, 0 until one completed (or without timestamps).
+  uint64_t gpu_busy_ns() const { return gpu_busy_ns_; }
+
   // Timestamps per pass in every frame from now on (gpu_timer.h), starting with the open list.
   // Logs and returns false on failure.
   bool EnableGpuTimer();
@@ -147,6 +152,10 @@ class D3D12Device {
   bool SetUpColorSpace();
   bool OpenList();
   bool CloseAndExecute(std::span<ID3D12CommandList* const> first);
+  // gpu_busy_ns: the timestamps around the frame's submissions. False (logged) on failure.
+  bool CreateBusyTimer();
+  void StampBusy();
+  void ReadBusy();
   bool GetBackBuffers();
   bool FollowWindowSize();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -182,6 +191,15 @@ class D3D12Device {
   HWND game_window_ = nullptr;
 
   std::unique_ptr<GpuTimer> gpu_timer_;
+
+  // Two timestamps per submission, up to kBusySpans submissions per frame (later ones join the
+  // last), per slot.
+  static constexpr uint32_t kBusySpans = 16;
+  ComPtr<ID3D12QueryHeap> busy_heap_;
+  ComPtr<ID3D12Resource> busy_readback_;
+  uint32_t busy_stamps_[kFramesInFlight] = {};
+  double busy_ns_per_tick_ = 0.0;
+  uint64_t gpu_busy_ns_ = 0;
 
   // The debug window and its message thread.
   std::thread window_thread_;

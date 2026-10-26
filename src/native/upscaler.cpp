@@ -25,6 +25,13 @@ REXCVAR_DEFINE_INT32(pgr4_native_upscaler_width, 1280, "PGR4 native",
                      "with the height at 720: antialiasing only)");
 REXCVAR_DEFINE_INT32(pgr4_native_upscaler_height, 720, "PGR4 native",
                      "Height the upscaler's scene renders at, upscaled to 720 (180-720)");
+REXCVAR_DEFINE_INT32(pgr4_native_upscaler_target_fps, 0, "PGR4 native",
+                     "Vary the upscaler's render size each frame, from the width and height "
+                     "down to --pgr4_native_upscaler_min_height, so that the GPU keeps up with "
+                     "this frame rate (0: a fixed size)");
+REXCVAR_DEFINE_INT32(pgr4_native_upscaler_min_height, 360, "PGR4 native",
+                     "With --pgr4_native_upscaler_target_fps: the least height the scene renders "
+                     "at (180-720)");
 
 namespace pgr4::native {
 
@@ -96,31 +103,47 @@ Upscaler::~Upscaler() {
 
 bool Upscaler::Initialize(ID3D12Device* device) {
   device_ = device;
-  render_width_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_width), kSceneWidth);
-  render_height_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_height), kSceneHeight);
-  // AMD's recommended texture LOD bias for the render size (FSR docs, "Mipmap biasing"),
-  // in the sampler key's quarter steps.
-  const float ratio = std::min(float(render_width_) / float(kSceneWidth),
-                               float(render_height_) / float(kSceneHeight));
-  mip_bias_quarters_ = uint32_t(std::lround(-4.0f * (std::log2(ratio) - 1.0f)));
+  max_width_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_width), kSceneWidth);
+  max_height_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_height), kSceneHeight);
+  if (const int32_t fps = REXCVAR_GET(pgr4_native_upscaler_target_fps); fps > 0) {
+    const uint32_t min_height =
+        RenderExtent(REXCVAR_GET(pgr4_native_upscaler_min_height), kSceneHeight);
+    const uint32_t min_level =
+        (min_height * DynamicResolution::kSteps + max_height_ - 1) / max_height_;
+    dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps));
+  }
   api_ = LoadApi();
   if (!api_ || !CreateContext(false)) return false;
   ffxQueryGetProviderVersion provider = {};
   provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
   if (api_->query(&context_, &provider.header) == FFX_API_RETURN_OK && provider.versionName)
-    REXLOG_INFO("PGR4 native upscaler: {} from {}x{} to {}x{}", provider.versionName, render_width_,
-                render_height_, kSceneWidth, kSceneHeight);
+    REXLOG_INFO("PGR4 native upscaler: {} from {}x{}{} to {}x{}", provider.versionName, max_width_,
+                max_height_, dynamic_ ? " or less" : "", kSceneWidth, kSceneHeight);
+  return SetLevel(DynamicResolution::kSteps) && CreateTargets();
+}
 
+bool Upscaler::SetLevel(uint32_t level) {
+  constexpr uint32_t n = DynamicResolution::kSteps;
+  render_width_ = std::max(1u, (max_width_ * level + n / 2) / n);
+  render_height_ = std::max(1u, (max_height_ * level + n / 2) / n);
+  // AMD's recommended texture LOD bias for the render size (FSR docs, "Mipmap biasing"),
+  // in the sampler key's quarter steps.
+  const float ratio = std::min(float(render_width_) / float(kSceneWidth),
+                               float(render_height_) / float(kSceneHeight));
+  mip_bias_quarters_ = uint32_t(std::lround(-4.0f * (std::log2(ratio) - 1.0f)));
   ffxQueryDescUpscaleGetJitterPhaseCount phases = {};
   phases.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
   phases.renderWidth = render_width_;
   phases.displayWidth = kSceneWidth;
-  phases.pOutPhaseCount = &phase_count_;
-  if (api_->query(&context_, &phases.header) != FFX_API_RETURN_OK || phase_count_ <= 0) {
-    REXLOG_ERROR("PGR4 native upscaler: no jitter phase count");
+  int32_t count = 0;
+  phases.pOutPhaseCount = &count;
+  if (api_->query(&context_, &phases.header) != FFX_API_RETURN_OK || count <= 0) {
+    PGR4_WARN_ONCE("PGR4 native upscaler: no jitter phase count for {}x{}", render_width_,
+                   render_height_);
     return false;
   }
-  return CreateTargets();
+  phase_count_ = count;
+  return true;
 }
 
 bool Upscaler::CreateContext(bool debug) {
@@ -142,8 +165,9 @@ bool Upscaler::CreateContext(bool debug) {
   // and its depth is reversed (cleared to 0, tested GEQUAL).
   desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
                FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+               (dynamic_ ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0u) |
                (debug ? FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION : 0u);
-  desc.maxRenderSize = {kSceneWidth, kSceneHeight};
+  desc.maxRenderSize = {max_width_, max_height_};
   desc.maxUpscaleSize = {kSceneWidth, kSceneHeight};
   desc.fpMessage = Message;
   if (const ffxReturnCode_t rc = api_->create(&context_, &desc.header, nullptr);
@@ -180,8 +204,8 @@ bool Upscaler::CreateTargets() {
   output_.width = kSceneWidth;
   output_.height = kSceneHeight;
 
-  d.Width = render_width_;
-  d.Height = render_height_;
+  d.Width = max_width_;
+  d.Height = max_height_;
   d.Format = kMotionFormat;
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   D3D12_CLEAR_VALUE zero = {};
@@ -200,8 +224,16 @@ bool Upscaler::CreateTargets() {
   return true;
 }
 
-void Upscaler::BeginFrame(uint64_t frame) {
+bool Upscaler::BeginFrame(uint64_t frame, uint64_t gpu_busy_ns) {
   frame_ = frame;
+  bool resized = false;
+  if (dynamic_) {
+    const uint32_t level = dynamic_->level();
+    if (dynamic_->Update(gpu_busy_ns) != level) {
+      SetLevel(dynamic_->level());  // without a phase count, the jitter keeps the old size's
+      resized = true;
+    }
+  }
   const uint64_t now = NowNs();
   frame_ms_ = last_ns_ ? float(double(now - last_ns_) * 1e-6) : 0.0f;
   last_ns_ = now;
@@ -212,6 +244,7 @@ void Upscaler::BeginFrame(uint64_t frame) {
   q.pOutX = &jitter_[0];
   q.pOutY = &jitter_[1];
   if (api_->query(&context_, &q.header) != FFX_API_RETURN_OK) jitter_[0] = jitter_[1] = 0.0f;
+  return resized;
 }
 
 bool Upscaler::SetDebugView(bool on) {

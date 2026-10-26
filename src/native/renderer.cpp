@@ -524,7 +524,9 @@ void NativeRenderer::SwitchUpscaler(bool on) {
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
   // and the unused ones age out (RenderTargets::BeginFrame).
   if (on) {
-    rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, 1, upscaler_->scale());
+    rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, 1,
+                       upscaler_->max_scale());
+    rt_->SetSceneScale(upscaler_->scale());
     upscaler_->Reset();
   } else if (scene_msaa_ != 2) {
     rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, scene_msaa_, {});
@@ -554,7 +556,8 @@ void NativeRenderer::BeginFrameModules() {
   rt_->BeginFrame(frame_index_, fence, done);
   resolver_->set_linear_output(device_->hdr());
   resolver_->BeginFrame(frame_index_, fence, done);
-  if (Upscaler* u = upscaler()) u->BeginFrame(frame_index_);
+  if (Upscaler* u = upscaler(); u && u->BeginFrame(frame_index_, device_->gpu_busy_ns()))
+    rt_->SetSceneScale(u->scale());
   frame_begun_ = true;
 }
 
@@ -1118,6 +1121,8 @@ void NativeRenderer::AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bo
       Fix3("guest_swap_ms", s.guest_swap_ns / 1e6),
       Fix1("pace_wait_us", s.pace_wait_ns / 1000.0),
       Uint("present", s.present),
+      Fix3("gpu_busy_ms", device_->gpu_busy_ns() / 1e6),
+      Uint("render_height", upscaler() ? upscaler()->render_height() : 0),
   };
   AppendCsvCells(cells, header, false, line);
 }

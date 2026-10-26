@@ -125,8 +125,10 @@ struct RenderTarget {
   uint32_t pitch = 0;              // pixels (RB_SURFACE_INFO surface_pitch)
   uint32_t samples = 1;            // 1, 2, 4 or 8
   uint32_t edram_samples = 1;      // the guest surface's (RenderTargets::OverrideScene)
-  uint32_t width = 0, height = 0;  // guest pixels; the resource is scale.Extent of them
-  RenderScale scale;
+  uint32_t width = 0, height = 0;  // guest pixels; the resource is size_scale.Extent of them
+  // Draws and reads take `scale`; the resource has room for `size_scale` (the upscaler's largest
+  // render size), at least as large.
+  RenderScale scale, size_scale;
   uint32_t guest_format = 0;  // last xenos::ColorRenderTargetFormat / DepthRenderTargetFormat
   DXGI_FORMAT resource_format = DXGI_FORMAT_UNKNOWN;
   DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;         // RTV or DSV
@@ -224,7 +226,7 @@ class RenderTargets {
   // Host targets of the surfaces whose RB_SURFACE_INFO has `value` under `mask` (the 3D scene)
   // have `samples` samples whatever the guest's MSAA (1 for the upscaler, --pgr4_native_msaa's
   // otherwise) and `scale`'s size; mask 0: none. They are other targets than the surfaces' guest
-  // ones. Between frames.
+  // ones. Between frames. SetSceneScale then draws them at a smaller scale.
   // The most samples, up to `want` (a power of 2), that the host formats of every target allow.
   uint32_t SupportedSamples(uint32_t want) const;
 
@@ -232,8 +234,11 @@ class RenderTargets {
     scene_mask_ = mask;
     scene_value_ = value;
     scene_samples_ = samples;
-    scene_scale_ = scale;
+    scene_scale_ = scene_size_scale_ = scale;
   }
+  // Between frames: the overridden targets' scale from the next frame on, at most OverrideScene's.
+  // Their content keeps its old scale; the scene clears them every frame before it draws.
+  void SetSceneScale(const RenderScale& scale);
 
   // Forgets every recorded EDRAM fill, for clears that are not guest content (the resolve self
   // test), so no game surface over the same tiles takes them over.
@@ -312,7 +317,7 @@ class RenderTargets {
   uint64_t fill_seq_ = 0;
   std::FILE* log_ = nullptr;
   uint32_t scene_mask_ = 0, scene_value_ = 0, scene_samples_ = 1;
-  RenderScale scene_scale_;
+  RenderScale scene_scale_, scene_size_scale_;
 };
 
 }  // namespace pgr4::native

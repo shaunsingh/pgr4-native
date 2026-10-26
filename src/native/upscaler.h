@@ -7,22 +7,25 @@
 // only surface of that pitch and MSAA in the race and the menus (draw logs of td-265). With
 // --pgr4_native_upscaler its host targets are single-sampled and of the render size
 // (--pgr4_native_upscaler_width/height, RenderTargets::OverrideScene: the draws' viewports,
-// scissors and clears scale with them), every draw into it is offset by the frame's sub-pixel
-// jitter and samples its mipmapped textures with AMD's LOD bias for the render size (DrawRenderer,
-// the jitter through the system constants' NDC offset), the draws that write depth also write their
-// motion into MotionTarget
-// (vertex shaders that run again with the previous frame's constants, DxbcShaderTranslator's
-// motion_vectors), and the first resolve out of it in a frame (EndTiling's depth resolve, before
-// its color resolves clear the surface) upscales its color, depth and motion into the output,
-// which the color resolves copy from instead of the target.
+// scissors and clears scale with them; with --pgr4_native_upscaler_target_fps a size up to that
+// chosen each frame, DynamicResolution and RenderTargets::SetSceneScale), every draw into it is
+// offset by the frame's sub-pixel jitter and samples its mipmapped textures with AMD's LOD bias for
+// the render size (DrawRenderer, the jitter through the system constants' NDC offset), the draws
+// that write depth also write their motion into MotionTarget (vertex shaders that run again with
+// the previous frame's constants, DxbcShaderTranslator's motion_vectors), and the first resolve out
+// of it in a frame (EndTiling's depth resolve, before its color resolves clear the surface)
+// upscales its color, depth and motion into the output, which the color resolves copy from instead
+// of the target.
 //
 // Threading: everything on the thread that records the frames (NativeRenderer::Execute*).
 #pragma once
 
 #include "d3d12_device.h"
+#include "dynamic_resolution.h"
 #include "render_targets.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace pgr4::native {
 
@@ -54,8 +57,11 @@ class Upscaler {
   // Loads the FidelityFX API and creates the upscaling context; false (logged) when either fails.
   bool Initialize(ID3D12Device* device);
 
-  // Once per frame before recording it: the frame's jitter.
-  void BeginFrame(uint64_t frame);
+  // Once per frame before recording it: the frame's jitter, and with
+  // --pgr4_native_upscaler_target_fps its render size from the GPU's time (D3D12Device::
+  // gpu_busy_ns). True when the render size changed: the scene's targets take the new scale()
+  // (RenderTargets::SetSceneScale) before the frame's draws.
+  bool BeginFrame(uint64_t frame, uint64_t gpu_busy_ns);
   // The history is not this scene's (the upscaler was off): the next upscaling starts over.
   void Reset() {
     reset_ = true;
@@ -71,15 +77,19 @@ class Upscaler {
   // This frame's sub-pixel jitter in render pixels (x right, y down), for the scene's draws.
   float jitter_x() const { return jitter_[0]; }
   float jitter_y() const { return jitter_[1]; }
-  // The scene's render size (--pgr4_native_upscaler_width/height) on its guest size.
+  // The scene's render size this frame on its guest size, and its largest
+  // (--pgr4_native_upscaler_width/height: the size of the scene's targets).
   RenderScale scale() const {
     return {{render_width_, render_height_}, {kSceneWidth, kSceneHeight}};
   }
+  RenderScale max_scale() const { return {{max_width_, max_height_}, {kSceneWidth, kSceneHeight}}; }
+  uint32_t render_height() const { return render_height_; }
   // The scene's texture LOD bias, in negative quarter levels (SamplerKey::lod_bias).
   uint32_t mip_bias_quarters() const { return mip_bias_quarters_; }
 
-  // The motion vector target of the scene's draws at the render size (DxbcShaderTranslator's
-  // kMotionVectorRenderTarget, kMotionFormat), cleared to no motion at the first call of a frame.
+  // The motion vector target of the scene's draws at the largest render size
+  // (DxbcShaderTranslator's kMotionVectorRenderTarget, kMotionFormat), cleared to no motion at the
+  // first call of a frame.
   static constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
   D3D12_CPU_DESCRIPTOR_HANDLE MotionTarget(ID3D12GraphicsCommandList* list);
 
@@ -96,6 +106,9 @@ class Upscaler {
   // The upscaling context, with debug visualization or not; false (logged) on failure.
   bool CreateContext(bool debug);
   bool CreateTargets();
+  // The render size, LOD bias and jitter phases of a DynamicResolution level; false (logged)
+  // without a phase count.
+  bool SetLevel(uint32_t level);
 
   ID3D12Device* device_ = nullptr;
   const Api* api_ = nullptr;
@@ -107,7 +120,9 @@ class Upscaler {
   ComPtr<ID3D12DescriptorHeap> motion_rtv_;
   D3D12_RESOURCE_STATES motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
   uint64_t motion_frame_ = UINT64_MAX;  // the frame motion_ was cleared for
+  uint32_t max_width_ = kSceneWidth, max_height_ = kSceneHeight;
   uint32_t render_width_ = kSceneWidth, render_height_ = kSceneHeight;
+  std::optional<DynamicResolution> dynamic_;  // with --pgr4_native_upscaler_target_fps
   uint32_t mip_bias_quarters_ = 0;
   uint64_t frame_ = 0;
   uint64_t upscaled_frame_ = UINT64_MAX;
