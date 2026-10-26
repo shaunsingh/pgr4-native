@@ -1,0 +1,36 @@
+# Custom Match street race in Tokyo at night, Shinjuku Kabukicho Loop, 2 laps, Enzo Ferrari:
+# Single Player -> Custom Match -> Street Race, the city grid's default (Tokyo) and route, the
+# weather one step right of Clear (rain), Lobby -> Start, then full throttle. Its start lights
+# are the brightest emissive colors of the routes here (above 7e3's 31.875). Run it with
+# --race-draws 2000 (the race draws about 2900 per frame). Needs a fresh save and title update 2,
+# which adds World Challenge to the Single Player menu. Taps of 300 ms move menus twice.
+30000 return          # skip the intro FMV
++12000 return         # title: PRESS START -> Gamer Profiles
++8000 space           # Next -> Select Driver
++8000 d 300           # right-hand driver
++1800 space           # -> Select Nationality
++8000 space           # -> Driver customisation
++8000 space           # Continue -> Main Menu
++20000 space          # Single Player -> Arcade Mode
++6000 d 60            # -> Gotham Career
++2000 d 60            # -> World Challenge
++2000 d 60            # -> Time Attack
++2000 d 60            # -> Custom Match
++3000 space           # -> Street Race / Eliminator
++7000 space           # Street Race -> Options (City highlighted)
++5000 space           # City grid (Tokyo highlighted)
++3000 space           # Tokyo -> Options
++4000 shift+down 100  # -> Route
++2000 shift+down 60   # -> Weather
++3000 space           # weather grid (Clear highlighted)
++4000 shift+right 60  # -> rain
++3000 space           # -> Options
++6000 shift+down 100
++2000 shift+down 100
++2000 shift+down 100  # -> Lobby
++3000 space           # Lobby
++7000 return          # Start: loading, race starts on its own
++25000 mark loaded
++0 e 60000            # full throttle
++0 mark throttle
++5000 mark race

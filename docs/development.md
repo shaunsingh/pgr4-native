@@ -88,7 +88,8 @@ the script starts Proton itself. Everything it uses lives under `~/pgr4-proton/p
 
 `deck-run.sh` keeps a prefix of its own and starts each run with a fresh save. It drives a
 scripted route from boot to a race (`scripts/routes/route-stpetersburg.keys` by default, played
-by `scripts/route_player.py`) and reports the frame rate, 1 % lows, pacing, GPU load and clock,
+by `scripts/route_player.py`; the other routes there drive Quebec in snow, Tokyo at night in rain,
+and St Petersburg with pauses) and reports the frame rate, 1 % lows, pacing, GPU load and clock,
 APU power and the busiest threads. The `primary` mode (the default) runs the native renderer,
 `none` runs Xenos alone, `oracle` runs both and compares their front buffers by PSNR, and
 `release` runs an unpacked release package the way a player starts it. Its header describes
@@ -164,6 +165,7 @@ The `REXCVAR_DEFINE_*` lines in `src/` describe every setting.
 | `flicker.py`, `marks.py` | Flashes and whole-image jumps in glitch catcher dumps, and the seconds before each mark |
 | `rt_passes.py`, `trace_summary.py` | Render target passes in a frame trace, and frame trace summaries and checks |
 | `hdr_shot.py` | Luminance distribution of HDR10 AVIF screenshots |
+| `shots.py` | Change, sharpness and pixels of given colors per `--shots` screenshot, and a contact sheet |
 | `scan_d3d_surface.py` | Generates `src/d3d_surface.inc` from the generated code |
 | `tu_address_map.py` | Matches functions between two executables instruction by instruction |
 
