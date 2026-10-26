@@ -47,6 +47,7 @@
 namespace pgr4::native {
 
 class GpuTimer;
+class Upscaler;
 
 // What the texture cache needs to use a resolve result (TextureMod contract).
 // The resources live as long as the Resolver.
@@ -142,6 +143,8 @@ class Resolver {
   // HDR output: resolves from a float target into k_2_10_10_10 also keep their linear color
   // (ResolvedImage::linear). Takes effect at the next resolve.
   void set_linear_output(bool on) { linear_output_ = on; }
+  // With the upscaler: resolves out of its scene surface copy the upscaled color (upscaler.h).
+  void set_upscaler(Upscaler* upscaler) { upscaler_ = upscaler; }
   // With GPU timing: Resolve marks its phases (GpuTimer::ResolvePhase).
   void set_gpu_timer(GpuTimer* timer) { timer_ = timer; }
 
@@ -203,6 +206,7 @@ class Resolver {
   std::function<void(uint32_t)> changed_;
   std::unique_ptr<Dump, DumpDeleter> dump_;
   GpuTimer* timer_ = nullptr;
+  Upscaler* upscaler_ = nullptr;
 };
 
 }  // namespace pgr4::native

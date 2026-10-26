@@ -12,6 +12,7 @@
 #include "hook_args.h"
 #include "log.h"
 #include "texture_layout.h"
+#include "upscaler.h"
 
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -859,8 +860,13 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   bool ok = true;
   if (copy_x1 > x0 && copy_y1 > y0 && dx >= 0 && dy >= 0) {
     const D3D12_RECT src = {LONG(x0), LONG(y0), LONG(copy_x1), LONG(copy_y1)};
+    RenderTarget* source = rt;
+    if (upscaler_ && Upscaler::IsScene(p.regs.surface_info)) {
+      RenderTarget* upscaled = upscaler_->Upscale(list, *targets_, p.regs);
+      if (upscaled && !depth) source = upscaled;
+    }
     targets_->PrepareRead(list, rt, src);
-    ok = Copy(list, p, rt, src, dx, dy);
+    ok = Copy(list, p, source, src, dx, dy);
   }
 
   // Clears of the source surfaces over the source rectangle (after the copy).

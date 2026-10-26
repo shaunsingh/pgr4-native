@@ -76,8 +76,8 @@ struct EdramGrid {
 EdramGrid GridOf(const RenderTarget& rt) {
   EdramGrid g;
   g.base = rt.edram_base;
-  g.dx = (rt.samples >= 4 ? 2 : 1) * (!rt.depth && Is64bpp(rt.guest_format) ? 2 : 1);
-  g.dy = rt.samples >= 2 ? 2 : 1;
+  g.dx = (rt.edram_samples >= 4 ? 2 : 1) * (!rt.depth && Is64bpp(rt.guest_format) ? 2 : 1);
+  g.dy = rt.edram_samples >= 2 ? 2 : 1;
   g.pitch = std::max(1u, (rt.pitch * g.dx + 79) / 80);
   return g;
 }
@@ -291,7 +291,8 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
 RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t info,
                                  uint32_t height) {
   const uint32_t pitch = surface_info & 0x3FFF;
-  const uint32_t samples = SurfaceSamples(surface_info);
+  const uint32_t edram_samples = SurfaceSamples(surface_info);
+  const uint32_t samples = HostSamples(surface_info);
   const uint32_t base = info & 0xFFF;
   DXGI_FORMAT resource, view, srv, stencil_srv = DXGI_FORMAT_UNKNOWN;
   uint32_t guest_format;
@@ -328,7 +329,8 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     memo.rt->last_frame = frame_;
     return memo.rt;
   }
-  uint32_t want = std::max(std::min(height, kMaxHeight), EdramRows(base, pitch, samples, wide));
+  uint32_t want =
+      std::max(std::min(height, kMaxHeight), EdramRows(base, pitch, edram_samples, wide));
   want = std::min((std::max(want, 8u) + 7) & ~7u, kMaxHeight);
   auto it = targets_.find(key);
   RenderTarget* rt;
@@ -339,6 +341,7 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     rt->edram_base = base;
     rt->pitch = pitch;
     rt->samples = samples;
+    rt->edram_samples = edram_samples;
     rt->resource_format = resource;
     rt->view_format = view;
     rt->srv_format = srv;
@@ -384,7 +387,7 @@ void RenderTargets::Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt
 bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
                          uint32_t color_mask, bool depth_used, uint32_t height, BoundTargets* out) {
   *out = BoundTargets{};
-  const uint32_t samples = SurfaceSamples(regs.surface_info);
+  const uint32_t samples = HostSamples(regs.surface_info);
   out->samples = samples;
   out->width = UINT32_MAX;
   out->height = UINT32_MAX;

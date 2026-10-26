@@ -246,6 +246,10 @@ ComPtr<ID3D12RootSignature> CreateBindlessRootSignature(ID3D12Device* device, ui
             0),
   };
   p[kBindlessRoot_ViewHeap] = Table(views, 3, D3D12_SHADER_VISIBILITY_ALL);
+  p[kBindlessRoot_PreviousFloatConstantsVertex] =
+      Cbv(CB::kPreviousFloatConstants, D3D12_SHADER_VISIBILITY_VERTEX);
+  p[kBindlessRoot_PreviousFetchConstantsVertex] =
+      Cbv(CB::kPreviousFetchConstants, D3D12_SHADER_VISIBILITY_VERTEX);
   D3D12_ROOT_SIGNATURE_DESC desc = {kBindlessRoot_Count, p, 0, nullptr,
                                     D3D12_ROOT_SIGNATURE_FLAG_NONE};
   return Create(device, desc, blob_hash);

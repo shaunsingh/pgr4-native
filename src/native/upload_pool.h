@@ -33,6 +33,9 @@ class UploadPool {
   explicit UploadPool(uint64_t block_size, bool cpu_cached = false)
       : block_size_(block_size), cpu_cached_(cpu_cached) {}
   void SetDevice(ID3D12Device* d) { device_ = d; }
+  // Keeps each frame's memory until the next frame completes too, so that a frame's draws can
+  // read what the previous one uploaded (the motion vector pass's previous constants).
+  void set_keep_previous_frame(bool keep) { keep_previous_frame_ = keep; }
   // Creates `blocks` recycled blocks now. A block created during play costs 2-16 ms (16 ms
   // for a 32 MB block at race start, while the driver also creates hundreds of textures), so
   // reserve as many as the race start keeps in flight.
@@ -58,11 +61,18 @@ class UploadPool {
     out->gpu = b.gpu + b.used;
     b.used += size;
     b.fence = fence;
+    frame_fence_ = fence;
     return true;
   }
-  // After the frame's submission: blocks used so far wait for their fence.
+  // After the frame's submission: blocks used so far wait for their fence (with
+  // keep_previous_frame, the previous frame's wait for this frame's).
   void EndFrame(uint64_t completed) {
-    for (auto& b : active_) retired_.push_back(std::move(b));
+    for (auto& b : previous_) {
+      b->fence = std::max(b->fence, frame_fence_);
+      retired_.push_back(std::move(b));
+    }
+    previous_.clear();
+    for (auto& b : active_) (keep_previous_frame_ ? previous_ : retired_).push_back(std::move(b));
     active_.clear();
     current_ = nullptr;
     for (size_t i = 0; i < retired_.size();) {
@@ -136,9 +146,11 @@ class UploadPool {
   ID3D12Device* device_ = nullptr;
   uint64_t block_size_;
   bool cpu_cached_;
+  bool keep_previous_frame_ = false;
   Block* current_ = nullptr;
+  uint64_t frame_fence_ = 0;  // the latest Allocate's fence
   uint32_t created_ = 0, reserved_ = 0;
-  std::vector<std::unique_ptr<Block>> active_, retired_, free_;
+  std::vector<std::unique_ptr<Block>> active_, previous_, retired_, free_;
 };
 
 }  // namespace pgr4::native

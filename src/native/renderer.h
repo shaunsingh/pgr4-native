@@ -54,6 +54,7 @@ class Presenter;
 class RenderTargets;
 class Resolver;
 class TextureCache;
+class Upscaler;
 struct ClearCall;
 struct DrawPrep;
 struct DrawState;
@@ -139,6 +140,9 @@ class NativeRenderer {
   Resolver& resolver() { return *resolver_; }
   // The game's occlusion queries, counted by the draws; nullptr when they are not.
   OcclusionQueries* occlusion() { return occlusion_.get(); }
+  // The scene's upscaler while it replaces the scene's MSAA (--pgr4_native_upscaler, switched
+  // with bind_upscaler); nullptr otherwise.
+  Upscaler* upscaler() { return upscaler_on_ ? upscaler_.get() : nullptr; }
 
   ~NativeRenderer();
 
@@ -209,6 +213,13 @@ class NativeRenderer {
   }
   void HandOver(uint8_t* base, uint32_t device);
   void TakeBack();
+  // Upscaler switch. bind_upscaler (F7) switches the scene between MSAA and the upscaler and
+  // bind_upscaler_debug (F8) its debug view, requested on the UI thread and taken at the start
+  // of the next frame. The upscaler is created at its first use and kept after.
+  void SwitchUpscaler(bool on);
+  std::atomic<bool> upscaler_switch_requested_{false}, upscaler_debug_requested_{false};
+  bool upscaler_bound_ = false;  // primary mode
+  bool upscaler_on_ = false;
 
   static inline std::atomic<bool> paces_frames_{false};       // pacer_->pacing(), for any thread
   static inline std::atomic<NativeRenderer*> live_{nullptr};  // Live()
@@ -226,6 +237,7 @@ class NativeRenderer {
   std::unique_ptr<DrawRenderer> draw_;
   std::unique_ptr<Presenter> present_;
   std::unique_ptr<OcclusionQueries> occlusion_;  // primary mode with --pgr4_native_occlusion
+  std::unique_ptr<Upscaler> upscaler_;
   // Primary mode with --pgr4_native_frame_latency > 0, or observing only with --pgr4_native_csv.
   std::unique_ptr<FramePacer> pacer_;
   GpuTimer* gpu_timer_ = nullptr;  // device_'s, with --pgr4_native_gpu_timing

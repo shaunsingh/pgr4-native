@@ -153,6 +153,7 @@ Anything the render thread reads late must not change under it.
 | `present` | Front buffer to window (aspect fit, the display controller's gamma ramp, HDR10 output) and captures. `present_debug` holds the PNG writer, the glitch catcher and the luma probe |
 | `frame_pacer` | Frame pacing on the display |
 | `occlusion` | The game's occlusion queries (the light flares): host queries around each draw inside one, ZPass and pre-test coverage, written into the guest's reports at GetData |
+| `upscaler`, `motion_history.h` | The scene antialiased by FidelityFX Super Resolution instead of MSAA (`--pgr4_native_upscaler`, switched with F7, its debug view on F8): single-sampled scene targets, jitter, motion vectors from the vertex shaders run again with each draw's constants of the previous frame, and the upscaling at the scene's first resolve |
 | `gpu_timer` | GPU time per pass (`--pgr4_native_gpu_timing`) |
 | `profile.h`, `clock` | TSC stage timers and counters (`--pgr4_native_profile`), and the CPU clock |
 | `async_file`, `log.h`, `win_handle.h`, `guest_memory.h` | Buffered file writer, bounded warnings, owned Win32 handles, and guest address translation with big-endian loads |

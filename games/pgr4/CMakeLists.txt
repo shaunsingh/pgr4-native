@@ -15,7 +15,8 @@ endif()
 set(PGR4_NATIVE_SRC "" CACHE PATH "The native renderer's sources (src/ of pgr4-native)")
 set(PGR4_REXGLUE_SDK_SRC "" CACHE PATH "The source tree the ReXGlue SDK was built from")
 set(PGR4_HOST_REXGLUE "" CACHE FILEPATH "A codegen tool that runs on the build machine")
-foreach(dir PGR4_NATIVE_SRC PGR4_REXGLUE_SDK_SRC)
+set(PGR4_FIDELITYFX_SDK "" CACHE PATH "The AMD FidelityFX SDK checkout (scripts/fidelityfx.lock)")
+foreach(dir PGR4_NATIVE_SRC PGR4_REXGLUE_SDK_SRC PGR4_FIDELITYFX_SDK)
     if(NOT IS_DIRECTORY "${${dir}}")
         message(FATAL_ERROR "${dir} is not set to a directory")
     endif()
@@ -39,6 +40,10 @@ add_executable(pgr4_recompiled WIN32
     "${PGR4_REXGLUE_SDK_SRC}/src/graphics/pipeline/texture/info_formats.cpp"
 )
 target_include_directories(pgr4_recompiled PRIVATE "${PGR4_NATIVE_SRC}" ../common)
+# The upscaler's API (src/native/upscaler.cpp); its DLLs are loaded at run time.
+target_include_directories(pgr4_recompiled SYSTEM PRIVATE
+    "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/api/include"
+    "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/upscalers/include")
 rexglue_setup_target(pgr4_recompiled)
 target_link_libraries(pgr4_recompiled PRIVATE d3d12 dxgi dxguid)
 include("${PGR4_NATIVE_SRC}/native/shader_xlate.cmake")

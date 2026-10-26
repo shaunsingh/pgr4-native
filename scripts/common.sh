@@ -82,7 +82,7 @@ game_args() {
   args=(--game_data_root "$(win "$1")" --user_data_root "$(win "$2")"
     --execute_unclipped_draw_vs_on_cpu --gpu_plugin=xenos --d3d12_present_vsync
     --gpu_vblank_deadline_timer --gpu_wait_reg_mem_high_res --no-clear_memory_page_state
-    --gpu_ring_wake_fast --texture_cache_memory_limit_soft_lifetime=30)
+    --gpu_ring_wake_fast --texture_cache_memory_limit_soft_lifetime=30 --bind_achievements=F6)
   if [[ ${3:-} == 60fps ]]; then args+=(--pgr4_60fps); fi
 }
 

@@ -58,7 +58,9 @@ uint32_t GeometryShaderKeyFor(xenos::PrimitiveType primitive_type, uint64_t vert
   DxbcShaderTranslator::Modification vm(vertex_modification), pm(pixel_modification);
   GeometryShaderKey key;
   key.type = type;
-  key.interpolator_count = rex::bit_count(vm.vertex.interpolator_mask);
+  key.interpolator_count =
+      rex::bit_count(vm.vertex.interpolator_mask) +
+      (vm.vertex.motion_vectors ? DxbcShaderTranslator::kMotionVectorInterpolatorCount : 0);
   key.user_clip_plane_count = vm.vertex.user_clip_plane_count;
   key.user_clip_plane_cull = vm.vertex.user_clip_plane_cull;
   key.has_vertex_kill_and = vm.vertex.vertex_kill_and;

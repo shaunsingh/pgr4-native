@@ -12,6 +12,7 @@
 
 #include "geometry_shader.h"
 #include "log.h"
+#include "motion_history.h"
 #include "occlusion.h"
 #include "pipeline_store.h"
 #include "profile.h"
@@ -23,6 +24,7 @@
 #include "shader_translate.h"
 #include "textures.h"
 #include "upload_pool.h"
+#include "upscaler.h"
 
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
@@ -969,11 +971,14 @@ struct DrawRenderer::Impl {
   float bound_blend[4] = {};
   uint32_t bound_stencil_ref = UINT32_MAX;
   float bound_depth_bias = NAN, bound_slope_bias = NAN;
-  D3D12_CPU_DESCRIPTOR_HANDLE bound_rtv[4] = {};
+  D3D12_CPU_DESCRIPTOR_HANDLE bound_rtv[DxbcShaderTranslator::kMotionVectorRenderTarget + 1] = {};
   D3D12_CPU_DESCRIPTOR_HANDLE bound_dsv{};
   uint32_t bound_rt_count = UINT32_MAX;
   D3D12_INDEX_BUFFER_VIEW bound_ibv{};
   CachedCbv cb_system, cb_float_vs, cb_float_ps, cb_bool_loop, cb_fetch, cb_desc_vs, cb_desc_ps;
+  // The motion vector pass's previous constants (b5, b6) as bound in the list.
+  D3D12_GPU_VIRTUAL_ADDRESS bound_previous_float = 0, bound_previous_fetch = 0;
+  MotionHistory motion_history;
   std::array<CachedCbv*, 7> Cbvs() {
     return {&cb_system, &cb_float_vs, &cb_float_ps, &cb_bool_loop,
             &cb_fetch,  &cb_desc_vs,  &cb_desc_ps};
@@ -1093,7 +1098,7 @@ struct DrawRenderer::Impl {
   void FillSystemConstants(const DrawState& s, const RegisterFile& regs, xenos::PrimitiveType prim,
                            bool polygonal, xenos::Endian index_endian, const ViewportInfo& vp,
                            uint32_t used_textures, const uint8_t* signs,
-                           DxbcShaderTranslator::SystemConstants& sys);
+                           const BoundTargets& targets, DxbcShaderTranslator::SystemConstants& sys);
   DxbcShader* LoadShader(ShaderMemo* table, ShaderMemo*& last, const ShaderRef& ref,
                          xenos::ShaderType type);
   // Copies go to the end of `out`.
@@ -1141,6 +1146,10 @@ struct DrawRenderer::Impl {
   void TransitionShared(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES to);
   // Uploads cb.size bytes of cb.last unless cb.gpu is current, and binds it at `root_index`.
   bool CommitCbv(CachedCbv& cb, uint32_t root_index, ID3D12GraphicsCommandList* list);
+  // A motion vector draw's previous float and vertex fetch constants (b5, b6), after its own
+  // are committed: the matching draw's of the previous frame (MotionHistory), or its own.
+  void BindPreviousConstants(const DrawState& s, const DxbcShader& vs_generic, const DxbcShader* vs,
+                             ID3D12GraphicsCommandList* list);
   bool UploadCbv(CachedCbv& cb, const void* data, uint32_t size, uint32_t root_index,
                  ID3D12GraphicsCommandList* list) {
     if (cb.size != size || !Equal(cb.last, data, size)) {
@@ -1622,6 +1631,7 @@ void DrawRenderer::Impl::ResetListState() {
   bound_rt_count = UINT32_MAX;
   bound_ibv = {};
   for (CachedCbv* cb : Cbvs()) cb->bound = 0;
+  bound_previous_float = bound_previous_fetch = 0;
 }
 
 void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
@@ -2198,6 +2208,28 @@ bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
   return true;
 }
 
+void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcShader& vs_generic,
+                                               const DxbcShader* vs,
+                                               ID3D12GraphicsCommandList* list) {
+  const uint64_t key = motion_history.Key(vs_generic.ucode_data_hash() ^
+                                          (uint64_t(s.index_address) << 32 | s.count) ^
+                                          (uint64_t(s.primitive) << 58));
+  const MotionHistory::Constants now = {vs, cb_float_vs.gpu, cb_fetch.gpu};
+  const MotionHistory::Constants* previous = motion_history.Previous(key);
+  if (!previous || previous->vs != vs) previous = &now;
+  if (bound_previous_float != previous->float_constants) {
+    list->SetGraphicsRootConstantBufferView(kBindlessRoot_PreviousFloatConstantsVertex,
+                                            previous->float_constants);
+    bound_previous_float = previous->float_constants;
+  }
+  if (bound_previous_fetch != previous->fetch_constants) {
+    list->SetGraphicsRootConstantBufferView(kBindlessRoot_PreviousFetchConstantsVertex,
+                                            previous->fetch_constants);
+    bound_previous_fetch = previous->fetch_constants;
+  }
+  motion_history.Record(key, now);
+}
+
 uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
                                                const DxbcShader::TextureBinding& tb) {
   ++stats.srv_lookups;
@@ -2428,6 +2460,17 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
     b.LogicOp = D3D12_LOGIC_OP_NOOP;
     b.RenderTargetWriteMask = rt.mask;
   }
+  if (ps && DxbcShaderTranslator::Modification(ps->modification()).pixel.motion_vectors) {
+    constexpr uint32_t kMotion = DxbcShaderTranslator::kMotionVectorRenderTarget;
+    d.NumRenderTargets = kMotion + 1;
+    d.RTVFormats[kMotion] = Upscaler::kMotionFormat;
+    D3D12_RENDER_TARGET_BLEND_DESC& b = d.BlendState.RenderTarget[kMotion];
+    b.SrcBlend = b.SrcBlendAlpha = D3D12_BLEND_ONE;
+    b.DestBlend = b.DestBlendAlpha = D3D12_BLEND_ZERO;
+    b.BlendOp = b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    b.LogicOp = D3D12_LOGIC_OP_NOOP;
+    b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
+  }
   Pipeline* p = pipelines.emplace(hash, std::make_unique<Pipeline>()).first->second.get();
   if (new_pipelines_logged < kNewPipelineLog) {
     ++pipeline_states[StateDigest(key)];
@@ -2463,6 +2506,9 @@ void DrawRenderer::Impl::Prewarm() {
   };
   do {
     const PipelineStore::Pipeline& sp = list[prewarm_next++];
+    // An upscaler session's motion vector pipelines: unused without the upscaler.
+    if (!r.upscaler() && DxbcShaderTranslator::Modification(sp.vs_mod).vertex.motion_vectors)
+      continue;
     DxbcShader* vs = load(sp.vs_hash, xenos::ShaderType::kVertex);
     DxbcShader* ps = sp.ps_hash ? load(sp.ps_hash, xenos::ShaderType::kPixel) : nullptr;
     DxbcShader::Translation* vst = vs ? shaders.Translate(*vs, sp.vs_mod) : nullptr;
@@ -2682,6 +2728,9 @@ void DrawRenderer::Impl::SyncListFrame() {
   ResetListState();
   shared_state = D3D12_RESOURCE_STATE_COMMON;
   for (CachedCbv* cb : Cbvs()) cb->Reset();
+  // The motion vector pass reads the previous frame's constants where that frame uploaded them.
+  constant_upload.set_keep_previous_frame(r.upscaler() != nullptr);
+  motion_history.BeginFrame(list_frame);
 }
 
 DxbcShader::Translation* DrawRenderer::Impl::Translated(DxbcShader& shader, uint64_t modification) {
@@ -2922,8 +2971,10 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
   DxbcShader* generic_ps = nullptr;
   if (variant && generic_pipelines &&
       (!p || (p->behind_generic && p->state.load(std::memory_order_acquire) == kCompiling))) {
-    const ShaderModifications gm =
+    ShaderModifications gm =
         SelectModifications(shaders.translator(), *vs_generic, ps_generic, sdr);
+    if (DxbcShaderTranslator::Modification(pixel_mod).pixel.motion_vectors && gm.pixel_shader_used)
+      gm = WithMotionVectors(gm);
     DxbcShader* gps = gm.pixel_shader_used ? ps_generic : nullptr;
     // The draw's setup so far read the specialized pixel shader's depth output.
     if (gm.draw && !gps == !ps && (!gps || gps->writes_depth() == ps->writes_depth())) {
@@ -3158,6 +3209,7 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
                                              xenos::PrimitiveType prim, bool polygonal,
                                              xenos::Endian index_endian, const ViewportInfo& vp,
                                              uint32_t used_textures, const uint8_t* signs,
+                                             const BoundTargets& targets,
                                              DxbcShaderTranslator::SystemConstants& sys) {
   std::memset(&sys, 0, sizeof(sys));
   auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
@@ -3202,6 +3254,12 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
     sys.ndc_scale[i] = vp.ndc_scale[i];
     sys.ndc_offset[i] = vp.ndc_offset[i];
   }
+  // The upscaler's jitter, a translation in host clip space as FSR's docs apply it to the
+  // projection (NDC y up, pixels down).
+  if (const Upscaler* upscaler = r.upscaler(); upscaler && Upscaler::IsScene(surface_info.value)) {
+    sys.ndc_offset[0] += 2.0f * upscaler->jitter_x() / float(std::max(vp.xy_extent[0], 1u));
+    sys.ndc_offset[1] -= 2.0f * upscaler->jitter_y() / float(std::max(vp.xy_extent[1], 1u));
+  }
   if (prim == xenos::PrimitiveType::kPointList) {
     auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
     auto size = regs.Get<reg::PA_SU_POINT_SIZE>();
@@ -3225,8 +3283,9 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
       if ((f[4] >> 12) & 0x3FF) ++diag.fetch_classes[6];
     }
   }
-  sys.sample_count_log2[0] = surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
-  sys.sample_count_log2[1] = surface_info.msaa_samples >= xenos::MsaaSamples::k2X ? 1 : 0;
+  // The host targets' (one sample for the upscaler's scene, whatever the guest's MSAA).
+  sys.sample_count_log2[0] = targets.samples >= 4 ? 1 : 0;
+  sys.sample_count_log2[1] = targets.samples >= 2 ? 1 : 0;
   sys.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
   sys.alpha_to_mask = colorcontrol.alpha_to_mask_enable ? (colorcontrol.value >> 24) | (1 << 8) : 0;
   for (uint32_t i = 0; i < 4; ++i) {
@@ -3330,6 +3389,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         mods_memo.ps_textures |= 1u << tb.fetch_constant;
   }
   ShaderModifications mods = mods_memo.mods;
+  const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
+  // The upscaler's scene: the draws that write depth write their motion too.
+  const bool motion = mods.pixel_shader_used && depth_control.z_enable &&
+                      depth_control.z_write_enable && r.upscaler() &&
+                      Upscaler::IsScene(sdr.rb_surface_info);
+  if (motion) mods = WithMotionVectors(mods);
   const uint64_t generic_pixel_mod = mods.pixel;
   mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
                                        signed_is_unsigned_formats);
@@ -3431,7 +3496,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   }
 
   // Render targets.
-  const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
   const uint32_t color_mask = ps ? GetNormalizedColorMask(regs, ps->writes_color_targets()) : 0;
   const bool depth_used = rasterization && (depth_control.z_enable || depth_control.stencil_enable);
   uint32_t rt_mask = 0;
@@ -3528,7 +3592,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   profile::Mark(profile::kTextures);
 
   DxbcShaderTranslator::SystemConstants sys;
-  FillSystemConstants(s, regs, prim, polygonal, index_endian, vp, used_textures, signs, sys);
+  FillSystemConstants(s, regs, prim, polygonal, index_endian, vp, used_textures, signs, targets,
+                      sys);
   profile::Mark(profile::kSysConst);
 
   // Float constants packed by the shaders' maps (UpdateBindings), compared and staged in place.
@@ -3589,6 +3654,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     ++stats.failed;
     return;
   }
+  if (motion) BindPreviousConstants(s, *vs_generic, vs, list);
   profile::Mark(profile::kCbv);
   if (bound_pso != pso) {
     list->SetPipelineState(pso);
@@ -3636,18 +3702,26 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     bound_depth_bias = depth_bias;
     bound_slope_bias = slope_bias;
   }
-  // Render targets: only the ones the pipeline declares, the DSV only when it is used.
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv[4] = {};
-  for (uint32_t i = 0; i < key.num_rts; ++i) rtv[i] = targets.rtv[i];
+  // Render targets: only the ones the pipeline declares (the guest's, null ones up to the motion
+  // vectors with them), the DSV only when it is used.
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv[DxbcShaderTranslator::kMotionVectorRenderTarget + 1] = {};
+  uint32_t rt_count = key.num_rts;
+  if (motion) {
+    rt_count = DxbcShaderTranslator::kMotionVectorRenderTarget + 1;
+    for (uint32_t i = 0; i < DxbcShaderTranslator::kMotionVectorRenderTarget; ++i)
+      rtv[i] = targets.rtv[i];
+    rtv[DxbcShaderTranslator::kMotionVectorRenderTarget] = r.upscaler()->MotionTarget(list);
+  } else {
+    for (uint32_t i = 0; i < key.num_rts; ++i) rtv[i] = targets.rtv[i];
+  }
   D3D12_CPU_DESCRIPTOR_HANDLE dsv = {};
   if (key.dsv != DXGI_FORMAT_UNKNOWN) dsv = targets.dsv;
-  if (bound_rt_count != key.num_rts || std::memcmp(bound_rtv, rtv, sizeof(rtv)) ||
+  if (bound_rt_count != rt_count || std::memcmp(bound_rtv, rtv, sizeof(rtv)) ||
       bound_dsv.ptr != dsv.ptr) {
-    list->OMSetRenderTargets(key.num_rts, key.num_rts ? rtv : nullptr, FALSE,
-                             dsv.ptr ? &dsv : nullptr);
+    list->OMSetRenderTargets(rt_count, rt_count ? rtv : nullptr, FALSE, dsv.ptr ? &dsv : nullptr);
     std::memcpy(bound_rtv, rtv, sizeof(rtv));
     bound_dsv = dsv;
-    bound_rt_count = key.num_rts;
+    bound_rt_count = rt_count;
   }
 
   uint32_t draw_count = count, first_index = 0;

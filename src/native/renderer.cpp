@@ -15,6 +15,7 @@
 #include "render_targets.h"
 #include "resolve.h"
 #include "textures.h"
+#include "upscaler.h"
 
 #include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
@@ -353,6 +354,10 @@ NativeRenderer* NativeRenderer::Get() {
 
 NativeRenderer::~NativeRenderer() {
   if (switch_bound_) rex::ui::UnregisterBind("bind_renderer_switch");
+  if (upscaler_bound_) {
+    rex::ui::UnregisterBind("bind_upscaler");
+    rex::ui::UnregisterBind("bind_upscaler_debug");
+  }
 }
 
 bool NativeRenderer::Initialize() {
@@ -395,6 +400,7 @@ bool NativeRenderer::Initialize() {
   resolver_ = std::make_unique<Resolver>();
   if (!resolver_->Initialize(device_->device(), rt_.get(), device_->command_queue())) return false;
   resolver_->set_gpu_timer(gpu_timer_);
+  if (Upscaler::Requested()) SwitchUpscaler(true);
   textures_ = std::make_unique<TextureCache>(device_->device(), rex::system::kernel_memory());
   textures_->SetResolvedLookup([this](uint32_t a) { return resolver_->Find(a); });
   textures_->SetCaptureOrder(REXCVAR_GET(pgr4_native_texture_capture_order));
@@ -431,6 +437,17 @@ bool NativeRenderer::Initialize() {
                           "PGR4 native: switch between the native renderer and the Xenos plugin",
                           [this] { switch_requested_.store(true, std::memory_order_relaxed); });
     switch_bound_ = true;
+  }
+  if (primary) {
+    rex::ui::RegisterBind(
+        "bind_upscaler", "F7",
+        "PGR4 native: switch the 3D scene between MSAA and FidelityFX Super Resolution",
+        [this] { upscaler_switch_requested_.store(true, std::memory_order_relaxed); });
+    rex::ui::RegisterBind(
+        "bind_upscaler_debug", "F8",
+        "PGR4 native: show FidelityFX Super Resolution's debug view (its inputs and history)",
+        [this] { upscaler_debug_requested_.store(true, std::memory_order_relaxed); });
+    upscaler_bound_ = true;
   }
   csv_ = std::make_unique<Csv>();
   profile::enabled.store(REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
@@ -483,11 +500,45 @@ ID3D12CommandQueue* NativeRenderer::command_queue() const { return device_->comm
 ID3D12GraphicsCommandList* NativeRenderer::command_list() const { return device_->command_list(); }
 uint64_t NativeRenderer::frame_fence() const { return device_->frame_fence(); }
 
+void NativeRenderer::SwitchUpscaler(bool on) {
+  if (on && !upscaler_) {
+    upscaler_ = std::make_unique<Upscaler>();
+    if (!upscaler_->Initialize(device_->device())) {
+      REXLOG_ERROR("PGR4 native: upscaler unavailable; the scene keeps its MSAA");
+      upscaler_.reset();
+      return;
+    }
+  }
+  upscaler_on_ = on;
+  // The scene's targets are keyed by their sample count: the next draws make the other ones,
+  // and the unused ones age out (RenderTargets::BeginFrame).
+  if (on) {
+    rt_->SingleSample(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface);
+    upscaler_->Reset();
+  } else {
+    rt_->SingleSample(0, 0);
+  }
+  resolver_->set_upscaler(upscaler());
+  REXLOG_INFO("PGR4 native: the scene {}", on ? "upscaled by FidelityFX" : "with MSAA");
+}
+
 void NativeRenderer::BeginFrameModules() {
+  if (upscaler_switch_requested_.exchange(false, std::memory_order_relaxed))
+    SwitchUpscaler(!upscaler_on_);
+  if (upscaler_debug_requested_.exchange(false, std::memory_order_relaxed) && upscaler()) {
+    // The context made again: its old resources may be in the lists still running.
+    if (!upscaler_->debug_context()) device_->WaitIdle();
+    if (!upscaler_->SetDebugView(!upscaler_->debug_view())) {
+      REXLOG_ERROR("PGR4 native: upscaler unavailable; the scene keeps its MSAA");
+      upscaler_.reset();
+      SwitchUpscaler(false);
+    }
+  }
   const uint64_t fence = device_->frame_fence(), done = device_->completed_fence();
   rt_->BeginFrame(frame_index_, fence, done);
   resolver_->set_linear_output(device_->hdr());
   resolver_->BeginFrame(frame_index_, fence, done);
+  if (Upscaler* u = upscaler()) u->BeginFrame(frame_index_);
   frame_begun_ = true;
 }
 

@@ -7,6 +7,8 @@
 //   (DxbcShaderTranslator::SystemConstants), b1 float constants (only the constants the shader
 //   reads, packed in ascending order: Shader::constant_register_map().float_bitmap), b2 bool and
 //   loop constants, b3 the 96 fetch constants (raw guest dwords), b4 bindless descriptor indices;
+//   with motion vectors (Modification::vertex.motion_vectors) b5 and b6, the previous frame's
+//   b1 and b3 of the vertex shader;
 // - vertex data is not fed through the input assembler: the vertex shader reads guest memory
 //   from the "shared memory" ByteAddressBuffer (SRV t0 space 0) at the vfetch constant's address;
 // - textures and samplers: bindless (spaces 1-3, indices from b4), listed by
@@ -83,7 +85,19 @@ inline uint64_t SpecializePixelTextures(uint64_t pixel, const uint32_t* fetch, u
   m.pixel.textures_unsigned = 1;
   return m.value;
 }
-// Root parameter indices of the bindless root signature (the plugin's order).
+// The draw's modifications with motion vectors (Modification::vertex/pixel.motion_vectors), for
+// a draw with a pixel shader.
+inline ShaderModifications WithMotionVectors(ShaderModifications mods) {
+  DxbcShaderTranslator::Modification vm(mods.vertex), pm(mods.pixel);
+  vm.vertex.motion_vectors = 1;
+  pm.pixel.motion_vectors = 1;
+  mods.vertex = vm.value;
+  mods.pixel = pm.value;
+  return mods;
+}
+
+// Root parameter indices of the bindless root signature (the plugin's order, then the motion
+// vector pass's).
 enum BindlessRootParameter : uint32_t {
   kBindlessRoot_FetchConstants,
   kBindlessRoot_FloatConstantsVertex,
@@ -95,6 +109,8 @@ enum BindlessRootParameter : uint32_t {
   kBindlessRoot_SharedMemory,  // table: SRV t0 (shared memory), UAV u0 (shared memory)
   kBindlessRoot_SamplerHeap,   // unbounded sampler table from heap start
   kBindlessRoot_ViewHeap,      // unbounded 2D-array / 3D / cube SRVs (spaces 1-3) from table start
+  kBindlessRoot_PreviousFloatConstantsVertex,
+  kBindlessRoot_PreviousFetchConstantsVertex,
   kBindlessRoot_Count,
 };
 

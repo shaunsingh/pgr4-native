@@ -14,6 +14,10 @@ and the commits it was built from (`LICENSES/SOURCE.txt`).
   `patches/0048-*` reimplement fixes MTR-PGR4 found: the frame rate unlock, the garage walking
   step count, the bounds of the car preview's visibility search, and song names from the
   soundtrack's file names. No MTR-PGR4 code is included; its license follows for the credit.
+- `src/native/upscaler.cpp` builds with the AMD FidelityFX SDK's API headers (MIT, below). A
+  release package ships AMD's signed `amd_fidelityfx_loader_dx12.dll` and
+  `amd_fidelityfx_upscaler_dx12.dll` from the same SDK, under its binary license
+  (`LICENSES/AMD-FidelityFX-SDK.txt`).
 
 ## ReXGlue SDK (https://github.com/rexglue/rexglue-sdk)
 
@@ -258,6 +262,33 @@ CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE
 SOFTWARE.
+```
+
+### AMD FidelityFX SDK API headers (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+
+The `ffx_api` and `ffx_upscale` headers of v2.3.0, whose inline functions are built into
+`pgr4_recompiled.exe`.
+
+```
+Copyright (C) 2026 Advanced Micro Devices, Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files(the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and /or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ```
 
 ### DXBC checksum (`DXBCChecksum.cpp`), in the shader translator

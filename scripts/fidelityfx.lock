@@ -1,0 +1,5 @@
+# The AMD FidelityFX SDK scripts/build.sh builds the native renderer's upscaler with: the release at
+# this commit (v2.3.0). The build takes the API and upscaler headers from it, and the install ships
+# AMD's signed loader and upscaler DLLs. Sourced by scripts/build.sh.
+FFX_URL=https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+FFX_COMMIT=60f4ea81909200d8542eca14dccb2628b763a9a3

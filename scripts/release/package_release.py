@@ -5,8 +5,9 @@
 
 --dest is the build tree scripts/build.sh wrote (default ~/recomp/builds/pgr4/native-deck): the
 programs come from its run/runtime, the libraries' license texts from its ReXGlue checkout
-(rexglue-sdk/). The ZIP, pgr4-native-<version>-windows-x64.zip in --out (default out/ in the
-repository), holds one folder of that name with the programs, their settings
+(rexglue-sdk/) and its FidelityFX SDK checkout (fidelityfx-sdk/). The ZIP,
+pgr4-native-<version>-windows-x64.zip in --out (default out/ in the repository), holds one folder
+of that name with the programs and AMD's FidelityFX DLLs, their settings
 (games/*/*_recompiled.toml), the player README (scripts/release/README.md), the licenses, and
 LICENSES/SOURCE.txt: the commits the program was built from, which the LGPL of FFmpeg and
 libmspack asks for. The player adds game/, with the title update in game/Content/ (README.md).
@@ -28,6 +29,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = ("pgr4_recompiled.exe", "gw_recompiled.exe", "rexruntime.dll", "rexgpu-xenos.dll")
+# AMD's signed upscaler DLLs as the FidelityFX SDK ships them, under its license
+# (LICENSES/AMD-FidelityFX-SDK.txt). The renderer loads them for --pgr4_native_upscaler.
+FIDELITYFX = ("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")
+FIDELITYFX_LICENSE = "Kits/FidelityFX/docs/license.md"
 SETTINGS = ("games/pgr4/pgr4_recompiled.toml", "games/gw/gw_recompiled.toml")
 ALLOWED_SUFFIXES = {".exe", ".dll", ".toml", ".txt", ".md"}
 
@@ -104,7 +109,7 @@ def check_linked(build_ninja: Path) -> None:
             sys.exit(f"{dll} links {', '.join(unknown)}: add their licenses to package_release.py")
 
 
-def source_note(sdk: Path) -> str:
+def source_note(sdk: Path, ffx: Path) -> str:
     series = (sdk / ".pgr4-series").read_text().strip()
     lines = [
         "The program in this package was built from these sources.",
@@ -116,6 +121,8 @@ def source_note(sdk: Path) -> str:
     for sub in ("thirdparty/FFmpeg", "thirdparty/libmspack"):
         url = git(sdk, "config", "-f", ".gitmodules", f"submodule.{sub}.url")
         lines.append(f"{sub.split('/')[1]:<12} {url}  {git(sdk / sub, 'rev-parse', 'HEAD')}")
+    lines.append(f"FidelityFX   {git(ffx, 'remote', 'get-url', 'origin')}  {git(ffx, 'rev-parse', 'HEAD')}")
+    lines.append("             amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll as signed by AMD")
     lines += [
         "",
         "FFmpeg (libavutil, libavcodec, libavformat) and libmspack are statically linked into",
@@ -139,14 +146,16 @@ def main() -> None:
     name = f"pgr4-native-{version}-windows-x64"
     runtime = args.dest / "run/runtime"
     sdk = args.dest / "rexglue-sdk"
+    ffx = args.dest / "fidelityfx-sdk"
 
     # Package path -> source path or contents, the whole list.
-    files: dict[str, Path | bytes] = {f: runtime / f for f in PROGRAM}
+    files: dict[str, Path | bytes] = {f: runtime / f for f in PROGRAM + FIDELITYFX}
     files.update({Path(f).name: REPO / f for f in SETTINGS})
     files["README.md"] = REPO / "scripts/release/README.md"
     files["LICENSE.txt"] = REPO / "LICENSE"
     files["LICENSES/THIRD_PARTY_NOTICES.txt"] = REPO / "THIRD_PARTY_NOTICES.md"
     files.update({f"LICENSES/{n}.txt": sdk / p for n, p in LICENSES.items()})
+    files["LICENSES/AMD-FidelityFX-SDK.txt"] = ffx / FIDELITYFX_LICENSE
 
     if missing := [str(p) for p in files.values() if isinstance(p, Path) and not p.is_file()]:
         sys.exit("missing: " + ", ".join(missing))
@@ -157,7 +166,7 @@ def main() -> None:
         if any(s.startswith(".lprf") for s in pe_sections(files[exe])):
             sys.exit(f"{exe} is an instrumented (--pgo gen) build")
     check_linked(sdk / "out/build/native-release/build.ninja")
-    files["LICENSES/SOURCE.txt"] = source_note(sdk).encode()
+    files["LICENSES/SOURCE.txt"] = source_note(sdk, ffx).encode()
 
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH") or git(REPO, "log", "-1", "--format=%ct"))
     stamp = time.gmtime(max(epoch, 315532800))[:6]  # ZIP dates start in 1980

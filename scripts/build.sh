@@ -16,8 +16,11 @@
 #            where codegen applies the update; out/pgr4_recompiled.exe with the renderer
 #            (src/). games/gw: $game/gw.xex, the garage's Geometry Wars cabinet;
 #            out/gw_recompiled.exe.
-#   install  $dest/run/runtime: both executables, rexruntime.dll, rexgpu-xenos.dll, and
-#            title-update/ (the runtime's update:\ when no --update_data_root is given).
+#            $dest/fidelityfx-sdk: the AMD FidelityFX SDK at the commit scripts/fidelityfx.lock
+#            names, only its upscaler API headers and signed DLLs.
+#   install  $dest/run/runtime: both executables, rexruntime.dll, rexgpu-xenos.dll, AMD's FidelityFX
+#            loader and upscaler DLLs (--pgr4_native_upscaler), and title-update/ (the runtime's
+#            update:\ when no --update_data_root is given).
 #
 # --update PATH is the player's copy of Title Update #2: its package as downloaded
 # (TU_16L61VP_0000004000000.00000000000G1), extracted into $dest/title-update with the SDK's
@@ -94,12 +97,17 @@ if [[ $pgo == auto ]]; then
 fi
 # shellcheck source=../patches/rexglue.lock
 source "$repo_root/patches/rexglue.lock"
+# shellcheck source=fidelityfx.lock
+source "$here/fidelityfx.lock"
 sdk_patches=("$repo_root"/patches/*.patch)
 sdk_src=$dest/rexglue-sdk
 sdk_build=$sdk_src/out/build/native-release
 sdk=$dest/sdk-install
 host_build=$dest/host-sdk
 host_rexglue=$sdk_src/out/linux-amd64/rexglue
+ffx_src=$dest/fidelityfx-sdk
+ffx_kit=$ffx_src/Kits/FidelityFX
+ffx_dlls=("$ffx_kit/signedbin/amd_fidelityfx_loader_dx12.dll" "$ffx_kit/signedbin/amd_fidelityfx_upscaler_dx12.dll")
 titles=(gw pgr4)
 toolchain=$repo_root/cmake/clang-cl-xwin.cmake
 title_update_sums=$repo_root/games/pgr4/title-update.sha256
@@ -199,6 +207,20 @@ sdk_checkout() {
   echo "$series" > "$stamp"
 }
 
+# $ffx_src: the FidelityFX SDK at $FFX_COMMIT, a shallow sparse checkout of what the build and the
+# install use, without the SDK's samples, media and effect sources.
+ffx_checkout() {
+  [[ $(git -C "$ffx_src" rev-parse -q --verify HEAD 2>/dev/null) == "$FFX_COMMIT" ]] &&
+    { echo "FidelityFX SDK $FFX_COMMIT already checked out"; return 0; }
+  rm -rf "$ffx_src"
+  git init -q "$ffx_src"
+  git -C "$ffx_src" remote add origin "$FFX_URL"
+  git -C "$ffx_src" sparse-checkout set --no-cone /Kits/FidelityFX/api/include/ \
+    /Kits/FidelityFX/upscalers/include/ /Kits/FidelityFX/docs/license.md "${ffx_dlls[@]#"$ffx_src"}"
+  git -C "$ffx_src" fetch -q --depth 1 --filter=blob:none origin "$FFX_COMMIT"
+  git -C "$ffx_src" checkout -q --detach FETCH_HEAD
+}
+
 # clang_rt.profile.lib for --pgo gen: the compiler-rt profile runtime of this clang-cl, the
 # sources compiler-rt's CMakeLists.txt lists for Windows, built with the game's dynamic CRT (/MD,
 # no default libraries named); compiler-rt's own build would bring the static CRT along.
@@ -271,7 +293,7 @@ build_title() {
   configure "$project/out" "$flags" "$ldflags" -S "$project" -G Ninja \
     "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DXWIN_DIR=$xwin" -DCMAKE_BUILD_TYPE=Release \
     "-DCMAKE_PREFIX_PATH=$sdk" -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF "-DPGR4_NATIVE_SRC=$repo_root/src" "-DPGR4_REXGLUE_SDK_SRC=$sdk_src" \
-    "-DPGR4_HOST_REXGLUE=$host_rexglue"
+    "-DPGR4_HOST_REXGLUE=$host_rexglue" "-DPGR4_FIDELITYFX_SDK=$ffx_src"
   cmake --build "$project/out" -j "$jobs"
   ls -l "$project/out/${title}_recompiled.exe"
 }
@@ -279,6 +301,7 @@ build_title() {
 game_stage() {
   need "$game/default.xex" "$game/gw.xex" "$host_rexglue" "$sdk/lib/cmake/rexglue/rexglueConfig.cmake"
   need_update
+  step "fidelityfx checkout" ffx_checkout
   mkdir -p "$dest/game"
   local t excludes=()
   for t in "${titles[@]}"; do excludes+=("--exclude=/$t/generated" "--exclude=/$t/game-data" "--exclude=/$t/out"); done
@@ -307,7 +330,7 @@ game_stage() {
 install_stage() {
   local runtime=$dest/run/runtime
   local files=("$dest/game/pgr4/out/pgr4_recompiled.exe" "$dest/game/gw/out/gw_recompiled.exe"
-    "$sdk/bin/rexruntime.dll" "$sdk/bin/rexgpu-xenos.dll")
+    "$sdk/bin/rexruntime.dll" "$sdk/bin/rexgpu-xenos.dll" "${ffx_dlls[@]}")
   need "${files[@]}"
   need_update
   mkdir -p "$runtime/title-update"

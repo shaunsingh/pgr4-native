@@ -97,9 +97,10 @@ constexpr uint32_t kMaxPendingClears = 16;
 // One host render target.
 struct RenderTarget {
   bool depth = false;
-  uint32_t edram_base = 0;  // tiles
-  uint32_t pitch = 0;       // pixels (RB_SURFACE_INFO surface_pitch)
-  uint32_t samples = 1;     // 1, 2 or 4
+  uint32_t edram_base = 0;     // tiles
+  uint32_t pitch = 0;          // pixels (RB_SURFACE_INFO surface_pitch)
+  uint32_t samples = 1;        // 1, 2 or 4
+  uint32_t edram_samples = 1;  // the guest surface's (RenderTargets::SingleSample)
   uint32_t width = 0, height = 0;
   uint32_t guest_format = 0;  // last xenos::ColorRenderTargetFormat / DepthRenderTargetFormat
   DXGI_FORMAT resource_format = DXGI_FORMAT_UNKNOWN;
@@ -194,6 +195,13 @@ class RenderTargets {
   // Frees replaced targets the GPU is done with and drops targets unused for kMaxAge frames.
   void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
 
+  // Host targets of the surfaces whose RB_SURFACE_INFO has `value` under `mask` have one sample,
+  // whatever the guest's MSAA (the upscaler's scene); mask 0: none. Between frames.
+  void SingleSample(uint32_t mask, uint32_t value) {
+    single_sample_mask_ = mask;
+    single_sample_value_ = value;
+  }
+
   // Forgets every recorded EDRAM fill, for clears that are not guest content (the resolve self
   // test), so no game surface over the same tiles takes them over.
   void DropAllFills() { fills_.clear(); }
@@ -238,6 +246,11 @@ class RenderTargets {
   void Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt);
 
   RenderTarget* Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height);
+  uint32_t HostSamples(uint32_t surface_info) const {
+    return single_sample_mask_ && (surface_info & single_sample_mask_) == single_sample_value_
+               ? 1
+               : SurfaceSamples(surface_info);
+  }
   void Retire(ComPtr<ID3D12Resource> resource);
   bool Create(RenderTarget* rt, uint32_t height);
   uint32_t AllocView(bool depth);
@@ -264,6 +277,7 @@ class RenderTargets {
   std::vector<EdramFill> fills_;  // oldest first
   uint64_t fill_seq_ = 0;
   std::FILE* log_ = nullptr;
+  uint32_t single_sample_mask_ = 0, single_sample_value_ = 0;
 };
 
 }  // namespace pgr4::native

@@ -19,6 +19,11 @@ pgr4_60fps = true
 # At least 16x anisotropic filtering on the game's mipmapped, linearly filtered textures.
 pgr4_native_anisotropy = 16
 
+# F7 switches the 3D scene between the game's MSAA and FidelityFX Super Resolution
+# (pgr4_native_upscaler sets which one it starts with) and F8 shows the upscaler's debug view,
+# so the achievements overlay moves to F6.
+bind_achievements = "F6"
+
 # Runtime settings.
 execute_unclipped_draw_vs_on_cpu = true
 gpu_plugin = "xenos"

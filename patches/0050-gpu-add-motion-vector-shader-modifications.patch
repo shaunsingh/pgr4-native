@@ -1,0 +1,770 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Tue, 27 Oct 2026 12:00:00 -0400
+Subject: [PATCH 50/50] feat(gpu): add motion vector shader modifications for a
+ temporal upscaler
+
+A temporal upscaler (FSR, DLSS, XeSS) needs each pixel's motion to where
+it was in the previous frame. Guest vertex shaders compute their position
+from float constants and from vertex streams (instance and bone
+transforms) that the title rewrites every frame, so the translator gets
+the previous position by running the vertex shader's code a second time
+against the previous frame's float and vertex fetch constants.
+
+With vertex.motion_vectors, the DXBC translator emits the main loop twice:
+after the normal pass it re-initializes the registers and translates the
+ucode again, with float constants read from CbufferRegister::
+kPreviousFloatConstants (b5) and vertex fetch constants from
+kPreviousFetchConstants (b6), keeping only register and position writes.
+It outputs the current and the previous host clip space positions as two
+TEXCOORDs after the guest's interpolators. With pixel.motion_vectors, the
+pixel shader writes the motion from the pixel to its previous position in
+UV space (Y down) to SV_Target4 (kMotionVectorRenderTarget), past the
+guest's color targets. Both are for RTV-path kVertex shaders without
+memexport; the host renderer chooses the draws and supplies the previous
+constants. The new bits are zero in existing modifications, which
+translate as before.
+
+ShaderTranslator::TranslateUcode is split out of TranslateAnalyzedShader
+so that an implementation can emit the code more than once, and the DXBC
+translator's main loop and position conversions become functions of their
+own.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 9c112af..7450906 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -67,7 +67,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // stage-specific or cut off.
+   //
+   // - Interpolators (TEXCOORD) - VS > GS > RS > PS, used interpolators are all
+-  //   unconditionally referenced in all these stages.
++  //   unconditionally referenced in all these stages. With motion_vectors, two
++  //   more TEXCOORDs follow the guest's (kMotionVectorInterpolatorCount).
+   // - Point coordinates (XESPRITETEXCOORD) - GS > RS > PS, must be present in
+   //   none or in all, if drawing points, and PsParamGen is used.
+   // - Position (SV_Position) - VS > GS > RS > PS, used in PS if actually needed
+@@ -158,6 +159,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       // uint32_t 1.
+       // Pipeline stage and input configuration.
+       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
++      // Motion vectors for a temporal upscaler: the shader runs a second time with the previous
++      // frame's float and vertex fetch constants (CbufferRegister::kPreviousFloatConstants,
++      // kPreviousFetchConstants) and outputs both host clip space positions after the
++      // interpolators. kVertex only, without memexport.
++      uint32_t motion_vectors : 1;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+@@ -181,6 +187,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       // fetches sample the unsigned SRV unconditionally and skip the sign, gamma and exponent
+       // conversions.
+       uint32_t textures_unsigned : 1;
++      // Motion vectors for a temporal upscaler, with a vertex shader that has motion_vectors:
++      // writes the screen space motion from this pixel to its previous position to
++      // kMotionVectorRenderTarget. RTV only.
++      uint32_t motion_vectors : 1;
+     } pixel;
+ 
+     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
+@@ -203,8 +213,20 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     kBoolLoopConstants,
+     kFetchConstants,
+     kDescriptorIndices,
++    // Vertex shaders with motion_vectors: the float constants of the previous frame, packed like
++    // kFloatConstants, and the fetch constants its vertex fetches read (vertex data the title
++    // streams per frame, such as instance transforms, moves between frames).
++    kPreviousFloatConstants,
++    kPreviousFetchConstants,
+   };
+ 
++  // Motion vectors (Modification::vertex/pixel.motion_vectors): the current and the previous
++  // host clip space position after the guest's interpolators, and the render target the motion
++  // in UV space goes to (RG: previous minus current position, Y down; fixed past the guest's
++  // targets so the guest's stay where they are).
++  static constexpr uint32_t kMotionVectorInterpolatorCount = 2;
++  static constexpr uint32_t kMotionVectorRenderTarget = xenos::kMaxColorRenderTargets;
++
+   // Some are referenced in xenos_draw.hlsli - check it too when updating!
+   enum : uint32_t {
+     kSysFlag_SharedMemoryIsUAV_Shift,
+@@ -664,6 +686,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     return is_vertex_shader() ? modification.vertex.interpolator_mask
+                               : modification.pixel.interpolator_mask;
+   }
++  bool IsMotionVectorShader() const {
++    Modification modification = GetDxbcShaderModification();
++    return is_vertex_shader() ? modification.vertex.motion_vectors
++                              : modification.pixel.motion_vectors;
++  }
++  // The motion vector positions follow the guest's interpolators.
++  uint32_t GetMotionVectorInterpolatorIndex() const {
++    return rex::bit_count(GetModificationInterpolatorMask());
++  }
++  uint32_t GetInterpolatorRegisterCount() const {
++    return GetMotionVectorInterpolatorIndex() +
++           (IsMotionVectorShader() ? kMotionVectorInterpolatorCount : 0);
++  }
+ 
+   // Whether to use switch-case rather than if (pc >= label) for control flow.
+   bool UseSwitchForControlFlow() const;
+@@ -766,6 +801,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   void StartPixelShader_LoadROVParameters();
+   void StartPixelShader();
+ 
++  // Undoes the guest's XY/W, Z/W and 1/W position output options in a temp.
++  void NormalizeVertexPosition(uint32_t position_temp, uint32_t temp);
++  // Guest to host clip space (the NDC scale and offset).
++  void ConvertVertexPositionToHost(uint32_t position_temp);
++  // With motion_vectors, after the main loop: runs the shader again with the previous float and
++  // vertex fetch constants, keeping only its position, and outputs that in host clip space.
++  void CompleteVertexShader_PreviousPosition();
+   void CompleteVertexOrDomainShader();
+   // For RTV, adds the sample to coverage_temp.coverage_temp_component if it
+   // passes alpha to mask (or, if initialize == true (for the first sample
+@@ -784,10 +826,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // alpha can be exponent-biased.
+   void CompletePixelShader_AlphaToMask();
+   void CompletePixelShader_WriteToRTVs();
++  void CompletePixelShader_WriteMotionVectors();
+   void CompletePixelShader_DSV_DepthTo24Bit();
+   void CompletePixelShader_WriteToROV();
+   void CompletePixelShader();
+ 
++  // The loop and the switch (or the conditional) that jumps to labels by setting pc, around the
++  // code of TranslateUcode.
++  void StartMainLoop();
++  void CompleteMainLoop();
+   void CompleteShaderCode();
+ 
+   // Writes the original instruction disassembly in the output DXBC if enabled,
+@@ -997,6 +1044,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   uint32_t cbuffer_index_bool_loop_constants_;
+   uint32_t cbuffer_index_fetch_constants_;
+   uint32_t cbuffer_index_descriptor_indices_;
++  uint32_t cbuffer_index_previous_float_constants_;
++  uint32_t cbuffer_index_previous_fetch_constants_;
++  // The motion vector pass (CompleteVertexShader_PreviousPosition): float and vertex fetch
++  // constants are the previous frame's, and only registers and the position are written.
++  bool motion_vector_pass_;
+ 
+   struct SystemConstantRdef {
+     const char* name;
+diff --git a/include/rex/graphics/pipeline/shader/translator.h b/include/rex/graphics/pipeline/shader/translator.h
+index 340ced5..67c82cb 100644
+--- a/include/rex/graphics/pipeline/shader/translator.h
++++ b/include/rex/graphics/pipeline/shader/translator.h
+@@ -82,6 +82,11 @@ class ShaderTranslator {
+     translation.host_disassembly_ = std::move(value);
+   }
+ 
++  // Translates the control flow instructions and the instructions of their execs, in ucode
++  // order. TranslateAnalyzedShader calls it once between StartTranslation and
++  // CompleteTranslation; an implementation may call it again to emit the shader's code once more.
++  void TranslateUcode();
++
+   // Pre-process a control-flow instruction before anything else.
+   virtual void PreProcessControlFlowInstructions(
+       std::vector<ucode::ControlFlowInstruction> /*instrs*/) {}
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index 2c31a0e..785bf52 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -123,6 +123,9 @@ void DxbcShaderTranslator::Reset() {
+   cbuffer_index_bool_loop_constants_ = kBindingIndexUnallocated;
+   cbuffer_index_fetch_constants_ = kBindingIndexUnallocated;
+   cbuffer_index_descriptor_indices_ = kBindingIndexUnallocated;
++  cbuffer_index_previous_float_constants_ = kBindingIndexUnallocated;
++  cbuffer_index_previous_fetch_constants_ = kBindingIndexUnallocated;
++  motion_vector_pass_ = false;
+ 
+   system_constants_used_ = 0;
+ 
+@@ -772,8 +775,11 @@ void DxbcShaderTranslator::StartPixelShader() {
+ void DxbcShaderTranslator::StartTranslation() {
+   // Set up the input and output registers.
+   Modification shader_modification = GetDxbcShaderModification();
+-  uint32_t interpolator_register_mask = GetModificationInterpolatorMask();
+-  uint32_t interpolator_register_count = rex::bit_count(interpolator_register_mask);
++  uint32_t interpolator_register_count = GetInterpolatorRegisterCount();
++  assert_false(IsMotionVectorShader() &&
++               (edram_rov_used_ || current_shader().memexport_eM_written() ||
++                (is_vertex_shader() && shader_modification.vertex.host_vertex_shader_type !=
++                                           Shader::HostVertexShaderType::kVertex)));
+   if (is_vertex_shader()) {
+     uint32_t out_reg_index = 0;
+     // Interpolators.
+@@ -903,6 +909,10 @@ void DxbcShaderTranslator::StartTranslation() {
+     return;
+   }
+ 
++  StartMainLoop();
++}
++
++void DxbcShaderTranslator::StartMainLoop() {
+   // Start the main loop (for jumping to labels by setting pc and continuing).
+   a_.OpLoop();
+   // Switch and the first label (pc == 0).
+@@ -914,8 +924,23 @@ void DxbcShaderTranslator::StartTranslation() {
+   }
+ }
+ 
+-void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+-  uint32_t temp = PushSystemTemp();
++void DxbcShaderTranslator::CompleteMainLoop() {
++  // Close the last exec, there's nothing to merge it with anymore, and we're
++  // closing upper-level flow control blocks.
++  CloseExecConditionals();
++  // Close the last label and the switch.
++  if (UseSwitchForControlFlow()) {
++    a_.OpBreak();
++    a_.OpEndSwitch();
++  } else {
++    a_.OpEndIf();
++  }
++  // End the main loop.
++  a_.OpBreak();
++  a_.OpEndLoop();
++}
++
++void DxbcShaderTranslator::NormalizeVertexPosition(uint32_t position_temp, uint32_t temp) {
+   dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
+   dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
+ 
+@@ -925,25 +950,85 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+   // into W. Using div rather than relaxed-precision rcp for safety.
+   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlag_WNotReciprocal));
+   a_.OpIf(false, temp_x_src);
+-  a_.OpDiv(dxbc::Dest::R(system_temp_position_, 0b1000), dxbc::Src::LF(1.0f),
+-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
++  a_.OpDiv(dxbc::Dest::R(position_temp, 0b1000), dxbc::Src::LF(1.0f),
++           dxbc::Src::R(position_temp, dxbc::Src::kWWWW));
+   a_.OpEndIf();
+ 
+   // Check if the shader returns XY/W rather than XY, and if it does, revert
+   // that.
+   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlag_XYDividedByW));
+   a_.OpIf(true, temp_x_src);
+-  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0011), dxbc::Src::R(system_temp_position_),
+-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
++  a_.OpMul(dxbc::Dest::R(position_temp, 0b0011), dxbc::Src::R(position_temp),
++           dxbc::Src::R(position_temp, dxbc::Src::kWWWW));
+   a_.OpEndIf();
+ 
+   // Check if the shader returns Z/W rather than Z, and if it does, revert that.
+   a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlag_ZDividedByW));
+   a_.OpIf(true, temp_x_src);
+-  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0100),
+-           dxbc::Src::R(system_temp_position_, dxbc::Src::kZZZZ),
+-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
++  a_.OpMul(dxbc::Dest::R(position_temp, 0b0100), dxbc::Src::R(position_temp, dxbc::Src::kZZZZ),
++           dxbc::Src::R(position_temp, dxbc::Src::kWWWW));
+   a_.OpEndIf();
++}
++
++void DxbcShaderTranslator::ConvertVertexPositionToHost(uint32_t position_temp) {
++  // Apply scale for guest to host viewport and clip space conversion. Also, if
++  // the vertex shader is multipass, the NDC scale constant can be used to set
++  // position to NaN to kill all primitives.
++  a_.OpMul(dxbc::Dest::R(position_temp, 0b0111), dxbc::Src::R(position_temp),
++           LoadSystemConstant(SystemConstants::Index::kNDCScale,
++                              offsetof(SystemConstants, ndc_scale), 0b100100));
++
++  // Apply offset (multiplied by W) used for the same purposes.
++  a_.OpMAd(dxbc::Dest::R(position_temp, 0b0111),
++           LoadSystemConstant(SystemConstants::Index::kNDCOffset,
++                              offsetof(SystemConstants, ndc_offset), 0b100100),
++           dxbc::Src::R(position_temp, dxbc::Src::kWWWW), dxbc::Src::R(position_temp));
++}
++
++void DxbcShaderTranslator::CompleteVertexShader_PreviousPosition() {
++  // The guest position of this frame, kept while the code overwrites system_temp_position_.
++  uint32_t current_position = PushSystemTemp();
++  a_.OpMov(dxbc::Dest::R(current_position), dxbc::Src::R(system_temp_position_));
++
++  motion_vector_pass_ = true;
++  // The registers as StartVertexOrDomainShader leaves them, and the main loop's temps as
++  // StartTranslation allocates them.
++  bool uses_register_dynamic_addressing = current_shader().uses_register_dynamic_addressing();
++  for (uint32_t i = 0; i < register_count(); ++i) {
++    a_.OpMov(uses_register_dynamic_addressing ? dxbc::Dest::X(0, i) : dxbc::Dest::R(i),
++             dxbc::Src::LF(0.0f));
++  }
++  a_.OpMov(dxbc::Dest::R(system_temp_position_), dxbc::Src::LF(0.0f));
++  StartVertexShader_LoadVertexIndex();
++  system_temp_result_ = PushSystemTemp();
++  system_temp_ps_pc_p0_a0_ = PushSystemTemp(0b1111);
++  system_temp_aL_ = PushSystemTemp(0b1111);
++  system_temp_loop_count_ = PushSystemTemp(0b1111);
++  system_temp_grad_h_lod_ = PushSystemTemp(0b1111);
++  system_temp_grad_v_vfetch_address_ = PushSystemTemp(0b1111);
++  StartMainLoop();
++  TranslateUcode();
++  CompleteMainLoop();
++  PopSystemTemp(6);
++  motion_vector_pass_ = false;
++
++  uint32_t temp = PushSystemTemp();
++  NormalizeVertexPosition(system_temp_position_, temp);
++  PopSystemTemp();
++  ConvertVertexPositionToHost(system_temp_position_);
++  a_.OpMov(dxbc::Dest::O(out_reg_vs_interpolators_ + GetMotionVectorInterpolatorIndex() + 1),
++           dxbc::Src::R(system_temp_position_));
++
++  a_.OpMov(dxbc::Dest::R(system_temp_position_), dxbc::Src::R(current_position));
++  PopSystemTemp();
++}
++
++void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
++  uint32_t temp = PushSystemTemp();
++  dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
++  dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
++
++  NormalizeVertexPosition(system_temp_position_, temp);
+ 
+   Modification shader_modification = GetDxbcShaderModification();
+   uint32_t clip_distance_next_component = 0;
+@@ -964,19 +1049,11 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+     ++ucp_clip_cull_distance_next_component_ref;
+   }
+ 
+-  // Apply scale for guest to host viewport and clip space conversion. Also, if
+-  // the vertex shader is multipass, the NDC scale constant can be used to set
+-  // position to NaN to kill all primitives.
+-  a_.OpMul(dxbc::Dest::R(system_temp_position_, 0b0111), dxbc::Src::R(system_temp_position_),
+-           LoadSystemConstant(SystemConstants::Index::kNDCScale,
+-                              offsetof(SystemConstants, ndc_scale), 0b100100));
+-
+-  // Apply offset (multiplied by W) used for the same purposes.
+-  a_.OpMAd(dxbc::Dest::R(system_temp_position_, 0b0111),
+-           LoadSystemConstant(SystemConstants::Index::kNDCOffset,
+-                              offsetof(SystemConstants, ndc_offset), 0b100100),
+-           dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
+-           dxbc::Src::R(system_temp_position_));
++  ConvertVertexPositionToHost(system_temp_position_);
++  if (shader_modification.vertex.motion_vectors) {
++    a_.OpMov(dxbc::Dest::O(out_reg_vs_interpolators_ + GetMotionVectorInterpolatorIndex()),
++             dxbc::Src::R(system_temp_position_));
++  }
+ 
+   // Kill the primitive if needed - check if the shader wants to kill (bits
+   // 0:30 of the vertex kill register are not zero - using `and`, not abs or
+@@ -1023,19 +1100,7 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+ 
+ void DxbcShaderTranslator::CompleteShaderCode() {
+   if (!is_depth_only_pixel_shader_) {
+-    // Close the last exec, there's nothing to merge it with anymore, and we're
+-    // closing upper-level flow control blocks.
+-    CloseExecConditionals();
+-    // Close the last label and the switch.
+-    if (UseSwitchForControlFlow()) {
+-      a_.OpBreak();
+-      a_.OpEndSwitch();
+-    } else {
+-      a_.OpEndIf();
+-    }
+-    // End the main loop.
+-    a_.OpBreak();
+-    a_.OpEndLoop();
++    CompleteMainLoop();
+ 
+     // Release the following system temporary values so epilogue can reuse them:
+     // - system_temp_result_.
+@@ -1061,6 +1126,9 @@ void DxbcShaderTranslator::CompleteShaderCode() {
+ 
+   // Write stage-specific epilogue.
+   if (is_vertex_shader()) {
++    if (IsMotionVectorShader()) {
++      CompleteVertexShader_PreviousPosition();
++    }
+     CompleteVertexOrDomainShader();
+   } else if (is_pixel_shader()) {
+     CompletePixelShader();
+@@ -1331,8 +1399,10 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
+       }
+     } break;
+     case InstructionStorageSource::kConstantFloat: {
+-      if (cbuffer_index_float_constants_ == kBindingIndexUnallocated) {
+-        cbuffer_index_float_constants_ = cbuffer_count_++;
++      uint32_t& cbuffer_index = motion_vector_pass_ ? cbuffer_index_previous_float_constants_
++                                                    : cbuffer_index_float_constants_;
++      if (cbuffer_index == kBindingIndexUnallocated) {
++        cbuffer_index = cbuffer_count_++;
+       }
+       const Shader::ConstantRegisterMap& constant_register_map =
+           current_shader().constant_register_map();
+@@ -1347,8 +1417,10 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
+       } else {
+         assert_true(constant_register_map.float_dynamic_addressing);
+       }
+-      src = dxbc::Src::CB(cbuffer_index_float_constants_,
+-                          uint32_t(CbufferRegister::kFloatConstants), index);
++      src = dxbc::Src::CB(cbuffer_index,
++                          uint32_t(motion_vector_pass_ ? CbufferRegister::kPreviousFloatConstants
++                                                       : CbufferRegister::kFloatConstants),
++                          index);
+     } break;
+     default:
+       assert_unhandled_case(operand.storage_source);
+@@ -1376,6 +1448,12 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
+     return;
+   }
+ 
++  // The motion vector pass computes only the position.
++  if (motion_vector_pass_ && result.storage_target != InstructionStorageTarget::kRegister &&
++      result.storage_target != InstructionStorageTarget::kPosition) {
++    return;
++  }
++
+   // Get the destination address and type.
+   dxbc::Dest dest(dxbc::Dest::Null());
+   bool is_clamped = result.is_clamped;
+@@ -2081,6 +2159,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+   if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
+     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_descriptor_indices");
+   }
++  uint32_t constant_name_ptr_previous_float = name_ptr;
++  if (cbuffer_index_previous_float_constants_ != kBindingIndexUnallocated) {
++    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_previous_float_constants");
++  }
++  uint32_t constant_name_ptr_previous_fetch = name_ptr;
++  if (cbuffer_index_previous_fetch_constants_ != kBindingIndexUnallocated) {
++    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_previous_fetch_constants");
++  }
+ 
+   // System constants.
+   uint32_t constant_position_dwords_system = uint32_t(shader_object_.size());
+@@ -2192,6 +2278,39 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+     constant_descriptor_indices.start_sampler = UINT32_MAX;
+   }
+ 
++  // Previous float constants.
++  uint32_t constant_position_dwords_previous_float = uint32_t(shader_object_.size());
++  if (cbuffer_index_previous_float_constants_ != kBindingIndexUnallocated) {
++    assert_not_zero(constant_register_map.float_count);
++    shader_object_.resize(constant_position_dwords_previous_float +
++                          sizeof(dxbc::RdefVariable) / sizeof(uint32_t));
++    auto& constant_previous_float = *reinterpret_cast<dxbc::RdefVariable*>(
++        shader_object_.data() + constant_position_dwords_previous_float);
++    constant_previous_float.name_ptr = constant_name_ptr_previous_float;
++    constant_previous_float.size_bytes = sizeof(float) * 4 * constant_register_map.float_count;
++    constant_previous_float.flags = dxbc::kRdefVariableFlagUsed;
++    constant_previous_float.type_ptr =
++        types_ptr + sizeof(dxbc::RdefType) * uint32_t(ShaderRdefTypeIndex::kFloat4ConstantArray);
++    constant_previous_float.start_texture = UINT32_MAX;
++    constant_previous_float.start_sampler = UINT32_MAX;
++  }
++
++  // Previous fetch constants.
++  uint32_t constant_position_dwords_previous_fetch = uint32_t(shader_object_.size());
++  if (cbuffer_index_previous_fetch_constants_ != kBindingIndexUnallocated) {
++    shader_object_.resize(constant_position_dwords_previous_fetch +
++                          sizeof(dxbc::RdefVariable) / sizeof(uint32_t));
++    auto& constant_previous_fetch = *reinterpret_cast<dxbc::RdefVariable*>(
++        shader_object_.data() + constant_position_dwords_previous_fetch);
++    constant_previous_fetch.name_ptr = constant_name_ptr_previous_fetch;
++    constant_previous_fetch.size_bytes = sizeof(uint32_t) * 6 * 32;
++    constant_previous_fetch.flags = dxbc::kRdefVariableFlagUsed;
++    constant_previous_fetch.type_ptr =
++        types_ptr + sizeof(dxbc::RdefType) * uint32_t(ShaderRdefTypeIndex::kUint4Array48);
++    constant_previous_fetch.start_texture = UINT32_MAX;
++    constant_previous_fetch.start_sampler = UINT32_MAX;
++  }
++
+   // ***************************************************************************
+   // Constant buffers
+   // ***************************************************************************
+@@ -2218,6 +2337,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+   if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
+     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_descriptor_indices_cbuffer");
+   }
++  uint32_t cbuffer_name_ptr_previous_float = name_ptr;
++  if (cbuffer_index_previous_float_constants_ != kBindingIndexUnallocated) {
++    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_previous_float_cbuffer");
++  }
++  uint32_t cbuffer_name_ptr_previous_fetch = name_ptr;
++  if (cbuffer_index_previous_fetch_constants_ != kBindingIndexUnallocated) {
++    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_previous_fetch_cbuffer");
++  }
+ 
+   // All the constant buffers, sorted by their binding index.
+   uint32_t cbuffers_position_dwords = uint32_t(shader_object_.size());
+@@ -2263,6 +2390,18 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+             (constant_position_dwords_descriptor_indices - blob_position_dwords) * sizeof(uint32_t);
+         cbuffer.size_vector_aligned_bytes =
+             sizeof(uint32_t) * rex::align(GetBindlessResourceCount(), uint32_t(4));
++      } else if (i == cbuffer_index_previous_float_constants_) {
++        cbuffer.name_ptr = cbuffer_name_ptr_previous_float;
++        cbuffer.variable_count = 1;
++        cbuffer.variables_ptr =
++            (constant_position_dwords_previous_float - blob_position_dwords) * sizeof(uint32_t);
++        cbuffer.size_vector_aligned_bytes = sizeof(float) * 4 * constant_register_map.float_count;
++      } else if (i == cbuffer_index_previous_fetch_constants_) {
++        cbuffer.name_ptr = cbuffer_name_ptr_previous_fetch;
++        cbuffer.variable_count = 1;
++        cbuffer.variables_ptr =
++            (constant_position_dwords_previous_fetch - blob_position_dwords) * sizeof(uint32_t);
++        cbuffer.size_vector_aligned_bytes = sizeof(uint32_t) * 6 * 32;
+       } else {
+         assert_unhandled_case(i);
+       }
+@@ -2479,6 +2618,12 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+       } else if (i == cbuffer_index_descriptor_indices_) {
+         cbuffer.name_ptr = cbuffer_name_ptr_descriptor_indices;
+         cbuffer.bind_point = uint32_t(CbufferRegister::kDescriptorIndices);
++      } else if (i == cbuffer_index_previous_float_constants_) {
++        cbuffer.name_ptr = cbuffer_name_ptr_previous_float;
++        cbuffer.bind_point = uint32_t(CbufferRegister::kPreviousFloatConstants);
++      } else if (i == cbuffer_index_previous_fetch_constants_) {
++        cbuffer.name_ptr = cbuffer_name_ptr_previous_fetch;
++        cbuffer.bind_point = uint32_t(CbufferRegister::kPreviousFetchConstants);
+       } else {
+         assert_unhandled_case(i);
+       }
+@@ -2579,7 +2724,7 @@ void DxbcShaderTranslator::WriteInputSignature() {
+     // Intepolators (TEXCOORD#).
+     size_t interpolator_position = shader_object_.size();
+     uint32_t interpolator_mask = GetModificationInterpolatorMask();
+-    uint32_t interpolator_count = rex::bit_count(interpolator_mask);
++    uint32_t interpolator_count = GetInterpolatorRegisterCount();
+     shader_object_.resize(shader_object_.size() + interpolator_count * kParameterDwords);
+     parameter_count += interpolator_count;
+     {
+@@ -2598,6 +2743,15 @@ void DxbcShaderTranslator::WriteInputSignature() {
+         interpolator.always_reads_mask = interpolator_index < register_count() ? 0b1111 : 0b0000;
+         ++used_interpolator_index;
+       }
++      // Motion vector positions: XY and W.
++      for (; used_interpolator_index < interpolator_count; ++used_interpolator_index) {
++        dxbc::SignatureParameter& interpolator = interpolators[used_interpolator_index];
++        interpolator.semantic_index = used_interpolator_index;
++        interpolator.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
++        interpolator.register_index = in_reg_ps_interpolators_ + used_interpolator_index;
++        interpolator.mask = 0b1111;
++        interpolator.always_reads_mask = 0b1011;
++      }
+     }
+ 
+     // Point coordinates for PsParamGen (XESPRITETEXCOORD).
+@@ -2825,7 +2979,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
+   if (is_vertex_shader()) {
+     // Intepolators (TEXCOORD#).
+     size_t interpolator_position = shader_object_.size();
+-    uint32_t interpolator_count = rex::bit_count(GetModificationInterpolatorMask());
++    uint32_t interpolator_count = GetInterpolatorRegisterCount();
+     shader_object_.resize(shader_object_.size() + interpolator_count * kParameterDwords);
+     parameter_count += interpolator_count;
+     {
+@@ -2969,8 +3123,10 @@ void DxbcShaderTranslator::WriteOutputSignature() {
+ 
+       // Color render targets (SV_Target#).
+       size_t target_position = SIZE_MAX;
+-      uint32_t color_targets_written_count = rex::bit_count(color_targets_written);
+-      if (color_targets_written) {
++      bool motion_vectors = GetDxbcShaderModification().pixel.motion_vectors;
++      uint32_t color_targets_written_count =
++          rex::bit_count(color_targets_written) + uint32_t(motion_vectors);
++      if (color_targets_written_count) {
+         target_position = shader_object_.size();
+         shader_object_.resize(shader_object_.size() +
+                               color_targets_written_count * kParameterDwords);
+@@ -2988,6 +3144,13 @@ void DxbcShaderTranslator::WriteOutputSignature() {
+           target.register_index = i;
+           target.mask = 0b1111;
+         }
++        if (motion_vectors) {
++          dxbc::SignatureParameter& target = targets[target_index++];
++          target.semantic_index = kMotionVectorRenderTarget;
++          target.component_type = dxbc::SignatureRegisterComponentType::kFloat32;
++          target.register_index = kMotionVectorRenderTarget;
++          target.mask = 0b0011;
++        }
+       }
+ 
+       // Coverage output for alpha to mask (SV_Coverage).
+@@ -3133,6 +3296,17 @@ void DxbcShaderTranslator::WriteShaderCode() {
+                                 ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
+                                 : dxbc::ConstantBufferAccessPattern::kImmediateIndexed);
+   }
++  if (cbuffer_index_previous_float_constants_ != kBindingIndexUnallocated) {
++    const Shader::ConstantRegisterMap& constant_register_map =
++        current_shader().constant_register_map();
++    ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_previous_float_constants_,
++                                          uint32_t(CbufferRegister::kPreviousFloatConstants),
++                                          uint32_t(CbufferRegister::kPreviousFloatConstants)),
++                            constant_register_map.float_count,
++                            constant_register_map.float_dynamic_addressing
++                                ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
++                                : dxbc::ConstantBufferAccessPattern::kImmediateIndexed);
++  }
+   if (cbuffer_index_system_constants_ != kBindingIndexUnallocated) {
+     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_system_constants_,
+                                           uint32_t(CbufferRegister::kSystemConstants),
+@@ -3145,6 +3319,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
+                                           uint32_t(CbufferRegister::kFetchConstants)),
+                             48);
+   }
++  if (cbuffer_index_previous_fetch_constants_ != kBindingIndexUnallocated) {
++    ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_previous_fetch_constants_,
++                                          uint32_t(CbufferRegister::kPreviousFetchConstants),
++                                          uint32_t(CbufferRegister::kPreviousFetchConstants)),
++                            48);
++  }
+   if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
+     assert_not_zero(GetBindlessResourceCount());
+     ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_descriptor_indices_,
+@@ -3272,7 +3452,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
+       }
+     }
+     // Interpolator output.
+-    uint32_t interpolator_count = rex::bit_count(GetModificationInterpolatorMask());
++    uint32_t interpolator_count = GetInterpolatorRegisterCount();
+     for (uint32_t i = 0; i < interpolator_count; ++i) {
+       ao_.OpDclOutput(dxbc::Dest::O(out_reg_vs_interpolators_ + i));
+     }
+@@ -3323,6 +3503,14 @@ void DxbcShaderTranslator::WriteShaderCode() {
+           dxbc::Dest::V1D(interpolator_register_index));
+       ++interpolator_register_index;
+     }
++    if (shader_modification.pixel.motion_vectors) {
++      for (uint32_t i = 0; i < kMotionVectorInterpolatorCount; ++i) {
++        ao_.OpDclInputPS(
++            dxbc::InterpolationMode::kLinear,
++            dxbc::Dest::V1D(in_reg_ps_interpolators_ + GetMotionVectorInterpolatorIndex() + i,
++                            0b1011));
++      }
++    }
+     if (in_reg_ps_point_coordinates_ != UINT32_MAX) {
+       // Point coordinates input.
+       ao_.OpDclInputPS(dxbc::InterpolationMode::kLinear,
+@@ -3371,6 +3559,9 @@ void DxbcShaderTranslator::WriteShaderCode() {
+           ao_.OpDclOutput(dxbc::Dest::O(i));
+         }
+       }
++      if (shader_modification.pixel.motion_vectors) {
++        ao_.OpDclOutput(dxbc::Dest::O(kMotionVectorRenderTarget, 0b0011));
++      }
+       // Coverage output for alpha to mask.
+       if ((color_targets_written & 0b1) && !global_flag_force_early_depth_stencil) {
+         ao_.OpDclOutput(dxbc::Dest::OMask());
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index bdce483..1f732ec 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -53,11 +53,15 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
+ 
+   // Create a 2-component dxbc::Src for the fetch constant (vf0 is in [0].xy of
+   // the fetch constants array, vf1 is in [0].zw, vf2 is in [1].xy).
+-  if (cbuffer_index_fetch_constants_ == kBindingIndexUnallocated) {
+-    cbuffer_index_fetch_constants_ = cbuffer_count_++;
++  uint32_t& cbuffer_index = motion_vector_pass_ ? cbuffer_index_previous_fetch_constants_
++                                                : cbuffer_index_fetch_constants_;
++  if (cbuffer_index == kBindingIndexUnallocated) {
++    cbuffer_index = cbuffer_count_++;
+   }
+   dxbc::Src fetch_constant_src(
+-      dxbc::Src::CB(cbuffer_index_fetch_constants_, uint32_t(CbufferRegister::kFetchConstants),
++      dxbc::Src::CB(cbuffer_index,
++                    uint32_t(motion_vector_pass_ ? CbufferRegister::kPreviousFetchConstants
++                                                 : CbufferRegister::kFetchConstants),
+                     instr.operands[1].storage_index >> 1,
+                     (instr.operands[1].storage_index & 1) ? 0b10101110 : 0b00000100));
+ 
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+index a7d508a..1868438 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+@@ -1570,6 +1570,22 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
+   PopSystemTemp();
+ }
+ 
++void DxbcShaderTranslator::CompletePixelShader_WriteMotionVectors() {
++  // The current and the previous host clip space position.
++  uint32_t positions = in_reg_ps_interpolators_ + GetMotionVectorInterpolatorIndex();
++  uint32_t temp = PushSystemTemp();
++  // XY: this frame's NDC position, ZW: the previous frame's.
++  a_.OpDiv(dxbc::Dest::R(temp, 0b0011), dxbc::Src::V1D(positions),
++           dxbc::Src::V1D(positions, dxbc::Src::kWWWW));
++  a_.OpDiv(dxbc::Dest::R(temp, 0b1100), dxbc::Src::V1D(positions + 1, 0b01000100),
++           dxbc::Src::V1D(positions + 1, dxbc::Src::kWWWW));
++  a_.OpAdd(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp, 0b1110), -dxbc::Src::R(temp));
++  // NDC to UV: half the extent, Y down.
++  a_.OpMul(dxbc::Dest::O(kMotionVectorRenderTarget, 0b0011), dxbc::Src::R(temp),
++           dxbc::Src::LF(0.5f, -0.5f, 0.0f, 0.0f));
++  PopSystemTemp();
++}
++
+ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
+   bool shader_writes_depth = current_shader().writes_depth();
+ 
+@@ -2755,6 +2771,9 @@ void DxbcShaderTranslator::CompletePixelShader() {
+     CompletePixelShader_WriteToROV();
+   } else {
+     CompletePixelShader_WriteToRTVs();
++    if (GetDxbcShaderModification().pixel.motion_vectors) {
++      CompletePixelShader_WriteMotionVectors();
++    }
+     CompletePixelShader_DSV_DepthTo24Bit();
+   }
+ }
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251..a4a52e0 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -635,22 +635,7 @@ bool ShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation)
+   }
+   PreProcessControlFlowInstructions(cf_instructions);
+ 
+-  // Translate all instructions.
+-  const std::set<uint32_t>& label_addresses = shader.label_addresses();
+-  for (uint32_t i = 0; i < cf_pair_index_bound; ++i) {
+-    ControlFlowInstruction cf_ab[2];
+-    UnpackControlFlowInstructions(ucode_dwords + i * 3, cf_ab);
+-    for (uint32_t j = 0; j < 2; ++j) {
+-      uint32_t cf_index = i * 2 + j;
+-      cf_index_ = cf_index;
+-      if (label_addresses.find(cf_index) != label_addresses.end()) {
+-        ProcessLabel(cf_index);
+-      }
+-      ProcessControlFlowInstructionBegin(cf_index);
+-      TranslateControlFlowInstruction(cf_ab[j]);
+-      ProcessControlFlowInstructionEnd(cf_index);
+-    }
+-  }
++  TranslateUcode();
+ 
+   translation.errors_ = std::move(errors_);
+   translation.translated_binary_ = CompleteTranslation();
+@@ -671,6 +656,27 @@ bool ShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation)
+   return translation.is_valid_;
+ }
+ 
++void ShaderTranslator::TranslateUcode() {
++  const Shader& shader = current_shader();
++  const uint32_t* ucode_dwords = shader.ucode_data().data();
++  std::memset(&previous_vfetch_full_, 0, sizeof(previous_vfetch_full_));
++  const std::set<uint32_t>& label_addresses = shader.label_addresses();
++  for (uint32_t i = 0; i < shader.cf_pair_index_bound(); ++i) {
++    ControlFlowInstruction cf_ab[2];
++    UnpackControlFlowInstructions(ucode_dwords + i * 3, cf_ab);
++    for (uint32_t j = 0; j < 2; ++j) {
++      uint32_t cf_index = i * 2 + j;
++      cf_index_ = cf_index;
++      if (label_addresses.find(cf_index) != label_addresses.end()) {
++        ProcessLabel(cf_index);
++      }
++      ProcessControlFlowInstructionBegin(cf_index);
++      TranslateControlFlowInstruction(cf_ab[j]);
++      ProcessControlFlowInstructionEnd(cf_index);
++    }
++  }
++}
++
+ void ShaderTranslator::EmitTranslationError(const char* message, bool is_fatal) {
+   Shader::Error error;
+   error.is_fatal = is_fatal;
+-- 
+2.47.0
+

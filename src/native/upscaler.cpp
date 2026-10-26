@@ -1,0 +1,280 @@
+// pgr4-native PGR4 native renderer: FidelityFX Super Resolution of the scene. See upscaler.h.
+#include "upscaler.h"
+
+#include "clock.h"
+#include "log.h"
+
+#include <ffx_api.h>
+#include <ffx_upscale.h>
+#include <dx12/ffx_api_dx12.h>
+
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+#include <string>
+
+REXCVAR_DEFINE_BOOL(pgr4_native_upscaler, false, "PGR4 native",
+                    "Render the 3D scene without MSAA and antialias it with AMD FidelityFX Super "
+                    "Resolution (amd_fidelityfx_loader_dx12.dll and "
+                    "amd_fidelityfx_upscaler_dx12.dll beside the executable, or what OptiScaler "
+                    "puts behind them) from the start; bind_upscaler (F7) switches it");
+
+namespace pgr4::native {
+
+struct Upscaler::Api {
+  PfnFfxCreateContext create = nullptr;
+  PfnFfxDestroyContext destroy = nullptr;
+  PfnFfxQuery query = nullptr;
+  PfnFfxDispatch dispatch = nullptr;
+};
+
+namespace {
+
+constexpr wchar_t kLoaderDll[] = L"amd_fidelityfx_loader_dx12.dll";
+constexpr DXGI_FORMAT kOutputFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+constexpr D3D12_RESOURCE_STATES kInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+// The camera's planes and vertical field of view are not known to the renderer. FSR uses them
+// only to scale its disocclusion threshold with view-space depth; these are a chase camera's.
+constexpr float kCameraNear = 0.1f, kCameraFar = 10000.0f, kCameraFovY = 1.0f;
+
+void Message(uint32_t type, const wchar_t* message) {
+  std::string s;
+  const int n = WideCharToMultiByte(CP_UTF8, 0, message, -1, nullptr, 0, nullptr, nullptr);
+  if (n > 1) {
+    s.resize(size_t(n));
+    WideCharToMultiByte(CP_UTF8, 0, message, -1, s.data(), n, nullptr, nullptr);
+    s.resize(size_t(n - 1));
+  }
+  if (type == FFX_API_MESSAGE_TYPE_ERROR)
+    PGR4_LOG_FIRST(16, ERROR, "PGR4 native upscaler: {}", s);
+  else
+    PGR4_LOG_FIRST(16, WARN, "PGR4 native upscaler: {}", s);
+}
+
+}  // namespace
+
+bool Upscaler::Requested() { return REXCVAR_GET(pgr4_native_upscaler); }
+
+const Upscaler::Api* Upscaler::LoadApi() {
+  static const Api api = [] {
+    Api a;
+    HMODULE dll = LoadLibraryW(kLoaderDll);
+    if (!dll) {
+      REXLOG_ERROR("PGR4 native upscaler: cannot load amd_fidelityfx_loader_dx12.dll ({})",
+                   uint32_t(GetLastError()));
+      return a;
+    }
+    a.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(dll, "ffxCreateContext"));
+    a.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(dll, "ffxDestroyContext"));
+    a.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(dll, "ffxQuery"));
+    a.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(dll, "ffxDispatch"));
+    if (!a.create || !a.destroy || !a.query || !a.dispatch) {
+      REXLOG_ERROR("PGR4 native upscaler: amd_fidelityfx_loader_dx12.dll lacks the ffx API");
+      a = {};
+    }
+    return a;
+  }();
+  return api.create ? &api : nullptr;
+}
+
+Upscaler::~Upscaler() {
+  if (context_) api_->destroy(&context_, nullptr);
+}
+
+bool Upscaler::Initialize(ID3D12Device* device) {
+  device_ = device;
+  api_ = LoadApi();
+  if (!api_ || !CreateContext(false)) return false;
+  ffxQueryGetProviderVersion provider = {};
+  provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+  if (api_->query(&context_, &provider.header) == FFX_API_RETURN_OK && provider.versionName)
+    REXLOG_INFO("PGR4 native upscaler: {} at {}x{}", provider.versionName, kSceneWidth,
+                kSceneHeight);
+
+  ffxQueryDescUpscaleGetJitterPhaseCount phases = {};
+  phases.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
+  phases.renderWidth = kSceneWidth;
+  phases.displayWidth = kSceneWidth;
+  phases.pOutPhaseCount = &phase_count_;
+  if (api_->query(&context_, &phases.header) != FFX_API_RETURN_OK || phase_count_ <= 0) {
+    REXLOG_ERROR("PGR4 native upscaler: no jitter phase count");
+    return false;
+  }
+  return CreateTargets();
+}
+
+bool Upscaler::CreateContext(bool debug) {
+  if (context_) {
+    api_->destroy(&context_, nullptr);
+    context_ = nullptr;
+  }
+  ffxCreateBackendDX12Desc backend = {};
+  backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+  backend.device = device_;
+  ffxCreateContextDescUpscaleVersion version = {};
+  version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
+  version.header.pNext = &backend.header;
+  version.version = FFX_UPSCALER_VERSION;
+  ffxCreateContextDescUpscale desc = {};
+  desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+  desc.header.pNext = &version.header;
+  // The scene is linear light in a float target, before the game's exposure and tone mapping,
+  // and its depth is reversed (cleared to 0, tested GEQUAL).
+  desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+               FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
+               (debug ? FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION : 0u);
+  desc.maxRenderSize = {kSceneWidth, kSceneHeight};
+  desc.maxUpscaleSize = {kSceneWidth, kSceneHeight};
+  desc.fpMessage = Message;
+  if (const ffxReturnCode_t rc = api_->create(&context_, &desc.header, nullptr);
+      rc != FFX_API_RETURN_OK) {
+    REXLOG_ERROR("PGR4 native upscaler: ffxCreateContext failed ({}){}", rc,
+                 debug ? " with debug visualization" : "");
+    context_ = nullptr;
+    return false;
+  }
+  debug_context_ = debug;
+  reset_ = true;
+  return true;
+}
+
+bool Upscaler::CreateTargets() {
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC d = {};
+  d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  d.Width = kSceneWidth;
+  d.Height = kSceneHeight;
+  d.DepthOrArraySize = 1;
+  d.MipLevels = 1;
+  d.Format = kOutputFormat;
+  d.SampleDesc.Count = 1;
+  d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                              IID_PPV_ARGS(&output_.resource)),
+             "upscaler output"))
+    return false;
+  output_.resource_format = output_.view_format = output_.srv_format = kOutputFormat;
+  output_.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  output_.width = kSceneWidth;
+  output_.height = kSceneHeight;
+
+  d.Format = kMotionFormat;
+  d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_CLEAR_VALUE zero = {};
+  zero.Format = kMotionFormat;
+  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, motion_state_, &zero,
+                                              IID_PPV_ARGS(&motion_)),
+             "upscaler motion vectors"))
+    return false;
+  D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+  hd.NumDescriptors = 1;
+  if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&motion_rtv_)), "upscaler RTV heap"))
+    return false;
+  device_->CreateRenderTargetView(motion_.Get(), nullptr,
+                                  motion_rtv_->GetCPUDescriptorHandleForHeapStart());
+  return true;
+}
+
+void Upscaler::BeginFrame(uint64_t frame) {
+  frame_ = frame;
+  const uint64_t now = NowNs();
+  frame_ms_ = last_ns_ ? float(double(now - last_ns_) * 1e-6) : 0.0f;
+  last_ns_ = now;
+  ffxQueryDescUpscaleGetJitterOffset q = {};
+  q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET;
+  q.index = int32_t(frame % uint64_t(phase_count_));
+  q.phaseCount = phase_count_;
+  q.pOutX = &jitter_[0];
+  q.pOutY = &jitter_[1];
+  if (api_->query(&context_, &q.header) != FFX_API_RETURN_OK) jitter_[0] = jitter_[1] = 0.0f;
+}
+
+bool Upscaler::SetDebugView(bool on) {
+  if (on && !debug_context_ && !CreateContext(true)) return false;
+  debug_view_ = on;
+  return true;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE Upscaler::MotionTarget(ID3D12GraphicsCommandList* list) {
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = motion_rtv_->GetCPUDescriptorHandleForHeapStart();
+  if (motion_state_ != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+    const D3D12_RESOURCE_BARRIER b =
+        TransitionBarrier(motion_.Get(), motion_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    list->ResourceBarrier(1, &b);
+    motion_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  }
+  if (motion_frame_ != frame_) {
+    motion_frame_ = frame_;
+    const float zero[4] = {};
+    list->ClearRenderTargetView(rtv, zero, 0, nullptr);
+  }
+  return rtv;
+}
+
+RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& targets,
+                                const SurfaceRegs& regs) {
+  if (upscaled_frame_ == frame_) return upscaled_ ? &output_ : nullptr;
+  upscaled_frame_ = frame_;
+  upscaled_ = false;
+
+  RenderTarget* color = targets.GetColor(regs, 0, kSceneHeight);
+  RenderTarget* depth = targets.GetDepth(regs, kSceneHeight);
+  if (!color || !depth || color->samples != 1 || depth->samples != 1 ||
+      color->srv_format != kOutputFormat) {
+    PGR4_WARN_ONCE("PGR4 native upscaler: unexpected scene targets (surface {:08X} color {:08X})",
+                   regs.surface_info, regs.color_info[0]);
+    return nullptr;
+  }
+  const D3D12_RECT all = {0, 0, LONG(kSceneWidth), LONG(kSceneHeight)};
+  targets.PrepareRead(list, color, all);
+  targets.PrepareRead(list, depth, all);
+
+  D3D12_RESOURCE_BARRIER bs[4];
+  uint32_t nb = 0;
+  auto to = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES* state, D3D12_RESOURCE_STATES after) {
+    if (*state == after) return;
+    bs[nb++] = TransitionBarrier(r, *state, after);
+    *state = after;
+  };
+  MotionTarget(list);  // cleared if no draw wrote motion this frame
+  to(color->resource.Get(), &color->state, kInputState);
+  to(depth->resource.Get(), &depth->state, kInputState);
+  to(motion_.Get(), &motion_state_, kInputState);
+  to(output_.resource.Get(), &output_.state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (nb) list->ResourceBarrier(nb, bs);
+
+  ffxDispatchDescUpscale d = {};
+  d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+  d.commandList = list;
+  d.color = ffxApiGetResourceDX12(color->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  d.depth = ffxApiGetResourceDX12(depth->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  d.motionVectors = ffxApiGetResourceDX12(motion_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  d.output = ffxApiGetResourceDX12(output_.resource.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+  d.jitterOffset = {jitter_[0], jitter_[1]};
+  d.motionVectorScale = {float(kSceneWidth), float(kSceneHeight)};
+  d.renderSize = {kSceneWidth, kSceneHeight};
+  d.upscaleSize = {kSceneWidth, kSceneHeight};
+  d.enableSharpening = false;
+  if (debug_view_) d.flags = FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
+  d.frameTimeDelta = frame_ms_;
+  d.preExposure = 1.0f;
+  d.reset = reset_;
+  d.cameraNear = kCameraNear;
+  d.cameraFar = kCameraFar;
+  d.cameraFovAngleVertical = kCameraFovY;
+  d.viewSpaceToMetersFactor = 1.0f;
+  if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK) {
+    PGR4_WARN_ONCE("PGR4 native upscaler: ffxDispatch failed ({})", rc);
+    return nullptr;
+  }
+  reset_ = false;
+  upscaled_ = true;
+  output_.guest_format = color->guest_format;
+  return &output_;
+}
+
+}  // namespace pgr4::native
