@@ -62,12 +62,13 @@ command line overrides it: in Steam's launch options, `%command% --fullscreen=fa
 
 ## Upscaling
 
-The 3D scene uses the game's own 2x MSAA by default, and `pgr4_native_msaa` sets 1, 4 or 8
-samples instead. More samples cost GPU time: on a Steam Deck OLED at 90 Hz in the St Petersburg
-race, 8x still averages about 88 fps, but its 1% lows drop from about 69 to 47 fps. With
+The release settings give the 3D scene 4x MSAA (`pgr4_native_msaa`: 1, 2 for the game's own, 4
+or 8). More samples cost GPU time: on a Steam Deck OLED at 90 Hz in the St Petersburg race, with
+16x anisotropic filtering, 4x averages 89.7 fps with 1% lows of 62.6 fps (GPU 86 % busy), and 8x
+about 88 fps with 1% lows near 47 fps. With
 `pgr4_native_upscaler = true` in `pgr4_recompiled.toml`, AMD's FidelityFX Super Resolution
-antialiases the scene instead and upscales it to 1280x720. The scene renders at `pgr4_native_upscaler_width` x
-`pgr4_native_upscaler_height`:
+antialiases the scene instead and upscales it to 1280x720. The scene renders at
+`pgr4_native_upscaler_width` x `pgr4_native_upscaler_height`:
 
 | Size | FSR's name for it |
 |---|---|
@@ -76,8 +77,8 @@ antialiases the scene instead and upscales it to 1280x720. The scene renders at 
 | 752x423 | Balanced |
 | 640x360 | Performance |
 
-F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view.
-The interface always stays at full resolution, and no sharpening is added.
+With `pgr4_native_upscaler_keys = true`, F7 switches between MSAA and the upscaler while you play,
+and F8 shows the upscaler's debug view. The interface always stays at full resolution, and no sharpening is added.
 
 On a Steam Deck OLED, MSAA is still the fastest at 90 fps. In a St Petersburg race, MSAA averaged
 89.6 fps, FSR at 1280x720 84.0 and FSR at 853x480 86.9. The upscaler is there for its image, and

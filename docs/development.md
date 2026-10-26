@@ -115,9 +115,10 @@ to `~/pgr4-proton/play/logs/<stamp>-*`.
   `marks.py` turn the dumps into PNG sheets with the frame CSV's counters.
 - **Renderer switch.** F9 switches to the Xenos plugin and back at the next Swap. A bug that
   stays with Xenos is in the game or the SDK, and one that goes away is the renderer's.
-- **Upscaler switch.** F7 switches the 3D scene between MSAA and FidelityFX Super Resolution at
-  the next frame, and F8 shows FSR's debug view: its color, depth, motion vector and
-  reactiveness inputs and its output, in a grid. The motion vector tile shows a draw whose
+- **Upscaler switch.** With `--pgr4_native_upscaler_keys` (on in `play.sh --debug`), F7
+  switches the 3D scene between MSAA and FidelityFX Super Resolution at the next frame, and F8
+  shows FSR's debug view: its color, depth, motion vector and reactiveness inputs and its
+  output, in a grid. The motion vector tile shows a draw whose
   motion is wrong (an unmatched draw is still, and ghosts). The achievements overlay is on F6.
 - **Draw logs.** `--pgr4_native_draw_log_from=<frame>` with `_draw_log_frames=<n>`, or
   `deck-run.sh --draw-log N`, logs every draw, clear, resolve and render target creation of those
