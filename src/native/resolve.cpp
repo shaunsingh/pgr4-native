@@ -864,7 +864,7 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
   if (copy_x1 > x0 && copy_y1 > y0 && dx >= 0 && dy >= 0) {
     const D3D12_RECT src = {LONG(x0), LONG(y0), LONG(copy_x1), LONG(copy_y1)};
     RenderTarget* source = rt;
-    if (upscaler_ && Upscaler::IsScene(p.regs.surface_info)) {
+    if (upscaler_ && Upscaler::IsScene(p.regs.surface_info) && Upscaler::IsSceneWidth(p.x0, p.x1)) {
       RenderTarget* upscaled = upscaler_->Upscale(list, *targets_, p.regs);
       if (upscaled && !depth) source = upscaled;
     }

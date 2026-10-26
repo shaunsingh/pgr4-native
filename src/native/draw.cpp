@@ -3273,7 +3273,10 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
   }
   // The upscaler's jitter in render pixels, a translation in host clip space as FSR's docs
   // apply it to the projection (NDC y up, pixels down).
-  if (const Upscaler* upscaler = r.upscaler(); upscaler && Upscaler::IsScene(surface_info.value)) {
+  if (const Upscaler* upscaler = r.upscaler();
+      upscaler && Upscaler::IsScene(surface_info.value) &&
+      Upscaler::IsSceneWidth(int32_t(vp.xy_offset[0]),
+                             int32_t(vp.xy_offset[0] + vp.xy_extent[0]))) {
     const float w = float(std::max(vp.xy_extent[0], 1u)) * targets.scale.factor(0);
     const float h = float(std::max(vp.xy_extent[1], 1u)) * targets.scale.factor(1);
     sys.ndc_offset[0] += 2.0f * upscaler->jitter_x() / w;
