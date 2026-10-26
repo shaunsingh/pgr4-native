@@ -126,7 +126,8 @@ In `OptiScaler.ini`, `Dx12Upscaler` picks the upscaler (`ffx` for FSR 3.1 and 4,
 an OptiScaler that knows the Lite model (its current source does) with `Fsr4GpuSupport=4`.
 OptiScaler then answers AMD's GPU query itself, without FSR4Injector's shim. Keep the render
 size in `pgr4_native_upscaler_width` and `_height`: the game renders at that size whatever
-OptiScaler's own ratio settings say.
+OptiScaler's own ratio settings say. Insert opens OptiScaler's menu (`ShortcutKey` in
+`OptiScaler.ini` changes the key).
 
 ## Geometry Wars
 

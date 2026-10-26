@@ -28,6 +28,7 @@ scripts/build.sh --game <disc folder> --update <title update package or folder>
 scripts/play.sh --install      # install the build and write the Steam desktop entries
 scripts/play.sh                # play
 scripts/play.sh --debug        # play with logs, the frame CSV, marks (F12) and a CPU profile
+scripts/play.sh --fgmod        # play with FSR 4's Lite model through OptiScaler (Insert: its menu)
 scripts/deck-run.sh deck <tag> --refresh 90 --hold 45 --output eDP-1   # scripted race with timings
 ```
 
