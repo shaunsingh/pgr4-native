@@ -145,7 +145,7 @@ Anything the render thread reads late must not change under it.
 | `shader_cache`, `shader_translate`, `shader_xlate.cmake` | Ucode to DXBC, keyed by XXH3 of the ucode and translated per modification with ReXGlue's DXBC translator |
 | `shader_specialize` | Bool-constant specialization, which rewrites the ucode's control flow for a draw's bool constants and loads the result as a shader of its own |
 | `geometry_shader` | Generated geometry shaders for points, rectangle lists and quads |
-| `render_targets` | Host render targets for the guest's EDRAM surfaces, with deferred and merged clears |
+| `render_targets` | Host render targets for the guest's EDRAM surfaces, with deferred and merged clears. The scene's can have other sample counts than the guest's (`OverrideScene`: one for the upscaler, `--pgr4_native_msaa`'s otherwise); a resolve out of one averages all its samples or takes sample 0 |
 | `resolve` | Guest resolves into host images keyed by destination, through compute shaders specialized for each kind of resolve. `resolve_debug` holds dumps and the self-test |
 | `textures`, `texture_layout` | `TextureCache`, which maps fetch constants to host textures and handles untiling, format conversion, page watches, resolved-image copies, placed heaps and eviction |
 | `upload_pool.h` | Persistently mapped upload blocks, allocated linearly and recycled by fence |

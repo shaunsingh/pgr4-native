@@ -60,6 +60,7 @@ executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings.
 | `--pgr4_native_texture_capture_order` | true | Bind textures as they were when the game queued the draw |
 | `--pgr4_native_texture_memory_soft_mb=<n>` | 512 | Above this much texture memory, destroy textures unused for `_soft_lifetime_s` (30) seconds (0 means no limit) |
 | `--pgr4_native_texture_memory_hard_mb=<n>` | 1024 | Above this much texture memory, destroy the least recently used textures (0 means no limit) |
+| `--pgr4_native_msaa=<n>` | 2 | Samples per pixel of the 3D scene's MSAA when the upscaler is off: 1, 2 (the game's own), 4 or 8 (fewer if the GPU lacks them) |
 | `--pgr4_native_upscaler` | false | Antialias and upscale the 3D scene with FidelityFX Super Resolution instead of MSAA (F7 switches, F8 shows its debug view). OptiScaler and FSR 4: `scripts/release/README.md`, "Upscaling" |
 | `--pgr4_native_upscaler_width=<n>` | 1280 | Width the upscaler's scene renders at, 320 to 1280 (853 for FSR's Quality, 640 for Performance) |
 | `--pgr4_native_upscaler_height=<n>` | 720 | Height the upscaler's scene renders at, 180 to 720 (480 for Quality, 360 for Performance) |

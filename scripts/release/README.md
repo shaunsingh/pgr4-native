@@ -62,9 +62,11 @@ command line overrides it: in Steam's launch options, `%command% --fullscreen=fa
 
 ## Upscaling
 
-The 3D scene uses the game's own 2x MSAA by default. With `pgr4_native_upscaler = true` in
-`pgr4_recompiled.toml`, AMD's FidelityFX Super Resolution antialiases the scene instead and
-upscales it to 1280x720. The scene renders at `pgr4_native_upscaler_width` x
+The 3D scene uses the game's own 2x MSAA by default, and `pgr4_native_msaa` sets 1, 4 or 8
+samples instead. More samples cost GPU time: on a Steam Deck OLED at 90 Hz in the St Petersburg
+race, 8x still averages about 88 fps, but its 1% lows drop from about 69 to 47 fps. With
+`pgr4_native_upscaler = true` in `pgr4_recompiled.toml`, AMD's FidelityFX Super Resolution
+antialiases the scene instead and upscales it to 1280x720. The scene renders at `pgr4_native_upscaler_width` x
 `pgr4_native_upscaler_height`:
 
 | Size | FSR's name for it |
