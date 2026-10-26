@@ -39,6 +39,13 @@ void SetLanes(uint32_t lanes[2], uint64_t count) {
   lanes[1] = uint32_t(count) >> 1;
 }
 
+// A host count in guest samples, rounded to nearest and at least 1 when not 0 (Canary's
+// XenosZPDReport::Normalized for its draw resolution scale).
+uint64_t GuestCount(uint64_t count, float guest_per_host) {
+  if (!count || guest_per_host == 1.0f) return count;
+  return std::max<uint64_t>(1, uint64_t(double(count) * guest_per_host + 0.5));
+}
+
 }  // namespace
 
 bool OcclusionQueries::Initialize(ID3D12Device* device) {
@@ -58,6 +65,7 @@ bool OcclusionQueries::Initialize(ID3D12Device* device) {
   if (Failed(readback_->Map(0, &all, &data), "Map(occlusion readback)")) return false;
   counts_ = static_cast<const uint64_t*>(data);
   coverage_drawn_.assign(kPairs, 0);
+  guest_per_host_.assign(kPairs, 1.0f);
   REXLOG_INFO("PGR4 native: the game's occlusion queries are counted on the host");
   return true;
 }
@@ -109,10 +117,12 @@ void OcclusionQueries::BeginCoverage(ID3D12GraphicsCommandList* list, uint32_t p
   list->BeginQuery(heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, 2 * pair + 1);
 }
 
-void OcclusionQueries::EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, bool drawn) {
+void OcclusionQueries::EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, bool drawn,
+                                   float guest_per_host) {
   // Ended even without a draw: every query of a resolved range must have been issued.
   list->EndQuery(heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, 2 * pair + 1);
   coverage_drawn_[pair] = drawn;
+  guest_per_host_[pair] = guest_per_host;
 }
 
 void OcclusionQueries::Resolve(ID3D12GraphicsCommandList* list, uint64_t frame_fence) {
@@ -143,8 +153,9 @@ void OcclusionQueries::Retire(uint64_t completed_fence) {
     for (uint64_t p = e.first; p < e.end; ++p) {
       const uint32_t i = uint32_t(p % kPairs);
       const uint64_t z_pass = counts_[2 * i];
-      r.z_pass += z_pass;
-      r.coverage += coverage_drawn_[i] ? std::max(counts_[2 * i + 1], z_pass) : z_pass;
+      const uint64_t coverage = coverage_drawn_[i] ? std::max(counts_[2 * i + 1], z_pass) : z_pass;
+      r.z_pass += GuestCount(z_pass, guest_per_host_[i]);
+      r.coverage += GuestCount(coverage, guest_per_host_[i]);
     }
     results_[e.query] = r;
     ended_.pop_front();

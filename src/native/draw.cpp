@@ -464,7 +464,10 @@ struct SamplerKey {
   uint32_t aniso : 3 = 0;                                      // xenos::AnisoFilter
   uint32_t mag_linear : 1 = 0, min_linear : 1 = 0, mip_linear : 1 = 0, mip_base_map : 1 = 0;
   uint32_t mip_min_level : 4 = 0;  // below xenos::kTextureMaxMips
-  uint32_t reserved : 10 = 0;
+  // Negative LOD bias in quarter levels, of linearly filtered textures with mips only (the
+  // upscaler's scene, Upscaler::mip_bias_quarters).
+  uint32_t lod_bias : 4 = 0;
+  uint32_t reserved : 6 = 0;
   uint32_t value() const { return std::bit_cast<uint32_t>(*this); }
 };
 static_assert(sizeof(SamplerKey) == sizeof(uint32_t));
@@ -476,9 +479,10 @@ xenos::ClampMode NormalizeClampMode(xenos::ClampMode m) {
   return m;
 }
 
-// `min_aniso`: --pgr4_native_anisotropy (DrawRenderer::Impl::min_aniso).
+// `min_aniso`: --pgr4_native_anisotropy (DrawRenderer::Impl::min_aniso); `lod_bias`: the
+// draw's SamplerKey::lod_bias.
 SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBinding& binding,
-                         xenos::AnisoFilter min_aniso) {
+                         xenos::AnisoFilter min_aniso, uint32_t lod_bias) {
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
   SamplerKey k{};
   xenos::ClampMode cx, cy, cz;
@@ -509,8 +513,10 @@ SamplerKey GetSamplerKey(const RegisterFile& regs, const DxbcShader::SamplerBind
   // Linearly filtered textures with mips get at least `min_aniso`; render targets, lookup
   // tables and other point-sampled or single-level textures keep the game's filtering.
   if (mag == xenos::TextureFilter::kLinear && min == xenos::TextureFilter::kLinear &&
-      mip != xenos::TextureFilter::kBaseMap && mip_max_level > mip_min_level)
+      mip != xenos::TextureFilter::kBaseMap && mip_max_level > mip_min_level) {
     aniso = std::max(aniso, min_aniso);
+    k.lod_bias = lod_bias;
+  }
   k.aniso = uint32_t(aniso);
   if (aniso != xenos::AnisoFilter::kDisabled) {
     k.mag_linear = k.min_linear = k.mip_linear = 1;
@@ -561,6 +567,7 @@ D3D12_SAMPLER_DESC SamplerDesc(const SamplerKey& k) {
     default:
       break;
   }
+  d.MipLODBias = float(k.lod_bias) * -0.25f;
   d.MinLOD = float(k.mip_min_level);
   if (k.mip_base_map) {
     d.MaxLOD = d.MinLOD;
@@ -786,6 +793,7 @@ struct DrawRenderer::Impl {
   struct SamplerMemo {
     uint32_t fetch[6] = {};
     uint8_t filters[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    uint32_t lod_bias = 0;
     uint32_t index = 0;
   };
   static constexpr uint32_t kSamplerMemoBits = 10;
@@ -819,6 +827,7 @@ struct DrawRenderer::Impl {
     // Fields a hit reads, packed so a hit reads one contiguous run (entry[] only when the epoch
     // moved, or at its first hit in a frame).
     const DxbcShader* shader = nullptr;
+    uint32_t lod_bias = 0;  // the samplers' (TextureBindContext::lod_bias)
     uint64_t epoch = 0;
     uint64_t used = 0;  // bind_clock at the last fill or set lookup (the set's replacement order)
     uint64_t touched = 0;  // the frame fence its textures were last marked used with
@@ -1092,6 +1101,7 @@ struct DrawRenderer::Impl {
     uint64_t frame_fence;
     uint64_t captured;  // TextureCache::MarkCapture stamp
     uint8_t* signs;     // [32], by fetch constant: the bound textures' swizzled signs
+    uint32_t lod_bias;  // SamplerKey::lod_bias of the draw's samplers
   };
   // The shader's descriptor table into `indices`; returns its entry count.
   uint32_t BindTextures(const TextureBindContext& ctx, const DxbcShader& shader, uint32_t* indices);
@@ -2782,7 +2792,10 @@ PipelineKey DrawRenderer::Impl::BuildPipelineKey(
     GetPreferredFacePolygonOffset(regs, polygonal, poly_offset_scale, poly_offset);
     key.depth_bias = rex::graphics::draw_util::GetD3D10IntegerPolygonOffset(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format, poly_offset);
-    key.slope_scaled_depth_bias = poly_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+    // The slope is per host pixel: scaled like Canary's for its draw resolution scale, by the
+    // larger factor (more bias rather than Z fighting).
+    key.slope_scaled_depth_bias = poly_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit *
+                                  std::max(targets.scale.factor(0), targets.scale.factor(1));
     key.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
     if (targets.depth) {
       uint8_t func = uint8_t(xenos::CompareFunction::kAlways);
@@ -3047,7 +3060,7 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
   // While the draw log records, every binding goes through Get so each one is logged.
   if (!draw_log && ss.count <= BindMemo::kMaxSlots && tex.size() <= BindMemo::kMaxBound) {
     auto same_fetch = [&](const BindMemo& e) {
-      if (e.shader != &shader) return false;
+      if (e.shader != &shader || e.lod_bias != ctx.lod_bias) return false;
       const uint32_t* stored = e.data;
       for (uint32_t m = ss.mask; m; m &= m - 1, stored += 6)
         if (std::memcmp(stored, s.fetch(uint32_t(std::countr_zero(m))), 24) != 0) return false;
@@ -3060,7 +3073,8 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
       found = true;
       profile::Count(profile::kBindMru);
     } else {
-      uint64_t h = uint64_t(reinterpret_cast<uintptr_t>(&shader)) * 0x9E3779B97F4A7C15ull;
+      uint64_t h =
+          (uint64_t(reinterpret_cast<uintptr_t>(&shader)) ^ ctx.lod_bias) * 0x9E3779B97F4A7C15ull;
       for (uint32_t m = ss.mask; m; m &= m - 1) {
         const uint32_t* f = s.fetch(uint32_t(std::countr_zero(m)));
         uint64_t a, b, c;
@@ -3171,15 +3185,17 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
     uint32_t fw;
     std::memcpy(&fw, filters, 4);
     sh = (sh ^ fw) * 0x9E3779B1u;
+    sh = (sh ^ ctx.lod_bias) * 0x9E3779B1u;
     SamplerMemo& m = sampler_memo[sh >> (32 - kSamplerMemoBits)];
     uint32_t index;
-    if (std::memcmp(m.filters, filters, 4) == 0 &&
+    if (std::memcmp(m.filters, filters, 4) == 0 && m.lod_bias == ctx.lod_bias &&
         std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0) {
       index = m.index;
     } else {
-      index = SamplerDescriptor(GetSamplerKey(regs, sb, min_aniso));
+      index = SamplerDescriptor(GetSamplerKey(regs, sb, min_aniso, ctx.lod_bias));
       std::memcpy(m.filters, filters, 4);
       std::memcpy(m.fetch, fetch, sizeof(m.fetch));
+      m.lod_bias = ctx.lod_bias;
       m.index = index;
     }
     if (sb.bindless_descriptor_index < 64) indices[sb.bindless_descriptor_index] = index;
@@ -3189,6 +3205,7 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
   stats.textures_stale += stale;
   if (bm && !missing && !stale) {
     bm->shader = &shader;
+    bm->lod_bias = ctx.lod_bias;
     bm->epoch = epoch;
     bm->touched = frame_fence;  // Get marked them
     uint32_t* stored = bm->data;
@@ -3254,11 +3271,13 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
     sys.ndc_scale[i] = vp.ndc_scale[i];
     sys.ndc_offset[i] = vp.ndc_offset[i];
   }
-  // The upscaler's jitter, a translation in host clip space as FSR's docs apply it to the
-  // projection (NDC y up, pixels down).
+  // The upscaler's jitter in render pixels, a translation in host clip space as FSR's docs
+  // apply it to the projection (NDC y up, pixels down).
   if (const Upscaler* upscaler = r.upscaler(); upscaler && Upscaler::IsScene(surface_info.value)) {
-    sys.ndc_offset[0] += 2.0f * upscaler->jitter_x() / float(std::max(vp.xy_extent[0], 1u));
-    sys.ndc_offset[1] -= 2.0f * upscaler->jitter_y() / float(std::max(vp.xy_extent[1], 1u));
+    const float w = float(std::max(vp.xy_extent[0], 1u)) * targets.scale.factor(0);
+    const float h = float(std::max(vp.xy_extent[1], 1u)) * targets.scale.factor(1);
+    sys.ndc_offset[0] += 2.0f * upscaler->jitter_x() / w;
+    sys.ndc_offset[1] -= 2.0f * upscaler->jitter_y() / h;
   }
   if (prim == xenos::PrimitiveType::kPointList) {
     auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
@@ -3391,9 +3410,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   ShaderModifications mods = mods_memo.mods;
   const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
   // The upscaler's scene: the draws that write depth write their motion too.
+  const Upscaler* const scene_upscaler =
+      Upscaler::IsScene(sdr.rb_surface_info) ? r.upscaler() : nullptr;
   const bool motion = mods.pixel_shader_used && depth_control.z_enable &&
-                      depth_control.z_write_enable && r.upscaler() &&
-                      Upscaler::IsScene(sdr.rb_surface_info);
+                      depth_control.z_write_enable && scene_upscaler;
   if (motion) mods = WithMotionVectors(mods);
   const uint64_t generic_pixel_mod = mods.pixel;
   mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
@@ -3585,7 +3605,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
                                    r.textures(),
                                    r.frame_fence(),
                                    prep ? prep->captured : TextureCache::kCapturedNow,
-                                   signs};
+                                   signs,
+                                   scene_upscaler ? scene_upscaler->mip_bias_quarters() : 0};
   const uint32_t n_desc_vs = BindTextures(bind, *vs, desc_vs);
   const uint32_t n_desc_ps = ps ? BindTextures(bind, *ps, desc_ps) : 1;
   if (!ps) desc_ps[0] = 0;
@@ -3616,16 +3637,19 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   FlushCopies(list);
   profile::Mark(profile::kVertices);
 
-  // Fixed-function state.
-  D3D12_VIEWPORT viewport = {float(vp.xy_offset[0]),
-                             float(vp.xy_offset[1]),
-                             float(vp.xy_extent[0]),
-                             float(vp.xy_extent[1]),
+  // Fixed-function state, in the targets' host pixels. The pixel position PsParamGen gives
+  // stays in host pixels: the scene's shader that reads it in the race (3F533EA17A8E6CFC, draw
+  // logs of td-265) uses only its facing sign.
+  const float sx = targets.scale.factor(0), sy = targets.scale.factor(1);
+  D3D12_VIEWPORT viewport = {float(vp.xy_offset[0]) * sx,
+                             float(vp.xy_offset[1]) * sy,
+                             float(vp.xy_extent[0]) * sx,
+                             float(vp.xy_extent[1]) * sy,
                              vp.z_min,
                              vp.z_max};
-  D3D12_RECT scissor_rect = {LONG(scissor.offset[0]), LONG(scissor.offset[1]),
-                             LONG(scissor.offset[0] + scissor.extent[0]),
-                             LONG(scissor.offset[1] + scissor.extent[1])};
+  const D3D12_RECT scissor_rect = targets.scale.Rect(
+      {LONG(scissor.offset[0]), LONG(scissor.offset[1]),
+       LONG(scissor.offset[0] + scissor.extent[0]), LONG(scissor.offset[1] + scissor.extent[1])});
 
   // Root state.
   if (list_dirty) {
@@ -3789,7 +3813,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
       issue();
     }
-    occlusion->EndCoverage(list, pair, cover != nullptr);
+    const RenderTarget* const t = targets.depth ? targets.depth : targets.color[0];
+    const float guest_per_host =
+        t ? float(t->edram_samples) /
+                (float(t->samples) * targets.scale.factor(0) * targets.scale.factor(1))
+          : 1.0f;
+    occlusion->EndCoverage(list, pair, cover != nullptr, guest_per_host);
   }
   ++stats.draws;
   ++diag.draws;

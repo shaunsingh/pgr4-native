@@ -141,7 +141,18 @@ bool Intersects(const D3D12_RECT& a, const D3D12_RECT& b) {
   return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
 }
 
-// One clear call of `v` over `rects` (none: the whole target).
+// `n` rectangles in rt's guest pixels on its host resource, into `out`, without those that cover
+// no host pixel; returns how many are left.
+size_t ScaleRects(const RenderTarget& rt, const D3D12_RECT* rects, size_t n, D3D12_RECT* out) {
+  size_t kept = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const D3D12_RECT r = rt.scale.Rect(rects[i]);
+    if (!IsWhole(r)) out[kept++] = r;
+  }
+  return kept;
+}
+
+// One clear call of `v` over `rects` (host pixels; none: the whole target).
 void Record(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
             const D3D12_RECT* rects, UINT n) {
   if (rt->depth) {
@@ -230,8 +241,8 @@ void RenderTargets::Retire(ComPtr<ID3D12Resource> resource) {
 bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   D3D12_RESOURCE_DESC d = {};
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  d.Width = std::max(1u, rt->pitch);
-  d.Height = height;
+  d.Width = rt->scale.Extent(std::max(1u, rt->pitch), 0);
+  d.Height = rt->scale.Extent(height, 1);
   d.DepthOrArraySize = 1;
   d.MipLevels = 1;
   d.Format = rt->resource_format;
@@ -254,11 +265,11 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   if (log_)
     std::fprintf(log_, "rt created %s base %u pitch %u x%u format %d %ux%u%s\n",
                  rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
-                 int(rt->view_format), uint32_t(d.Width), height, rt->resource ? " (grown)" : "");
+                 int(rt->view_format), uint32_t(d.Width), d.Height, rt->resource ? " (grown)" : "");
   Retire(std::move(rt->resource));
   rt->resource = std::move(res);
   rt->state = initial;
-  rt->width = uint32_t(d.Width);
+  rt->width = std::max(1u, rt->pitch);
   rt->height = height;
   rt->pending_count = 0;  // a grown target loses the old one's content
   if (rt->view_index == UINT32_MAX) {
@@ -292,7 +303,8 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
                                  uint32_t height) {
   const uint32_t pitch = surface_info & 0x3FFF;
   const uint32_t edram_samples = SurfaceSamples(surface_info);
-  const uint32_t samples = HostSamples(surface_info);
+  const bool upscaled = IsUpscaled(surface_info);
+  const uint32_t samples = upscaled ? 1 : edram_samples;
   const uint32_t base = info & 0xFFF;
   DXGI_FORMAT resource, view, srv, stencil_srv = DXGI_FORMAT_UNKNOWN;
   uint32_t guest_format;
@@ -321,8 +333,10 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     wide = Is64bpp(guest_format);
   }
   if (pitch == 0) return nullptr;
+  // An upscaled target is not the guest-sized one-sample target of the same surface's pitch.
   const uint64_t key = (uint64_t(depth) << 63) | (uint64_t(samples >> 1) << 60) |
-                       (uint64_t(base) << 44) | (uint64_t(pitch) << 30) | uint64_t(view);
+                       (uint64_t(upscaled) << 56) | (uint64_t(base) << 44) |
+                       (uint64_t(pitch) << 30) | uint64_t(view);
   GetMemo& memo = get_memo_[(key ^ (key >> 30) ^ (key >> 44) ^ (key >> 60)) & 15];
   if (memo.rt && memo.key == key && std::min(height, kMaxHeight) <= memo.rt->height) {
     memo.rt->guest_format = guest_format;
@@ -342,6 +356,7 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     rt->pitch = pitch;
     rt->samples = samples;
     rt->edram_samples = edram_samples;
+    if (upscaled) rt->scale = upscaled_scale_;
     rt->resource_format = resource;
     rt->view_format = view;
     rt->srv_format = srv;
@@ -404,6 +419,7 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
     out->color[i] = rt;
     out->rtv[i] = rt->view;
     out->color_count = i + 1;
+    out->scale = rt->scale;
     out->width = std::min(out->width, rt->width);
     out->height = std::min(out->height, rt->height);
   }
@@ -414,6 +430,7 @@ bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& reg
     if (rt->pending_count) Flush(list, rt);
     out->depth = rt;
     out->dsv = rt->view;
+    out->scale = rt->scale;
     out->width = std::min(out->width, rt->width);
     out->height = std::min(out->height, rt->height);
   }
@@ -450,7 +467,7 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
     p.depth = float(args.f[0]);
     p.stencil = uint8_t(args.r[6]);
     if (rects)
-      for (uint32_t i = 0; i < count && i < 64; ++i) read_rect(rects + i * 16);
+      for (uint32_t i = 0; i < count && i < kMaxClearRects; ++i) read_rect(rects + i * 16);
     if (rects && count && p.rects.empty()) return false;  // only empty rectangles
   } else if (args.fn == HookFn::kClearF) {
     // ClearF(dev, Flags r4, pRect r5, pColor r6 (D3DVECTOR4), Z f1, Stencil r8): Z takes r7's
@@ -543,20 +560,25 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
 }
 
 void RenderTargets::Defer(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
-                          const std::vector<D3D12_RECT>& rects) {
-  DropCovered(rt, v.flags, rects.data(), rects.size());
+                          const std::vector<D3D12_RECT>& guest_rects) {
+  D3D12_RECT rects[kMaxClearRects];
+  const size_t count = ScaleRects(*rt, guest_rects.data(),
+                                  std::min<size_t>(guest_rects.size(), kMaxClearRects), rects);
+  // Rectangles too small to cover a host pixel clear nothing (an empty one would be all of it).
+  if (!guest_rects.empty() && !count) return;
+  DropCovered(rt, v.flags, rects, count);
   // Outside the rectangles the target shows what the EDRAM holds there.
-  if (!rects.empty() && rt->fill_seq != fill_seq_) SyncEdram(list, rt);
-  const size_t n = std::max<size_t>(rects.size(), 1);
+  if (count && rt->fill_seq != fill_seq_) SyncEdram(list, rt);
+  const size_t n = std::max<size_t>(count, 1);
   if (rt->pending_count + n > kMaxPendingClears) Flush(list, rt);
   if (n > kMaxPendingClears) {
-    Record(list, rt, v, rects.data(), UINT(rects.size()));
+    Record(list, rt, v, rects, UINT(count));
     return;
   }
-  if (rects.empty()) {
+  if (!count) {
     rt->pending[rt->pending_count++] = {v, {}};
   } else {
-    for (const D3D12_RECT& r : rects) rt->pending[rt->pending_count++] = {v, r};
+    for (size_t i = 0; i < count; ++i) rt->pending[rt->pending_count++] = {v, rects[i]};
   }
 }
 
@@ -606,8 +628,10 @@ void RenderTargets::Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
 void RenderTargets::PrepareRead(ID3D12GraphicsCommandList* list, RenderTarget* rt,
                                 const D3D12_RECT& r) {
   if (!rt->depth) SyncEdram(list, rt);
-  if (std::any_of(rt->pending.begin(), rt->pending.begin() + rt->pending_count,
-                  [&](const PendingClear& c) { return IsWhole(c.rect) || Intersects(c.rect, r); }))
+  const D3D12_RECT host = rt->scale.Rect(r);
+  if (std::any_of(
+          rt->pending.begin(), rt->pending.begin() + rt->pending_count,
+          [&](const PendingClear& c) { return IsWhole(c.rect) || Intersects(c.rect, host); }))
     Flush(list, rt);
 }
 
@@ -674,15 +698,16 @@ void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt)
       continue;
     }
     // The whole pixels inside each span, clipped to the target.
-    D3D12_RECT rects[3];
-    UINT nr = 0;
+    D3D12_RECT guest[3], rects[3];
+    UINT ng = 0;
     for (int32_t i = 0; i < n; ++i) {
       const GridSpan& s = spans[i];
       const int64_t x0 = (s.x0 + g.dx - 1) / g.dx, x1 = std::min<int64_t>(s.x1 / g.dx, rt->width);
       const int64_t y0 = (std::max<int64_t>(s.y0, 0) + g.dy - 1) / g.dy;
       const int64_t y1 = std::min<int64_t>(s.y1 / g.dy, rt->height);
-      if (x1 > x0 && y1 > y0) rects[nr++] = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
+      if (x1 > x0 && y1 > y0) guest[ng++] = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
     }
+    const UINT nr = UINT(ScaleRects(*rt, guest, ng, rects));
     if (!nr) continue;
     // The pending clears are older than the fill: those under it are never seen.
     if (rt->pending_count) {

@@ -35,6 +35,7 @@
 
 #include "d3d12_device.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -78,6 +79,28 @@ constexpr uint32_t kDevTileRects = 12744;
 constexpr uint32_t kDevTileOrigins = 12984;
 constexpr uint32_t kMaxTiles = 15;
 
+// Host pixels per guest pixel of a target, per axis, as num / den (1 / 1: the guest's size).
+// Only the upscaler's scene renders at another size (RenderTargets::Upscaled); everything
+// outside the host resources (guest rectangles, heights, the EDRAM) stays in guest pixels.
+struct RenderScale {
+  uint32_t num[2] = {1, 1}, den[2] = {1, 1};
+  bool identity() const { return num[0] == den[0] && num[1] == den[1]; }
+  float factor(int axis) const { return float(num[axis]) / float(den[axis]); }
+  // A guest pixel edge on the host, rounded to the nearest host pixel edge.
+  LONG Edge(LONG e, int axis) const {
+    return LONG((uint64_t(std::max<LONG>(e, 0)) * num[axis] + den[axis] / 2) / den[axis]);
+  }
+  // Host pixels holding `e` guest pixels.
+  uint32_t Extent(uint32_t e, int axis) const {
+    return uint32_t((uint64_t(e) * num[axis] + den[axis] - 1) / den[axis]);
+  }
+  D3D12_RECT Rect(const D3D12_RECT& r) const {
+    if (identity()) return r;
+    return {Edge(r.left, 0), Edge(r.top, 1), Edge(r.right, 0), Edge(r.bottom, 1)};
+  }
+  bool operator==(const RenderScale&) const = default;
+};
+
 // The values of one host target's clear: color, or depth and stencil.
 struct ClearValue {
   uint32_t flags = 0;  // a color target: 1; a depth target: D3D12_CLEAR_FLAGS
@@ -93,15 +116,17 @@ struct PendingClear {
   D3D12_RECT rect;
 };
 constexpr uint32_t kMaxPendingClears = 16;
+constexpr uint32_t kMaxClearRects = 64;  // of one guest Clear; more are ignored
 
 // One host render target.
 struct RenderTarget {
   bool depth = false;
-  uint32_t edram_base = 0;     // tiles
-  uint32_t pitch = 0;          // pixels (RB_SURFACE_INFO surface_pitch)
-  uint32_t samples = 1;        // 1, 2 or 4
-  uint32_t edram_samples = 1;  // the guest surface's (RenderTargets::SingleSample)
-  uint32_t width = 0, height = 0;
+  uint32_t edram_base = 0;         // tiles
+  uint32_t pitch = 0;              // pixels (RB_SURFACE_INFO surface_pitch)
+  uint32_t samples = 1;            // 1, 2 or 4
+  uint32_t edram_samples = 1;      // the guest surface's (RenderTargets::Upscaled)
+  uint32_t width = 0, height = 0;  // guest pixels; the resource is scale.Extent of them
+  RenderScale scale;
   uint32_t guest_format = 0;  // last xenos::ColorRenderTargetFormat / DepthRenderTargetFormat
   DXGI_FORMAT resource_format = DXGI_FORMAT_UNKNOWN;
   DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;         // RTV or DSV
@@ -127,6 +152,7 @@ struct BoundTargets {
   D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
   uint32_t samples = 1;
   uint32_t width = 0, height = 0;  // smallest bound target (the draw's maximum extent)
+  RenderScale scale;               // of every bound target (they are one surface's)
 };
 
 // Decoded Clear / ClearF arguments.
@@ -135,7 +161,7 @@ struct ClearParams {
   float color[4] = {};  // RGBA
   float depth = 1.0f;
   uint8_t stencil = 0;
-  std::vector<D3D12_RECT> rects;  // surface pixels; empty: whole surface
+  std::vector<D3D12_RECT> rects;  // surface pixels, up to kMaxClearRects; empty: whole surface
   // The EDRAM the guest clears, in pixels from the surface's EDRAM base, where it is not
   // `rects`: under predicated tiling every tile is rendered at the base, so BeginTiling's
   // ClearF clears the largest tile's extent there once (and `rects` holds every tile), and
@@ -195,11 +221,13 @@ class RenderTargets {
   // Frees replaced targets the GPU is done with and drops targets unused for kMaxAge frames.
   void BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t completed_fence);
 
-  // Host targets of the surfaces whose RB_SURFACE_INFO has `value` under `mask` have one sample,
-  // whatever the guest's MSAA (the upscaler's scene); mask 0: none. Between frames.
-  void SingleSample(uint32_t mask, uint32_t value) {
-    single_sample_mask_ = mask;
-    single_sample_value_ = value;
+  // Host targets of the surfaces whose RB_SURFACE_INFO has `value` under `mask` (the upscaler's
+  // scene) have one sample, whatever the guest's MSAA, and `scale`'s size; mask 0: none. They
+  // are other targets than the surfaces' guest-sized ones. Between frames.
+  void Upscaled(uint32_t mask, uint32_t value, const RenderScale& scale) {
+    upscaled_mask_ = mask;
+    upscaled_value_ = value;
+    upscaled_scale_ = scale;
   }
 
   // Forgets every recorded EDRAM fill, for clears that are not guest content (the resolve self
@@ -236,20 +264,21 @@ class RenderTargets {
   // (after its pending clears, which are older).
   void SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt);
 
-  // Adds `v` over `rects` (none: all of the target) to rt's pending clears.
+  // Adds `v` over `rects` (guest pixels; none: all of the target) to rt's pending clears.
   void Defer(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
              const std::vector<D3D12_RECT>& rects);
-  // Drops rt's pending clears that a later write of planes `flags` over `rects` (none: all of
-  // the target) overwrites.
+  // Drops rt's pending clears that a later write of planes `flags` over `rects` (host pixels, as
+  // the pending clears are; none: all of the target) overwrites.
   void DropCovered(RenderTarget* rt, uint32_t flags, const D3D12_RECT* rects, size_t n);
   // Records rt's pending clears into `list`, oldest first.
   void Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt);
 
   RenderTarget* Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height);
+  bool IsUpscaled(uint32_t surface_info) const {
+    return upscaled_mask_ && (surface_info & upscaled_mask_) == upscaled_value_;
+  }
   uint32_t HostSamples(uint32_t surface_info) const {
-    return single_sample_mask_ && (surface_info & single_sample_mask_) == single_sample_value_
-               ? 1
-               : SurfaceSamples(surface_info);
+    return IsUpscaled(surface_info) ? 1 : SurfaceSamples(surface_info);
   }
   void Retire(ComPtr<ID3D12Resource> resource);
   bool Create(RenderTarget* rt, uint32_t height);
@@ -277,7 +306,8 @@ class RenderTargets {
   std::vector<EdramFill> fills_;  // oldest first
   uint64_t fill_seq_ = 0;
   std::FILE* log_ = nullptr;
-  uint32_t single_sample_mask_ = 0, single_sample_value_ = 0;
+  uint32_t upscaled_mask_ = 0, upscaled_value_ = 0;
+  RenderScale upscaled_scale_;
 };
 
 }  // namespace pgr4::native

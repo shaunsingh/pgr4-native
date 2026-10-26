@@ -513,10 +513,10 @@ void NativeRenderer::SwitchUpscaler(bool on) {
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
   // and the unused ones age out (RenderTargets::BeginFrame).
   if (on) {
-    rt_->SingleSample(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface);
+    rt_->Upscaled(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, upscaler_->scale());
     upscaler_->Reset();
   } else {
-    rt_->SingleSample(0, 0);
+    rt_->Upscaled(0, 0, {});
   }
   resolver_->set_upscaler(upscaler());
   REXLOG_INFO("PGR4 native: the scene {}", on ? "upscaled by FidelityFX" : "with MSAA");

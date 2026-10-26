@@ -171,7 +171,7 @@ bool IsFloatFormat(uint32_t f) {
 
 const char kShader[] = R"(
 cbuffer Params : register(b0) {
-  int2 src_origin;      // source rectangle origin in the render target
+  int2 src_origin;      // source rectangle origin in the render target (guest pixels)
   uint2 size;           // rectangle size
   uint2 dest_origin;    // destination point in the image
   uint cb_dest_format;  // xenos::TextureFormat
@@ -181,6 +181,7 @@ cbuffer Params : register(b0) {
   int cb_exp_bias;
   uint cb_dest_layout;  // DestLayout of dst
   uint pad;
+  float2 src_scale;     // host pixels of the render target per guest pixel (RenderScale)
 };
 // A specialized variant has the parameters of one kind of resolve compiled in, so the compiler
 // drops the paths and conversions it does not take; the generic shader reads them above.
@@ -363,7 +364,8 @@ uint4 Unpack(uint4 v) {
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= size.x || id.y >= size.y) return;
   float4 floats;
-  uint4 v = PackPixel(src_origin + int2(id.xy), floats);
+  // The host pixel under the guest pixel's center (the same pixel at a scale of 1).
+  uint4 v = PackPixel(int2((float2(src_origin + int2(id.xy)) + 0.5) * src_scale), floats);
   uint2 p = dest_origin + id.xy;
 #if DEPTH
   dst[p] = Unpack(v);
@@ -386,8 +388,9 @@ struct ShaderConstants {
   uint32_t dest_format, src_format, flags;  // flags: kShader's cb_flags
   int32_t exp_bias;
   uint32_t dest_layout, pad;
+  float src_scale[2];
 };
-static_assert(sizeof(ShaderConstants) == 48);
+static_assert(sizeof(ShaderConstants) == 56);
 
 // What a copy pipeline is compiled for: the generic ones read the resolve's parameters from the
 // root constants, a specialized one has them compiled in (kShader's SPEC_* macros).
@@ -998,6 +1001,8 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
             (p.dest_number << 12) | (linear ? 0x8000u : 0u);
   c.exp_bias = p.exp_bias;
   c.dest_layout = storage->layout;
+  c.src_scale[0] = rt->scale.factor(0);
+  c.src_scale[1] = rt->scale.factor(1);
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   list->SetDescriptorHeaps(1, heaps);
   list->SetComputeRootSignature(pipelines_->root_signature.Get());

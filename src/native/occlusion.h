@@ -58,8 +58,10 @@ class OcclusionQueries {
   void EndPass(ID3D12GraphicsCommandList* list, uint32_t pair) const;
   void BeginCoverage(ID3D12GraphicsCommandList* list, uint32_t pair) const;
   // `drawn`: the coverage draw was issued; otherwise the pair's coverage is its ZPass (no depth
-  // or stencil test to fail, or no pipeline for the coverage draw yet).
-  void EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, bool drawn);
+  // or stencil test to fail, or no pipeline for the coverage draw yet). `guest_per_host`: guest
+  // samples per host sample of the draw's targets (fewer samples, or a smaller render size).
+  void EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, bool drawn,
+                   float guest_per_host);
   // At the Swap, into the frame's last list, which signals `frame_fence`.
   void Resolve(ID3D12GraphicsCommandList* list, uint64_t frame_fence);
   // After the Swap: the results of the guest queries whose frames completed, for WriteResult.
@@ -89,6 +91,7 @@ class OcclusionQueries {
   ComPtr<ID3D12Resource> readback_;
   const uint64_t* counts_ = nullptr;  // readback_, mapped: ZPass then coverage of each pair
   std::vector<uint8_t> coverage_drawn_;
+  std::vector<float> guest_per_host_;
   std::vector<Open> open_;
   std::deque<Ended> ended_;
   std::deque<std::pair<uint64_t, uint64_t>> resolves_;  // (pairs resolved up to, frame fence)
