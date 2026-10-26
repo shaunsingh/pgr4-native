@@ -25,6 +25,7 @@ REXCVAR_DEFINE_BOOL(
 REXCVAR_DEFINE_INT32(pgr4_native_hdr_peak_nits, 0, "PGR4 native",
                      "HDR output: the peak luminance in nits the image is fitted to; 0: the "
                      "display's, or 1000 when it reports none");
+REXCVAR_DECLARE(int32_t, d3d12_queue_priority);
 
 namespace pgr4::native {
 
@@ -167,11 +168,22 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
   char name[128] = {};
   WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
 
+  // The Xenos plugin's priority (d3d12_provider.cpp): its queue still submits at every guest
+  // swap, and vkd3d-proton submits a queue's lists one at a time, each after the last finished,
+  // while a queue of higher priority is active (staggered submissions, command.c).
+  constexpr D3D12_COMMAND_QUEUE_PRIORITY kPriorities[] = {
+      D3D12_COMMAND_QUEUE_PRIORITY_NORMAL, D3D12_COMMAND_QUEUE_PRIORITY_HIGH,
+      D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME};
   D3D12_COMMAND_QUEUE_DESC qd = {};
   qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  if (Failed(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(queue_.GetAddressOf())),
-             "CreateCommandQueue"))
-    return false;
+  qd.Priority = kPriorities[std::clamp(REXCVAR_GET(d3d12_queue_priority), 0, 2)];
+  HRESULT hr = device_->CreateCommandQueue(&qd, IID_PPV_ARGS(queue_.GetAddressOf()));
+  // Realtime needs a privilege; the plugin falls back to high without it.
+  if (FAILED(hr) && qd.Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME) {
+    qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+    hr = device_->CreateCommandQueue(&qd, IID_PPV_ARGS(queue_.GetAddressOf()));
+  }
+  if (Failed(hr, "CreateCommandQueue")) return false;
   queue_->SetName(L"pgr4 native queue");
   if (Failed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence_.GetAddressOf())),
              "CreateFence") ||
