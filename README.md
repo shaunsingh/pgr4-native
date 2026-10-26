@@ -9,6 +9,8 @@ Update #2), built on the [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK w
 
 ![St Petersburg on a Steam Deck OLED](docs/images/st-petersburg.jpg)
 
+![St Petersburg upscaled from 960x540 by FSR 4's Lite model through OptiScaler](docs/images/fsr4-lite.jpg)
+
 ## Building and running
 
 Most people should grab the latest release from https://github.com/shaunsingh/pgr4-native/releases,
