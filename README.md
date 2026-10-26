@@ -16,8 +16,9 @@ the instructions below are for active development of the latest changes etc
 
 The build runs on Linux and cross-compiles the Windows executables with clang-cl. They run under
 Proton, or on Windows. You need your own PGR4 disc, extracted, and Title Update #2, either as its
-package or as its two files. This repository contains no game data, and the C++ that the build
-generates from the game's executables must not be published.
+package or as its two files. The disc is region-free and the PAL one matches the NTSC one file for
+file, so either works, and `--user_language` picks the language. This repository contains no game
+data, and the C++ that the build generates from the game's executables must not be published.
 
 ```sh
 scripts/fetch-xwin.sh          # MSVC CRT and Windows SDK (accepts Microsoft's license)
@@ -65,6 +66,7 @@ executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings.
 | `--pgr4_native_hdr_paper_white=<n>` | 400 | Luminance of SDR white in HDR output, in nits |
 | `--pgr4_60fps` | false | Present every vblank instead of at the game's 30 FPS interval, when the native renderer does not pace the frames |
 | `--content_root=<dir>` | `<game>\Content` | Folder of content packages (title update, DLC) installed at startup |
+| `--user_language=<n>` | 1 | The game's language: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Traditional Chinese, 10 Simplified Chinese, 11 Polish, 12 Russian |
 | `--pgr4_native_csv=<file>` | off | Write per-frame counters and CPU times to this file |
 | `--pgr4_native_profile` | false | Add the draw path's CPU time per stage to the CSV |
 | `--pgr4_native_gpu_timing` | false | Log GPU time per pass (`_shaders` times per shader pair instead) |
