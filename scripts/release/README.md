@@ -77,6 +77,11 @@ antialiases the scene instead and upscales it to 1280x720. The scene renders at
 | 752x423 | Balanced |
 | 640x360 | Performance |
 
+With `pgr4_native_upscaler_target_fps` set (90 for the Steam Deck OLED), the upscaler starts at
+that size and lowers it, down to a height of `pgr4_native_upscaler_min_height`, whenever the
+GPU falls behind that frame rate, then raises it again once the GPU catches up. In the same race, FSR up to 1280x720 with a target
+of 90 averaged 86.9 fps with 1% lows of 64.1 fps, against 82.9 and 52.7 at a fixed 1280x720.
+
 F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view.
 Both start off. The interface always stays at full resolution, and no sharpening is added.
 

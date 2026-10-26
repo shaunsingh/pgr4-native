@@ -64,6 +64,8 @@ executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings.
 | `--pgr4_native_upscaler` | false | Antialias and upscale the 3D scene with FidelityFX Super Resolution instead of MSAA (F7 switches, F8 shows its debug view). OptiScaler and FSR 4: `scripts/release/README.md`, "Upscaling" |
 | `--pgr4_native_upscaler_width=<n>` | 1280 | Width the upscaler's scene renders at, 320 to 1280 (853 for FSR's Quality, 640 for Performance) |
 | `--pgr4_native_upscaler_height=<n>` | 720 | Height the upscaler's scene renders at, 180 to 720 (480 for Quality, 360 for Performance) |
+| `--pgr4_native_upscaler_target_fps=<n>` | 0 | Lower the upscaler's render size each frame, from the width and height down to `_min_height`, while the GPU's time per frame is above 90 % of this frame rate's (0 keeps a fixed size) |
+| `--pgr4_native_upscaler_min_height=<n>` | 360 | With a target frame rate, the least height the upscaler's scene renders at, 180 to 720 |
 | `--pgr4_native_anisotropy=<n>` | 1 | Minimum anisotropic filtering (2, 4, 8 or 16) for linearly filtered textures with mips. 1 keeps the game's own, and the release settings use 16 |
 | `--pgr4_native_frame_latency=<n>` | 3 | In primary mode, begin a frame once the display has shown the frame n before it (1 to 3, or 0 for the game's own vblank pacing) |
 | `--pgr4_native_low_latency` | true | Begin each frame as late as the time recent frames waited for the display allows |
