@@ -49,10 +49,6 @@ REXCVAR_DEFINE_BOOL(pgr4_native_primary, false, "PGR4 native",
                     "The native renderer is the game's output: it presents into the game window "
                     "and the Xenos plugin skips all draws, resolves and swaps (gpu_skip_draws, "
                     "patches/0031); implies --pgr4_native");
-REXCVAR_DEFINE_BOOL(pgr4_native_upscaler_keys, false, "PGR4 native",
-                    "With --pgr4_native_primary: bind_upscaler (F7) switches the scene between "
-                    "MSAA and the upscaler, and bind_upscaler_debug (F8) shows the upscaler's "
-                    "debug view");
 REXCVAR_DEFINE_INT32(pgr4_native_msaa, 2, "PGR4 native",
                      "Samples of the 3D scene's MSAA without the upscaler: 1, 2 (the game's), 4 "
                      "or 8 (fewer if the GPU lacks them)");
@@ -453,7 +449,7 @@ bool NativeRenderer::Initialize() {
                           [this] { switch_requested_.store(true, std::memory_order_relaxed); });
     switch_bound_ = true;
   }
-  if (primary && REXCVAR_GET(pgr4_native_upscaler_keys)) {
+  if (primary) {
     rex::ui::RegisterBind(
         "bind_upscaler", "F7",
         "PGR4 native: switch the 3D scene between MSAA and FidelityFX Super Resolution",

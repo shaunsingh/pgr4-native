@@ -9,8 +9,7 @@
 #                              150 frames, the per-frame CSV (frame_times.py, scripts/analysis/),
 #                              deck_sampler.py's GPU load and clock, APU power, CPU load per
 #                              thread and memory every second, marks (F12) and the glitch catcher,
-#                              the upscaler keys (F7, F8) and a CPU profile of every PGR4 and
-#                              Geometry Wars process
+#                              and a CPU profile of every PGR4 and Geometry Wars process
 #   play.sh --fgmod            play with the scene upscaled by FSR 4's Lite model, through
 #                              OptiScaler as fgmod (Decky Framegen's ~/fgmod) installs it, from
 #                              runtime-fgmod/: a copy of the build with AMD's amdxcffx64.dll 4.1.2
@@ -152,7 +151,7 @@ if [[ $debug != 0 ]]; then
   args+=(--pgr4_native_gpu_timing "--pgr4_native_csv=$(win "$base-frames.csv")"
     "--pgr4_native_capture_dir=$(win "$top/captures")" --pgr4_native_capture_xenos=false
     "--pgr4_native_glitch_catch=$(win "$base-")" --guest_frame_stats --pgr4_native_mark_audit=3
-    --pgr4_native_upscaler_keys --log_level=info)
+    --log_level=info)
   # err-hid: Wine logs every output report Steam's virtual pad gets (about 30 a second).
   export WINEDEBUG=${WINEDEBUG:-fixme-all,err-hid} VKD3D_DEBUG=${VKD3D_DEBUG:-warn}
 else

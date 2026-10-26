@@ -31,9 +31,8 @@ pgr4_native_upscaler = false
 pgr4_native_upscaler_width = 1280
 pgr4_native_upscaler_height = 720
 
-# With true, F7 switches the scene between MSAA and the upscaler and F8 shows the upscaler's debug
-# view. The achievements overlay is on F6 either way.
-pgr4_native_upscaler_keys = false
+# F7 switches the scene between MSAA and the upscaler, and F8 shows the upscaler's debug view, so
+# the achievements overlay moves to F6.
 bind_achievements = "F6"
 
 # Runtime settings.
