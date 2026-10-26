@@ -77,8 +77,8 @@ antialiases the scene instead and upscales it to 1280x720. The scene renders at
 | 752x423 | Balanced |
 | 640x360 | Performance |
 
-With `pgr4_native_upscaler_keys = true`, F7 switches between MSAA and the upscaler while you play,
-and F8 shows the upscaler's debug view. The interface always stays at full resolution, and no sharpening is added.
+F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view.
+Both start off. The interface always stays at full resolution, and no sharpening is added.
 
 On a Steam Deck OLED, MSAA is still the fastest at 90 fps. In a St Petersburg race, MSAA averaged
 89.6 fps, FSR at 1280x720 84.0 and FSR at 853x480 86.9. The upscaler is there for its image, and
