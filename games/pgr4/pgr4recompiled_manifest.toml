@@ -134,6 +134,216 @@ name = "Pgr4MotionBlurStepHook"
 registers = ["f0"]
 after_instruction = true
 
+# Native 16:10 (development.md's "Native 16:10"): the device's presentation size, its front buffer
+# and its depth buffer, hardcoded 1280x720 (sub_82317D48).
+[[entrypoint.midasm_hook]]
+address = 0x82317D98
+name = "Pgr4RenderHeightHook"
+registers = ["r11"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82317E6C
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82318050
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+# The same for the game's own 1280x720 surfaces: the front/back buffers and the scene's depth
+# (sub_824B8200, sub_824B86F8, sub_824D27B8, sub_82309394, sub_8287F8D0), the scene targets
+# (sub_82324DD8, sub_824B7F80), the three viewport structs (sub_824C15D0), the video-mode struct
+# (sub_828634B8) and the capture struct (sub_824D0840).
+[[entrypoint.midasm_hook]]
+address = 0x824B8274
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824B82D8
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824B888C
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x823253AC
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824D2854
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824B7FD8
+name = "Pgr4RenderHeightHook"
+registers = ["r5"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824B7FE4
+name = "Pgr4RenderHeightHook"
+registers = ["r11"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824C1670
+name = "Pgr4RenderHeightHook"
+registers = ["r10"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824C1680
+name = "Pgr4RenderHeightHook"
+registers = ["r10"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824C168C
+name = "Pgr4RenderHeightHook"
+registers = ["r10"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x828634C0
+name = "Pgr4RenderHeightHook"
+registers = ["r9"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x824D0B88
+name = "Pgr4RenderHeightHook"
+registers = ["r11"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82309394
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8287F8FC
+name = "Pgr4RenderHeightHook"
+registers = ["r5"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8287F934
+name = "Pgr4RenderHeightHook"
+registers = ["r5"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8287F944
+name = "Pgr4RenderHeightHook"
+registers = ["r11"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8287F96C
+name = "Pgr4RenderHeightHook"
+registers = ["r5"]
+after_instruction = true
+
+# More of the same height: the render-size accessor (sub_824C0E00, beside the 1280 one), the
+# mode struct (sub_82863500), the remaining surface creates (sub_82309360, sub_82323BD0,
+# sub_8263CDE8, sub_823205B8) and the stack struct of sub_8287F8D0's create.
+[[entrypoint.midasm_hook]]
+address = 0x824C0E00
+name = "Pgr4RenderHeightHook"
+registers = ["r3"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82863534
+name = "Pgr4RenderHeightHook"
+registers = ["r10"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x823093B0
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x823093F0
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82323C20
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x82323C3C
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x8263CE34
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+after_instruction = true
+
+[[entrypoint.midasm_hook]]
+address = 0x823206DC
+name = "Pgr4RenderHeightHook"
+registers = ["r5"]
+after_instruction = true
+
+# And at the D3D boundary, for the sizes the game keeps in its view objects: the int and float
+# viewport setters (r4: {X, Y, W, H, MinZ, MaxZ}), SetScissorRect's rect (r4: x1, y1, x2, y2),
+# Resolve's rect (r5), and the surface creators' height argument (r4).
+[[entrypoint.midasm_hook]]
+address = 0x826C6378
+name = "Pgr4ViewportHook"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x826C63F8
+name = "Pgr4ViewportFHook"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x826C59D8
+name = "Pgr4ScissorRectHook"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x826CBEE0
+name = "Pgr4ResolveRectHook"
+registers = ["r5"]
+
+[[entrypoint.midasm_hook]]
+address = 0x826C8B18
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x822B3FC8
+name = "Pgr4RenderHeightHook"
+registers = ["r4"]
+
 # Garage walking (sub_824BB618, the walking camera's collision callback): mflr r12 holds the
 # caller; lwz r29,80(r1) is trunc(distance * 20), the collision step count, which also bounds the
 # step loop (cmpw cr6,r28,r29). Moves shorter than 5 cm at unlocked frame rates get zero steps.

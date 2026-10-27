@@ -4,8 +4,10 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
+#include <rex/system/kernel_state.h>
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
 
 REXCVAR_DEFINE_BOOL(pgr4_60fps, false, "PGR4",
@@ -20,12 +22,63 @@ float Pgr4MotionBlurStep(float step);
 
 bool Pgr4Enable60Fps() { return REXCVAR_GET(pgr4_60fps); }
 
-void Pgr4PresentationIntervalHook(PPCRegister& r10) {
-  r10.u64 = Pgr4PresentationInterval(r10.u32);
+void Pgr4PresentationIntervalHook(PPCRegister& r10) { r10.u64 = Pgr4PresentationInterval(r10.u32); }
+
+void Pgr4MotionBlurStepHook(PPCRegister& f0) { f0.f64 = double(Pgr4MotionBlurStep(float(f0.f64))); }
+
+// Native 16:10 (development.md): the manifest hooks every instruction that loads the 720 of the
+// game's hardcoded 1280x720 frame; each gets the new render height instead. The boundary hooks
+// below cover the copies the loads cannot: structs the game fills itself and hands to the D3D
+// (viewport, scissor and resolve rects) and the surface creators whose packed sizes the
+// viewport clamp reads back (sub_826C6100).
+REXCVAR_DEFINE_INT32(pgr4_render_height, 800, "PGR4",
+                     "The render height the 16:10 patch gives every hooked 720 (720 disables it)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+void Pgr4RenderHeightHook(PPCRegister& r) {
+  if (r.u32 == 720) r.u64 = uint32_t(REXCVAR_GET(pgr4_render_height));
 }
 
-void Pgr4MotionBlurStepHook(PPCRegister& f0) {
-  f0.f64 = double(Pgr4MotionBlurStep(float(f0.f64)));
+uint32_t GuestLoad32(uint32_t a) {
+  return __builtin_bswap32(*rex::system::kernel_memory()->TranslateVirtual<const uint32_t*>(a));
+}
+
+void GuestStore32(uint32_t a, uint32_t v) {
+  *rex::system::kernel_memory()->TranslateVirtual<uint32_t*>(a) = __builtin_bswap32(v);
+}
+
+// The D3D structs that carry a 1280x720 frame: Resolve's rect (r5 of sub_826CBEE0), the int
+// SetViewport's (r4 of sub_826C6378) and SetScissorRect's (r4 of sub_826C59D8), both
+// {x1, y1, x2, y2}. A 1280x720 one becomes the render height.
+void Pgr4ResolveRectHook(PPCRegister& r5) {
+  if (!r5.u32) return;
+  if (GuestLoad32(r5.u32 + 8) == 1280 && GuestLoad32(r5.u32 + 12) == 720)
+    GuestStore32(r5.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+}
+
+void Pgr4ViewportHook(PPCRegister& r4) {
+  if (!r4.u32) return;
+  if (GuestLoad32(r4.u32 + 8) == 1280 && GuestLoad32(r4.u32 + 12) == 720)
+    GuestStore32(r4.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+}
+
+// The float viewport setter (sub_826C63F8, the one the scene's views use): r4 points at
+// {X, Y, W, H, MinZ, MaxZ} floats.
+void Pgr4ViewportFHook(PPCRegister& r4) {
+  if (!r4.u32) return;
+  constexpr uint32_t kW = 0x44A00000;  // 1280.0f
+  constexpr uint32_t kH = 0x44340000;  // 720.0f
+  if (GuestLoad32(r4.u32 + 8) == kW && GuestLoad32(r4.u32 + 12) == kH) {
+    const float h = float(REXCVAR_GET(pgr4_render_height));
+    GuestStore32(r4.u32 + 12, std::bit_cast<uint32_t>(h));
+  }
+}
+
+// SetScissorRect (fn_826C59D8): r4 points at {x1, y1, x2, y2}.
+void Pgr4ScissorRectHook(PPCRegister& r4) {
+  if (!r4.u32) return;
+  if (GuestLoad32(r4.u32 + 8) == 1280 && GuestLoad32(r4.u32 + 12) == 720)
+    GuestStore32(r4.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
 }
 
 namespace {
@@ -61,8 +114,9 @@ bool Pgr4CarPreviewCellHook(PPCRegister& r30, PPCRegister& r31) {
     return false;
   static std::atomic_bool logged = false;
   if (!logged.exchange(true))
-    REXLOG_WARN("PGR4 car preview: visibility search passed {} cells (row {}, column {}); ending it",
-                kCarPreviewCellLimit, r30.u32, r31.u32);
+    REXLOG_WARN(
+        "PGR4 car preview: visibility search passed {} cells (row {}, column {}); ending it",
+        kCarPreviewCellLimit, r30.u32, r31.u32);
   return true;
 }
 
@@ -73,8 +127,9 @@ bool Pgr4CarPreviewChainHook(PPCRegister& r3, PPCRegister& r10) {
     return false;
   static std::atomic_bool logged = false;
   if (!logged.exchange(true))
-    REXLOG_WARN("PGR4 car preview: visibility list passed {} nodes (node {:#x}, cell {:#x}); "
-                "skipping the rest",
-                kCarPreviewChainLimit, r3.u32, r10.u32);
+    REXLOG_WARN(
+        "PGR4 car preview: visibility list passed {} nodes (node {:#x}, cell {:#x}); "
+        "skipping the rest",
+        kCarPreviewChainLimit, r3.u32, r10.u32);
   return true;
 }
