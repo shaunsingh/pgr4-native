@@ -47,6 +47,7 @@ namespace pgr4::native {
 
 class D3D12Device;
 class DrawRenderer;
+class FrameGeneration;
 class FramePacer;
 class GpuTimer;
 class OcclusionQueries;
@@ -239,6 +240,7 @@ class NativeRenderer {
   std::unique_ptr<Presenter> present_;
   std::unique_ptr<OcclusionQueries> occlusion_;  // primary mode with --pgr4_native_occlusion
   std::unique_ptr<Upscaler> upscaler_;
+  std::unique_ptr<FrameGeneration> frame_generation_;  // --pgr4_native_frame_generation, paced
   // Primary mode with --pgr4_native_frame_latency > 0, or observing only with --pgr4_native_csv.
   std::unique_ptr<FramePacer> pacer_;
   GpuTimer* gpu_timer_ = nullptr;  // device_'s, with --pgr4_native_gpu_timing

@@ -40,10 +40,12 @@ add_executable(pgr4_recompiled WIN32
     "${PGR4_REXGLUE_SDK_SRC}/src/graphics/pipeline/texture/info_formats.cpp"
 )
 target_include_directories(pgr4_recompiled PRIVATE "${PGR4_NATIVE_SRC}" ../common)
-# The upscaler's API (src/native/upscaler.cpp); its DLLs are loaded at run time.
+# The FidelityFX API of the upscaler and the frame generation (src/native/fidelityfx.h); its DLLs
+# are loaded at run time.
 target_include_directories(pgr4_recompiled SYSTEM PRIVATE
     "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/api/include"
-    "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/upscalers/include")
+    "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/upscalers/include"
+    "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/framegeneration/include")
 rexglue_setup_target(pgr4_recompiled)
 target_link_libraries(pgr4_recompiled PRIVATE d3d12 dxgi dxguid)
 include("${PGR4_NATIVE_SRC}/native/shader_xlate.cmake")

@@ -6,6 +6,7 @@
 #include "d3d12_device.h"
 #include "d3d_state.h"
 #include "draw.h"
+#include "frame_generation.h"
 #include "frame_pacer.h"
 #include "gpu_timer.h"
 #include "guest_memory.h"
@@ -411,6 +412,16 @@ bool NativeRenderer::Initialize() {
   resolver_ = std::make_unique<Resolver>();
   if (!resolver_->Initialize(device_->device(), rt_.get(), device_->command_queue())) return false;
   resolver_->set_gpu_timer(gpu_timer_);
+  if (FrameGeneration::Requested()) {
+    // The generated frames are paced by FIFO and the pacer's display clock (frame_generation.h).
+    if (!paced) {
+      REXLOG_ERROR("PGR4 native: frame generation needs the frame pacer (--pgr4_native_primary)");
+    } else if (frame_generation_ = std::make_unique<FrameGeneration>(*device_, *resolver_);
+               !frame_generation_->Initialize()) {
+      REXLOG_ERROR("PGR4 native: frame generation unavailable");
+      frame_generation_.reset();
+    }
+  }
   SwitchUpscaler(Upscaler::Requested());
   textures_ = std::make_unique<TextureCache>(device_->device(), rex::system::kernel_memory());
   textures_->SetResolvedLookup([this](uint32_t a) { return resolver_->Find(a); });
@@ -519,6 +530,7 @@ void NativeRenderer::SwitchUpscaler(bool on) {
       upscaler_.reset();
       return;
     }
+    upscaler_->set_frame_generation(frame_generation_.get());
   }
   upscaler_on_ = on;
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
@@ -881,6 +893,9 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     }
     gpu_timer_->Pass(device_->command_list(), key);
   }
+  if (frame_generation_ &&
+      frame_generation_->BeforeDraw(device_->command_list(), frame_index_, state.regs))
+    draw_->InvalidateListState();
   draw_->OnDraw(state, prep);
   SubmitEarly();
   draw_ticks_ += Ticks() - t0;
@@ -902,6 +917,7 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   ++stats_.resolves;
   if (gpu_timer_) gpu_timer_->Pass(device_->command_list(), GpuTimer::KeyResolve(p));
   draw_->LogResolve(p);
+  if (frame_generation_) frame_generation_->OnResolve(p);
   // Sets its own compute root signature, pipeline and descriptor heap on the list.
   resolver_->Resolve(device_->command_list(), p);
   draw_->InvalidateListState();
@@ -978,7 +994,8 @@ bool NativeRenderer::OwnGameWindow(bool own) {
   window_taken_ = true;
   if (!d.AttachSwapchain()) return false;
   if (pacer_) {
-    HANDLE waitable = d.TakeFrameLatencyWaitable(FramePacer::kMaxFrameLatency);
+    HANDLE waitable =
+        d.TakeFrameLatencyWaitable(FramePacer::kMaxFrameLatency * (frame_generation_ ? 2 : 1));
     if (!waitable) return false;
     pacer_->Attach(waitable, d.fence());
     paces_frames_.store(pacer_->pacing(), std::memory_order_relaxed);
@@ -998,8 +1015,22 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   if (primary_ && !OwnGameWindow(!swap.hand_over && !rex::kernel::xam::xeXamIsUIActive()))
     return Fail();
   const bool shown = !incomplete && d.has_swapchain();
+  FrameGeneration* const fg = frame_generation_.get();
+  const bool generate = shown && fg && fg->prepared(frame_index_);
+  SwapCopy hudless;
+  if (generate) {
+    d.SetFrameImage(fg->image(), fg->image_rtv());
+    if (const ResolvedImage* source = fg->hudless_source(frame_index_))
+      hudless = {source, fg->hudless(), fg->hudless_rtv()};
+  }
   // The resolved front buffer into the back buffer (PRESENT in and out).
-  present_->OnSwap(swap, shown);
+  present_->OnSwap(swap, shown, hudless.image ? &hudless : nullptr);
+  if (fg) fg->OnSwap(present_->front_buffer_base());
+  if (generate) {
+    const ImageRect& r = present_->image_rect();
+    d.SetGeneratedFrame(fg->Generate(d.command_list(), frame_index_,
+                                     {r.left, r.top, r.width, r.height}, hudless.image));
+  }
   // The frame's texture copies read upload memory the untile workers fill.
   const uint64_t u0 = NowNs();
   textures_->FinishUploads();
@@ -1014,7 +1045,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_fence_ns = et.fence_ns;
   stats_.present = et.presented ? et.presents : 0;
   if (pacer_ && et.presented)
-    pacer_->Presented(fence);
+    pacer_->Presented(fence, et.frame_presents);
   else if (pacer_)
     pacer_->RetireUnshown();
   ++frame_index_;

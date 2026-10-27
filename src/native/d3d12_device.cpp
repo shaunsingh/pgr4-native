@@ -355,6 +355,7 @@ bool D3D12Device::FollowWindowSize() {
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {
+  if (frame_image_) return frame_image_rtv_;
   D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
   h.ptr += size_t(back_index_) * rtv_stride_;
   return h;
@@ -456,8 +457,33 @@ bool D3D12Device::Submit(std::span<ID3D12CommandList* const> first) {
   return true;
 }
 
+void D3D12Device::CopyToBackBuffer(ID3D12Resource* image) {
+  D3D12_RESOURCE_BARRIER bs[2] = {
+      TransitionBarrier(image, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+      TransitionBarrier(back_buffers_[back_index_].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST)};
+  list_->ResourceBarrier(2, bs);
+  list_->CopyResource(back_buffers_[back_index_].Get(), image);
+  for (D3D12_RESOURCE_BARRIER& b : bs) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+  list_->ResourceBarrier(2, bs);
+}
+
+bool D3D12Device::Present() {
+  const HRESULT hr = vsync_ ? swapchain_->Present(1, 0)
+                            : swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  if (!Failed(hr, "Present")) return true;
+  if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+    Failed(device_->GetDeviceRemovedReason(), "device removed, reason");
+  return false;
+}
+
 bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
   const uint64_t t0 = NowNs();
+  const bool shown = swapchain_ && present;
+  ID3D12Resource* const image = std::exchange(frame_image_, nullptr);
+  ID3D12Resource* const generated = std::exchange(generated_frame_, nullptr);
+  // The generated frame goes first; the frame's image then into the back buffer after it.
+  if (shown && image) CopyToBackBuffer(generated ? generated : image);
   if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
   StampBusy();
   list_->ResolveQueryData(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * kBusySpans * 2,
@@ -465,19 +491,19 @@ bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> fir
                           uint64_t(slot_) * kBusySpans * 2 * 8);
   if (!CloseAndExecute(first)) return false;
   const uint64_t t1 = NowNs();
-  const bool shown = swapchain_ && present;
-  HRESULT hr = !shown   ? S_OK
-               : vsync_ ? swapchain_->Present(1, 0)
-                        : swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+  bool ok = !shown || Present();
+  if (ok && shown && generated) {
+    back_index_ = swapchain_->GetCurrentBackBufferIndex();
+    ok = !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
+    if (ok) CopyToBackBuffer(image);
+    ok = ok && CloseAndExecute({}) && Present();
+  }
   end_frame_times_.submit_ns = t1 - t0;
   end_frame_times_.present_ns = NowNs() - t1;
-  if (Failed(hr, "Present")) {
-    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
-      Failed(device_->GetDeviceRemovedReason(), "device removed, reason");
-    return false;
-  }
+  if (!ok) return false;
   end_frame_times_.presented = shown;
-  end_frame_times_.presents += end_frame_times_.presented;
+  end_frame_times_.frame_presents = shown ? 1 + (generated != nullptr) : 0;
+  end_frame_times_.presents += end_frame_times_.frame_presents;
   uint64_t v = next_fence_++;
   if (Failed(queue_->Signal(fence_.Get(), v), "CommandQueue::Signal")) return false;
   slot_fence_[slot_] = v;

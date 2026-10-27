@@ -31,12 +31,15 @@
 
 #include "hook_args.h"
 
+#include <d3d12.h>
+
 #include <cstdint>
 #include <memory>
 
 namespace pgr4::native {
 
 class NativeRenderer;
+struct ResolvedImage;
 
 // --pgr4_native_luma_probe: the mean brightness (0-255, before the gamma ramp) of each quarter
 // of three rows of a front buffer, at 10, 40 and 80 % of its height (left to right), read
@@ -48,6 +51,11 @@ struct LumaProbe {
   float luma[kRows][kSegments] = {};
 };
 
+// Where a frame shown put the front buffer's image in the back buffer: scaled to fit, centred.
+struct ImageRect {
+  int32_t left = 0, top = 0, width = 0, height = 0;
+};
+
 // What OnSwap needs from the guest Swap call (read at the call).
 struct SwapCall {
   uint32_t texture = 0;    // r4: the front buffer D3DBaseTexture (0 = none)
@@ -56,6 +64,15 @@ struct SwapCall {
   int8_t capture_request = -1;
   // The renderer switch hands the game to the Xenos plugin after this frame: hide the window.
   bool hand_over = false;
+};
+
+// An image OnSwap draws as it draws the front buffer, with the same transform: frame generation's
+// HUD-less copy of the front buffer (frame_generation.h), into a target of the back buffers' size
+// and format (PRESENT state in and out).
+struct SwapCopy {
+  const ResolvedImage* image = nullptr;
+  ID3D12Resource* target = nullptr;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
 };
 
 class Presenter {
@@ -81,8 +98,8 @@ class Presenter {
   // In NativeRenderer::ExecuteSwap before D3D12Device::EndFrame: records the blit into the back
   // buffer (PRESENT state on entry and exit) and, for a capture, the readback copy. Sets its own
   // root signature, pipeline and descriptor heap on the list. `shown`: the frame is presented
-  // (false: held, no blit).
-  void OnSwap(const SwapCall& swap, bool shown);
+  // (false: held, no blit). `copy`: also drawn, when not null.
+  void OnSwap(const SwapCall& swap, bool shown, const SwapCopy* copy = nullptr);
 
   // In NativeRenderer::ExecuteSwap after EndFrame: finishes a pending capture (with the Xenos
   // copy: waits for the frame's fence, holds the guest thread, reads guest memory, writes the
@@ -90,6 +107,10 @@ class Presenter {
   void AfterEndFrame();
 
   bool front_buffer_found() const;
+  // The last Swap's front buffer, its guest physical address (0: none).
+  uint32_t front_buffer_base() const;
+  // The last frame shown's (empty before one).
+  const ImageRect& image_rect() const;
   const LumaProbe& luma_probe() const;
 
  private:

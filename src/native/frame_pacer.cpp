@@ -62,9 +62,11 @@ void FramePacer::Detach() {
   fence_ = nullptr;
 }
 
-void FramePacer::Presented(uint64_t fence_value) {
+void FramePacer::Presented(uint64_t fence_value, uint32_t presents) {
   std::lock_guard<std::mutex> lock(mutex_);
-  presents_[presented_++ % kRing] = {++swaps_, fence_value, 0};
+  presents_count_ += presents;
+  presents_[presented_++ % kRing] = {
+      .frame = ++swaps_, .number = presents_count_, .fence = fence_value, .presents = presents};
   if (ready_ + 1 == presented_ && fence_) {
     fence_->SetEventOnCompletion(fence_value, fence_event_.get());
     armed_ = fence_value;
@@ -91,19 +93,21 @@ void FramePacer::Run() {
     std::unique_lock<std::mutex> lock(mutex_);
     OnFenceLocked(now);
     if (r == WAIT_OBJECT_0 || shown_ == presented_) continue;
-    Present p = presents_[shown_ % kRing];
+    Present& head = presents_[shown_ % kRing];
+    if (head.shown++ == 0) head.first_shown_ns = now;
+    if (head.shown < head.presents) continue;
+    Present p = head;
     // Shown implies finished; the fence's value may trail the present by a wakeup.
     if (!p.ready_ns) p.ready_ns = now;
     ++shown_;
     ready_ = std::max(ready_, shown_);
     RetireLocked(1, now);
     ControlLocked(p, now);
-    const uint64_t present = shown_;
     const int64_t delay = delay_ns_;
     lock.unlock();
     retired_cv_.notify_one();
     if (log_)
-      log_->Printf("%llu,%llu,%.3f,%.3f,%.3f\n", (unsigned long long)present,
+      log_->Printf("%llu,%llu,%.3f,%.3f,%.3f\n", (unsigned long long)p.number,
                    (unsigned long long)p.frame, p.ready_ns / 1e6, now / 1e6, delay / 1e6);
   }
 }
@@ -162,7 +166,7 @@ void FramePacer::ControlLocked(const Present& p, uint64_t shown_ns) {
     return;
   }
   const int64_t headroom = std::max<int64_t>(
-      0, int64_t(shown_ns) - missed * interval - int64_t(p.ready_ns) + int64_t(lag));
+      0, int64_t(p.first_shown_ns) - missed * interval - int64_t(p.ready_ns) + int64_t(lag));
   const uint64_t second = shown_ns / 1'000'000'000;
   if (headroom_count_++ == 0) {
     headroom_by_s_.fill(std::numeric_limits<int64_t>::max());

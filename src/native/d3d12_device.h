@@ -79,9 +79,22 @@ class D3D12Device {
   ID3D12CommandQueue* command_queue() const { return queue_.Get(); }
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
 
-  // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV.
-  ID3D12Resource* back_buffer() const { return back_buffers_[back_index_].Get(); }
+  // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV, or the
+  // frame's image (SetFrameImage).
+  ID3D12Resource* back_buffer() const {
+    return frame_image_ ? frame_image_ : back_buffers_[back_index_].Get();
+  }
   D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv() const;
+  // Frame generation (frame_generation.h), for the frame being recorded. SetFrameImage, before
+  // the frame draws into the back buffer: until EndFrame, back_buffer() is `image` (the back
+  // buffers' size and format, PRESENT state outside EndFrame), which EndFrame copies into the back
+  // buffer. SetGeneratedFrame, before EndFrame: EndFrame presents `generated` (the same kind of
+  // image) before the frame, so the frame takes two presents.
+  void SetFrameImage(ID3D12Resource* image, D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+    frame_image_ = image;
+    frame_image_rtv_ = rtv;
+  }
+  void SetGeneratedFrame(ID3D12Resource* generated) { generated_frame_ = generated; }
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
   // The swapchain presents HDR10 (kHdrBackBufferFormat): --pgr4_native_hdr is on and the display
@@ -101,8 +114,9 @@ class D3D12Device {
   void WaitFence(uint64_t value);
 
   // Closes and submits the frame's command list (the caller recorded into the back buffer;
-  // EndFrame adds no barriers), presents (unless `present` is false or there is no swapchain:
-  // the window keeps the previous frame), signals the frame fence, follows the game window's
+  // EndFrame adds no barriers but the frame image's copy), presents (unless `present` is false or
+  // there is no swapchain: the window keeps the previous frame; after the generated frame, if
+  // any), signals the frame fence, follows the game window's
   // client size, then waits for the slot kFramesInFlight frames back and opens the next frame's
   // list.
   // `first`: closed lists that run ahead of the frame's in the same ExecuteCommandLists, for
@@ -118,11 +132,12 @@ class D3D12Device {
   bool Submit(std::span<ID3D12CommandList* const> first = {});
   // Where the last EndFrame spent its time.
   struct EndFrameTimes {
-    uint64_t submit_ns = 0;   // Close + ExecuteCommandLists
-    uint64_t present_ns = 0;  // Present
-    uint64_t fence_ns = 0;    // OpenList: waiting for the GPU to finish the slot's last frame
-    bool presented = false;   // Present ran (a swapchain and a complete frame)
-    uint64_t presents = 0;    // Presents so far, this one included
+    uint64_t submit_ns = 0;       // Close + ExecuteCommandLists
+    uint64_t present_ns = 0;      // Present
+    uint64_t fence_ns = 0;        // OpenList: waiting for the GPU to finish the slot's last frame
+    bool presented = false;       // Present ran (a swapchain and a complete frame)
+    uint32_t frame_presents = 0;  // the frame's Presents: 2 with a generated frame
+    uint64_t presents = 0;        // Presents so far, the frame's included
   };
   const EndFrameTimes& end_frame_times() const { return end_frame_times_; }
 
@@ -158,6 +173,10 @@ class D3D12Device {
   void ReadBusy();
   bool GetBackBuffers();
   bool FollowWindowSize();
+  // Records the copy of `image` (PRESENT state) into the current back buffer.
+  void CopyToBackBuffer(ID3D12Resource* image);
+  // Presents the current back buffer; false (logged) on failure.
+  bool Present();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
   uint32_t width_ = 0, height_ = 0;
@@ -182,6 +201,9 @@ class D3D12Device {
   ComPtr<ID3D12DescriptorHeap> rtv_heap_;
   uint32_t rtv_stride_ = 0;
   uint32_t back_index_ = 0;
+  ID3D12Resource* frame_image_ = nullptr;  // SetFrameImage's, until EndFrame
+  D3D12_CPU_DESCRIPTOR_HANDLE frame_image_rtv_ = {};
+  ID3D12Resource* generated_frame_ = nullptr;  // SetGeneratedFrame's, until EndFrame
   UINT swapchain_flags_ = 0;  // DXGI_SWAP_CHAIN_FLAG_*: creation and every ResizeBuffers
   bool tearing_ = false;
   bool vsync_ = false;

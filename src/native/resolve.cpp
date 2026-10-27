@@ -784,7 +784,7 @@ bool Resolver::CreatePipelines() {
   return true;
 }
 
-Resolver::Image* Resolver::GetImage(const ResolveParams& p, Destination** dest_out) {
+Resolver::Image* Resolver::GetImage(const ResolveParams& p, Destination& dest) {
   const DestStorage& storage = *GetDestStorage(p.dest_format);
   if (storage.layout == kB5G6R5Unorm && !b5g6r5_store_) {
     PGR4_LOG_FIRST(4, WARN, "PGR4 native resolve: no typed UAV store for B5G6R5 (format {})",
@@ -792,8 +792,6 @@ Resolver::Image* Resolver::GetImage(const ResolveParams& p, Destination** dest_o
     return nullptr;
   }
   const bool depth = p.source == 4;
-  Destination& dest = destinations_[p.dest_base];
-  *dest_out = &dest;
   for (const std::unique_ptr<Image>& img : dest.images)
     if (img->storage == &storage && img->width == p.dest_width && img->height == p.dest_height &&
         bool(img->depth_r32f) == depth)
@@ -832,9 +830,9 @@ Resolver::Image* Resolver::GetImage(const ResolveParams& p, Destination** dest_o
   img->view.depth_r32f = img->depth_r32f.Get();
   // Creation stalls the frame-recording thread (the render thread by default); every one is
   // logged so frame-time spikes can be matched against it.
-  REXLOG_INFO("PGR4 native resolve: image {} at {:08X}: format {} {}x{}{} ({} at this address)",
-              ++image_count_, p.dest_base, p.dest_format, p.dest_width, p.dest_height,
-              depth ? " + depth float" : "", dest.images.size() + 1);
+  REXLOG_INFO("PGR4 native resolve: image {} {} {:08X}: format {} {}x{}{} ({} there)",
+              ++image_count_, &dest == &own_ ? "for copies of" : "at", p.dest_base, p.dest_format,
+              p.dest_width, p.dest_height, depth ? " + depth float" : "", dest.images.size() + 1);
   return dest.images.emplace_back(std::move(img)).get();
 }
 
@@ -852,6 +850,15 @@ void Resolver::BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t complet
 }
 
 bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) {
+  return Resolve(list, p, nullptr);
+}
+
+const ResolvedImage* Resolver::ResolveCopy(ID3D12GraphicsCommandList* list,
+                                           const ResolveParams& p) {
+  return Resolve(list, p, &own_) && own_.current ? &own_.current->view : nullptr;
+}
+
+bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, Destination* own) {
   const bool depth = p.source == 4;
   if (!GetDestStorage(p.dest_format)) return false;
   RenderTarget* rt = depth ? targets_->GetDepth(p.regs, uint32_t(std::max(p.y1, 0)))
@@ -879,11 +886,11 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
       if (upscaled && !depth) source = upscaled;
     }
     targets_->PrepareRead(list, rt, src);
-    ok = Copy(list, p, source, src, dx, dy);
+    ok = Copy(list, p, source, src, dx, dy, own ? *own : destinations_[p.dest_base]);
   }
 
   // Clears of the source surfaces over the source rectangle (after the copy).
-  if (p.clear_flags) {
+  if (p.clear_flags && !own) {
     if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p, GpuTimer::kResolveClear));
     ClearParams cp;
     cp.flags = ((p.clear_flags & 0x100) ? (1u << (depth ? 0 : p.source)) : 0) |
@@ -901,12 +908,11 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) 
 }
 
 bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
-                    const D3D12_RECT& src, int32_t dx, int32_t dy) {
+                    const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest) {
   const bool depth = p.source == 4;
   const DestStorage* storage = GetDestStorage(p.dest_format);
   const uint32_t w = uint32_t(src.right - src.left), h = uint32_t(src.bottom - src.top);
-  Destination* dest = nullptr;
-  Image* img = GetImage(p, &dest);
+  Image* img = GetImage(p, dest);
   if (!img) {
     PGR4_LOG_FIRST(4, WARN, "PGR4 native resolve: no host image for format {} {}x{}", p.dest_format,
                    p.dest_width, p.dest_height);
@@ -1036,7 +1042,8 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   img->view.width = std::max(img->view.width, uint32_t(dx) + w);
   img->view.height = std::max(img->view.height, uint32_t(dy) + h);
   img->view.seq = ++seq_;
-  dest->current = img;
+  dest.current = img;
+  if (&dest == &own_) return true;
   if (changed_) changed_(p.dest_base);
 
   if (dump_) DumpRecord(list, p, img->view, uint32_t(dx) + w, uint32_t(dy) + h);

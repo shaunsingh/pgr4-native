@@ -29,9 +29,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 PROGRAM = ("pgr4_recompiled.exe", "gw_recompiled.exe", "rexruntime.dll", "rexgpu-xenos.dll")
-# AMD's signed upscaler DLLs as the FidelityFX SDK ships them, under its license
-# (LICENSES/AMD-FidelityFX-SDK.txt). The renderer loads them for --pgr4_native_upscaler.
-FIDELITYFX = ("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")
+# AMD's signed DLLs as the FidelityFX SDK ships them, under its license
+# (LICENSES/AMD-FidelityFX-SDK.txt). The renderer loads them for --pgr4_native_upscaler and
+# --pgr4_native_frame_generation.
+FIDELITYFX = ("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll",
+              "amd_fidelityfx_framegeneration_dx12.dll")
 FIDELITYFX_LICENSE = "Kits/FidelityFX/docs/license.md"
 SETTINGS = ("games/pgr4/pgr4_recompiled.toml", "games/gw/gw_recompiled.toml")
 ALLOWED_SUFFIXES = {".exe", ".dll", ".toml", ".txt", ".md"}
@@ -122,7 +124,7 @@ def source_note(sdk: Path, ffx: Path) -> str:
         url = git(sdk, "config", "-f", ".gitmodules", f"submodule.{sub}.url")
         lines.append(f"{sub.split('/')[1]:<12} {url}  {git(sdk / sub, 'rev-parse', 'HEAD')}")
     lines.append(f"FidelityFX   {git(ffx, 'remote', 'get-url', 'origin')}  {git(ffx, 'rev-parse', 'HEAD')}")
-    lines.append("             amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll as signed by AMD")
+    lines.append(f"             {', '.join(FIDELITYFX)} as signed by AMD")
     lines += [
         "",
         "FFmpeg (libavutil, libavcodec, libavformat) and libmspack are statically linked into",

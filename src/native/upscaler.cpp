@@ -2,9 +2,9 @@
 #include "upscaler.h"
 
 #include "clock.h"
+#include "frame_generation.h"
 #include "log.h"
 
-#include <ffx_api.h>
 #include <ffx_upscale.h>
 #include <dx12/ffx_api_dx12.h>
 
@@ -35,22 +35,10 @@ REXCVAR_DEFINE_INT32(pgr4_native_upscaler_min_height, 360, "PGR4 native",
 
 namespace pgr4::native {
 
-struct Upscaler::Api {
-  PfnFfxCreateContext create = nullptr;
-  PfnFfxDestroyContext destroy = nullptr;
-  PfnFfxQuery query = nullptr;
-  PfnFfxDispatch dispatch = nullptr;
-};
-
 namespace {
 
-constexpr wchar_t kLoaderDll[] = L"amd_fidelityfx_loader_dx12.dll";
 constexpr DXGI_FORMAT kOutputFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr D3D12_RESOURCE_STATES kInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-// The camera's planes and vertical field of view are not known to the renderer. FSR uses them
-// only to scale its disocclusion threshold with view-space depth; these are a chase camera's.
-constexpr float kCameraNear = 0.1f, kCameraFar = 10000.0f, kCameraFovY = 1.0f;
 
 void Message(uint32_t type, const wchar_t* message) {
   std::string s;
@@ -114,28 +102,6 @@ uint32_t RenderExtent(int32_t setting, uint32_t scene) {
 
 bool Upscaler::Requested() { return REXCVAR_GET(pgr4_native_upscaler); }
 
-const Upscaler::Api* Upscaler::LoadApi() {
-  static const Api api = [] {
-    Api a;
-    HMODULE dll = LoadLibraryW(kLoaderDll);
-    if (!dll) {
-      REXLOG_ERROR("PGR4 native upscaler: cannot load amd_fidelityfx_loader_dx12.dll ({})",
-                   uint32_t(GetLastError()));
-      return a;
-    }
-    a.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(dll, "ffxCreateContext"));
-    a.destroy = reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(dll, "ffxDestroyContext"));
-    a.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(dll, "ffxQuery"));
-    a.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(dll, "ffxDispatch"));
-    if (!a.create || !a.destroy || !a.query || !a.dispatch) {
-      REXLOG_ERROR("PGR4 native upscaler: amd_fidelityfx_loader_dx12.dll lacks the ffx API");
-      a = {};
-    }
-    return a;
-  }();
-  return api.create ? &api : nullptr;
-}
-
 Upscaler::~Upscaler() {
   if (context_) api_->destroy(&context_, nullptr);
 }
@@ -151,7 +117,7 @@ bool Upscaler::Initialize(ID3D12Device* device) {
         (min_height * DynamicResolution::kSteps + max_height_ - 1) / max_height_;
     dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps));
   }
-  api_ = LoadApi();
+  api_ = LoadFfxApi();
   if (!api_ || !CreateContext(false)) return false;
   ffxQueryGetProviderVersion provider = {};
   provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
@@ -452,14 +418,17 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   d.frameTimeDelta = frame_ms_;
   d.preExposure = 1.0f;
   d.reset = reset_;
-  d.cameraNear = kCameraNear;
-  d.cameraFar = kCameraFar;
-  d.cameraFovAngleVertical = kCameraFovY;
+  d.cameraNear = kFfxCameraNear;
+  d.cameraFar = kFfxCameraFar;
+  d.cameraFovAngleVertical = kFfxCameraFovY;
   d.viewSpaceToMetersFactor = 1.0f;
   if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK) {
     PGR4_WARN_ONCE("PGR4 native upscaler: ffxDispatch failed ({})", rc);
     return nullptr;
   }
+  if (frame_generation_)
+    frame_generation_->Prepare(frame_, list, d.depth, d.motionVectors, d.renderSize, d.jitterOffset,
+                               d.motionVectorScale, frame_ms_, reset_);
   if (alpha_pso_) {
     D3D12_RESOURCE_BARRIER b = {};  // after FSR's writes to the output
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

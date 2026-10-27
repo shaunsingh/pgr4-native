@@ -1,7 +1,6 @@
 // pgr4-native PGR4 native renderer: temporal upscaling of the 3D scene with AMD FidelityFX Super
-// Resolution, through the FidelityFX API (ffx_api) of amd_fidelityfx_loader_dx12.dll beside the
-// executable, loaded at run time. OptiScaler hooks the same calls (it loads as dxgi.dll and
-// intercepts the loader), which is how other upscalers such as FSR 4 replace this one.
+// Resolution, through the FidelityFX API (fidelityfx.h), which OptiScaler hooks to put other
+// upscalers such as FSR 4 in its place.
 //
 // The scene is PGR4's 1280x720 2x MSAA surface: RB_SURFACE_INFO pitch 1280 with 2x MSAA, the
 // only surface of that pitch and MSAA in the race and the menus (draw logs of td-265). With
@@ -17,19 +16,23 @@
 // upscales its color, depth and motion into the output, which the color resolves copy from instead
 // of the target. FSR reads the color clamped to the range of its 7e3 EDRAM format, as the resolves
 // do, and the output then takes the scene's alpha, which FSR does not upscale: the motion blur's
-// mask, which keeps the player's car sharp.
+// mask, which keeps the player's car sharp. With frame generation (frame_generation.h) the same
+// depth and motion are its inputs.
 //
 // Threading: everything on the thread that records the frames (NativeRenderer::Execute*).
 #pragma once
 
 #include "d3d12_device.h"
 #include "dynamic_resolution.h"
+#include "fidelityfx.h"
 #include "render_targets.h"
 
 #include <cstdint>
 #include <optional>
 
 namespace pgr4::native {
+
+class FrameGeneration;
 
 class Upscaler {
  public:
@@ -43,7 +46,7 @@ class Upscaler {
   static constexpr bool IsScene(uint32_t surface_info) {
     return (surface_info & kSceneSurfaceMask) == kSceneSurface;
   }
-  static constexpr uint32_t kSceneWidth = 1280, kSceneHeight = 720;
+  static constexpr uint32_t kSceneWidth = kFfxSceneWidth, kSceneHeight = kFfxSceneHeight;
   // Whether a span of the scene surface (a resolve's, a viewport's) is the scene's width: the
   // scene resolves in tiles of its whole width, while the rear-view mirror renders into a corner
   // of the scene surface and resolves that corner on its own (neither upscaled nor jittered).
@@ -100,11 +103,10 @@ class Upscaler {
   // nullptr (logged once) when that failed; the resolves then copy the target as it is.
   RenderTarget* Upscale(ID3D12GraphicsCommandList* list, RenderTargets& targets,
                         const SurfaceRegs& regs);
+  // Frame generation's inputs, recorded by each Upscale; nullptr: none.
+  void set_frame_generation(FrameGeneration* fg) { frame_generation_ = fg; }
 
  private:
-  struct Api;
-  // The loader's entry points, loaded once; nullptr (logged) without them.
-  static const Api* LoadApi();
   // The upscaling context, with debug visualization or not; false (logged) on failure.
   bool CreateContext(bool debug);
   bool CreateTargets();
@@ -122,7 +124,8 @@ class Upscaler {
                uint32_t height);
 
   ID3D12Device* device_ = nullptr;
-  const Api* api_ = nullptr;
+  const FfxApi* api_ = nullptr;
+  FrameGeneration* frame_generation_ = nullptr;
   void* context_ = nullptr;  // ffxContext
   // The upscaled color (an R16G16B16A16_FLOAT UAV: the scene's host format), in the fields the
   // resolve reads; and the motion vectors.

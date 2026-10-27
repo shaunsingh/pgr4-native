@@ -17,9 +17,10 @@
 #            (src/). games/gw: $game/gw.xex, the garage's Geometry Wars cabinet;
 #            out/gw_recompiled.exe.
 #            $dest/fidelityfx-sdk: the AMD FidelityFX SDK at the commit scripts/fidelityfx.lock
-#            names, only its upscaler API headers and signed DLLs.
+#            names, only its upscaler and frame generation API headers and signed DLLs.
 #   install  $dest/run/runtime: both executables, rexruntime.dll, rexgpu-xenos.dll, AMD's FidelityFX
-#            loader and upscaler DLLs (--pgr4_native_upscaler), and title-update/ (the runtime's
+#            loader, upscaler and frame generation DLLs (--pgr4_native_upscaler,
+#            --pgr4_native_frame_generation), and title-update/ (the runtime's
 #            update:\ when no --update_data_root is given).
 #
 # --update PATH is the player's copy of Title Update #2: its package as downloaded
@@ -107,7 +108,12 @@ host_build=$dest/host-sdk
 host_rexglue=$sdk_src/out/linux-amd64/rexglue
 ffx_src=$dest/fidelityfx-sdk
 ffx_kit=$ffx_src/Kits/FidelityFX
-ffx_dlls=("$ffx_kit/signedbin/amd_fidelityfx_loader_dx12.dll" "$ffx_kit/signedbin/amd_fidelityfx_upscaler_dx12.dll")
+ffx_dlls=("$ffx_kit/signedbin/amd_fidelityfx_loader_dx12.dll"
+  "$ffx_kit/signedbin/amd_fidelityfx_upscaler_dx12.dll"
+  "$ffx_kit/signedbin/amd_fidelityfx_framegeneration_dx12.dll")
+ffx_paths=(/Kits/FidelityFX/api/include/ /Kits/FidelityFX/upscalers/include/
+  /Kits/FidelityFX/framegeneration/include/ /Kits/FidelityFX/docs/license.md
+  "${ffx_dlls[@]#"$ffx_src"}")
 titles=(gw pgr4)
 toolchain=$repo_root/cmake/clang-cl-xwin.cmake
 title_update_sums=$repo_root/games/pgr4/title-update.sha256
@@ -210,13 +216,17 @@ sdk_checkout() {
 # $ffx_src: the FidelityFX SDK at $FFX_COMMIT, a shallow sparse checkout of what the build and the
 # install use, without the SDK's samples, media and effect sources.
 ffx_checkout() {
-  [[ $(git -C "$ffx_src" rev-parse -q --verify HEAD 2>/dev/null) == "$FFX_COMMIT" ]] &&
-    { echo "FidelityFX SDK $FFX_COMMIT already checked out"; return 0; }
+  if [[ $(git -C "$ffx_src" rev-parse -q --verify HEAD 2>/dev/null) == "$FFX_COMMIT" ]]; then
+    # A checkout made before a path joined the list takes it; the partial clone fetches its blobs.
+    [[ $(git -C "$ffx_src" sparse-checkout list) == "$(printf '%s\n' "${ffx_paths[@]}")" ]] ||
+      git -C "$ffx_src" sparse-checkout set --no-cone "${ffx_paths[@]}"
+    echo "FidelityFX SDK $FFX_COMMIT checked out"
+    return 0
+  fi
   rm -rf "$ffx_src"
   git init -q "$ffx_src"
   git -C "$ffx_src" remote add origin "$FFX_URL"
-  git -C "$ffx_src" sparse-checkout set --no-cone /Kits/FidelityFX/api/include/ \
-    /Kits/FidelityFX/upscalers/include/ /Kits/FidelityFX/docs/license.md "${ffx_dlls[@]#"$ffx_src"}"
+  git -C "$ffx_src" sparse-checkout set --no-cone "${ffx_paths[@]}"
   git -C "$ffx_src" fetch -q --depth 1 --filter=blob:none origin "$FFX_COMMIT"
   git -C "$ffx_src" checkout -q --detach FETCH_HEAD
 }

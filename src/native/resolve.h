@@ -131,6 +131,10 @@ class Resolver {
   void AfterSwap();
 
   bool Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p);
+  // The copy of `p` into the Resolver's own image instead of p.dest_base, without its clears:
+  // the texels the guest's resolve would write there now (frame_generation.h's HUD-less copy of
+  // the front buffer). No texture sees it. Returns the image, nullptr on failure (logged).
+  const ResolvedImage* ResolveCopy(ID3D12GraphicsCommandList* list, const ResolveParams& p);
 
   // The last resolve into this guest physical address, or nullptr.
   const ResolvedImage* Find(uint32_t guest_phys_base) const;
@@ -169,12 +173,14 @@ class Resolver {
     void operator()(Dump* dump) const;
   };
   bool CreatePipelines();
-  // The image at p.dest_base for p's format and size, created if missing; `*dest_out`: its
-  // destination.
-  Image* GetImage(const ResolveParams& p, Destination** dest_out);
-  // Copies the clipped rectangle `src` of rt to (dx, dy) in the destination image.
+  // Resolve into `own` (ResolveCopy, no clears), or with own null into p.dest_base.
+  bool Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, Destination* own);
+  // The image of `dest` for p's format and size, created if missing.
+  Image* GetImage(const ResolveParams& p, Destination& dest);
+  // Copies the clipped rectangle `src` of rt to (dx, dy) in an image of `dest` (p.dest_base's or
+  // own_).
   bool Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
-            const D3D12_RECT& src, int32_t dx, int32_t dy);
+            const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest);
 
   // Oracle dumps and the self test (resolve_debug.cpp), and what they use of resolve.cpp.
   void InitializeOracles(ID3D12CommandQueue* queue);  // as their cvars ask
@@ -200,6 +206,7 @@ class Resolver {
   bool b5g6r5_store_ = false;  // typed UAV store of B5G6R5_UNORM (k_5_6_5 / k_6_5_5 images)
   bool linear_output_ = false;
   std::unordered_map<uint32_t, Destination> destinations_;
+  Destination own_;  // ResolveCopy's
   size_t image_count_ = 0;
   uint64_t frame_ = 0, frame_fence_ = 0;
   uint64_t seq_ = 0;

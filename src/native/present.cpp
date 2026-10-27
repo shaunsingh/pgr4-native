@@ -231,6 +231,8 @@ struct Presenter::Impl {
   std::atomic<bool> capture_holding{false};
   bool log_fmt = false, log_missing = false;
   bool front_buffer_found = false;  // the last Swap's front buffer had a host image
+  uint32_t front_buffer_base = 0;
+  ImageRect image_rect;
 
   present_debug::GlitchCatch glitch;
   present_debug::LumaProbeReadback probe;
@@ -241,7 +243,7 @@ struct Presenter::Impl {
   }
 
   bool Initialize();
-  void OnSwap(const SwapCall& swap, bool shown);
+  void OnSwap(const SwapCall& swap, bool shown, const SwapCopy* copy);
   // Copies the guest's current ramp of the mode into the frame's slot; false without one.
   bool WriteRamp(RampMode mode, uint32_t slot);
   bool CaptureRequested(uint64_t frame);
@@ -479,7 +481,7 @@ void Presenter::Impl::FinishCapture() {
   }
 }
 
-void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
+void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* copy) {
   D3D12Device& d = r.device();
   ID3D12GraphicsCommandList* list = d.command_list();
   ID3D12Device* device = r.d3d12();
@@ -494,6 +496,7 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
     fetch[1] = (fetch[1] & 0xFFFu) | phys;
     image = r.resolver().Find(phys);
   }
+  front_buffer_base = tex ? fetch[1] & 0xFFFFF000u : 0;
   bool found = image && image->texture;
   // The host image is in the copy destination format (k_2_10_10_10 for PGR4's
   // k_2_10_10_10_AS_16_16_16_16 front buffer).
@@ -537,28 +540,32 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
     const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     if (!found) list->ClearRenderTargetView(rtv, black, 0, nullptr);
     if (found) {
-      D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-      sd.Format = linear ? DXGI_FORMAT_R16G16B16A16_FLOAT : host->unorm;
-      sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      sd.Shader4ComponentMapping = mapping;
-      sd.Texture2D.MipLevels = 1;
-      const uint32_t slot = heap_next++ % kHeapSize;
-      D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
-      cpu.ptr += size_t(slot) * heap_stride;
-      D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
-      gpu.ptr += uint64_t(slot) * heap_stride;
-      device->CreateShaderResourceView(linear ? linear : image->texture, &sd, cpu);
+      // The image's view: its linear one with HDR output, as the front buffer's.
+      const auto view = [&](const ResolvedImage& src) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format = linear ? DXGI_FORMAT_R16G16B16A16_FLOAT : host->unorm;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = mapping;
+        sd.Texture2D.MipLevels = 1;
+        const uint32_t slot = heap_next++ % kHeapSize;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += size_t(slot) * heap_stride;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += uint64_t(slot) * heap_stride;
+        device->CreateShaderResourceView(linear ? src.linear : src.texture, &sd, cpu);
+        return gpu;
+      };
       ID3D12DescriptorHeap* heaps[] = {heap.Get()};
       list->SetDescriptorHeaps(1, heaps);
       list->SetGraphicsRootSignature(root_signature.Get());
       list->SetPipelineState(hdr ? hdr_pso.Get() : pso.Get());
-      list->SetGraphicsRootDescriptorTable(0, gpu);
       // The image (1280x720 in PGR4's mode) scaled to fit the window, centred, aspect kept.
       const float iw = float(extent.width), ih = float(extent.height);
       const float ww = float(d.width()), wh = float(d.height());
       const float s = std::min(ww / iw, wh / ih);
       const float vw = std::round(iw * s), vh = std::round(ih * s);
       const LONG vx = LONG(std::floor((ww - vw) * 0.5f)), vy = LONG(std::floor((wh - vh) * 0.5f));
+      image_rect = {int32_t(vx), int32_t(vy), int32_t(vw), int32_t(vh)};
       // Black bars around the aspect-fit image. The swapchain's images get no fast clear, so
       // a full clear would write every pixel the blit then writes again.
       const LONG w = LONG(d.width()), h = LONG(d.height()), rx = vx + LONG(vw), ry = vy + LONG(vh);
@@ -567,7 +574,6 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
       UINT clears = 0;
       for (const D3D12_RECT& bar : bars)
         if (bar.right > bar.left && bar.bottom > bar.top) clear[clears++] = bar;
-      if (clears) list->ClearRenderTargetView(rtv, black, clears, clear);
       const RampMode wanted = rgb10a2 ? kRampPwl : kRampTable;
       const uint32_t ramp_slot = d.frame_slot();
       const float paper_white = float(std::max(1, REXCVAR_GET(pgr4_native_hdr_paper_white)));
@@ -587,13 +593,28 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown) {
       list->SetGraphicsRoot32BitConstants(1, sizeof(constants) / 4, &constants, 0);
       list->SetGraphicsRootConstantBufferView(
           2, ramp_buffer->GetGPUVirtualAddress() + uint64_t(ramp_slot) * kRampSlotBytes);
-      list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
       D3D12_VIEWPORT vp = {float(vx), float(vy), vw, vh, 0.0f, 1.0f};
       D3D12_RECT sc = {0, 0, LONG(d.width()), LONG(d.height())};
       list->RSSetViewports(1, &vp);
       list->RSSetScissorRects(1, &sc);
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-      list->DrawInstanced(3, 1, 0, 0);
+      const auto blit = [&](const ResolvedImage& src, D3D12_CPU_DESCRIPTOR_HANDLE target) {
+        if (clears) list->ClearRenderTargetView(target, black, clears, clear);
+        list->SetGraphicsRootDescriptorTable(0, view(src));
+        list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+        list->DrawInstanced(3, 1, 0, 0);
+      };
+      // The copy first: the glitch catcher draws the front buffer's view again.
+      if (copy && copy->image->format == format &&
+          (linear ? copy->image->linear : copy->image->texture)) {
+        D3D12_RESOURCE_BARRIER cb = TransitionBarrier(copy->target, D3D12_RESOURCE_STATE_PRESENT,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+        list->ResourceBarrier(1, &cb);
+        blit(*copy->image, copy->rtv);
+        std::swap(cb.Transition.StateBefore, cb.Transition.StateAfter);
+        list->ResourceBarrier(1, &cb);
+      }
+      blit(*image, rtv);
       if (glitch.on()) {
         if (hdr) list->SetPipelineState(pso.Get());  // the catcher keeps SDR frames
         glitch.Record(device, list, ramp_slot, iw, ih, constants.ramp_mode, r.frame_index());
@@ -670,9 +691,13 @@ void Presenter::ReadSwap(const uint8_t* base, const HookArgs& args, SwapCall* ou
     for (int i = 0; i < 6; ++i) out->fetch[i] = Load32(base, out->texture + 28 + 4 * i);
 }
 
-void Presenter::OnSwap(const SwapCall& swap, bool shown) { impl_->OnSwap(swap, shown); }
+void Presenter::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* copy) {
+  impl_->OnSwap(swap, shown, copy);
+}
 
 bool Presenter::front_buffer_found() const { return impl_->front_buffer_found; }
+uint32_t Presenter::front_buffer_base() const { return impl_->front_buffer_base; }
+const ImageRect& Presenter::image_rect() const { return impl_->image_rect; }
 
 const LumaProbe& Presenter::luma_probe() const { return impl_->probe.result(); }
 

@@ -21,7 +21,8 @@
 // shown late (td-118). This is DXVK's latency sleep (dxvk_latency_builtin.cpp) measured against
 // the display, as the game cannot know the frame interval under gamescope's limiter.
 // - A shown frame's headroom is the time from the GPU finishing it (the frame fence) to the
-//   display showing it, plus the delay it began with. A frame shown n intervals late counts
+//   display showing it (its first present: a generated frame's, which the GPU finished with
+//   it), plus the delay it began with. A frame shown n intervals late counts
 //   against the slot it missed, n intervals earlier, and none counts below zero. A frame shown
 //   more than kStallSlots slots late is a stall (a loading screen), not the pipeline's time: the
 //   estimate starts over.
@@ -46,6 +47,8 @@
 // present when vkWaitForPresentKHR returns, but only in FIFO (with other present modes once the
 // frame's blit finished, which is why the renderer presents with vsync while the pacer paces);
 // DXGI when the frame leaves the present queue. A thread here waits on it and on the frame fence.
+// A frame with a generated one before it (frame_generation.h) is shown with the second of its
+// presents, and the display's interval is then that of every other refresh.
 // A frame the render thread does not present (held for pipelines, or while ReXGlue's presenter
 // has the window: a XAM dialog, the Xenos plugin) counts as shown at once (RetireUnshown).
 //
@@ -77,8 +80,8 @@ class FramePacer {
     uint32_t frame_latency = kMaxFrameLatency;
     bool low_latency = true;  // the delay D above
     uint64_t latency_margin_ns = 4'000'000;
-    // When not null: one "present,frame,ready_ms,shown_ms,delay_ms" row per present the display
-    // showed (NowNs clock).
+    // When not null: one "present,frame,ready_ms,shown_ms,delay_ms" row per frame the display
+    // showed (NowNs clock), `present` the number of its last present.
     std::unique_ptr<AsyncFile> log;
   };
 
@@ -97,9 +100,10 @@ class FramePacer {
   // released: its presents not counted yet are shown, and the waitable is closed.
   void Attach(HANDLE waitable, ID3D12Fence* fence);
   void Detach();
-  // Render thread, once per Swap: the frame was presented and signals `fence_value` once the GPU
-  // finished it, or will not be presented (RetireUnshown).
-  void Presented(uint64_t fence_value);
+  // Render thread, once per Swap: the frame was presented, in `presents` presents (a generated
+  // frame's before it, frame_generation.h) and signals `fence_value` once the GPU finished it, or
+  // will not be presented (RetireUnshown). It is shown with its last present.
+  void Presented(uint64_t fence_value, uint32_t presents = 1);
   void RetireUnshown();
 
   // Game thread, once per frame after the Swap queued it: blocks until the next frame may
@@ -129,9 +133,13 @@ class FramePacer {
   static constexpr uint64_t kNoLag = ~0ull;
 
   struct Present {
-    uint64_t frame = 0;  // the frame's number (Swaps since the pacer started, from 1)
+    uint64_t frame = 0;   // the frame's number (Swaps since the pacer started, from 1)
+    uint64_t number = 0;  // its last present's (presents since the pacer started, from 1)
     uint64_t fence = 0;
     uint64_t ready_ns = 0;  // when the pacer saw the fence reach `fence`; 0: not yet
+    uint32_t presents = 1;  // the frame's: 2 with a generated frame before it
+    uint32_t shown = 0;     // of them, shown
+    uint64_t first_shown_ns = 0;
   };
 
   void Run();
@@ -155,6 +163,7 @@ class FramePacer {
   const UniqueHandle fence_event_;  // set when the GPU finished the oldest present not seen ready
   std::thread thread_;              // waits on waitable_ and fence_event_ from Attach to Detach
   uint64_t swaps_ = 0;              // render thread: Presented and RetireUnshown calls
+  uint64_t presents_count_ = 0;     // render thread: the presents of Presented calls
   uint64_t queued_ = 0;             // game thread: frames WaitToBegin was called for
 
   // Sleeps with sub-millisecond precision: Wine's NtDelayExecution sleeps in the process (a
