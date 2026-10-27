@@ -3808,11 +3808,16 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     issue();
     occlusion->EndPass(list, pair);
     // Without a depth target nothing is tested, and every sample passes. A generic pipeline's
-    // shaders differ from the key's, which the bindings were made for.
-    ID3D12PipelineState* const cover =
-        key.dsv != DXGI_FORMAT_UNKNOWN && vs == vs_selected && ps == ps_selected
-            ? CoveragePipeline(key, *vst, pst)
-            : nullptr;
+    // shaders differ from the key's, which the bindings were made for, and a coverage pipeline
+    // still compiling leaves the pair uncounted rather than reported fully visible.
+    ID3D12PipelineState* cover = nullptr;
+    auto coverage = OcclusionQueries::Coverage::kUnknown;
+    if (key.dsv == DXGI_FORMAT_UNKNOWN) {
+      coverage = OcclusionQueries::Coverage::kPasses;
+    } else if (vs == vs_selected && ps == ps_selected) {
+      cover = CoveragePipeline(key, *vst, pst);
+      if (cover) coverage = OcclusionQueries::Coverage::kCounted;
+    }
     occlusion->BeginCoverage(list, pair);
     if (cover) {
       list->SetPipelineState(cover);
@@ -3825,7 +3830,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         t ? float(t->edram_samples) /
                 (float(t->samples) * targets.scale.factor(0) * targets.scale.factor(1))
           : 1.0f;
-    occlusion->EndCoverage(list, pair, cover != nullptr, guest_per_host);
+    occlusion->EndCoverage(list, pair, coverage, guest_per_host);
+    if (draw_log) std::fprintf(draw_log, "  occ pair=%u cov=%u\n", pair, uint32_t(coverage));
   }
   ++stats.draws;
   ++diag.draws;

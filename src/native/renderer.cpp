@@ -129,6 +129,7 @@ struct NativeRenderer::Csv {
   uint64_t stage_ticks[profile::kStageCount] = {}, track_calls = 0;
   TextureCache::Stats tex_prev;                  // texture counters at the previous CSV row
   uint64_t evicted_prev = 0, evict_ns_prev = 0;  // the same for every row (tex_prev: profile)
+  uint64_t occ_unknown_prev = 0;                 // OcclusionQueries::unknown_pairs() likewise
   bool luma = false;                             // --pgr4_native_luma_probe columns
   std::string line;                              // the row being written
 };
@@ -842,7 +843,7 @@ void NativeRenderer::OnQueryIssue(const uint8_t* base, const HookArgs& args) {
 }
 
 void NativeRenderer::OnQueryGetData(uint8_t* base, const HookArgs& args) {
-  if (occlusion_) occlusion_->WriteResult(base, args.r[0]);
+  if (occlusion_) occlusion_->WriteResult(base, args.r[0], frame_index_);
 }
 
 void NativeRenderer::OnSwapSuspended() {
@@ -958,7 +959,7 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
 
 void NativeRenderer::ExecuteQuery(const QueryCall& q) {
   if (q.end)
-    occlusion_->End(q.query, device_->frame_fence());
+    occlusion_->End(q.query, frame_index_, device_->frame_fence());
   else
     occlusion_->Begin(q.query);
 }
@@ -1172,6 +1173,7 @@ void NativeRenderer::AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bo
       Fix1("tex_evict_us", (ts.evict_ns - csv_->evict_ns_prev) / 1000.0),
       Uint("views", ds.views),
       Uint("pso_generic", ds.pso_generic),
+      Uint("occ_unknown", occlusion_ ? occlusion_->unknown_pairs() - csv_->occ_unknown_prev : 0),
       // rex_xam_take_frame_pad's layout.
       Hex4("pad_buttons", s.pad & 0xFFFF),
       Uint("pad_lt", uint8_t(s.pad >> 16)),
@@ -1247,6 +1249,7 @@ void NativeRenderer::WriteCsvRow(const FrameStats& s, uint64_t frame_ns) {
   AppendCsvColumns(s, frame_ns, false, &c.line);
   c.evicted_prev = textures_->stats().evicted;
   c.evict_ns_prev = textures_->stats().evict_ns;
+  c.occ_unknown_prev = occlusion_ ? occlusion_->unknown_pairs() : 0;
   if (profile::On()) {
     AppendCsvProfileColumns(false, &c.line);
     c.tex_prev = textures_->stats();

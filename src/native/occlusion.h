@@ -15,6 +15,9 @@
 // in a shader (xenos_zpd_report.h, FromNativeQueryAndTotal). A guest query sums the pairs
 // recorded between its BEGIN and END, so guest queries may overlap, and no host query spans a
 // command list. The pairs are resolved at the Swap and read once the frame's fence completed.
+// A pair whose coverage draw could not run (its pipeline, tests off, still compiling) is left
+// out: with Total := ZPass its flare would snap to full brightness for those frames, and a query
+// whose pairs are all left out keeps its previous result until they are counted.
 //
 // The game thread writes a result into the guest's blocks at the entry of GetData, once the
 // guest fence passed: the command processor has then run the END's sentinel writes and waits, so
@@ -32,6 +35,7 @@
 #include "d3d12_device.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -41,15 +45,20 @@ namespace pgr4::native {
 
 class OcclusionQueries {
  public:
+  ~OcclusionQueries() {
+    if (trace_) std::fclose(trace_);
+  }
   static constexpr uint32_t kNoPair = UINT32_MAX;
   // Host query pairs in flight at most (about three frames of draws inside queries).
   static constexpr uint32_t kPairs = 4096;
 
   bool Initialize(ID3D12Device* device);
+  // The delivered window, 1..kWindowMax (--pgr4_native_occlusion_window).
+  uint32_t window_ = 1;
 
   // Recording thread, in the order of the guest's calls.
   void Begin(uint32_t query);
-  void End(uint32_t query, uint64_t frame_fence);
+  void End(uint32_t query, uint64_t frame, uint64_t frame_fence);
   // Whether a guest query is open: the next draw needs a pair.
   bool counting() const { return !open_.empty(); }
   // The pair for the next draw, or kNoPair when the ring is full (the draw is not counted).
@@ -57,11 +66,17 @@ class OcclusionQueries {
   void BeginPass(ID3D12GraphicsCommandList* list, uint32_t pair) const;
   void EndPass(ID3D12GraphicsCommandList* list, uint32_t pair) const;
   void BeginCoverage(ID3D12GraphicsCommandList* list, uint32_t pair) const;
-  // `drawn`: the coverage draw was issued; otherwise the pair's coverage is its ZPass (no depth
-  // or stencil test to fail, or no pipeline for the coverage draw yet). `guest_per_host`: guest
-  // samples per host sample of the draw's targets (fewer samples, or a smaller render size).
-  void EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, bool drawn,
+  enum class Coverage : uint8_t {
+    kCounted,  // the coverage draw ran
+    kPasses,   // no depth target to test against: the coverage is the draw's ZPass
+    kUnknown,  // the coverage pipeline was not ready: the pair is left out of the query's sums
+  };
+  // `guest_per_host`: guest samples per host sample of the draw's targets (fewer samples, or a
+  // smaller render size).
+  void EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, Coverage coverage,
                    float guest_per_host);
+  // Pairs recorded kUnknown so far (the frames CSV's occ_unknown).
+  uint64_t unknown_pairs() const { return unknown_pairs_; }
   // At the Swap, into the frame's last list, which signals `frame_fence`.
   void Resolve(ID3D12GraphicsCommandList* list, uint64_t frame_fence);
   // After the Swap: the results of the guest queries whose frames completed, for WriteResult.
@@ -69,7 +84,7 @@ class OcclusionQueries {
 
   // Guest thread, at GetData's entry: writes the query's latest result into its blocks, once the
   // guest fence passed and the blocks still wait for it.
-  void WriteResult(uint8_t* base, uint32_t query);
+  void WriteResult(uint8_t* base, uint32_t query, uint64_t frame);
 
  private:
   struct Open {
@@ -82,20 +97,30 @@ class OcclusionQueries {
     uint64_t fence;       // of the frame END was recorded in
     bool known;           // BEGIN was recorded (not before a renderer switch)
   };
+  // One guest query's recent underlying results: the delivered ZPass and Total are the sums of
+  // the window's newest --pgr4_native_occlusion_window frames. The game fades a flare by
+  // 1 - ZPass / Total, so the sum averages the frames' visibilities: a flare that alternates
+  // per frame (its sprite tested against the previous frame's depth of a moving scene) dims
+  // briefly instead of blinking, while a real change wins within the window.
+  static constexpr uint32_t kWindowMax = 8;
   struct Result {
-    uint64_t z_pass, coverage;
-    bool known;
+    uint64_t win_z[kWindowMax] = {}, win_t[kWindowMax] = {};
+    uint32_t win_count = 0;  // pushed so far, up to kWindowMax
+    uint32_t win_next = 0;   // the next slot to write (the oldest when full)
+    bool known = false;
   };
 
   ComPtr<ID3D12QueryHeap> heap_;
   ComPtr<ID3D12Resource> readback_;
   const uint64_t* counts_ = nullptr;  // readback_, mapped: ZPass then coverage of each pair
-  std::vector<uint8_t> coverage_drawn_;
+  std::vector<uint8_t> coverage_;     // Coverage of each pair
   std::vector<float> guest_per_host_;
   std::vector<Open> open_;
   std::deque<Ended> ended_;
   std::deque<std::pair<uint64_t, uint64_t>> resolves_;  // (pairs resolved up to, frame fence)
   uint64_t next_ = 0, resolved_ = 0, retired_ = 0;      // pairs, counted from the start
+  uint64_t unknown_pairs_ = 0;
+  std::FILE* trace_ = nullptr;  // --pgr4_native_occlusion_trace
 
   std::mutex mutex_;
   std::unordered_map<uint32_t, Result> results_;  // the latest by query (mutex_)
