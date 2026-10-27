@@ -14,9 +14,10 @@ and the commits it was built from (`LICENSES/SOURCE.txt`).
   `patches/0048-*` reimplement fixes MTR-PGR4 found: the frame rate unlock, the garage walking
   step count, the bounds of the car preview's visibility search, and song names from the
   soundtrack's file names. No MTR-PGR4 code is included; its license follows for the credit.
-- `src/native/upscaler.cpp` builds with the AMD FidelityFX SDK's API headers (MIT, below). A
-  release package ships AMD's signed `amd_fidelityfx_loader_dx12.dll` and
-  `amd_fidelityfx_upscaler_dx12.dll` from the same SDK, under its binary license
+- `src/native/fidelityfx.cpp`, `upscaler.cpp` and `frame_generation.cpp` build with the AMD
+  FidelityFX SDK's API headers (MIT, below). A release package ships AMD's signed
+  `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll` and
+  `amd_fidelityfx_framegeneration_dx12.dll` from the same SDK, under its binary license
   (`LICENSES/AMD-FidelityFX-SDK.txt`).
 
 ## ReXGlue SDK (https://github.com/rexglue/rexglue-sdk)
@@ -266,7 +267,7 @@ SOFTWARE.
 
 ### AMD FidelityFX SDK API headers (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
 
-The `ffx_api` and `ffx_upscale` headers of v2.3.0, whose inline functions are built into
+The `ffx_api`, `ffx_upscale` and `ffx_framegeneration` headers of v2.3.0, whose inline functions are built into
 `pgr4_recompiled.exe`.
 
 ```

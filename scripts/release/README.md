@@ -96,6 +96,20 @@ and none of them is tested with PGR4 yet. To see which upscaler runs, start the 
 `%command% --log_level=info` and look for `PGR4 native upscaler:` in `logs/`: it names the
 upscaler's version (`3.1.5` for the packaged FSR 3.1) and the render size.
 
+### Frame generation
+
+With `pgr4_native_frame_generation = true` as well as `pgr4_native_upscaler = true`, AMD's
+FidelityFX Frame Generation (`amd_fidelityfx_framegeneration_dx12.dll` beside the executable)
+makes a frame between each two the game draws, from the upscaler's depth and motion. The game
+then runs at half the display's refresh rate and the display shows twice as many frames: on a
+Steam Deck OLED at 90 Hz, 45 game frames and 90 shown a second. The interface is drawn whole
+into every frame, never interpolated. In the St Petersburg race, FSR at 1280x720 with frame
+generation held 45.0 fps with 1% lows of 44.5 fps and no frame shown late (GPU 83 % busy), and
+FSR 4 Lite at 960x540 through OptiScaler held 45.0 fps. Frame generation adds input latency: a
+frame takes about 66 ms from its start to the display, against about 33 ms without it.
+`pgr4_native_frame_generation_debug` shows its debug views (1 tear lines, 2 the generated frames
+alone, 3 FidelityFX's own view).
+
 ### FSR 4 on a Steam Deck (Proton)
 
 AMD's FSR 4.1.2 has a Lite model for handheld GPUs. Under Proton it falls back to FSR 3 because
