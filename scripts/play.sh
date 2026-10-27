@@ -23,8 +23,8 @@
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
 #                              the build to play, so later rebuilds do not change it, and write
 #                              a desktop entry and a Steam shortcut (steam_shortcuts.py, with
-#                              Steam closed) for each way to play: alone, --debug, --debug
-#                              --fgmod, --framegen and --debug --fgmod --framegen
+#                              Steam closed) for each way to play: alone, --debug and
+#                              --debug --fgmod --framegen
 #
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own: deck-run.sh stops only its own prefix's processes, so never a game being
@@ -95,10 +95,12 @@ DESKTOP
   fi
   entry pgr4-native-play 'PGR4 (native renderer)' ''
   entry pgr4-native-debug 'PGR4 (native renderer, debug)' ' --debug'
-  entry pgr4-native-fsr4 'PGR4 (native renderer, FSR 4 Lite, debug)' ' --debug --fgmod'
-  entry pgr4-native-framegen 'PGR4 (native renderer, frame generation)' ' --framegen'
   entry pgr4-native-fsr4-framegen 'PGR4 (native renderer, FSR 4 Lite, frame generation, debug)' \
     ' --debug --fgmod --framegen'
+  # Entries retired 2026-10-27: out of Steam's shortcuts and the applications menu, so the
+  # library holds only the three above. Drop this once no install still has them.
+  rm -f "$apps/pgr4-native-fsr4.desktop" "$apps/pgr4-native-framegen.desktop"
+  [[ $steam == 0 ]] || python3 "$here/steam_shortcuts.py" remove     'PGR4 (native renderer, FSR 4 Lite, debug)' 'PGR4 (native renderer, frame generation)'
   git -C "$repo" log -1 --format='installed %h %s' > "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   git -C "$repo" status --short >> "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   # The --fgmod copy, where fgmod adds OptiScaler at each start and keeps the OptiScaler.ini it
@@ -113,7 +115,7 @@ DESKTOP
     done < "$here/fsr4-optiscaler.ini"
   fi
   echo "installed $src -> $top/runtime (and runtime-fgmod); desktop entries pgr4-native-play," \
-    "pgr4-native-debug, pgr4-native-fsr4, pgr4-native-framegen, pgr4-native-fsr4-framegen in $apps"
+    "pgr4-native-debug and pgr4-native-fsr4-framegen in $apps"
   exit 0
 fi
 debug=${PGR4_DEBUG:-0}

@@ -4,6 +4,7 @@
   steam_shortcuts.py list
   steam_shortcuts.py add NAME EXE [--options '"--flag" ...'] [--start-dir DIR] [--icon PNG]
                      [--desktop FILE] [--art-from NAME]
+  steam_shortcuts.py remove NAME...
 
 add updates the shortcut of the same NAME (the options given), or appends one with the app ID Steam gives it (the
 CRC-32 of the quoted EXE and NAME, high bit set), so Steam keeps its play time and artwork.
@@ -98,10 +99,23 @@ def steam_running() -> bool:
     return subprocess.run(["pgrep", "-x", "steam"], capture_output=True).returncode == 0
 
 
+def write(path: str, root: dict) -> None:
+    data = serialize(root)
+    if os.path.exists(path):
+        if open(path, "rb").read() == data:
+            return
+        shutil.copyfile(path, f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    with open(path + ".tmp", "wb") as f:
+        f.write(data)
+    os.replace(path + ".tmp", path)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
+    remove = sub.add_parser("remove")
+    remove.add_argument("name", nargs="+")
     add = sub.add_parser("add")
     add.add_argument("name")
     add.add_argument("exe")
@@ -124,6 +138,18 @@ def main() -> None:
 
     if steam_running():
         sys.exit("Steam is running and would write its own shortcuts back: quit it first")
+    if args.cmd == "remove":
+        removed = False
+        for name in args.name:
+            key = next((k for k, e in shortcuts.items() if e["AppName"] == name), None)
+            if key is None:
+                print(f"no shortcut named {name}")
+            else:
+                del shortcuts[key]
+                removed = True
+        if removed:
+            write(path, root)
+        return
     exe = f'"{args.exe}"'
     start_dir = args.start_dir or os.path.dirname(args.exe) + "/"
     entry = next((e for e in shortcuts.values() if e["AppName"] == args.name), None)
@@ -150,14 +176,7 @@ def main() -> None:
             suffix = os.path.basename(art)[len(prefix):]
             shutil.copyfile(art, os.path.join(grid, str(unsigned(entry["appid"])) + suffix))
 
-    data = serialize(root)
-    if os.path.exists(path):
-        if open(path, "rb").read() == data:
-            return
-        shutil.copyfile(path, f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    with open(path + ".tmp", "wb") as f:
-        f.write(data)
-    os.replace(path + ".tmp", path)
+    write(path, root)
 
 
 if __name__ == "__main__":
