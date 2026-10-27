@@ -170,11 +170,26 @@ constexpr uint32_t SkipClassOf(FnId id) {
 uint64_t g_frame_begin_ns = 0;
 int64_t g_frame_step_ns = 0;
 std::atomic<int64_t> g_drawn_step_ns{0};
+// The drawn step smoothed over ~1/2 s (an EMA whose weight follows the frame's length). The
+// motion blur's strength means to match the sustained frame rate, a slow quantity; the raw
+// step's jitter was invisible in a race, where the reprojection dominates, but in pause the
+// reprojection is zero and the jitter was the whole of the visible blur: the still frame pumped
+// (issue #1).
+std::atomic<int64_t> g_smooth_step_ns{0};
 
 void NoteFrameBegin() {
   const uint64_t now = pgr4::native::NowNs();
   g_drawn_step_ns.store(g_frame_step_ns, std::memory_order_relaxed);
-  if (g_frame_begin_ns) g_frame_step_ns = int64_t(now - g_frame_begin_ns);
+  if (g_frame_begin_ns) {
+    g_frame_step_ns = int64_t(now - g_frame_begin_ns);
+    double smooth = double(g_smooth_step_ns.load(std::memory_order_relaxed));
+    // Clamped like the reader's: a load's long frame must not drag the average up. The first
+    // measured frame starts the average at itself, not at a ramp from zero.
+    const int64_t sample = std::min<int64_t>(g_frame_step_ns, 100'000'000);
+    if (smooth == 0) smooth = double(sample);
+    smooth += (sample - smooth) * (sample / 500'000'000.0);
+    g_smooth_step_ns.store(int64_t(smooth), std::memory_order_relaxed);
+  }
   g_frame_begin_ns = now;
 }
 
@@ -1363,9 +1378,9 @@ float Pgr4MotionBlurStep(float step) {
   constexpr int64_t kMinStepNs = 1'000'000, kMaxStepNs = 100'000'000;
   // Not measured yet (the first frames): the console's step. Clamped: steps under 1 ms are frames
   // queued behind a stall, which begin at once; steps over 100 ms are loads.
-  const int64_t drawn_ns = g_drawn_step_ns.load(std::memory_order_relaxed);
+  const int64_t smooth_ns = g_smooth_step_ns.load(std::memory_order_relaxed);
   const int64_t frame_ns =
-      drawn_ns ? std::clamp(drawn_ns, kMinStepNs, kMaxStepNs) : int64_t(kConsoleFrameNs);
+      smooth_ns ? std::clamp(smooth_ns, kMinStepNs, kMaxStepNs) : int64_t(kConsoleFrameNs);
   return float(step * (kConsoleFrameNs / double(frame_ns)));
 }
 
