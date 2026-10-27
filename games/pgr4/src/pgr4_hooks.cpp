@@ -72,6 +72,25 @@ void Pgr4ViewportFHook(PPCRegister& r4) {
   }
 }
 
+// The vertex block's c45, the HUD's orthographic projection, uploaded with the block by the
+// state apply (sub_82871A20): the game maps its 640x480 HUD space into the central 960x720 of
+// its 720-tall frame (4:3-safe, the pixel scale 1.5). With the frame pgr4_render_height tall,
+// the y scale and offset still divide by 720 and every c45 draw (the dials, the HUD text, the
+// menus) stretches by height/720. Rewrite the game's own value to the same mapping of the
+// taller frame: the central 960x720 of it, centered, as the 960-wide area already is.
+void Pgr4HudOrthoHook(PPCRegister& r5) {
+  const float h = float(REXCVAR_GET(pgr4_render_height));
+  if (h == 720.0f || !r5.u32) return;   // the 16:10 patch is off
+  const uint32_t c = r5.u32 + 45 * 16;  // c45 of the 256-register block
+  if (std::bit_cast<float>(GuestLoad32(c)) != 3.0f / 1280.0f ||
+      std::bit_cast<float>(GuestLoad32(c + 4)) != -3.0f / 720.0f ||
+      std::bit_cast<float>(GuestLoad32(c + 8)) != -0.75f ||
+      std::bit_cast<float>(GuestLoad32(c + 12)) != 1.0f)
+    return;  // not the game's HUD ortho (another mode's): leave it
+  GuestStore32(c + 4, std::bit_cast<uint32_t>(-3.0f / h));
+  GuestStore32(c + 12, std::bit_cast<uint32_t>(720.0f / h));
+}
+
 // SetScissorRect (fn_826C59D8): r4 points at {x1, y1, x2, y2}.
 void Pgr4ScissorRectHook(PPCRegister& r4) {
   if (!r4.u32) return;

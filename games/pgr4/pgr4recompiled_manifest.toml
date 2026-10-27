@@ -334,6 +334,16 @@ address = 0x826CBEE0
 name = "Pgr4ResolveRectHook"
 registers = ["r5"]
 
+# And the HUD's orthographic projection: c45 of the vertex block the state apply
+# (sub_82871A20) uploads, whose y scale and offset still map the 720-tall frame, stretching
+# every HUD draw by render_height/720. The hook rewrites the game's own value for the render
+# height; anything else passes.
+[[entrypoint.midasm_hook]]
+address = 0x82871CA8
+name = "Pgr4HudOrthoHook"
+registers = ["r5"]
+after_instruction = true
+
 [[entrypoint.midasm_hook]]
 address = 0x826C8B18
 name = "Pgr4RenderHeightHook"

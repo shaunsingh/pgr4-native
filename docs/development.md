@@ -285,8 +285,8 @@ never stretched. Rendering at 1280x800 needs a game patch rather than a renderer
   create their own targets.
 
 That patch shipped (`pgr4_render_height`, default 800): the frame renders at 1280x800 end to
-end at the same 90 fps, the projection gains the vertical field of view, and the HUD keeps its
-edges. The mechanism, all in `pgr4recompiled_manifest.toml` + `Pgr4*Hook` in
+end at the same 90 fps, the projection gains the vertical field of view, and the HUD and menus
+keep their shape (square pixels, centered). The mechanism, all in `pgr4recompiled_manifest.toml` + `Pgr4*Hook` in
 `games/pgr4/src/pgr4_hooks.cpp`:
 
 - Every instruction that loads the hardcoded 720 of the frame (surfaces, the mode structs, the
@@ -299,6 +299,11 @@ edges. The mechanism, all in `pgr4recompiled_manifest.toml` + `Pgr4*Hook` in
 - The scene's render targets come from the pair creators `fn_826C8B18`/`sub_822B3FC8`; their
   height argument is hooked too, because `sub_826C6100` clamps every viewport to the bound
   target's packed size and would otherwise clamp the scene back to 720.
+- The HUD and the menus share one orthographic projection, c45 of the vertex block the state
+  apply (`sub_82871A20`) uploads: 640x480 mapped into the central 960x720 of the frame (4:3-safe,
+  the pixel scale 1.5). Its y scale and offset are the one 720 the loads cannot reach (the game
+  computes them), so `Pgr4HudOrthoHook` rewrites the game's own value at the upload: the central
+  960x720 of the taller frame, centered, square pixels.
 - `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
   function; the manifest's comments name the false positives it deliberately skips (VMX byte
   offsets, allocation sizes, string calls, the 1280 widths).
