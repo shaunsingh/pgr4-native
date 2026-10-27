@@ -236,6 +236,35 @@ ReXGlue), `LittleBitUA/DPRecomp`, `SpeedBreakerProject/speedbreaker`,
 10. **Keep hot threads cheap.** Never read write-combined memory, avoid 256-bit vectors on the
     Deck, and read the TSC rather than `QueryPerformanceCounter`, which is a syscall under Wine.
 
+## Light flares
+
+The headlights, taillights and street lights dim as the traffic hides them, each from an
+occlusion query of its own. The game renders the scene with 2x MSAA, resolves its depth into
+guest textures, redraws that depth at 1x into a second buffer (on the Xenos the step is an
+exact EDRAM copy; here the game runs a depth-writing pixel shader for it), and then draws each
+flare additively against it with GREATER_EQUAL inside one query. The flare's brightness is
+1 - ZPass / Total, and the depth it tests against is the previous frame's.
+
+Why the flares flickered, measured with `--pgr4_native_occlusion_trace` and
+`scripts/analysis/occ_flicker.py`:
+
+- The raw test flips fully occluded to fully visible and back about once per 50 frames per
+  light, on the GPU side (the retire stream), not in the delivery. The flips are geometric:
+  the live sprite is compared pixel for pixel with the previous frame's depth of a moving
+  scene, so as the car under a flare moves, the stored depth at the sprite's pixels wobbles by
+  the panel's relief, more than any depth margin.
+- No bias fixes that. The guest's polygon offsets are absolute z (the float24 factors of the
+  SDK's draw.h), but on the host's float32 depth the rasterizer bias scales with the
+  primitive's exponent, so the flares' ~3e-4 margin vanishes near z=1; a test-side bias of
+  even 1e6 changed nothing, and subtracting 3e-4 from the resolved depth moved the visible
+  share 50 to 72 % but cut the flips by only a tenth. A faithful fix would be 20e4 depth end
+  to end (the translator's DSV_IsWritingFloat24Depth already writes it), not a bias.
+- The delivery is a windowed sum instead (`--pgr4_native_occlusion_window`, 4): the delivered
+  ZPass and Total are the sums of the query's newest frames, so the game's own fade averages
+  them. A blink becomes a four-frame ramp, and a real occlusion still wins within the window
+  (44 ms at 90 fps). The flips fell from 15.8 to 7.2 per 1000 reads, and the remaining ones
+  are a ~3 % brightness wobble of a light already at the edge of visibility, not a blink.
+
 ## Native 16:10
 
 The game renders at 1280x720, and the renderer shows it letterboxed on the Deck's 1280x800 panel,
