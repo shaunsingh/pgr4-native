@@ -213,5 +213,5 @@ work in a cached scratch row and copy whole rows out.
   sample count: the SDK's D3D12 backend waits for no result, and the flares show through walls.
 - A draw inside an occlusion query that writes nothing and tests neither depth nor stencil is
   skipped, so the query does not count its samples.
-- The game renders at 1280x720 and is shown letterboxed on a 1280x800 panel, never stretched.
-  Native 16:10 needs a game patch, described in [development.md](development.md#native-1610).
+- The game renders at 1280x800 natively (a game patch, `pgr4_render_height` in
+  [development.md](development.md#native-1610)), filling the 1280x800 panel, never stretched.

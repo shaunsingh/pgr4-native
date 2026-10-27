@@ -284,6 +284,25 @@ never stretched. Rendering at 1280x800 needs a game patch rather than a renderer
   UnleashedRecomp's `aspect_ratio_patches.cpp` does, and photo mode, replays and the garage may
   create their own targets.
 
+That patch shipped (`pgr4_render_height`, default 800): the frame renders at 1280x800 end to
+end at the same 90 fps, the projection gains the vertical field of view, and the HUD keeps its
+edges. The mechanism, all in `pgr4recompiled_manifest.toml` + `Pgr4*Hook` in
+`games/pgr4/src/pgr4_hooks.cpp`:
+
+- Every instruction that loads the hardcoded 720 of the frame (surfaces, the mode structs, the
+  video-mode table's selected case) gets a mid-asm hook that rewrites the register to the render
+  height. The post chain needs nothing: it derives 320x200, 160x100 and down from its sources.
+- The sizes that arrive as structs instead of immediates are patched at the D3D boundary:
+  `SetViewport` (the int one, `sub_826C6378`), the float viewport setter the scene's views use
+  (`sub_826C63F8`, `{X, Y, W, H, MinZ, MaxZ}` floats), `SetScissorRect` (`fn_826C59D8`) and
+  `Resolve` (`sub_826CBEE0`) take a 1280x720 struct to the render height.
+- The scene's render targets come from the pair creators `fn_826C8B18`/`sub_822B3FC8`; their
+  height argument is hooked too, because `sub_826C6100` clamps every viewport to the bound
+  target's packed size and would otherwise clamp the scene back to 720.
+- `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
+  function; the manifest's comments name the false positives it deliberately skips (VMX byte
+  offsets, allocation sizes, string calls, the 1280 widths).
+
 ## Gearbox
 
 What the game does with the shift buttons and where its automatic decides, for a future smarter
