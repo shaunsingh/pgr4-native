@@ -2906,7 +2906,8 @@ void DrawRenderer::Impl::LogDraw(const DrawState& s, const RegisterFile& regs, u
       regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
       regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET), key.depth_bias,
       key.slope_scaled_depth_bias);
-  // Where the draw's data comes from and the float constants each shader reads (hashed).
+  // Where the draw's data comes from and the float constants each shader reads (hashed, then
+  // in full).
   std::fprintf(draw_log, "  ia=%08X", s.indexed ? s.index_address : 0u);
   const Shader::ConstantRegisterMap& vmap = vs.constant_register_map();
   for (uint32_t w = 0; w < 3; ++w)
@@ -2928,18 +2929,20 @@ void DrawRenderer::Impl::LogDraw(const DrawState& s, const RegisterFile& regs, u
   std::fprintf(draw_log, " cvs=%016llX cps=%016llX\n",
                (unsigned long long)float_hash(&vs, XE_GPU_REG_SHADER_CONSTANT_000_X),
                (unsigned long long)float_hash(ps, XE_GPU_REG_SHADER_CONSTANT_256_X));
-  if (ps) {
-    std::fprintf(draw_log, "  pc");
-    const Shader::ConstantRegisterMap& map = ps->constant_register_map();
+  auto log_floats = [&](const char* name, const Shader& shader, uint32_t base) {
+    std::fprintf(draw_log, "  %s", name);
+    const Shader::ConstantRegisterMap& map = shader.constant_register_map();
     for (uint32_t w = 0; w < 4; ++w)
       for (uint64_t bits = map.float_bitmap[w]; bits; bits &= bits - 1) {
         const uint32_t c = w * 64 + uint32_t(std::countr_zero(bits));
-        const uint32_t r = XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4;
+        const uint32_t r = base + c * 4;
         std::fprintf(draw_log, " %u=%g,%g,%g,%g", c, regs.Get<float>(r), regs.Get<float>(r + 1),
                      regs.Get<float>(r + 2), regs.Get<float>(r + 3));
       }
     std::fputc('\n', draw_log);
-  }
+  };
+  log_floats("vc", vs, XE_GPU_REG_SHADER_CONSTANT_000_X);
+  if (ps) log_floats("pc", *ps, XE_GPU_REG_SHADER_CONSTANT_256_X);
 }
 
 ID3D12PipelineState* DrawRenderer::Impl::CoveragePipeline(const PipelineKey& key,
