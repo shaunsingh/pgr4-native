@@ -113,8 +113,10 @@ happens while a XAM dialog is up, since ReXGlue's presenter draws those, and whe
    counted on the swapchain's frame latency waitable. It then waits a delay so that it finishes
    just before its slot (`--pgr4_native_low_latency`, DXVK's latency sleep measured against the
    display). The game's time steps follow the intervals the display shows, at any refresh rate
-   or frame limit. The motion blur pass scales its per-sample step by the frame's time step
-   (`Pgr4MotionBlurStep`), so the blur is as long as at the console's 30 FPS.
+   or frame limit. The motion blur pass scales its per-sample step by the frame's time step,
+   smoothed over ~1/2 s (`Pgr4MotionBlurStep`), so the blur is as long as at the console's
+   30 FPS and steady on a still frame: with the raw step, its jitter was the whole of the
+   visible blur in pause, and the still frame pumped (issue #1).
 
 ## Coherency rules
 
