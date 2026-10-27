@@ -23,10 +23,10 @@ pgr4_native_anisotropy = 16
 # give smoother edges for more GPU time; 4x holds 90 fps on a Steam Deck OLED.
 pgr4_native_msaa = 4
 
-# The 3D scene with MSAA, or (true) antialiased and upscaled to 1280x720 by AMD's
+# The 3D scene with MSAA, or (true) antialiased and upscaled to the render height (800) by AMD's
 # FidelityFX Super Resolution, or what OptiScaler puts behind it (README.md, "Upscaling"). The
-# upscaler renders the scene at width x height: 1280x720 is antialiasing only, 853x480 FSR's
-# Quality, 640x360 its Performance.
+# upscaler renders the scene at width x height: 1280x800 is antialiasing only, 1280x720 FSR's
+# Quality, 640x400 its Performance.
 pgr4_native_upscaler = false
 pgr4_native_upscaler_width = 1280
 pgr4_native_upscaler_height = 720

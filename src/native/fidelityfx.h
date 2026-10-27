@@ -21,8 +21,10 @@ struct FfxApi {
 // The loader's entry points, loaded once; nullptr (logged) without them.
 const FfxApi* LoadFfxApi();
 
-// The scene both effects take: PGR4's 1280x720 (Upscaler::kSceneWidth/Height).
-inline constexpr uint32_t kFfxSceneWidth = 1280, kFfxSceneHeight = 720;
+// The scene both effects take: PGR4's frame, 1280 wide and --pgr4_render_height tall (1280x800
+// on the Steam Deck: the game's own render size, which pgr4_hooks.cpp's hooks make it render).
+inline constexpr uint32_t kFfxSceneWidth = 1280;
+uint32_t FfxSceneHeight();
 
 // The scene's camera: near and far planes and vertical field of view, by which FidelityFX scales
 // its disocclusion thresholds. NativeRenderer reads it each frame from the clip transform in the

@@ -140,7 +140,7 @@ bool FrameGeneration::Resize(uint32_t width, uint32_t height, bool hdr) {
   cd.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
              (hdr ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0u);
   cd.displaySize = {width, height};
-  cd.maxRenderSize = {kFfxSceneWidth, kFfxSceneHeight};
+  cd.maxRenderSize = {kFfxSceneWidth, FfxSceneHeight()};
   cd.backBufferFormat = ffxApiGetSurfaceFormatDX12(format);
   if (const ffxReturnCode_t rc = api_->create(&context_, &cd.header, nullptr);
       rc != FFX_API_RETURN_OK) {

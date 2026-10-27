@@ -57,6 +57,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_primary, false, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_msaa, 2, "PGR4 native",
                      "Samples of the 3D scene's MSAA without the upscaler: 1, 2 (the game's), 4 "
                      "or 8 (fewer if the GPU lacks them)");
+REXCVAR_DEFINE_INT32(pgr4_render_height, 800, "PGR4",
+                     "The render height the 16:10 patch gives every hooked 720 (720 disables it)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");
 REXCVAR_DEFINE_INT32(pgr4_native_width, 1280, "PGR4 native", "Debug window width");

@@ -109,10 +109,10 @@ Upscaler::~Upscaler() {
 bool Upscaler::Initialize(ID3D12Device* device) {
   device_ = device;
   max_width_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_width), kSceneWidth);
-  max_height_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_height), kSceneHeight);
+  max_height_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_height), SceneHeight());
   if (const int32_t fps = REXCVAR_GET(pgr4_native_upscaler_target_fps); fps > 0) {
     const uint32_t min_height =
-        RenderExtent(REXCVAR_GET(pgr4_native_upscaler_min_height), kSceneHeight);
+        RenderExtent(REXCVAR_GET(pgr4_native_upscaler_min_height), SceneHeight());
     const uint32_t min_level =
         (min_height * DynamicResolution::kSteps + max_height_ - 1) / max_height_;
     dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps));
@@ -123,7 +123,7 @@ bool Upscaler::Initialize(ID3D12Device* device) {
   provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
   if (api_->query(&context_, &provider.header) == FFX_API_RETURN_OK && provider.versionName)
     REXLOG_INFO("PGR4 native upscaler: {} from {}x{}{} to {}x{}", provider.versionName, max_width_,
-                max_height_, dynamic_ ? " or less" : "", kSceneWidth, kSceneHeight);
+                max_height_, dynamic_ ? " or less" : "", kSceneWidth, SceneHeight());
   return SetLevel(DynamicResolution::kSteps) && CreateTargets() && CreatePasses();
 }
 
@@ -219,7 +219,7 @@ bool Upscaler::SetLevel(uint32_t level) {
   // AMD's recommended texture LOD bias for the render size (FSR docs, "Mipmap biasing"),
   // in the sampler key's quarter steps.
   const float ratio = std::min(float(render_width_) / float(kSceneWidth),
-                               float(render_height_) / float(kSceneHeight));
+                               float(render_height_) / float(SceneHeight()));
   mip_bias_quarters_ = uint32_t(std::lround(-4.0f * (std::log2(ratio) - 1.0f)));
   ffxQueryDescUpscaleGetJitterPhaseCount phases = {};
   phases.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
@@ -258,7 +258,7 @@ bool Upscaler::CreateContext(bool debug) {
                (dynamic_ ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0u) |
                (debug ? FFX_UPSCALE_ENABLE_DEBUG_VISUALIZATION : 0u);
   desc.maxRenderSize = {max_width_, max_height_};
-  desc.maxUpscaleSize = {kSceneWidth, kSceneHeight};
+  desc.maxUpscaleSize = {kSceneWidth, SceneHeight()};
   desc.fpMessage = Message;
   if (const ffxReturnCode_t rc = api_->create(&context_, &desc.header, nullptr);
       rc != FFX_API_RETURN_OK) {
@@ -278,7 +278,7 @@ bool Upscaler::CreateTargets() {
   D3D12_RESOURCE_DESC d = {};
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   d.Width = kSceneWidth;
-  d.Height = kSceneHeight;
+  d.Height = SceneHeight();
   d.DepthOrArraySize = 1;
   d.MipLevels = 1;
   d.Format = kOutputFormat;
@@ -292,7 +292,7 @@ bool Upscaler::CreateTargets() {
   output_.resource_format = output_.view_format = output_.srv_format = kOutputFormat;
   output_.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   output_.width = kSceneWidth;
-  output_.height = kSceneHeight;
+  output_.height = SceneHeight();
 
   d.Width = max_width_;
   d.Height = max_height_;
@@ -370,15 +370,15 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   upscaled_frame_ = frame_;
   upscaled_ = false;
 
-  RenderTarget* color = targets.GetColor(regs, 0, kSceneHeight);
-  RenderTarget* depth = targets.GetDepth(regs, kSceneHeight);
+  RenderTarget* color = targets.GetColor(regs, 0, SceneHeight());
+  RenderTarget* depth = targets.GetDepth(regs, SceneHeight());
   if (!color || !depth || color->samples != 1 || depth->samples != 1 || color->scale != scale() ||
       depth->scale != scale() || color->srv_format != kOutputFormat) {
     PGR4_WARN_ONCE("PGR4 native upscaler: unexpected scene targets (surface {:08X} color {:08X})",
                    regs.surface_info, regs.color_info[0]);
     return nullptr;
   }
-  const D3D12_RECT all = {0, 0, LONG(kSceneWidth), LONG(kSceneHeight)};
+  const D3D12_RECT all = {0, 0, LONG(kSceneWidth), LONG(SceneHeight())};
   targets.PrepareRead(list, color, all);
   targets.PrepareRead(list, depth, all);
 
@@ -412,7 +412,7 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   d.jitterOffset = {jitter_[0], jitter_[1]};
   d.motionVectorScale = {float(render_width_), float(render_height_)};
   d.renderSize = {render_width_, render_height_};
-  d.upscaleSize = {kSceneWidth, kSceneHeight};
+  d.upscaleSize = {kSceneWidth, SceneHeight()};
   d.enableSharpening = false;
   if (debug_view_) d.flags = FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
   d.frameTimeDelta = frame_ms_;
@@ -435,8 +435,8 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
     b.UAV.pResource = output_.resource.Get();
     list->ResourceBarrier(1, &b);
     RunPass(list, alpha_pso_.Get(), color->resource.Get(), output_.resource.Get(), 1,
-            float(render_width_) / float(kSceneWidth), float(render_height_) / float(kSceneHeight),
-            kSceneWidth, kSceneHeight);
+            float(render_width_) / float(kSceneWidth), float(render_height_) / float(SceneHeight()),
+            kSceneWidth, SceneHeight());
   }
   reset_ = false;
   upscaled_ = true;

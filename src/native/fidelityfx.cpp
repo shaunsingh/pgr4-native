@@ -3,12 +3,19 @@
 
 #include "d3d12_device.h"  // windows.h
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include <algorithm>
 #include <cmath>
 
+REXCVAR_DECLARE(int32_t, pgr4_render_height);  // renderer.cpp
+
 namespace pgr4::native {
+
+uint32_t FfxSceneHeight() {
+  return uint32_t(std::clamp<int32_t>(REXCVAR_GET(pgr4_render_height), 360, 2160));
+}
 
 const FfxApi* LoadFfxApi() {
   static const FfxApi api = [] {

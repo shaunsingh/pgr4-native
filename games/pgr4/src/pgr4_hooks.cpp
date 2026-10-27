@@ -31,9 +31,7 @@ void Pgr4MotionBlurStepHook(PPCRegister& f0) { f0.f64 = double(Pgr4MotionBlurSte
 // below cover the copies the loads cannot: structs the game fills itself and hands to the D3D
 // (viewport, scissor and resolve rects) and the surface creators whose packed sizes the
 // viewport clamp reads back (sub_826C6100).
-REXCVAR_DEFINE_INT32(pgr4_render_height, 800, "PGR4",
-                     "The render height the 16:10 patch gives every hooked 720 (720 disables it)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(int32_t, pgr4_render_height);  // native/renderer.cpp: the FFX effects size from it
 
 void Pgr4RenderHeightHook(PPCRegister& r) {
   if (r.u32 == 720) r.u64 = uint32_t(REXCVAR_GET(pgr4_render_height));

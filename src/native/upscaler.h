@@ -46,7 +46,8 @@ class Upscaler {
   static constexpr bool IsScene(uint32_t surface_info) {
     return (surface_info & kSceneSurfaceMask) == kSceneSurface;
   }
-  static constexpr uint32_t kSceneWidth = kFfxSceneWidth, kSceneHeight = kFfxSceneHeight;
+  static constexpr uint32_t kSceneWidth = kFfxSceneWidth;
+  static uint32_t SceneHeight() { return FfxSceneHeight(); }
   // Whether a span of the scene surface (a resolve's, a viewport's) is the scene's width: the
   // scene resolves in tiles of its whole width, while the rear-view mirror renders into a corner
   // of the scene surface and resolves that corner on its own (neither upscaled nor jittered).
@@ -85,9 +86,11 @@ class Upscaler {
   // The scene's render size this frame on its guest size, and its largest
   // (--pgr4_native_upscaler_width/height: the size of the scene's targets).
   RenderScale scale() const {
-    return {{render_width_, render_height_}, {kSceneWidth, kSceneHeight}};
+    return {{render_width_, render_height_}, {kSceneWidth, SceneHeight()}};
   }
-  RenderScale max_scale() const { return {{max_width_, max_height_}, {kSceneWidth, kSceneHeight}}; }
+  RenderScale max_scale() const {
+    return {{max_width_, max_height_}, {kSceneWidth, SceneHeight()}};
+  }
   uint32_t render_height() const { return render_height_; }
   // The scene's texture LOD bias, in negative quarter levels (SamplerKey::lod_bias).
   uint32_t mip_bias_quarters() const { return mip_bias_quarters_; }
@@ -145,8 +148,8 @@ class Upscaler {
   ComPtr<ID3D12PipelineState> alpha_pso_;  // null without typed UAV loads
   ComPtr<ID3D12DescriptorHeap> pass_heap_;
   uint32_t pass_stride_ = 0;
-  uint32_t max_width_ = kSceneWidth, max_height_ = kSceneHeight;
-  uint32_t render_width_ = kSceneWidth, render_height_ = kSceneHeight;
+  uint32_t max_width_ = kSceneWidth, max_height_ = 0;  // Initialize's, from the render height
+  uint32_t render_width_ = kSceneWidth, render_height_ = 0;
   std::optional<DynamicResolution> dynamic_;  // with --pgr4_native_upscaler_target_fps
   uint32_t mip_bias_quarters_ = 0;
   uint64_t frame_ = 0;
