@@ -158,7 +158,8 @@ bool FrameGeneration::Resize(uint32_t width, uint32_t height, bool hdr) {
 void FrameGeneration::Prepare(uint64_t frame, ID3D12GraphicsCommandList* list,
                               const FfxApiResource& depth, const FfxApiResource& motion,
                               FfxApiDimensions2D render_size, FfxApiFloatCoords2D jitter,
-                              FfxApiFloatCoords2D motion_scale, float frame_ms, bool reset) {
+                              FfxApiFloatCoords2D motion_scale, const FfxCamera& camera,
+                              float frame_ms, bool reset) {
   if (!device_.has_swapchain() || !Resize(device_.width(), device_.height(), device_.hdr())) return;
   ffxDispatchDescFrameGenerationPrepareV2 d = {};
   d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
@@ -169,9 +170,9 @@ void FrameGeneration::Prepare(uint64_t frame, ID3D12GraphicsCommandList* list,
   d.motionVectorScale = motion_scale;
   d.frameTimeDelta = frame_ms;
   d.reset = reset;
-  d.cameraNear = kFfxCameraNear;
-  d.cameraFar = kFfxCameraFar;
-  d.cameraFovAngleVertical = kFfxCameraFovY;
+  d.cameraNear = camera.near_plane;
+  d.cameraFar = camera.far_plane;
+  d.cameraFovAngleVertical = camera.fov_y;
   d.viewSpaceToMetersFactor = 1.0f;
   d.depth = depth;
   d.motionVectors = motion;

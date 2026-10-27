@@ -27,6 +27,7 @@
 #pragma once
 
 #include "hook_args.h"
+#include "fidelityfx.h"
 
 #include <rex/cvar.h>
 
@@ -168,6 +169,9 @@ class NativeRenderer {
   void BeginFrameModules();
   // The recording half of the On* calls (on the guest thread, or the render thread).
   void ExecuteDraw(const DrawState& state, const DrawPrep* prep);
+  // The frame's camera (camera_): from the clip transform of its first depth-writing scene
+  // draws, while camera_scan_ counts how many more of them to look at.
+  void FindCamera(const DrawState& state);
   void ExecuteClear(const ClearCall& clear);
   void ExecuteResolve(const ResolveParams& p);
   void ExecuteSwap(const SwapCall& swap);
@@ -241,6 +245,11 @@ class NativeRenderer {
   std::unique_ptr<OcclusionQueries> occlusion_;  // primary mode with --pgr4_native_occlusion
   std::unique_ptr<Upscaler> upscaler_;
   std::unique_ptr<FrameGeneration> frame_generation_;  // --pgr4_native_frame_generation, paced
+  // The scene's camera for the FidelityFX effects, found each frame by FindCamera (the defaults
+  // until one matches); the upscaler reads it through the pointer set_camera gave it.
+  FfxCamera camera_;
+  uint32_t camera_scan_ = 0;  // this frame's scene depth draws still to scan for it
+  bool camera_logged_ = false;
   // Primary mode with --pgr4_native_frame_latency > 0, or observing only with --pgr4_native_csv.
   std::unique_ptr<FramePacer> pacer_;
   GpuTimer* gpu_timer_ = nullptr;  // device_'s, with --pgr4_native_gpu_timing

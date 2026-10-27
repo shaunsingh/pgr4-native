@@ -105,6 +105,8 @@ class Upscaler {
                         const SurfaceRegs& regs);
   // Frame generation's inputs, recorded by each Upscale; nullptr: none.
   void set_frame_generation(FrameGeneration* fg) { frame_generation_ = fg; }
+  // The scene's camera, the renderer's, read at each Upscale.
+  void set_camera(const FfxCamera* camera) { camera_ = camera; }
 
  private:
   // The upscaling context, with debug visualization or not; false (logged) on failure.
@@ -126,7 +128,8 @@ class Upscaler {
   ID3D12Device* device_ = nullptr;
   const FfxApi* api_ = nullptr;
   FrameGeneration* frame_generation_ = nullptr;
-  void* context_ = nullptr;  // ffxContext
+  const FfxCamera* camera_ = nullptr;  // the renderer's
+  void* context_ = nullptr;            // ffxContext
   // The upscaled color (an R16G16B16A16_FLOAT UAV: the scene's host format), in the fields the
   // resolve reads; and the motion vectors.
   RenderTarget output_;

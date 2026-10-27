@@ -418,9 +418,9 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   d.frameTimeDelta = frame_ms_;
   d.preExposure = 1.0f;
   d.reset = reset_;
-  d.cameraNear = kFfxCameraNear;
-  d.cameraFar = kFfxCameraFar;
-  d.cameraFovAngleVertical = kFfxCameraFovY;
+  d.cameraNear = camera_->near_plane;
+  d.cameraFar = camera_->far_plane;
+  d.cameraFovAngleVertical = camera_->fov_y;
   d.viewSpaceToMetersFactor = 1.0f;
   if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK) {
     PGR4_WARN_ONCE("PGR4 native upscaler: ffxDispatch failed ({})", rc);
@@ -428,7 +428,7 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   }
   if (frame_generation_)
     frame_generation_->Prepare(frame_, list, d.depth, d.motionVectors, d.renderSize, d.jitterOffset,
-                               d.motionVectorScale, frame_ms_, reset_);
+                               d.motionVectorScale, *camera_, frame_ms_, reset_);
   if (alpha_pso_) {
     D3D12_RESOURCE_BARRIER b = {};  // after FSR's writes to the output
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;

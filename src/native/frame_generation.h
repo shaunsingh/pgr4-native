@@ -63,8 +63,8 @@ class FrameGeneration {
   // size and format first, with the GPU idle.
   void Prepare(uint64_t frame, ID3D12GraphicsCommandList* list, const FfxApiResource& depth,
                const FfxApiResource& motion, FfxApiDimensions2D render_size,
-               FfxApiFloatCoords2D jitter, FfxApiFloatCoords2D motion_scale, float frame_ms,
-               bool reset);
+               FfxApiFloatCoords2D jitter, FfxApiFloatCoords2D motion_scale,
+               const FfxCamera& camera, float frame_ms, bool reset);
   // Whether Prepare recorded frame `frame`, which is then drawn into image() and generated.
   bool prepared(uint64_t frame) const { return context_ && prepared_frame_ == frame; }
   // The frame's image: the back buffers' size and format, in PRESENT outside the frame's draws.

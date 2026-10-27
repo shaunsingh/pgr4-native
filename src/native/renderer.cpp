@@ -18,6 +18,7 @@
 #include "textures.h"
 #include "upscaler.h"
 
+#include <rex/graphics/registers.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -43,6 +45,8 @@
 // patches/0025 (xam_input.cpp): what user 0's XamInputGetState calls returned
 // since the last call, merged (bit layout there).
 extern "C" uint64_t rex_xam_take_frame_pad();
+
+namespace reg = rex::graphics::reg;
 
 REXCVAR_DEFINE_BOOL(pgr4_native, false, "PGR4 native",
                     "Run the native D3D12 renderer beside the Xenos plugin (debug window)");
@@ -531,6 +535,7 @@ void NativeRenderer::SwitchUpscaler(bool on) {
       return;
     }
     upscaler_->set_frame_generation(frame_generation_.get());
+    upscaler_->set_camera(&camera_);
   }
   upscaler_on_ = on;
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
@@ -893,12 +898,39 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     }
     gpu_timer_->Pass(device_->command_list(), key);
   }
+  if (camera_scan_ && (upscaler_ || frame_generation_)) FindCamera(state);
   if (frame_generation_ &&
       frame_generation_->BeforeDraw(device_->command_list(), frame_index_, state.regs))
     draw_->InvalidateListState();
   draw_->OnDraw(state, prep);
   SubmitEarly();
   draw_ticks_ += Ticks() - t0;
+}
+
+void NativeRenderer::FindCamera(const DrawState& state) {
+  using enum rex::graphics::Register;
+  const uint32_t* regs = state.regs;
+  if (!Upscaler::IsScene(regs[XE_GPU_REG_RB_SURFACE_INFO])) return;
+  const reg::RB_DEPTHCONTROL depth{.value = regs[XE_GPU_REG_RB_DEPTHCONTROL]};
+  if (!depth.z_enable || !depth.z_write_enable) return;
+  --camera_scan_;
+  // A perspective clip transform: four aligned constant registers whose z row is a multiple of
+  // their w row (fidelityfx.cpp). The scene's vertex shaders keep it in c4-c7 (td-323).
+  const uint32_t* c = regs + XE_GPU_REG_SHADER_CONSTANT_000_X;
+  float m[16];
+  for (uint32_t v = 0; v + 4 <= 256; v += 4) {
+    for (uint32_t i = 0; i < 16; ++i) m[i] = std::bit_cast<float>(c[4 * v + i]);
+    if (!CameraFromClipRows(m, camera_)) continue;
+    camera_scan_ = 0;
+    if (!camera_logged_) {
+      camera_logged_ = true;
+      REXLOG_INFO(
+          "PGR4 native: the scene's camera, from c{} of its vertex shaders: near {}, "
+          "far {}, fov {:.1f} deg",
+          v, camera_.near_plane, camera_.far_plane, camera_.fov_y * 57.2958f);
+    }
+    return;
+  }
 }
 
 void NativeRenderer::ExecuteClear(const ClearCall& c) {
@@ -1017,6 +1049,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   const bool shown = !incomplete && d.has_swapchain();
   FrameGeneration* const fg = frame_generation_.get();
   const bool generate = shown && fg && fg->prepared(frame_index_);
+  camera_scan_ = (upscaler_ || fg) ? 8 : 0;  // FindCamera's budget in the next frame's draws
   SwapCopy hudless;
   if (generate) {
     d.SetFrameImage(fg->image(), fg->image_rtv());
