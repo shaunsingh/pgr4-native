@@ -22,9 +22,9 @@
 #                              --fgmod upscaled by FSR 4 Lite; --debug works with it
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
 #                              the build to play, so later rebuilds do not change it, and write
-#                              the desktop entries Steam's "Add a Non-Steam Game" lists (one of
-#                              them for debugging sessions, one for --debug --fgmod, one for
-#                              --framegen and one for --debug --fgmod --framegen)
+#                              a desktop entry and a Steam shortcut (steam_shortcuts.py, with
+#                              Steam closed) for each way to play: alone, --debug, --debug
+#                              --fgmod, --framegen and --debug --fgmod --framegen
 #
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own: deck-run.sh stops only its own prefix's processes, so never a game being
@@ -39,8 +39,8 @@
 # process and its profile in logs/<stamp>-perf-<exe>-<pid>.{maps,txt} (the .txt a minute or so
 # after a long session), the modules as they ran in logs/<stamp>-perf-modules/, and
 # logs/<stamp>-perf.clock, the wall clock and CLOCK_MONOTONIC (perf's clock here) at one instant,
-# for perf_symbols.py --pid and --window. In Steam, add the "PGR4 (native renderer)" shortcut
-# without a compatibility tool: this script starts Proton itself.
+# for perf_symbols.py --pid and --window. The Steam shortcuts --install writes have no
+# compatibility tool: this script starts Proton itself.
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 repo=$(cd "$here/.." && pwd)
@@ -81,7 +81,18 @@ Path=$top
 Terminal=false
 Categories=Game;
 DESKTOP
+    # Steam's shortcut of the same name, with the flags as its launch options.
+    local flag options=()
+    for flag in $3; do options+=("\"$flag\""); done
+    [[ $steam == 0 ]] || python3 "$here/steam_shortcuts.py" add "$2" "$here/play.sh" \
+      --start-dir "$here/" --desktop "$apps/$1.desktop" --options "${options[*]}" > /dev/null
   }
+  # Steam writes its shortcuts back when it exits, so they are updated only while it is closed.
+  steam=1
+  if pgrep -x steam > /dev/null; then
+    steam=0
+    echo "Steam is running: its shortcuts are left as they are (quit it and install again)" >&2
+  fi
   entry pgr4-native-play 'PGR4 (native renderer)' ''
   entry pgr4-native-debug 'PGR4 (native renderer, debug)' ' --debug'
   entry pgr4-native-fsr4 'PGR4 (native renderer, FSR 4 Lite, debug)' ' --debug --fgmod'
