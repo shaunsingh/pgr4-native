@@ -1,0 +1,28 @@
+# route-options.keys: St Petersburg race, pause, into OPTIONS, shots at each step.
+# Fresh save (deck-run.sh starts each run with one).
+30000 return          # skip the intro FMV ("Shadow" by the Prodigy)
++12000 return         # title: PRESS START -> Gamer Profiles "Welcome to PGR4!"
++8000 space           # Next -> Select Driver
++8000 d 300           # right-hand driver
++1800 space           # -> Select Nationality (United States)
++8000 space           # -> Driver customisation
++8000 space           # Continue -> "Saving content", then Main Menu
++20000 space          # Single Player -> Arcade Mode
++8000 space           # Arcade Mode -> Choose Chapter
++8000 space           # Catch Me If You Can -> Choose Event
++8000 space           # Event 1 Street Race -> car (Sierra Cosworth RS500)
++8000 space           # car -> Choose Difficulty (Silver)
++8000 space           # Silver -> loading, race starts on its own
++20000 mark loaded
++0 e 70000            # right trigger: full throttle for 70 s
++5000 mark race       # deck-run.sh measures from here
++6000 return          # pause
++6000 mark shot paused
++1000 s 120           # down: CONTINUE -> RESTART
++1000 s 120           # down: -> PHOTO MODE
++1000 s 120           # down: -> OPTIONS
++1500 space           # open OPTIONS
++4000 mark shot options
++2000 d 300           # a right, if it has tabs
++3000 mark shot options2
++0 e 30000

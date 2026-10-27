@@ -1,0 +1,8 @@
+# route-menu.keys: boot with an existing profile -> main menu, and sit there for shots.
+30000 return          # skip the intro FMV
++12000 return         # title: PRESS START -> Gamer Profiles "profile loaded"
++8000 space           # NEXT -> Main Menu
++12000 mark race      # main menu
++2000 mark shot menu
++9000 mark shot menu2
++0 e 60000            # keep the game busy

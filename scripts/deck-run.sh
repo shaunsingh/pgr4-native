@@ -152,7 +152,8 @@ export DISPLAY=${DISPLAY:-:0}
 userdata=$top/userdata
 [[ $mode == release ]] && userdata=$runtime/userdata
 mkdir -p "$top/logs" "$top/prefix" "$userdata" "$top/cache"
-fresh_save "$userdata"
+# PGR4_KEEP_SAVE=1 keeps the profile (routes that need career progress, e.g. an owned car).
+[[ ${PGR4_KEEP_SAVE:-} == 1 ]] || fresh_save "$userdata"
 stamp=$(date +%Y%m%d-%H%M%S)
 base=$top/logs/pgr4-proton-$tag-$stamp
 ilog=$top/logs/pgr4-co-input-$tag.log
