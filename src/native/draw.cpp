@@ -3035,6 +3035,12 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
     }
   }
   if (!use) use = p ? p : GetPipeline(key_hash, key, vst, pst, variant);
+  // The store's record of a prewarmed pipeline ages with its first use (the pso memo above and
+  // the pipelines map's hits reach no GetPipeline), so it stays while the player plays it.
+  if (use->store_entry != PipelineStore::kNoEntry) {
+    store.TouchEntry(use->store_entry);
+    use->store_entry = PipelineStore::kNoEntry;
+  }
   const uint8_t state = use->state.load(std::memory_order_acquire);
   if (state == kCompiling) {
     if (use->prewarm) PromotePipeline(use);
