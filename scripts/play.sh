@@ -16,10 +16,15 @@
 #                              ($fsr4/amdxcffx64.dll) and fsr4-optiscaler.ini's settings in its
 #                              OptiScaler.ini. fgmod needs an OptiScaler that has the Lite model
 #                              (master fd3a45a6 or later); --debug works with it
+#   play.sh --framegen         play with a frame AMD FidelityFX Frame Generation makes between
+#                              each two (--pgr4_native_frame_generation), the game at half the
+#                              display's refresh rate: the scene antialiased by FSR, or with
+#                              --fgmod upscaled by FSR 4 Lite; --debug works with it
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
 #                              the build to play, so later rebuilds do not change it, and write
 #                              the desktop entries Steam's "Add a Non-Steam Game" lists (one of
-#                              them for debugging sessions, one for --debug --fgmod)
+#                              them for debugging sessions, one for --debug --fgmod, one for
+#                              --framegen and one for --debug --fgmod --framegen)
 #
 # Everything lives under ~/pgr4-proton/play: runtime/ (the installed build), prefix/ (a Wine
 # prefix of its own: deck-run.sh stops only its own prefix's processes, so never a game being
@@ -80,6 +85,9 @@ DESKTOP
   entry pgr4-native-play 'PGR4 (native renderer)' ''
   entry pgr4-native-debug 'PGR4 (native renderer, debug)' ' --debug'
   entry pgr4-native-fsr4 'PGR4 (native renderer, FSR 4 Lite, debug)' ' --debug --fgmod'
+  entry pgr4-native-framegen 'PGR4 (native renderer, frame generation)' ' --framegen'
+  entry pgr4-native-fsr4-framegen 'PGR4 (native renderer, FSR 4 Lite, frame generation, debug)' \
+    ' --debug --fgmod --framegen'
   git -C "$repo" log -1 --format='installed %h %s' > "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   git -C "$repo" status --short >> "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   # The --fgmod copy, where fgmod adds OptiScaler at each start and keeps the OptiScaler.ini it
@@ -94,13 +102,19 @@ DESKTOP
     done < "$here/fsr4-optiscaler.ini"
   fi
   echo "installed $src -> $top/runtime (and runtime-fgmod); desktop entries pgr4-native-play," \
-    "pgr4-native-debug, pgr4-native-fsr4 in $apps"
+    "pgr4-native-debug, pgr4-native-fsr4, pgr4-native-framegen, pgr4-native-fsr4-framegen in $apps"
   exit 0
 fi
 debug=${PGR4_DEBUG:-0}
 fgmod=0
-while [[ ${1:-} == --debug || ${1:-} == --fgmod ]]; do
-  [[ $1 == --debug ]] && debug=1 || fgmod=1
+framegen=0
+while :; do
+  case ${1:-} in
+    --debug) debug=1 ;;
+    --fgmod) fgmod=1 ;;
+    --framegen) framegen=1 ;;
+    *) break ;;
+  esac
   shift
 done
 
@@ -163,6 +177,8 @@ fi
 # 60 fps on the Deck); the launch options can set another size.
 [[ $fgmod != 0 ]] && args+=(--pgr4_native_upscaler --pgr4_native_upscaler_width=960
   --pgr4_native_upscaler_height=540)
+# Frame generation takes the upscaler's depth and motion.
+[[ $framegen != 0 ]] && args+=(--pgr4_native_upscaler --pgr4_native_frame_generation)
 args+=("$@")
 
 export STEAM_COMPAT_DATA_PATH=$top/prefix STEAM_COMPAT_CLIENT_INSTALL_PATH=$HOME/.local/share/Steam
