@@ -853,12 +853,16 @@ struct DrawRenderer::Impl {
   // Waiting at each draw instead compiled one pipeline at a time, as the next draw requested
   // its own only once the previous one's was ready. Entries are never removed.
   // With --pgr4_native_pipeline_cache every new pipeline is recorded in `store`; the next run
-  // translates and creates the recorded ones at start-up (Prewarm, a slice per frame) and the
-  // workers load them from `library` instead of compiling them again.
+  // translates and creates the recently used ones at start-up (Prewarm, a slice per frame) and
+  // the workers load them from `library` instead of compiling them again. A record no recent
+  // session used leaves the store: it stays the size of what the player plays.
   enum : uint8_t { kCompiling, kReady, kFailed };
   struct Pipeline {
     ComPtr<ID3D12PipelineState> pso;
     std::atomic<uint8_t> state{kCompiling};
+    // The store record the pipeline was prewarmed from: the first draw that uses it touches the
+    // record (it survives another kKeepSessions), then this is kNoEntry again (draw thread only).
+    uint32_t store_entry = PipelineStore::kNoEntry;
     bool prewarm = false;  // its job was queued in prewarm_jobs (draw thread only)
     // A specialization whose draws use their unspecialized shaders' pipeline until it is ready
     // (draw thread only).
@@ -1194,7 +1198,8 @@ struct DrawRenderer::Impl {
   // Adds the pipeline under `hash` and creates it (queued on pso_threads when they run; a
   // prewarm job waits behind every draw's job).
   Pipeline* CreatePipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
-                           const DxbcShader::Translation* ps, bool prewarm);
+                           const DxbcShader::Translation* ps, bool prewarm,
+                           uint32_t store_entry = PipelineStore::kNoEntry);
   // `saves`: this worker saves the library when the workers have been idle for a while.
   // `on_wait`: this worker compiles only while WaitForPipelines waits.
   void PipelineWorker(bool saves, bool on_wait);
@@ -2329,6 +2334,10 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash, con
   Pipeline* p;
   if (it != pipelines.end()) {
     p = it->second.get();
+    if (p->store_entry != PipelineStore::kNoEntry) {
+      store.TouchEntry(p->store_entry);
+      p->store_entry = PipelineStore::kNoEntry;
+    }
   } else {
     if (new_pipelines_logged < kNewPipelineLog) {
       ++new_pipelines_logged;
@@ -2360,6 +2369,11 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::GetPipeline(uint64_t hash, con
       store.RecordPipeline(vss.ucode_data_hash(), vs.modification(),
                            ps ? ps->shader().ucode_data_hash() : 0, ps ? ps->modification() : 0,
                            &stored);
+      // One of the store's older records: mark it used so it stays (fresh records carry this
+      // session already).
+      store.TouchRecord(vss.ucode_data_hash(), vs.modification(),
+                        ps ? ps->shader().ucode_data_hash() : 0, ps ? ps->modification() : 0,
+                        &stored);
     }
   }
   return p;
@@ -2396,11 +2410,9 @@ void DrawRenderer::Impl::WaitForPipelines() {
   frame_pending.clear();
 }
 
-DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
-                                                                 const PipelineKey& key,
-                                                                 const DxbcShader::Translation& vs,
-                                                                 const DxbcShader::Translation* ps,
-                                                                 bool prewarm) {
+DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
+    uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
+    const DxbcShader::Translation* ps, bool prewarm, uint32_t store_entry) {
   D3D12_GRAPHICS_PIPELINE_STATE_DESC d;
   std::memset(&d, 0, sizeof(d));  // padding too: PipelineLibrary hashes the bytes
   d.pRootSignature = root_signature.Get();
@@ -2482,6 +2494,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
     b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
   }
   Pipeline* p = pipelines.emplace(hash, std::make_unique<Pipeline>()).first->second.get();
+  p->store_entry = store_entry;
   if (new_pipelines_logged < kNewPipelineLog) {
     ++pipeline_states[StateDigest(key)];
     ++pipeline_pairs[PairDigest(key)];
@@ -2507,7 +2520,11 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(uint64_t hash,
 
 void DrawRenderer::Impl::Prewarm() {
   const std::vector<PipelineStore::Pipeline>& list = store.loaded_pipelines();
-  if (prewarm_next >= list.size()) return;
+  // The store is ordered most recently used first; only its hot prefix is prewarmed (the rest
+  // compiles on demand if it comes up), so a start pays for what the player plays, not for
+  // everything they ever played.
+  const size_t hot = std::min(store.hot_count(), list.size());
+  if (prewarm_next >= hot) return;
   const auto t0 = std::chrono::steady_clock::now();
   auto load = [&](uint64_t hash, xenos::ShaderType type) -> DxbcShader* {
     const PipelineStore::Shader* s = store.loaded_shader(hash);
@@ -2515,7 +2532,8 @@ void DrawRenderer::Impl::Prewarm() {
     return shaders.Load(type, s->ucode.data(), uint32_t(s->ucode.size()));
   };
   do {
-    const PipelineStore::Pipeline& sp = list[prewarm_next++];
+    const size_t index = prewarm_next++;
+    const PipelineStore::Pipeline& sp = list[index];
     // An upscaler session's motion vector pipelines: unused without the upscaler.
     if (!r.upscaler() && DxbcShaderTranslator::Modification(sp.vs_mod).vertex.motion_vectors)
       continue;
@@ -2532,17 +2550,17 @@ void DrawRenderer::Impl::Prewarm() {
     key.vs = vst;
     key.ps = pst;
     const uint64_t hash = XXH3_64bits(&key, sizeof(key));
-    if (!pipelines.count(hash)) CreatePipeline(hash, key, *vst, pst, true);
-  } while (prewarm_next < list.size() &&
+    if (!pipelines.count(hash)) CreatePipeline(hash, key, *vst, pst, true, uint32_t(index));
+  } while (prewarm_next < hot &&
            std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2));
   prewarm_ms +=
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   ++prewarm_frames;
-  if (prewarm_next == list.size())
+  if (prewarm_next == hot)
     REXLOG_INFO(
-        "PGR4 native pipelines: prewarm queued {} pipelines ({} failed) in {:.1f} ms "
-        "over {} frames",
-        list.size() - prewarm_failed, prewarm_failed, prewarm_ms, prewarm_frames);
+        "PGR4 native pipelines: prewarm queued {} of {} recorded pipelines ({} failed) in "
+        "{:.1f} ms over {} frames",
+        hot - prewarm_failed, list.size(), prewarm_failed, prewarm_ms, prewarm_frames);
 }
 
 namespace {

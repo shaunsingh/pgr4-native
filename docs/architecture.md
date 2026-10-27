@@ -151,7 +151,7 @@ Anything the render thread reads late must not change under it.
 | `resolve` | Guest resolves into host images keyed by destination, through compute shaders specialized for each kind of resolve. `resolve_debug` holds dumps and the self-test |
 | `textures`, `texture_layout` | `TextureCache`, which maps fetch constants to host textures and handles untiling, format conversion, page watches, resolved-image copies, placed heaps and eviction |
 | `upload_pool.h` | Persistently mapped upload blocks, allocated linearly and recycled by fence |
-| `pipeline_store` | The stored pipeline list and prewarm |
+| `pipeline_store` | The stored pipeline list and prewarm. Each open counts a session, rewrites the file with what the last 8 sessions used (most recent first), and prewarms only what the last 3 did, so a start pays for what the player plays, not for everything they ever played |
 | `present` | Front buffer to window (aspect fit, the display controller's gamma ramp, HDR10 output) and captures. `present_debug` holds the PNG writer, the glitch catcher and the luma probe |
 | `frame_pacer` | Frame pacing on the display |
 | `occlusion` | The game's occlusion queries (the light flares): host queries around each draw inside one, ZPass and pre-test coverage, delivered as the sums of each query's newest frames (`--pgr4_native_occlusion_window`; development.md's "Light flares") and written into the guest's reports at GetData |
