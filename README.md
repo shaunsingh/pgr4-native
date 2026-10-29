@@ -81,6 +81,7 @@ over `pgr4_recompiled.toml`.
 | `--pgr4_native_hdr_peak_nits=<n>` | 0 | Peak luminance the HDR highlights are fitted to (0 uses the display's, or 1000 if it reports none) |
 | `--pgr4_native_hdr_paper_white=<n>` | 400 | Luminance of SDR white in HDR output, in nits |
 | `--pgr4_60fps` | false | Present every vblank instead of at the game's 30 FPS interval, when the native renderer does not pace the frames |
+| `--pgr4_automatic_keep_revs` | true | The automatic transmission shifts down once the engine would run under 90 % of the car's upshift point in the lower gear (the game's own factor is 0.82 to 0.9), keeping the revs and a turbo's boost up |
 | `--pgr4_game_debug_menus` | false | Show the debug entries of the game's own menus |
 | `--content_root=<dir>` | `<game>\Content` | Folder of content packages (title update, DLC) installed at startup |
 | `--user_language=<n>` | 1 | The game's language: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Traditional Chinese, 10 Simplified Chinese, 11 Polish, 12 Russian |

@@ -353,9 +353,9 @@ options, the cvars each choice sets, and the `Pgr4` table the scripts call.
 
 ## Gearbox
 
-What the game does with the shift buttons and where its automatic decides, for a future smarter
-automatic. Offsets are from the base of each object. All of it was read from Title Update #2's
-generated code. Probes on a St Petersburg race confirmed the pad, the bindings and the controls,
+What the game does with the shift buttons and where its automatic decides. Offsets are from the
+base of each object. All of it was read from Title Update #2's generated code. Probes on a
+St Petersburg race confirmed the pad, the bindings, the controls and the automatic's numbers,
 and that `sub_822F9D70` and `sub_822FB680` never run for the player's car.
 
 - **Pad.** The state of player N is at `0x82A90694 + 1888 * N`, refreshed once per frame by
@@ -377,22 +377,28 @@ and that `sub_822F9D70` and `sub_822FB680` never run for the player's car.
   gb + 29), shifts up on controls +16 or down on +17. The current gear is the signed byte at
   gb + 30 (-1 is reverse, 0 is neutral), and the time left in a shift is at gb + 16.
 - **Automatic.** `sub_822DE250` decides only when car + 61 is set (the automatic transmission)
-  or car + 20 is 1. It shifts up once gb + 16 has fallen below a constant, the gear is below the
-  top gear (car data at [car + 804] + 412), the value at gb + 0 times a constant exceeds the
-  upshift point at car data + 408, and gb + 31 is set. It shifts down while the next lower gear, estimated from the wheel
-  speeds, the gear ratios (car data + 472), the final drive (+468) and the wheel radius (+416),
-  stays under the upshift point. It also handles reverse when stopped.
+  or car + 20 is 1. The player's car has +20 at 0 and +61 set; the opponents have +20 at 1.
+  It shifts up once gb + 16 has fallen below a constant, the gear is below the top gear (car
+  data at [car + 804] + 412), the engine speed at gb + 0 (rad/s) exceeds the upshift point at
+  car data + 408 (rpm, 6500 to 7900), and gb + 31 is set. It shifts down while the next lower
+  gear, estimated from the wheel speeds, the gear ratios (car data + 472), the final drive
+  (+468) and the wheel radius (+416), would run under car data + 440 (0.82 to 0.9) times the
+  upshift point: `f31` after `fmuls f31,f10,f12` at `0x822DE400`. It also handles reverse when
+  stopped.
 - **Shifts.** `sub_822DDBE8` shifts up (from neutral to 1st, never past the top gear) and
   `sub_822DE150` shifts down (to 1st at walking speed, and on to reverse). Both set gb + 28 and
   extend gb + 16 to the car's shift time, car data + 436.
 
-A smarter automatic is a mid-asm hook at `0x822DE250` with `return_on_true`. When the hook
-returns true it skips the game's automatic. Its decision is then a press of controls +16 or +17,
-so the game's own `sub_822DDBE8` and `sub_822DE150` shift with their clutch timing in the same
-step. Like the game's automatic, it should decide only for cars with +61 set. To test without the menus, give a fresh profile
-the manual transmission by setting `XPROFILE_GAMER_RACE_TRANSMISSION` (0x10040026) to 1 in the
-SDK's `user_profile.cpp`.
-
+With a factor of 0.82 and about 1.4 between gears, the engine falls to under 60 % of the
+upshift point before the automatic takes the lower gear. `Pgr4AutomaticDownshiftHook` (after
+`0x822DE400`, behind `--pgr4_automatic_keep_revs`) raises the factor to 0.9 for the player's
+car. A tenth of the speed between the two shifts keeps a downshift from shifting straight back
+up. A different automatic altogether would be a mid-asm hook at `0x822DE250` with
+`return_on_true`, which skips the game's automatic. Its decision would be a press of controls
++16 or +17, so the game's own `sub_822DDBE8` and `sub_822DE150` shift with their clutch timing
+in the same step. To test the manual without the menus, give a fresh profile the manual
+transmission by setting `XPROFILE_GAMER_RACE_TRANSMISSION` (0x10040026) to 1 in the SDK's
+`user_profile.cpp`.
 ## Releases
 
 Pushing a `v*` tag builds on GitHub Actions (`.github/workflows/release.yml`, with the game files
