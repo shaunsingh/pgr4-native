@@ -265,11 +265,18 @@ Why the flares flickered, measured with `--pgr4_native_occlusion_trace` and
   even 1e6 changed nothing, and subtracting 3e-4 from the resolved depth moved the visible
   share 50 to 72 % but cut the flips by only a tenth. A faithful fix would be 20e4 depth end
   to end (the translator's DSV_IsWritingFloat24Depth already writes it), not a bias.
-- The delivery is a windowed sum instead (`--pgr4_native_occlusion_window`, 4): the delivered
-  ZPass and Total are the sums of the query's newest frames, so the game's own fade averages
-  them. A blink becomes a four-frame ramp, and a real occlusion still wins within the window
-  (44 ms at 90 fps). The flips fell from 15.8 to 7.2 per 1000 reads, and the remaining ones
-  are a ~3 % brightness wobble of a light already at the edge of visibility, not a blink.
+- The delivery is a windowed sum instead (`--pgr4_native_occlusion_window_ms`, 100): the
+  delivered ZPass and Total are the sums of the query's frames recorded within 100 ms of its
+  newest, so the game's own fade averages them. A blink becomes a shallow dip, and a real
+  occlusion still wins within the window. With four frames the flips fell from 15.8 to 7.2 per
+  1000 reads, and the remaining ones are a ~3 % brightness wobble of a light already at the
+  edge of visibility, not a blink.
+- A light's test covers a few pixels (Total 2 samples at the 25th percentile of a Tokyo night
+  race, 4 at the median, 10 at the 75th), so one frame's result is nearly all or nothing even
+  when the light goes behind a car's edge. The window is a time rather than a frame count so
+  that such an occlusion fades over the same 100 ms at every frame rate (9 frames at 90 fps, 3
+  at 30), where the original's single 30 fps frame was a blink. More samples would not help:
+  the depth the sprite tests against has no more detail than its pixels.
 
 ## Native 16:10
 
