@@ -3,15 +3,20 @@
 # terminal.
 #
 #   play.sh                    play the installed build: the game alone, as on a console (its
-#                              log keeps warnings and errors only), with OptiScaler loaded as
-#                              fgmod (Decky Framegen's ~/fgmod) installs it, from runtime-fgmod/:
+#                              log keeps warnings and errors only), with HelixSR Scaler loaded
+#                              where --install found a HelixSR (below), else with OptiScaler loaded
+#                              as fgmod (Decky Framegen's ~/fgmod) installs it, from runtime-fgmod/:
 #                              a copy of the build with AMD's amdxcffx64.dll 4.1.2
 #                              ($fsr4/amdxcffx64.dll) and fsr4-optiscaler.ini's settings in its
 #                              OptiScaler.ini. The scene keeps the settings' antialiasing (MSAA
 #                              unless the Options menu's Display page or F7 chose FSR); FSR is then
 #                              FSR 4's Lite model. fgmod needs an OptiScaler that has the Lite model
 #                              (master fd3a45a6 or later). Without ~/fgmod, or with --no-fgmod, the
-#                              build plays from runtime/ without OptiScaler, and FSR is FSR 3.1
+#                              build plays from runtime/ without OptiScaler, and FSR is FSR 3.1.
+#                              HelixSR Scaler (OptiScaler with HelixSR's upscalers) plays from
+#                              runtime-helixsr/ with helixsr-optiscaler.ini's settings: the
+#                              upscaler is HLX DLSS (or the one picked in its menu, Insert);
+#                              --no-helixsr plays as without it
 #   play.sh --debug            a debugging session (PGR4_DEBUG=1 does the same): the game log
 #                              with the native renderer's statistics and GPU pass breakdown every
 #                              150 frames, the per-frame CSV (frame_times.py, scripts/analysis/),
@@ -19,7 +24,10 @@
 #                              thread and memory every second, marks (F12) and the glitch catcher,
 #                              and a CPU profile of every PGR4 and Geometry Wars process
 #   play.sh --install [tree]   install $PGR4_BUILDS/native-<tree>/run/runtime (default: deck) as
-#                              the build to play, so later rebuilds do not change it, and write
+#                              the build to play, so later rebuilds do not change it, with
+#                              runtime-helixsr/ from the HelixSR release folder $PGR4_HELIXSR (the
+#                              newest under ~/helixsr by default) once its setup has built the
+#                              network on this PC (helixsr-setup.sh, HelixSR's README), and write
 #                              a desktop entry and a Steam shortcut (steam_shortcuts.py, with
 #                              Steam closed) for each way to play: alone and --debug
 #
@@ -51,6 +59,14 @@ bench=$HOME/pgr4-proton
 game=${PGR4_GAME:-$HOME/recomp/dumps/pgr4/game}
 fsr4=$bench/fsr4
 keep_sessions=30
+
+# Sets the key=value lines of $2 (settings over OptiScaler's defaults) in OptiScaler.ini $1.
+set_ini() {
+  local key value
+  while IFS='=' read -r key value; do
+    if [[ $key =~ ^[A-Za-z0-9]+$ ]]; then sed -i "s|^$key=.*|$key=$value|" "$1"; fi
+  done < "$2"
+}
 
 if [[ ${1:-} == --install ]]; then
   tree=${2:-deck}
@@ -111,19 +127,37 @@ DESKTOP
   if [[ -f $HOME/fgmod/OptiScaler.ini ]]; then
     ini=$top/runtime-fgmod/OptiScaler.ini
     cp "$HOME/fgmod/OptiScaler.ini" "$ini"
-    while IFS='=' read -r key value; do
-      [[ $key =~ ^[A-Za-z0-9]+$ ]] && sed -i "s|^$key=.*|$key=$value|" "$ini"
-    done < "$here/fsr4-optiscaler.ini"
+    set_ini "$ini" "$here/fsr4-optiscaler.ini"
+  fi
+  # The copy with HelixSR Scaler as dxgi.dll, its OptiScaler/ and HelixSR/ folders beside it.
+  # HelixSR's network is built for this PC, so only its setup's folder has it.
+  helixsr=${PGR4_HELIXSR:-$(find "$HOME/helixsr" -maxdepth 4 -path '*/HelixSR/helixsr.dll' \
+    -printf '%h\n' 2>/dev/null | sort -V | tail -n 1)}
+  helixsr=${helixsr%/HelixSR}
+  hsr=$top/runtime-helixsr
+  if [[ -n $helixsr && -f $helixsr/helixsr-scaler/OptiScaler.dll ]] &&
+    python3 "$helixsr/setup/helixsr_setup.py" "$helixsr/HelixSR" --status | grep -q 'network=1'; then
+    rsync -a --delete "$top/runtime/" "$hsr/"
+    cp "$helixsr/helixsr-scaler/OptiScaler.dll" "$hsr/dxgi.dll"
+    cp "$helixsr/helixsr-scaler/OptiScaler.ini" "$hsr/"
+    cp -r "$helixsr/helixsr-scaler/OptiScaler" "$helixsr/HelixSR" "$hsr/"
+    set_ini "$hsr/OptiScaler.ini" "$here/helixsr-optiscaler.ini"
+    echo "HelixSR Scaler from $helixsr -> $hsr"
+  else
+    rm -rf "$hsr"
+    echo "no HelixSR with its network built (${helixsr:-none under ~/helixsr}): no $hsr"
   fi
   echo "installed $src -> $top/runtime (and runtime-fgmod); desktop entries pgr4-native-play" \
     "and pgr4-native-debug in $apps"
   exit 0
 fi
 debug=${PGR4_DEBUG:-0}
+helixsr=1
 fgmod=1
 while :; do
   case ${1:-} in
     --debug) debug=1 ;;
+    --no-helixsr) helixsr=0 ;;
     --no-fgmod) fgmod=0 ;;
     *) break ;;
   esac
@@ -131,7 +165,10 @@ while :; do
 done
 
 runtime=$top/runtime
-if [[ $fgmod != 0 && -x $HOME/fgmod/fgmod && -d $top/runtime-fgmod ]]; then
+if [[ $helixsr != 0 && -f $top/runtime-helixsr/dxgi.dll ]]; then
+  runtime=$top/runtime-helixsr
+  fgmod=0
+elif [[ $fgmod != 0 && -x $HOME/fgmod/fgmod && -d $top/runtime-fgmod ]]; then
   runtime=$top/runtime-fgmod
   [[ -f $runtime/amdxcffx64.dll ]] || echo "no amdxcffx64.dll in $runtime: FSR 4 falls back" >&2
 else
@@ -195,6 +232,10 @@ export PROTON_USE_XALIA=0
 # HDR10 color space only with DXVK_HDR=1. An SDR display stays SDR; DXVK_HDR=0 turns HDR off.
 export DXVK_HDR=${DXVK_HDR:-1}
 export VKD3D_SHADER_CACHE_PATH=$top/cache
+# HelixSR Scaler's dxgi.dll beside the executable before Wine's own, as fgmod has it.
+if [[ $runtime == "$top/runtime-helixsr" ]]; then
+  export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES,}dxgi=n,b
+fi
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 # fgmod copies OptiScaler in as dxgi.dll beside the executable it finds in the command, adds
 # dxgi=n,b to WINEDLLOVERRIDES and runs the command.
