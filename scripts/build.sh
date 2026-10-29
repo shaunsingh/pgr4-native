@@ -18,6 +18,8 @@
 #            out/gw_recompiled.exe.
 #            $dest/fidelityfx-sdk: the AMD FidelityFX SDK at the commit scripts/fidelityfx.lock
 #            names, only its upscaler and frame generation API headers and signed DLLs.
+#            $dest/fennel: the Fennel compiler scripts/fennel.lock names, which compiles the
+#            port's UI scripts (games/pgr4/ui/) to Lua.
 #   install  $dest/run/runtime: both executables, rexruntime.dll, rexgpu-xenos.dll, AMD's FidelityFX
 #            loader, upscaler and frame generation DLLs (--pgr4_native_upscaler,
 #            --pgr4_native_frame_generation), and title-update/ (the runtime's
@@ -46,9 +48,9 @@
 #
 # --force rebuilds the codegen tool (sdk) and regenerates all game code (game).
 #
-# Needs clang-cl, lld-link and the llvm-* tools, cmake, ninja, python3 and git. When clang-cl is
-# not on PATH the script re-runs itself in the distrobox container named by $PGR4_DISTROBOX
-# (default pgr4dev). Run: scripts/deck-run.sh.
+# Needs clang-cl, lld-link and the llvm-* tools, cmake, ninja, python3, git, curl and a Lua (5.1
+# or later, or LuaJIT) to run Fennel. When clang-cl is not on PATH the script re-runs itself in
+# the distrobox container named by $PGR4_DISTROBOX (default pgr4dev). Run: scripts/deck-run.sh.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -100,6 +102,8 @@ fi
 source "$repo_root/patches/rexglue.lock"
 # shellcheck source=fidelityfx.lock
 source "$here/fidelityfx.lock"
+# shellcheck source=fennel.lock
+source "$here/fennel.lock"
 sdk_patches=("$repo_root"/patches/*.patch)
 sdk_src=$dest/rexglue-sdk
 sdk_build=$sdk_src/out/build/native-release
@@ -114,6 +118,7 @@ ffx_dlls=("$ffx_kit/signedbin/amd_fidelityfx_loader_dx12.dll"
 ffx_paths=(/Kits/FidelityFX/api/include/ /Kits/FidelityFX/upscalers/include/
   /Kits/FidelityFX/framegeneration/include/ /Kits/FidelityFX/docs/license.md
   "${ffx_dlls[@]#"$ffx_src"}")
+fennel=$dest/fennel/fennel-$FENNEL_VERSION
 titles=(gw pgr4)
 toolchain=$repo_root/cmake/clang-cl-xwin.cmake
 title_update_sums=$repo_root/games/pgr4/title-update.sha256
@@ -231,6 +236,18 @@ ffx_checkout() {
   git -C "$ffx_src" checkout -q --detach FETCH_HEAD
 }
 
+# $fennel: the Fennel compiler of scripts/fennel.lock, checked against its hash.
+fennel_fetch() {
+  local sum="$FENNEL_SHA256  $fennel"
+  if [[ -f $fennel ]] && sha256sum --quiet -c <<< "$sum"; then
+    echo "Fennel $FENNEL_VERSION fetched"
+    return 0
+  fi
+  mkdir -p "$(dirname "$fennel")"
+  curl -fsSL -o "$fennel" "$FENNEL_URL"
+  sha256sum --quiet -c <<< "$sum" || { rm -f "$fennel"; echo "$FENNEL_URL: not the release scripts/fennel.lock names" >&2; exit 1; }
+}
+
 # clang_rt.profile.lib for --pgo gen: the compiler-rt profile runtime of this clang-cl, the
 # sources compiler-rt's CMakeLists.txt lists for Windows, built with the game's dynamic CRT (/MD,
 # no default libraries named); compiler-rt's own build would bring the static CRT along.
@@ -303,7 +320,7 @@ build_title() {
   configure "$project/out" "$flags" "$ldflags" -S "$project" -G Ninja \
     "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DXWIN_DIR=$xwin" -DCMAKE_BUILD_TYPE=Release \
     "-DCMAKE_PREFIX_PATH=$sdk" -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF "-DPGR4_NATIVE_SRC=$repo_root/src" "-DPGR4_REXGLUE_SDK_SRC=$sdk_src" \
-    "-DPGR4_HOST_REXGLUE=$host_rexglue" "-DPGR4_FIDELITYFX_SDK=$ffx_src"
+    "-DPGR4_HOST_REXGLUE=$host_rexglue" "-DPGR4_FIDELITYFX_SDK=$ffx_src" "-DPGR4_FENNEL=$fennel"
   cmake --build "$project/out" -j "$jobs"
   ls -l "$project/out/${title}_recompiled.exe"
 }
@@ -312,6 +329,7 @@ game_stage() {
   need "$game/default.xex" "$game/gw.xex" "$host_rexglue" "$sdk/lib/cmake/rexglue/rexglueConfig.cmake"
   need_update
   step "fidelityfx checkout" ffx_checkout
+  step "fennel" fennel_fetch
   mkdir -p "$dest/game"
   local t excludes=()
   for t in "${titles[@]}"; do excludes+=("--exclude=/$t/generated" "--exclude=/$t/game-data" "--exclude=/$t/out"); done

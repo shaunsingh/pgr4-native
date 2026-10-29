@@ -1,0 +1,8 @@
+# Fennel (https://fennel-lang.org), the Lisp the port's own UI scripts are written in
+# (games/pgr4/ui/): scripts/build.sh fetches this release's compiler, a single Lua script, checks
+# it against the hash and passes it to the build, which compiles the scripts to Lua 5.1 for the
+# game's Lua. The release is signed with the key the project's security page names
+# (9D13D9426A0814B3373CF5E3D8A8243577A7859F). Sourced by scripts/build.sh.
+FENNEL_VERSION=1.6.1
+FENNEL_URL=https://fennel-lang.org/downloads/fennel-$FENNEL_VERSION
+FENNEL_SHA256=8d0c1e838c5604b42151ea8696a41251bebacf299273c3c5b3c99c0c5ad7d6d7

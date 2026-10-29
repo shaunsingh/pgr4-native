@@ -32,6 +32,8 @@ file(GLOB PGR4_NATIVE_SOURCES CONFIGURE_DEPENDS "${PGR4_NATIVE_SRC}/native/*.cpp
 add_executable(pgr4_recompiled WIN32
     src/main.cpp
     src/pgr4_hooks.cpp
+    src/pgr4_lua.cpp
+    src/pgr4_settings.cpp
     ../common/title_launch.cpp
     "${PGR4_NATIVE_SRC}/pgr4_d3d_trace.cpp"
     ${PGR4_NATIVE_SOURCES}
@@ -40,6 +42,46 @@ add_executable(pgr4_recompiled WIN32
     "${PGR4_REXGLUE_SDK_SRC}/src/graphics/pipeline/texture/info_formats.cpp"
 )
 target_include_directories(pgr4_recompiled PRIVATE "${PGR4_NATIVE_SRC}" ../common)
+# The port's UI scripts (ui/, in Fennel), compiled to Lua for the game's Lua 5.1 and embedded by
+# pgr4_lua.cpp. The compiler accepts only the globals listed here: the game's UI functions and
+# tables the scripts use, the screen functions they define, and Lua's own they call, so a
+# misspelt name fails the build.
+set(PGR4_FENNEL "" CACHE FILEPATH "The Fennel compiler (scripts/fennel.lock)")
+if(NOT EXISTS "${PGR4_FENNEL}")
+    message(FATAL_ERROR "PGR4_FENNEL is not set to the Fennel compiler")
+endif()
+find_program(PGR4_LUA NAMES lua luajit lua5.4 lua5.3 lua5.1 REQUIRED)
+set(PGR4_UI_GLOBALS
+    # Lua 5.1
+    error ipairs math pcall
+    # The game's UI
+    GUIBank GothamSystem UIButtons UIEnums UIGlobals UIScreen UIText
+    GetDefaultFrame MoveScrollBarV PlayMenuBack PlayMenuMove PlayMenuNext SetClipToFrame
+    SetupFadePanel SetupFrameScrollBar SetupFrameTitle SetupGroupEnd SetupInfoText
+    SetupScreenTimers SetupSlideMenuInfo SetupVariableSpinner StoreMenuSelection
+    # A screen's own, which a patch wraps
+    GUI Init MessageUpdate
+    # pgr4_lua.cpp
+    Pgr4)
+string(JOIN "," PGR4_UI_GLOBALS_ARG ${PGR4_UI_GLOBALS})
+file(GLOB_RECURSE PGR4_UI_SCRIPTS CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/ui" ui/*.fnl)
+set(PGR4_UI_LUA "")
+foreach(fnl IN LISTS PGR4_UI_SCRIPTS)
+    string(REGEX REPLACE "\\.fnl$" ".lua" lua "${CMAKE_CURRENT_BINARY_DIR}/pgr4_ui/${fnl}")
+    add_custom_command(OUTPUT "${lua}"
+        COMMAND "${CMAKE_COMMAND}" "-DLUA=${PGR4_LUA}" "-DFENNEL=${PGR4_FENNEL}"
+            "-DGLOBALS=${PGR4_UI_GLOBALS_ARG}" "-DIN=${CMAKE_CURRENT_SOURCE_DIR}/ui/${fnl}"
+            "-DOUT=${lua}" -P "${CMAKE_CURRENT_SOURCE_DIR}/ui/fennel.cmake"
+        DEPENDS "ui/${fnl}" ui/fennel.cmake "${PGR4_FENNEL}"
+        COMMENT "Compiling ui/${fnl}"
+        VERBATIM)
+    list(APPEND PGR4_UI_LUA "${lua}")
+endforeach()
+target_sources(pgr4_recompiled PRIVATE ${PGR4_UI_LUA})
+# #embed searches beside the file, then the embed directories, not the include path; and with -MD clang embeds a file it
+# cannot find as empty instead of failing (pgr4_lua.cpp asserts each script is not).
+set_source_files_properties(src/pgr4_lua.cpp PROPERTIES OBJECT_DEPENDS "${PGR4_UI_LUA}"
+    COMPILE_OPTIONS "/clang:--embed-dir=${CMAKE_CURRENT_BINARY_DIR}")
 # The FidelityFX API of the upscaler and the frame generation (src/native/fidelityfx.h); its DLLs
 # are loaded at run time.
 target_include_directories(pgr4_recompiled SYSTEM PRIVATE

@@ -1,0 +1,52 @@
+# route-settings.keys: fresh profile -> Main Menu -> OPTIONS -> the port's DISPLAY page: change
+# a start-up setting (Aspect ratio) and a live one (Antialiasing), save, reopen, then DEVELOPER.
+# Shots at each step. Fresh save (deck-run.sh starts each run with one).
+30000 return          # skip the intro FMV
++12000 return         # title: PRESS START -> Gamer Profiles "Welcome to PGR4!"
++8000 space           # Next -> Select Driver
++8000 d 300           # right-hand driver
++1800 space           # -> Select Nationality (United States)
++8000 space           # -> Driver customisation
++8000 space           # Continue -> "Saving content", then Main Menu
++20000 mark race      # main menu
++4000 d 120           # right, once the menu takes input: SINGLE PLAYER -> MULTIPLAYER
++1000 d 120           # -> XBOX LIVE
++1000 d 120           # -> ACHIEVEMENTS
++1000 d 120           # -> PGR SHOP
++1000 d 120           # -> PGR ON DEMAND
++1000 d 120           # -> OPTIONS
++1500 mark shot mainmenu
++500 space            # open OPTIONS
++5000 d 120           # right through the game's ten items (ids 12, 0, 1, 5, 2, 3, 4, 11, 9, 10)
++1000 d 120
++1000 d 120
++1000 d 120
++1000 d 120
++1000 d 120
++1000 d 120
++1000 d 120
++1000 d 120           # -> CHANGE SAVE LOCATION
++1000 d 120           # -> DISPLAY, the port's
++1500 mark shot options
++500 space            # open DISPLAY
++2500 mark shot display
++300 s 120            # Aspect ratio
++600 d 120            # -> 16:9, a start-up setting
++800 mark shot display-aspect
++300 s 120            # HDR
++600 s 120            # HDR brightness
++600 s 120            # Antialiasing
++600 d 120            # -> MSAA 4x, applied at once
++800 mark shot display-antialiasing
++300 space            # A: apply and save
++4000 mark shot saved
++500 space            # open DISPLAY again
++2500 mark shot display-again
++300 backspace        # B: leave unchanged
++4000 mark shot back
++500 d 120            # right: -> DEVELOPER
++1000 space           # open DEVELOPER
++2500 mark shot developer
++300 backspace        # B
++4000 mark shot back2
++0 e 20000
