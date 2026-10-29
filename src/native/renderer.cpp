@@ -95,6 +95,13 @@ REXCVAR_DEFINE_BOOL(pgr4_native_occlusion, true, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_renderer_switch, true, "PGR4 native",
                     "With --pgr4_native_primary, the key bind_renderer_switch (F9) switches "
                     "between the native renderer and the Xenos plugin at the next Swap");
+REXCVAR_DEFINE_BOOL(pgr4_native_classic, false, "PGR4 native",
+                    "With --pgr4_native_primary: the Xenos plugin draws the game from the start, "
+                    "as after the renderer switch, until the switch (F9 or the Display settings' "
+                    "Renderer) hands it to the native renderer");
+REXCVAR_DEFINE_BOOL(pgr4_native_debug_keys, true, "PGR4 native",
+                    "The renderer's keys: bind_renderer_switch (F9), bind_upscaler (F7) and "
+                    "bind_upscaler_debug (F8); false: they do nothing");
 REXCVAR_DEFINE_INT32(pgr4_native_frame_latency, 3, "PGR4 native",
                      "With --pgr4_native_primary: pace the game's frames on the display, with at "
                      "most this many frames begun but not yet shown (1-3, frame_pacer.h; the game "
@@ -416,14 +423,7 @@ bool NativeRenderer::Initialize() {
   }
   rt_ = std::make_unique<RenderTargets>();
   if (!rt_->Initialize(device_->device())) return false;
-  if (const int32_t msaa = REXCVAR_GET(pgr4_native_msaa);
-      msaa == 1 || msaa == 2 || msaa == 4 || msaa == 8) {
-    scene_msaa_ = rt_->SupportedSamples(uint32_t(msaa));
-    if (scene_msaa_ != uint32_t(msaa))
-      REXLOG_WARN("PGR4 native: {}x MSAA unsupported; the scene takes {}x", msaa, scene_msaa_);
-  } else {
-    REXLOG_ERROR("PGR4 native: --pgr4_native_msaa={} is not 1, 2, 4 or 8", msaa);
-  }
+  ReadSceneMsaa();
   resolver_ = std::make_unique<Resolver>();
   if (!resolver_->Initialize(device_->device(), rt_.get(), device_->command_queue())) return false;
   resolver_->set_gpu_timer(gpu_timer_);
@@ -469,21 +469,30 @@ bool NativeRenderer::Initialize() {
     REXLOG_ERROR(
         "PGR4 native: could not set xam_keyboard_accept_default "
         "(patches/0024 missing?)");
+  // The keys are read when pressed: the Developer settings turn them off and on.
+  const auto key = [](std::atomic<bool>& request) {
+    return [&request] {
+      if (REXCVAR_GET(pgr4_native_debug_keys)) request.store(true, std::memory_order_relaxed);
+    };
+  };
   if (primary && REXCVAR_GET(pgr4_native_renderer_switch)) {
     rex::ui::RegisterBind("bind_renderer_switch", "F9",
                           "PGR4 native: switch between the native renderer and the Xenos plugin",
-                          [this] { switch_requested_.store(true, std::memory_order_relaxed); });
+                          key(switch_requested_));
     switch_bound_ = true;
   }
+  // The first Swap hands the game to the plugin.
+  if (primary && REXCVAR_GET(pgr4_native_classic))
+    switch_requested_.store(true, std::memory_order_relaxed);
   if (primary) {
     rex::ui::RegisterBind(
         "bind_upscaler", "F7",
         "PGR4 native: switch the 3D scene between MSAA and FidelityFX Super Resolution",
-        [this] { upscaler_switch_requested_.store(true, std::memory_order_relaxed); });
+        key(upscaler_switch_requested_));
     rex::ui::RegisterBind(
         "bind_upscaler_debug", "F8",
         "PGR4 native: show FidelityFX Super Resolution's debug view (its inputs and history)",
-        [this] { upscaler_debug_requested_.store(true, std::memory_order_relaxed); });
+        key(upscaler_debug_requested_));
     upscaler_bound_ = true;
   }
   csv_ = std::make_unique<Csv>();
@@ -568,9 +577,31 @@ void NativeRenderer::SwitchUpscaler(bool on) {
     REXLOG_INFO("PGR4 native: the scene with {}x MSAA", scene_msaa_);
 }
 
+void NativeRenderer::ReadSceneMsaa() {
+  if (const int32_t msaa = REXCVAR_GET(pgr4_native_msaa);
+      msaa == 1 || msaa == 2 || msaa == 4 || msaa == 8) {
+    scene_msaa_ = rt_->SupportedSamples(uint32_t(msaa));
+    if (scene_msaa_ != uint32_t(msaa))
+      REXLOG_WARN("PGR4 native: {}x MSAA unsupported; the scene takes {}x", msaa, scene_msaa_);
+  } else {
+    REXLOG_ERROR("PGR4 native: --pgr4_native_msaa={} is not 1, 2, 4 or 8", msaa);
+  }
+}
+
 void NativeRenderer::BeginFrameModules() {
   if (frame_rate_requested_.exchange(false, std::memory_order_relaxed))
     device_->set_present_interval(uint32_t(std::max(1, REXCVAR_GET(pgr4_native_present_interval))));
+  if (antialiasing_requested_.exchange(false, std::memory_order_relaxed)) {
+    ReadSceneMsaa();
+    // The upscaler takes its sizes when it is made (Upscaler::Initialize); its resources may be
+    // in the lists still running.
+    if (upscaler_) {
+      device_->WaitIdle();
+      upscaler_on_ = false;
+      upscaler_.reset();
+    }
+    SwitchUpscaler(Upscaler::Requested());
+  }
   if (upscaler_switch_requested_.exchange(false, std::memory_order_relaxed))
     SwitchUpscaler(!upscaler_on_);
   if (upscaler_debug_requested_.exchange(false, std::memory_order_relaxed) && upscaler()) {

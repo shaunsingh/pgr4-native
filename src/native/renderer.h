@@ -146,9 +146,18 @@ class NativeRenderer {
   // with bind_upscaler); nullptr otherwise.
   Upscaler* upscaler() { return upscaler_on_ ? upscaler_.get() : nullptr; }
 
-  // --pgr4_native_present_interval changed, from any thread: taken at the start of the next
-  // frame.
+  // The in-game settings (games/pgr4/src/pgr4_settings.cpp), from any thread.
+  // The scene's antialiasing settings changed (--pgr4_native_msaa, --pgr4_native_upscaler and
+  // its sizes): taken at the start of the next frame, the upscaler made again with them.
+  void RequestAntialiasing() { antialiasing_requested_.store(true, std::memory_order_relaxed); }
+  // --pgr4_native_present_interval changed: taken at the start of the next frame.
   void RequestFrameRate() { frame_rate_requested_.store(true, std::memory_order_relaxed); }
+  // Primary mode: the native renderer (true) or the Xenos plugin draws from the next Swap on,
+  // as the renderer switch does.
+  void RequestRenderer(bool native) {
+    if (native != (live_.load(std::memory_order_relaxed) != nullptr))
+      switch_requested_.store(true, std::memory_order_relaxed);
+  }
 
   ~NativeRenderer();
 
@@ -227,10 +236,11 @@ class NativeRenderer {
   // of the next frame. The upscaler is created at its first use and kept after.
   void SwitchUpscaler(bool on);
   std::atomic<bool> upscaler_switch_requested_{false}, upscaler_debug_requested_{false};
-  std::atomic<bool> frame_rate_requested_{false};
+  std::atomic<bool> antialiasing_requested_{false}, frame_rate_requested_{false};
   bool upscaler_bound_ = false;  // primary mode
   bool upscaler_on_ = false;
   uint32_t scene_msaa_ = 2;  // --pgr4_native_msaa, as far as the GPU has it
+  void ReadSceneMsaa();      // scene_msaa_ from --pgr4_native_msaa
 
   static inline std::atomic<bool> paces_frames_{false};       // pacer_->pacing(), for any thread
   static inline std::atomic<NativeRenderer*> live_{nullptr};  // Live()
