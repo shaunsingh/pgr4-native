@@ -53,12 +53,13 @@ endif()
 find_program(PGR4_LUA NAMES lua luajit lua5.4 lua5.3 lua5.1 REQUIRED)
 set(PGR4_UI_GLOBALS
     # Lua 5.1
-    error ipairs math pcall table
+    error ipairs math pairs pcall table
     # The game's UI
-    GUIBank GothamSystem UIButtons UIEnums UIGlobals UIScreen UIText numberOfViewports
+    CustomPopup GUIBank GothamSystem UIButtons UIEnums UIGlobals UIScreen UIText
+    numberOfViewports
     GetDefaultFrame MoveScrollBarV PlayMenuBack PlayMenuMove PlayMenuNext SetClipToFrame
-    SetupFadedBackground SetupFadePanel SetupFrameScrollBar SetupFrameTitle SetupGroupEnd
-    SetupInfoText SetupIngameSlideGroup SetupScreenTimers SetupSlideMenuInfo
+    SetupCustomPopup SetupFadedBackground SetupFadePanel SetupFrameScrollBar SetupFrameTitle
+    SetupGroupEnd SetupInfoText SetupIngameSlideGroup SetupScreenTimers SetupSlideMenuInfo
     SetupVariableSpinner StoreMenuSelection
     # A script's own, which a patch wraps
     AdjustPositionAndSizeForViewports GetViewportDetails GUI Init MessageUpdate

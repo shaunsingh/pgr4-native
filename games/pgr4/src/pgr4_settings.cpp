@@ -399,8 +399,8 @@ void LuaPage(PPCContext& ctx, uint8_t* base) {
   pgr4::lua::Results(ctx, 1);
 }
 
-// Lua: Pgr4.Apply(page, {[id] = choice from 0...}) -> whether a start-up option differs from
-// what runs (a restart applies it).
+// Lua: Pgr4.Apply(page, {[id] = choice from 0...}) -> whether a start-up option of the page
+// differs from what runs (a restart applies it).
 void LuaApply(PPCContext& ctx, uint8_t* base) {
   pgr4::lua::Lua lua(ctx, base, ctx.r3.u32);
   const std::string page = lua.ToString(1);
@@ -416,7 +416,8 @@ void LuaApply(PPCContext& ctx, uint8_t* base) {
     }
     Save();
   }
-  lua.PushBoolean(!g_pending.empty());
+  lua.PushBoolean(std::ranges::any_of(
+      Options(), [&](const Option& o) { return o.page == page && g_pending.contains(o.id); }));
   pgr4::lua::Results(ctx, 1);
 }
 

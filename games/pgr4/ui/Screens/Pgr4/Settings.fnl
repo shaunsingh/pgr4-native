@@ -76,6 +76,19 @@
 (fn leave []
   (UIScreen.SetNextScreen (. menus GUI.from)))
 
+;; A start-up option takes its choice at the next start (the rows' " *"): the game's own popup
+;; (Popups\TheCustomPopup.lua) says so, and A on it goes back to the menu.
+(fn leave-for-restart []
+  (set (. CustomPopup.Data :pgr4_restart)
+       {:darken true
+        :title_text_ID (Pgr4.Text "RESTART REQUIRED")
+        :message_text_ID (Pgr4.Text (.. "The choices marked * take effect the next time the "
+                                        "game starts."))
+        :next_text_ID UIText.IDS_CONTINUE_A
+        :no_back true
+        :next_screen (. menus GUI.from)})
+  (SetupCustomPopup :pgr4_restart))
+
 (global Init
         (fn []
           (set GUI.from (or Pgr4.page_from :options))
@@ -174,12 +187,13 @@
               (do
                 (set GUI.finished true)
                 (PlayMenuNext)
-                (Pgr4.Apply GUI.page
-                            (collect [_ option (ipairs GUI.options)]
-                              (let [selection (UIButtons.GetSelection option.ID)]
-                                (when (not= selection option.value)
-                                  (values option.id selection)))))
-                (leave)
+                (if (Pgr4.Apply GUI.page
+                                (collect [_ option (ipairs GUI.options)]
+                                  (let [selection (UIButtons.GetSelection option.ID)]
+                                    (when (not= selection option.value)
+                                      (values option.id selection)))))
+                    (leave-for-restart)
+                    (leave))
                 false)
               :BUTTON_BACK
               (do
