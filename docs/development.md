@@ -312,11 +312,14 @@ keep their shape (square pixels, centered). The mechanism, all in `pgr4recompile
 - The scene's render targets come from the pair creators `fn_826C8B18`/`sub_822B3FC8`; their
   height argument is hooked too, because `sub_826C6100` clamps every viewport to the bound
   target's packed size and would otherwise clamp the scene back to 720.
-- The HUD and the menus share one orthographic projection, c45 of the vertex block the state
-  apply (`sub_82871A20`) uploads: 640x480 mapped into the central 960x720 of the frame (4:3-safe,
-  the pixel scale 1.5). Its y scale and offset are the one 720 the loads cannot reach (the game
-  computes them), so `Pgr4HudOrthoHook` rewrites the game's own value at the upload: the central
-  960x720 of the taller frame, centered, square pixels.
+- The HUD and the menus share one orthographic projection, vertex constant c45: 640x480 mapped
+  into the central 960x720 of the frame (4:3-safe, the pixel scale 1.5). Its y scale and offset
+  are the one 720 the loads cannot reach (the game computes them). The state apply
+  (`sub_82871A20`) uploads it with its block and the dials with calls of their own, all through
+  SetVertexShaderConstantF (`sub_826C9908`), so `Pgr4HudOrthoHook` rewrites the game's own
+  value in the device's shadow constants at the end of that function: the central 960x720 of the
+  taller frame, centered, square pixels. The text items anchor to the frame's edges through the
+  UI scripts' layout; the dials keep their place in the central 960x720.
 - `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
   function; the manifest's comments name the false positives it deliberately skips (VMX byte
   offsets, allocation sizes, string calls, the 1280 widths).
