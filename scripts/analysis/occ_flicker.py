@@ -4,8 +4,8 @@
 The trace has one line per event: "frame query what z_pass total", with `what` one of
 result (what GetData read), retire (what the GPU measured for one frame), end (the pair range),
 or why none was written (fence, blocks, read, none). A flare blinks when the visibility it is
-delivered (ZPass > 0) changes from one read to the next; --pgr4_native_occlusion_window sums the
-newest frames so a blink becomes a ramp (0,0) (1,4) (2,6) (3,8) instead of (0,2) <-> (2,2).
+delivered (ZPass > 0) changes from one read to the next; --pgr4_native_occlusion_window_ms sums
+the newest frames so a blink becomes a ramp (0,0) (1,4) (2,6) (3,8) instead of (0,2) <-> (2,2).
 
   occ_flicker.py TRACE...           reads, flips per 1000 reads, partial and full reads
   occ_flicker.py TRACE --shapes N   the ratio stream around N flips of the worst query

@@ -53,8 +53,6 @@ class OcclusionQueries {
   static constexpr uint32_t kPairs = 4096;
 
   bool Initialize(ID3D12Device* device);
-  // The delivered window, 1..kWindowMax (--pgr4_native_occlusion_window).
-  uint32_t window_ = 1;
 
   // Recording thread, in the order of the guest's calls.
   void Begin(uint32_t query);
@@ -95,16 +93,22 @@ class OcclusionQueries {
     uint32_t query;
     uint64_t first, end;  // pairs [first, end)
     uint64_t fence;       // of the frame END was recorded in
+    uint64_t ticks;       // when END was recorded
     bool known;           // BEGIN was recorded (not before a renderer switch)
   };
   // One guest query's recent underlying results: the delivered ZPass and Total are the sums of
-  // the window's newest --pgr4_native_occlusion_window frames. The game fades a flare by
-  // 1 - ZPass / Total, so the sum averages the frames' visibilities: a flare that alternates
-  // per frame (its sprite tested against the previous frame's depth of a moving scene) dims
-  // briefly instead of blinking, while a real change wins within the window.
-  static constexpr uint32_t kWindowMax = 8;
+  // the frames recorded within --pgr4_native_occlusion_window_ms of its newest one. The game
+  // fades a flare by 1 - ZPass / Total, so the sum averages the frames' visibilities: a flare
+  // that alternates per frame (its sprite tested against the previous frame's depth of a moving
+  // scene) dims briefly instead of blinking, and an occlusion fades over the window rather than
+  // in the one frame a light of a few samples takes to go behind something. A time rather than
+  // a frame count, so that the fade lasts as long at every frame rate.
+  static constexpr uint32_t kWindowMax = 32;  // frames: 300 ms at 90 fps, 100 ms at 320
+  struct Frame {
+    uint64_t z_pass, total, ticks;
+  };
   struct Result {
-    uint64_t win_z[kWindowMax] = {}, win_t[kWindowMax] = {};
+    Frame win[kWindowMax] = {};
     uint32_t win_count = 0;  // pushed so far, up to kWindowMax
     uint32_t win_next = 0;   // the next slot to write (the oldest when full)
     bool known = false;
@@ -120,6 +124,7 @@ class OcclusionQueries {
   std::deque<std::pair<uint64_t, uint64_t>> resolves_;  // (pairs resolved up to, frame fence)
   uint64_t next_ = 0, resolved_ = 0, retired_ = 0;      // pairs, counted from the start
   uint64_t unknown_pairs_ = 0;
+  uint64_t window_ns_ = 0;      // --pgr4_native_occlusion_window_ms
   std::FILE* trace_ = nullptr;  // --pgr4_native_occlusion_trace
 
   std::mutex mutex_;

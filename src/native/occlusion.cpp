@@ -1,6 +1,7 @@
 // pgr4-native PGR4 native renderer: the game's occlusion queries, counted on the host.
 #include "occlusion.h"
 
+#include "clock.h"
 #include "guest_memory.h"
 #include "log.h"
 
@@ -15,12 +16,12 @@
 REXCVAR_DEFINE_STRING(pgr4_native_occlusion_trace, "", "PGR4 native",
                       "Log every occlusion query result the game reads to this file: frame, query "
                       "and its ZPass and Total, or why none was written");
-REXCVAR_DEFINE_INT32(pgr4_native_occlusion_window, 4, "PGR4 native",
-                     "Newest frames of an occlusion query's results whose ZPass and Total sums "
-                     "it delivers (1 = the latest only). The flare test compares a live sprite "
-                     "with the previous frame's depth of a moving scene, so single frames flip "
-                     "fully occluded/visible; the sum turns those flips into a brief partial "
-                     "fade (the game fades by 1 - ZPass / Total) instead of a blink");
+REXCVAR_DEFINE_INT32(pgr4_native_occlusion_window_ms, 100, "PGR4 native",
+                     "Milliseconds of an occlusion query's newest results whose ZPass and Total "
+                     "sums it delivers (0-300, 0 = the latest frame only). A light flare's test "
+                     "covers a few pixels, so one frame's result is nearly all or nothing; the "
+                     "game fades the flare by 1 - ZPass / Total, and the sum makes that a fade "
+                     "over the window instead of a blink");
 
 namespace pgr4::native {
 
@@ -82,7 +83,7 @@ bool OcclusionQueries::Initialize(ID3D12Device* device) {
     trace_ = std::fopen(trace.c_str(), "wb");
     if (!trace_) REXLOG_ERROR("PGR4 native: cannot write the occlusion trace ({})", trace);
   }
-  window_ = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_occlusion_window), 1, int32_t(kWindowMax)));
+  window_ns_ = uint64_t(std::clamp(REXCVAR_GET(pgr4_native_occlusion_window_ms), 0, 300)) * 1000000;
   REXLOG_INFO("PGR4 native: the game's occlusion queries are counted on the host");
   return true;
 }
@@ -98,7 +99,7 @@ void OcclusionQueries::Begin(uint32_t query) {
 }
 
 void OcclusionQueries::End(uint32_t query, uint64_t frame, uint64_t frame_fence) {
-  Ended e = {query, next_, next_, frame_fence, false};
+  Ended e = {query, next_, next_, frame_fence, Ticks(), false};
   for (auto it = open_.begin(); it != open_.end(); ++it) {
     if (it->query == query) {
       e.first = it->first;
@@ -195,8 +196,7 @@ void OcclusionQueries::Retire(uint64_t completed_fence) {
       // Every pair's coverage unknown: keep the query's previous window rather than push a
       // Total of its ZPass, which would show its flares at full brightness for these frames.
       Result& d = results_[e.query];
-      d.win_z[d.win_next] = z_pass;
-      d.win_t[d.win_next] = coverage;
+      d.win[d.win_next] = {z_pass, coverage, e.ticks};
       d.win_next = (d.win_next + 1) % kWindowMax;
       if (d.win_count < kWindowMax) ++d.win_count;
       d.known = true;
@@ -236,11 +236,13 @@ void OcclusionQueries::WriteResult(uint8_t* base, uint32_t query, uint64_t frame
     if (it == results_.end()) return trace("none", 0, 0);  // none counted yet: S_FALSE
     const Result& d = it->second;
     known = d.known;
-    // The sums of the window's newest frames: the average visibility the game fades by.
-    for (uint32_t i = 0, n = std::min(window_, d.win_count); i < n; ++i) {
-      const uint32_t slot = (d.win_next + kWindowMax - 1 - i) % kWindowMax;
-      z_pass += d.win_z[slot];
-      coverage += d.win_t[slot];
+    // The sums of the window's frames: the average visibility the game fades by.
+    const uint32_t newest = (d.win_next + kWindowMax - 1) % kWindowMax;
+    for (uint32_t i = 0; i < d.win_count; ++i) {
+      const Frame& f = d.win[(newest + kWindowMax - i) % kWindowMax];
+      if (i && TicksToNs(d.win[newest].ticks - f.ticks) >= window_ns_) break;
+      z_pass += f.z_pass;
+      coverage += f.total;
     }
   }
   // No BEGIN seen (recorded before a renderer switch): a Total of 1, which the flares skip.
