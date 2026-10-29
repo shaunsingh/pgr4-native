@@ -73,7 +73,8 @@ be black, and the game's eye adaptation, kept in one of them, settles again over
 | Thread | Owner | Work |
 |---|---|---|
 | `Main XThread` (guest) | the game | Runs the game. The hooks run here and track state, then capture each call (or run the whole native path with `--pgr4_native_render_thread=false`) |
-| `PGR4 native render` | `NativeRenderer` | Replays captured commands into the modules, and owns the command lists, the D3D12 objects and all module state |
+| `PGR4 native render` | `NativeRenderer` | Replays captured commands into the modules, and owns the D3D12 objects and all module state |
+| `PGR4 native list` | `CommandStream` | Makes the D3D12 calls the render thread recorded, on the frame's command list, and submits and presents it |
 | `PGR4 native untile` (1 to 4) | `TextureCache` | Arms a texture's page watches, untiles it into upload memory, and records the uploads of textures first bound in the frame on an upload list of its own |
 | `PGR4 native watches` | `DrawRenderer` | Arms the page watches of copied vertex and index runs, and keeps each page valid while its hash still matches its copy |
 | `PGR4 native pipelines` | `DrawRenderer` | Creates pipeline states, loads and stores them in the pipeline library, and prewarms the stored list |
@@ -107,6 +108,13 @@ be black, and the game's eye adaptation, kept in one of them, settles again over
    for the untile workers (`TextureCache::FinishUploads`), and submits their upload lists ahead
    of the frame's list in one `ExecuteCommandLists`. `EndFrame` then closes, executes, presents
    and signals the fence, and the frame's upload memory is retired and its CSV row written.
+   The modules record into a `CommandStream` (`command_stream.h`), not the D3D12 list: the calls
+   are copied into 64 KB chunks, and the list thread makes them on the list a chunk behind, as
+   DXVK's CS thread does for D3D11. The submissions, presents, fence signals and FidelityFX
+   dispatches run there too, in order with the calls. A wait on the frame fence flushes the
+   stream, and `WaitIdle` drains it. With it, the render thread's time in the race's draws went
+   from 6.6 to 4.1 ms a frame (median, td-500 against td-501), and from 10 to 5.6 ms in the
+   slowest tenth of the frames, which are now the game thread's.
 4. **Pacing.** The game thread blocks at Swap while the render thread is more than one frame
    behind. In primary mode the guest presents immediately (`Pgr4PresentationInterval`, a mid-asm
    hook in `games/pgr4`), and `FramePacer` (`frame_pacer.h`) is the only clock. Frame F + 1
@@ -144,6 +152,7 @@ Anything the render thread reads late must not change under it.
 | `guest_d3d` | Guest D3D functions replaced in primary mode |
 | `d3d_state` | `GuestStateTracker` (register file and change log), `ReadDrawState` and the device layout |
 | `d3d12_device` | Queue, fence, frames in flight, back buffers, the debug window or the game window's swapchain, HDR10 colour space and metadata, `EndFrame`, and barrier and buffer helpers |
+| `command_stream` | The frame's command list, recorded on the render thread and made on a thread of its own |
 | `draw` | `DrawRenderer` with shader selection, the pipeline key and cache, bindless textures and samplers, system, float, bool and fetch constants, vertex and index upload, fixed-function state and the draw itself, plus `Prepare` for the capture step |
 | `shader_cache`, `shader_translate`, `shader_xlate.cmake` | Ucode to DXBC, keyed by XXH3 of the ucode and translated per modification with ReXGlue's DXBC translator |
 | `shader_specialize` | Bool-constant specialization, which rewrites the ucode's control flow for a draw's bool constants and loads the result as a shader of its own |
@@ -205,7 +214,7 @@ stored lists will prewarm the wrong keys.
 | Constant upload, 4 MB blocks | CPU-cached (custom heap, write-back), written with streaming stores and never read back |
 | Texture upload, 32 MB blocks | Owned by the untile workers |
 | Texture heaps, 128 MB each | Placed textures with a best-fit free list. Past the soft limit, textures are evicted by age, and past the hard limit by recency, once no frame in flight uses them |
-| Descriptor heaps | 65,536 views and 2,048 samplers, bindless, with freed views on a free list |
+| Descriptor heaps | 65,536 views and 2,048 samplers, bindless, with freed views on a free list. A render target's RTV or DSV is freed, and a grown target takes a new one, only once the frame fence passes, since the list thread reads it when it makes the frame's calls |
 
 Upload memory is write-combined unless noted, and must never be read on the CPU. Conversions
 work in a cached scratch row and copy whole rows out.
