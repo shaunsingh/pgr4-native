@@ -310,8 +310,8 @@ never stretched. Rendering at 1280x800 needs a game patch rather than a renderer
   create their own targets.
 
 That patch shipped (`pgr4_render_height`, default 800): the frame renders at 1280x800 end to
-end at the same 90 fps, the projection gains the vertical field of view, and the HUD and menus
-keep their shape (square pixels, centered). The mechanism, all in `pgr4recompiled_manifest.toml` + `Pgr4*Hook` in
+end at the same 90 fps, the scene keeps the game's horizontal field of view and gains vertical,
+and the HUD and menus keep their shape (square pixels, centered). The mechanism, all in `pgr4recompiled_manifest.toml` + `Pgr4*Hook` in
 `games/pgr4/src/pgr4_hooks.cpp`:
 
 - Every instruction that loads the hardcoded 720 of the frame (surfaces, the mode structs, the
@@ -332,6 +332,19 @@ keep their shape (square pixels, centered). The mechanism, all in `pgr4recompile
   (`GuestStateTracker::FrameHudProjection`, `src/native/d3d_state.cpp`): the central 960x720
   of the taller frame, centered, square pixels. The UI's space is then 640 by 480 x height / 720
   rows (533 at 800), its 480 rows in the middle.
+- The UI's renderers clip with SetScissorRect, from rows-to-pixels factors of their own: the 2D
+  items' (`sub_824D0840`) and the 3D models' (`sub_826400B8`) scale rows by the frame's height /
+  480 with no offset, which at 800 rows puts a clip up to 40 pixels off the projection's rows,
+  the most at the screen's edges. `Pgr4UiClipHook` and `Pgr4UiModelClipHook` give them the
+  720-row frame's factors moved down by the rows added above, and `Pgr4UiClipRectHook` takes a
+  clip that reaches the game's screen edge (row 0 or 480, as the HUD's items and the race
+  intro's ticker have) to the frame's edge.
+- Every view's perspective is built in `sub_822C2410` (the call of `sub_826E32F0`: vertical
+  field of view, aspect) with the 16:9 frame's aspect, the scene's through its pixel aspect
+  (view + 440) and the UI's 3D models' (the arcade's medals) as the view's width / height. A view
+  of the frame's shape gets the frame's aspect and the vertical field of view widened by height /
+  720 (`Pgr4ViewProjectionHook`), so the horizontal one stays the game's; v0.3.0 stretched the
+  scene 11 % taller and narrowed the medals instead.
 - The UI scripts lay out in that space (`games/pgr4/ui/patches/`). `UIGlobals.fnl` makes the
   screen and its safe area as tall as the frame, so the menus' items at the edges reach the
   frame's top and bottom. `GUIBank.fnl` keeps the race's viewports on rows 0 to 480, because
@@ -339,6 +352,11 @@ keep their shape (square pixels, centered). The mechanism, all in `pgr4recompile
   above its viewport's middle up with the frame's top, and each below it down with the bottom.
   The widgets that place themselves in the game's code (the rev counter: `sub_8245C2A8`,
   `sub_8245C310`) move the same way through `Pgr4HudWidgetHook` and `Pgr4HudWidgetBHook`.
+  `GUIBank.fnl` also moves the music player down with the bottom and has the screen's fades
+  (to a colour, and the previous screen's image) cover the frame. The UI's 3D models (`true_3d`
+  buttons) sit in frames placed from the safe top, which a taller screen raises; `UIGlobals.fnl`
+  raises them as far, through the world units a row spans at their depth in the UI's view
+  (field of view 1 rad). The loading screen's art stays 16:9, between bands.
 - `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
   function; the manifest's comments name the false positives it deliberately skips (VMX byte
   offsets, allocation sizes, string calls, the 1280 widths).
@@ -367,7 +385,8 @@ options, the cvars each choice sets, and the `Pgr4` table the scripts call.
   `NativeRenderer`'s `Request*` taken at the next frame; the others are marked `*` until the
   next start. Both are saved to `userdata/pgr4_settings.toml`, read after
   `pgr4_recompiled.toml`. A flag on the command line holds for its session only: the file keeps
-  its own value for that cvar until the menu changes the option.
+  its own value for that cvar until the menu changes the option. Leaving a page with a `*`
+  choice changed shows the game's popup (`SetupCustomPopup`) saying a restart applies it.
 - **Testing.** `scripts/routes/route-settings.keys` opens the pages on a fresh profile, changes
   a start-up and a live setting on Display and both of Driving's, saves and reopens.
   `route-pause-settings.keys` opens them from the pause menu of a race.
