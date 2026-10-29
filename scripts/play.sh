@@ -249,6 +249,10 @@ echo "session $stamp$([[ $debug != 0 ]] && echo ' (debug)'): $base-*"
 cd "$runtime"
 status=0
 "${cmd[@]}" > "$base-stdout.log" 2>&1 || status=$?
+# A title launch (Geometry Wars from the garage, and back) ends the process Proton started.
+# Outside Steam, Proton's launcher returns with it, so the session waits until no title runs
+# (from Steam, the launcher waits itself; a debugging session's command above does).
+[[ $debug != 0 ]] || while [[ -n $(prefix_title_pids "$top/prefix") ]]; do sleep 1; done
 if [[ $debug != 0 ]]; then
   kill "$sampler" "$snapshotter" 2>/dev/null || true
   wait "$sampler" "$snapshotter" 2>/dev/null || true

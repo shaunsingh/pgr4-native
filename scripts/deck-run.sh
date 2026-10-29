@@ -265,7 +265,12 @@ if [[ $session == gamescope ]]; then
   inner=$base-inner.sh
   { echo '#!/usr/bin/env bash'
     echo "printf 'export DISPLAY=%q GAMESCOPE_WAYLAND_DISPLAY=%q\\n' \"\$DISPLAY\" \"\$GAMESCOPE_WAYLAND_DISPLAY\" > '$envfile'"
-    printf 'cd %q && exec' "$runtime"; printf ' %q' "${cmd[@]}"; echo
+    # A title launch (Geometry Wars from the garage, and back) ends the process Proton started
+    # and its launcher with it, and gamescope ends the session with its first child: the session
+    # lasts until no title runs, as play.sh's does.
+    printf 'source %q\n' "$here/common.sh"
+    printf 'cd %q || exit; s=0;' "$runtime"; printf ' %q' "${cmd[@]}"; echo ' || s=$?'
+    printf 'while [[ -n $(prefix_title_pids %q) ]]; do sleep 1; done; exit "$s"\n' "$top/prefix"
   } > "$inner"
   chmod +x "$inner"
   hdr_args=()

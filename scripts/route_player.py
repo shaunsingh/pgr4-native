@@ -15,7 +15,7 @@ hyprctl on Hyprland and through xdotool on X11 or XWayland (KDE Plasma on SteamO
 manages focus itself, and --wm none turns them off. No Python packages: the uinput device is set
 up with raw ioctls.
 
-usage: route_player.py --script route.keys --log input.log [--match pgr4_recompiled] [--timeout 120]
+usage: route_player.py --script route.keys --log input.log [--match '(pgr4|gw)_recompiled'] [--timeout 120]
                        [--width 1280 --height 720] [--wm auto|hyprland|x11|gamescope|none]
                        [--input uinput|xtest] [--stretch 1.0]
 """
@@ -273,7 +273,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--script", required=True)
     ap.add_argument("--log", required=True)
-    ap.add_argument("--match", default="pgr4_recompiled")
+    ap.add_argument("--match", default="(pgr4|gw)_recompiled")
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -293,17 +293,22 @@ def main() -> None:
     wm = window_manager(args.wm, args.match)
     kb = XTestKeyboard() if args.input == "xtest" else Keyboard()
     held = []
-    try:
+
+    def find_window():
         deadline = time.monotonic() + args.timeout
-        win = None
-        while not win:
-            win = wm.find(args.match)
+        while not (found := wm.find(args.match)):
             if time.monotonic() > deadline:
-                seen = wm.windows() if hasattr(wm, "windows") else ""
-                say(f"error: no window matching {args.match} after {args.timeout} s"
-                    f" (DISPLAY={os.environ.get('DISPLAY', '')}; windows: {seen or 'none'})")
-                raise SystemExit(1)
+                return None
             time.sleep(0.1)
+        return found
+
+    try:
+        win = find_window()
+        if not win:
+            seen = wm.windows() if hasattr(wm, "windows") else ""
+            say(f"error: no window matching {args.match} after {args.timeout} s"
+                f" (DISPLAY={os.environ.get('DISPLAY', '')}; windows: {seen or 'none'})")
+            raise SystemExit(1)
         t0 = time.monotonic()
         clock = lambda: int((time.monotonic() - t0) * 1000)
         addr, pid = win
@@ -332,9 +337,15 @@ def main() -> None:
                 if e in held:
                     held.remove(e)
                 continue
-            if not wm.find(args.match):
-                say(f"error: game window gone at {clock()} ms")
-                raise SystemExit(1)
+            if not (win := wm.find(args.match)) or win[0] != addr:
+                # A title launch (Geometry Wars from the garage, and back) closes the game's
+                # window, and the next title opens its own; the script's times run on.
+                if not (win := win or find_window()):
+                    say(f"error: game window gone at {clock()} ms")
+                    raise SystemExit(1)
+                addr, pid = win
+                wm.place(addr, args.width, args.height)
+                say(f"window pid={pid} window={addr} t={clock()}")
             if kind == "mark":
                 say(f"mark {e['mark']} t={clock()}")
                 continue
