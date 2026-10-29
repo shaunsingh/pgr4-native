@@ -153,11 +153,11 @@ mkdir -p "$top/logs" "$top/prefix" "$top/userdata" "$top/cache" "$top/captures"
 stamp=$(date +%Y%m%d-%H%M%S)
 base=$top/logs/$stamp
 
-# Old sessions out, newest kept.
+# Old sessions out, newest kept, a debugging session's perf-modules/ folder too.
 mapfile -t sessions < <(find "$top/logs" -maxdepth 1 -name '*-cmdline.txt' -printf '%f\n' | sort)
 for ((i = 0; i + keep_sessions <= ${#sessions[@]}; i++)); do
   old=$top/logs/${sessions[i]%-cmdline.txt}
-  rm -f "$old".* "$old"-*
+  rm -rf "$old".* "$old"-*
 done
 
 # The release's runtime settings (also in runtime/*.toml) with the frame rate unlocked, the guest's vblank at the Deck OLED
