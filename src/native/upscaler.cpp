@@ -22,9 +22,10 @@ REXCVAR_DEFINE_BOOL(pgr4_native_upscaler, false, "PGR4 native",
                     "puts behind them) from the start; bind_upscaler (F7) switches it");
 REXCVAR_DEFINE_INT32(pgr4_native_upscaler_width, 1280, "PGR4 native",
                      "Width the upscaler's scene renders at, upscaled to 1280 (320-1280; 1280 "
-                     "with the height at 720: antialiasing only)");
-REXCVAR_DEFINE_INT32(pgr4_native_upscaler_height, 720, "PGR4 native",
-                     "Height the upscaler's scene renders at, upscaled to 720 (180-720)");
+                     "with the height at the render height: antialiasing only)");
+REXCVAR_DEFINE_INT32(pgr4_native_upscaler_height, 800, "PGR4 native",
+                     "Height the upscaler's scene renders at, upscaled to the render height "
+                     "(--pgr4_render_height, 800 or 720; from a quarter of it up to it)");
 REXCVAR_DEFINE_INT32(pgr4_native_upscaler_target_fps, 0, "PGR4 native",
                      "Vary the upscaler's render size each frame, from the width and height "
                      "down to --pgr4_native_upscaler_min_height, so that the GPU keeps up with "
@@ -32,7 +33,7 @@ REXCVAR_DEFINE_INT32(pgr4_native_upscaler_target_fps, 0, "PGR4 native",
                      "(--pgr4_native_present_interval, frame generation; 0: a fixed size)");
 REXCVAR_DEFINE_INT32(pgr4_native_upscaler_min_height, 360, "PGR4 native",
                      "With --pgr4_native_upscaler_target_fps: the least height the scene renders "
-                     "at (180-720)");
+                     "at (from a quarter of the render height up to it)");
 
 namespace pgr4::native {
 

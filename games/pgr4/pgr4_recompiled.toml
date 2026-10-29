@@ -25,11 +25,11 @@ pgr4_native_msaa = 4
 
 # The 3D scene with MSAA, or (true) antialiased and upscaled to the render height (800) by AMD's
 # FidelityFX Super Resolution, or what OptiScaler puts behind it (README.md, "Upscaling"). The
-# upscaler renders the scene at width x height: 1280x800 is antialiasing only, 1280x720 FSR's
+# upscaler renders the scene at width x height: 1280x800 is antialiasing only, 853x533 FSR's
 # Quality, 640x400 its Performance.
 pgr4_native_upscaler = false
 pgr4_native_upscaler_width = 1280
-pgr4_native_upscaler_height = 720
+pgr4_native_upscaler_height = 800
 # A frame rate (90: the Steam Deck OLED's) has the upscaler lower its render size each frame, down
 # to a height of pgr4_native_upscaler_min_height, while the GPU falls behind it, or behind the lower
 # frame rate the frames are shown at (pgr4_native_present_interval, frame generation). 0: a fixed
