@@ -2,6 +2,7 @@
 // See d3d_state.h for the model.
 #include "d3d_state.h"
 
+#include "frame_height.h"
 #include "guest_memory.h"
 
 #include <rex/cvar.h>
@@ -167,6 +168,29 @@ void GuestStateTracker::CopyFlushed(const uint8_t* base, uint32_t device,
     ((out = FlushBlock<kI>(base, device, flushed[kFlushBlocks[kI].mask], raw_, regs_, out)), ...);
   }(std::make_index_sequence<std::size(kFlushBlocks)>());
   if (sink_) log.Commit(out);
+  FrameHudProjection();
+}
+
+// The HUD's orthographic projection, vertex constant c45 (development.md, "Native 16:10"): the
+// game maps its 640x480 UI space into the central 960x720 of its 1280x720 frame (4:3-safe, the
+// pixel scale 1.5). In a frame FrameHeight() tall its y scale and offset still map 720 rows and
+// would stretch every HUD and menu draw by height/720, so the renderer takes the same mapping of
+// the taller frame instead: the central 960x720 of it, centered, square pixels. The game writes
+// c45 through SetVertexShaderConstantF and through stores of its own (the text's draws), so the
+// value is replaced where every draw flushes it. raw_ keeps the guest's, so a flush of the same
+// value again changes nothing, and the game's next value replaces this one.
+void GuestStateTracker::FrameHudProjection() {
+  constexpr uint32_t kC45 = 0x4000 + 45 * 4;
+  const uint32_t height = FrameHeight();
+  if (height == kGameFrameHeight) return;
+  constexpr auto bits = [](float f) { return std::bit_cast<uint32_t>(f); };
+  if (regs_[kC45] != bits(3.0f / 1280.0f) || regs_[kC45 + 1] != bits(-3.0f / 720.0f) ||
+      regs_[kC45 + 2] != bits(-0.75f) || regs_[kC45 + 3] != bits(1.0f))
+    return;
+  regs_[kC45 + 1] = bits(-3.0f / float(height));
+  regs_[kC45 + 3] = bits(720.0f / float(height));
+  Record(kC45 + 1, regs_[kC45 + 1]);
+  Record(kC45 + 3, regs_[kC45 + 3]);
 }
 void GuestStateTracker::Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr) {
   static uint64_t checks = 0, differing = 0;

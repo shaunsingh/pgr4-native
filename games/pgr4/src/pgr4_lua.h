@@ -3,7 +3,8 @@
 // functions are at 0x82505960-0x82507400, in lapi.c's order). pgr4_lua.cpp replaces the
 // archive's chunk loader so the game also loads scripts of this project (games/pgr4/ui/, written
 // in Fennel): screens of its own, and patches that run after a game script of the same name.
-// Their host functions are the global table Pgr4: Pgr4.Text, and those of Pgr4LuaFunctions().
+// Their host functions are the global table Pgr4: Pgr4.Text, Pgr4.ScreenHeight, and those of
+// Pgr4LuaFunctions().
 //
 // The game's text functions (UIButtons.AddItem, AddItemHelp, a button's text) take a string ID,
 // the hash its string table (sub_8289B1D0) finds the string by, as UIText holds them; a Lua

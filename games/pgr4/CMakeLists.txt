@@ -55,12 +55,13 @@ set(PGR4_UI_GLOBALS
     # Lua 5.1
     error ipairs math pcall
     # The game's UI
-    GUIBank GothamSystem UIButtons UIEnums UIGlobals UIScreen UIText
+    GUIBank GothamSystem UIButtons UIEnums UIGlobals UIScreen UIText numberOfViewports
     GetDefaultFrame MoveScrollBarV PlayMenuBack PlayMenuMove PlayMenuNext SetClipToFrame
     SetupFadePanel SetupFrameScrollBar SetupFrameTitle SetupGroupEnd SetupInfoText
     SetupScreenTimers SetupSlideMenuInfo SetupVariableSpinner StoreMenuSelection
-    # A screen's own, which a patch wraps
-    GUI Init MessageUpdate
+    # A script's own, which a patch wraps
+    AdjustPositionAndSizeForViewports GetViewportDetails GUI Init MessageUpdate
+    RedoScreenGlobals
     # pgr4_lua.cpp
     Pgr4)
 string(JOIN "," PGR4_UI_GLOBALS_ARG ${PGR4_UI_GLOBALS})

@@ -334,17 +334,18 @@ address = 0x826CBEE0
 name = "Pgr4ResolveRectHook"
 registers = ["r5"]
 
-# And the HUD's orthographic projection, vertex constant c45, whose y scale and offset still
-# map the 720-tall frame, stretching every HUD draw by render_height/720. The state apply
-# (sub_82871A20) uploads it with its block, and the dials and the menus' widgets with their own
-# calls, all through SetVertexShaderConstantF (sub_826C9908: device, start, data, count, dirty
-# mask). The hook, where the upload has copied into the device's shadow constants and before it
-# marks them dirty, rewrites the game's own value there for the render height; anything else
-# passes.
+# The HUD's widgets that place themselves by fractions of their viewport (sub_8245C2A8 and
+# sub_8245C310: widget, viewport, fractions f1 to f4), each at its blr, once it has stored the
+# widget's y (r3 + 72, r3 + 88): moved with the nearer of the frame's top and bottom.
 [[entrypoint.midasm_hook]]
-address = 0x826C99DC
-name = "Pgr4HudOrthoHook"
-registers = ["r3"]
+address = 0x8245C308
+name = "Pgr4HudWidgetHook"
+registers = ["r3", "r4", "f2"]
+
+[[entrypoint.midasm_hook]]
+address = 0x8245C370
+name = "Pgr4HudWidgetBHook"
+registers = ["r3", "r4", "f2"]
 
 [[entrypoint.midasm_hook]]
 address = 0x826C8B18

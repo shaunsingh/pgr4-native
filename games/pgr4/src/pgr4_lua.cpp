@@ -10,6 +10,8 @@
 // games/pgr4/ui/patches/ is the game's chunk and the patch, run after it as one chunk.
 #include "pgr4_lua.h"
 
+#include "native/frame_height.h"
+
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/system/function_dispatcher.h>
@@ -217,12 +219,25 @@ constexpr char kSettingsScreen[] = {
 constexpr char kOptionsMainMenuPatch[] = {
 #embed "pgr4_ui/patches/Screens/Options/MainMenu.lua"
 };
+constexpr char kUIGlobalsPatch[] = {
+#embed "pgr4_ui/patches/UIGlobals.lua"
+};
+constexpr char kGUIBankPatch[] = {
+#embed "pgr4_ui/patches/Screens/GUIBank.lua"
+};
+constexpr char kHudHelperPatch[] = {
+#embed "pgr4_ui/patches/Screens/HudHelper.lua"
+};
 #pragma clang diagnostic pop
-static_assert(sizeof kSettingsScreen > 0 && sizeof kOptionsMainMenuPatch > 0);
+static_assert(sizeof kSettingsScreen > 0 && sizeof kOptionsMainMenuPatch > 0 &&
+              sizeof kUIGlobalsPatch > 0 && sizeof kGUIBankPatch > 0 && sizeof kHudHelperPatch > 0);
 
 constexpr Script kScripts[] = {
     {"Screens\\Pgr4\\Settings.lua", {kSettingsScreen, sizeof kSettingsScreen}, false},
     {"Screens\\Options\\MainMenu.lua", {kOptionsMainMenuPatch, sizeof kOptionsMainMenuPatch}, true},
+    {"UIGlobals.lua", {kUIGlobalsPatch, sizeof kUIGlobalsPatch}, true},
+    {"Screens\\GUIBank.lua", {kGUIBankPatch, sizeof kGUIBankPatch}, true},
+    {"Screens\\HudHelper.lua", {kHudHelperPatch, sizeof kHudHelperPatch}, true},
 };
 
 std::span<const Script> Scripts() { return kScripts; }
@@ -285,7 +300,15 @@ void LuaText(PPCContext& ctx, uint8_t* base) {
   Results(ctx, 1);
 }
 
-constexpr Function kOwnFunctions[] = {{"Text", LuaText}};
+// Lua: Pgr4.ScreenHeight() -> the frame's height in the UI's 640x480 space, whose 480 the HUD's
+// projection maps to the game's 720 rows (native/d3d_state.cpp): 533.3 for an 800-row frame.
+void LuaScreenHeight(PPCContext& ctx, uint8_t* base) {
+  Lua lua(ctx, base, ctx.r3.u32);
+  lua.PushNumber(480.0 * native::FrameHeight() / native::kGameFrameHeight);
+  Results(ctx, 1);
+}
+
+constexpr Function kOwnFunctions[] = {{"Text", LuaText}, {"ScreenHeight", LuaScreenHeight}};
 
 // The Pgr4 table in L's globals, unless it is there: a state the UI made again gets it again.
 void InstallFunctions(Lua& lua) {

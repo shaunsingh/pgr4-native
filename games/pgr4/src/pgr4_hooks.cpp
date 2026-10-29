@@ -76,25 +76,36 @@ void Pgr4ViewportFHook(PPCRegister& r4) {
   }
 }
 
-// Vertex constant c45, the HUD's orthographic projection, in the device's shadow constants
-// (device + 1920, c0 on) at the end of SetVertexShaderConstantF (sub_826C9908, r3 the device):
-// the game maps its 640x480 HUD space into the central 960x720 of its 720-tall frame (4:3-safe,
-// the pixel scale 1.5). With the frame FrameHeight() tall, the y scale and offset still
-// divide by 720 and every c45 draw (the dials, the HUD text, the menus) stretches by
-// height/720. Rewrite the game's own value to the same mapping of the taller frame: the central
-// 960x720 of it, centered, as the 960-wide area already is. A rewritten value no longer
-// matches, so uploads of other registers leave it be.
-void Pgr4HudOrthoHook(PPCRegister& r3) {
-  const float h = float(FrameHeight());
-  if (h == 720.0f) return;                      // the 16:10 patch is off
-  const uint32_t c = r3.u32 + (120 + 45) * 16;  // c45 of the device's shadow
-  if (std::bit_cast<float>(GuestLoad32(c)) != 3.0f / 1280.0f ||
-      std::bit_cast<float>(GuestLoad32(c + 4)) != -3.0f / 720.0f ||
-      std::bit_cast<float>(GuestLoad32(c + 8)) != -0.75f ||
-      std::bit_cast<float>(GuestLoad32(c + 12)) != 1.0f)
-    return;  // not the game's HUD ortho (another mode's): leave it
-  GuestStore32(c + 4, std::bit_cast<uint32_t>(-3.0f / h));
-  GuestStore32(c + 12, std::bit_cast<uint32_t>(720.0f / h));
+// The HUD's widgets that place themselves (the rev counter among them): sub_8245C2A8 and
+// sub_8245C310 set one's x, y, width and height (r3 + 68 on, or + 84 on) from fractions of its
+// viewport (r4; f1 to f4), whose {sizeX, sizeY, topLeftX, topLeftY, heightRatio} the race
+// loading's SendViewportDetailVariables keeps at kHudViewports. The viewports are the game's,
+// within the UI's rows 0 to 480 (ui/patches/Screens/GUIBank.fnl); a taller frame adds
+// (480 * FrameHeight() / 720 - 480) / 2 rows of the UI's space above them and as many below.
+// As HudHelper.fnl moves the HUD's items, a widget above its viewport's middle moves up by the
+// rows added above the viewport, one below it down by those added below.
+namespace {
+constexpr uint32_t kHudViewports = 0x82AAD3EC;
+
+float GuestLoadF(uint32_t a) { return std::bit_cast<float>(GuestLoad32(a)); }
+
+void AnchorHudWidget(uint32_t y, uint32_t viewport, double fraction) {
+  const float added = (480.0f * FrameHeight() / pgr4::native::kGameFrameHeight - 480.0f) / 2;
+  const uint32_t v = kHudViewports + 20 * viewport;
+  const float top = GuestLoadF(v + 12), bottom = top + GuestLoadF(v + 4);
+  const float shift = fraction < 0.5 && top <= 0        ? -added
+                      : fraction > 0.5 && bottom >= 480 ? added
+                                                        : 0.0f;
+  if (shift != 0.0f) GuestStore32(y, std::bit_cast<uint32_t>(GuestLoadF(y) + shift));
+}
+}  // namespace
+
+void Pgr4HudWidgetHook(PPCRegister& r3, PPCRegister& r4, PPCRegister& f2) {
+  AnchorHudWidget(r3.u32 + 72, r4.u32, f2.f64);
+}
+
+void Pgr4HudWidgetBHook(PPCRegister& r3, PPCRegister& r4, PPCRegister& f2) {
+  AnchorHudWidget(r3.u32 + 88, r4.u32, f2.f64);
 }
 
 REXCVAR_DEFINE_BOOL(pgr4_automatic_keep_revs, true, "PGR4",

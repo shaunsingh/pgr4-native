@@ -231,6 +231,8 @@ class GuestStateTracker {
   // The float constants and block registers whose bit is set in `flushed` (masks +0..+40, host
   // order).
   void CopyFlushed(const uint8_t* base, uint32_t device, const uint64_t flushed[6]);
+  // The HUD's projection (c45) for the frame's height, in regs_ alone (d3d_state.cpp).
+  void FrameHudProjection();
   // --pgr4_native_track_verify: logs block registers whose shadow differs from regs_.
   void Verify(const uint8_t* base, uint32_t device, uint32_t fn_addr);
   void LoadLiterals(const uint8_t* base, uint32_t table, uint32_t data);
