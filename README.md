@@ -48,7 +48,7 @@ menu has the port's own Display, Driving and Developer pages, which save to
 | `--pgr4_native` | false | Run the native renderer beside the Xenos plugin, in a debug window |
 | `--pgr4_native_primary` | false | Make the native renderer the game's output (implies `--pgr4_native`, sets `--gpu_skip_draws`) |
 | `--pgr4_native_renderer_switch` | true | In primary mode, F9 (`bind_renderer_switch`) switches between the native renderer and the Xenos plugin |
-| `--pgr4_native_classic` | false | In primary mode, start on the Xenos plugin, as after F9 (the Display settings' Renderer) |
+| `--pgr4_native_classic` | false | In primary mode, start on the Xenos plugin, as after F9 (the Display settings' Renderer). The game then renders its own 16:9 frame, the only one the plugin draws, and F9 switches both ways; at 16:10 F9 stays with the native renderer |
 | `--pgr4_native_debug_keys` | true | Let F7, F8 and F9 do what they do (the Developer settings' Debug keys) |
 | `--pgr4_native_replace_draws` | true | In primary mode, the guest D3D's DrawIndexedVertices builds no command packets |
 | `--pgr4_native_render_thread` | true | Record and submit on a render thread, so the game thread only captures each call |
@@ -68,7 +68,7 @@ menu has the port's own Display, Driving and Developer pages, which save to
 | `--pgr4_native_upscaler` | false | Antialias and upscale the 3D scene with FidelityFX Super Resolution instead of MSAA (F7 switches, F8 shows its debug view: `--pgr4_native_fsr_debug`). OptiScaler and FSR 4: `scripts/release/README.md`, "Upscaling" |
 | `--pgr4_native_upscaler_width=<n>` | 1280 | Width the upscaler's scene renders at, 320 to 1280 (853 for FSR's Quality, 640 for Performance) |
 | `--pgr4_native_upscaler_height=<n>` | 720 | Height the upscaler's scene renders at, up to the render height (720 for Quality at 800, 400 for Performance) |
-| `--pgr4_native_upscaler_target_fps=<n>` | 0 | Lower the upscaler's render size each frame, from the width and height down to `_min_height`, while the GPU's time per frame is above 90 % of this frame rate's (0 keeps a fixed size) |
+| `--pgr4_native_upscaler_target_fps=<n>` | 0 | Lower the upscaler's render size each frame, from the width and height down to `_min_height`, while the GPU's time per frame is above 90 % of a frame's time: at this frame rate, or at the lower one the frames are shown at (`--pgr4_native_present_interval`, frame generation). 0 keeps a fixed size |
 | `--pgr4_native_upscaler_min_height=<n>` | 360 | With a target frame rate, the least height the upscaler's scene renders at, down to a quarter of the render height |
 | `--pgr4_native_frame_generation` | false | With the upscaler on and the frames paced (`--pgr4_native_frame_latency` above 0), show a frame FidelityFX Frame Generation makes between each two, the game at half the display's refresh rate. `scripts/release/README.md`, "Frame generation" |
 | `--pgr4_native_fsr_debug` | false | FidelityFX's debug views of the upscaled scene and the generated frames, and with FSR 4 AMD's watermark of the model it runs (F8 switches; the Developer settings' FSR debug view) |

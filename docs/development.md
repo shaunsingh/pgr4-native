@@ -89,8 +89,8 @@ the script starts Proton itself. Everything it uses lives under `~/pgr4-proton/p
 installed, both play `runtime-fgmod/`, a copy of the build with AMD's `amdxcffx64.dll` 4.1.2,
 through fgmod, so OptiScaler is loaded and the upscaler, once the Display page or F7 turns it on,
 is FSR 4's Lite model (`--no-fgmod` plays `runtime/` without it). Loaded with the scene on
-MSAA, OptiScaler costs nothing measurable (`deck-run.sh --fgmod`: 9.39 against 9.43 ms of GPU
-time a frame in St Petersburg).
+MSAA, OptiScaler costs nothing measurable (`deck-run.sh --fgmod`: 9.19 against 9.23 ms of GPU
+time a frame in the Tokyo race in the rain, td-472 and td-470).
 
 `deck-run.sh` keeps a prefix of its own and starts each run with a fresh save. It drives a
 scripted route from boot to a race (`scripts/routes/route-stpetersburg.keys` by default, played
@@ -121,7 +121,10 @@ to `~/pgr4-proton/play/logs/<stamp>-*`.
   and writes the frames around each whole-image jump. `scripts/analysis/flicker.py` and
   `marks.py` turn the dumps into PNG sheets with the frame CSV's counters.
 - **Renderer switch.** F9 switches to the Xenos plugin and back at the next Swap. A bug that
-  stays with Xenos is in the game or the SDK, and one that goes away is the renderer's.
+  stays with Xenos is in the game or the SDK, and one that goes away is the renderer's. The
+  plugin draws only the game's own 1280x720 frame (`src/native/frame_height.h`), so compare in a
+  run that starts on it (`--pgr4_native_classic`) or at `--pgr4_render_height=720`; at 16:10 F9
+  only logs that.
 - **Upscaler switch.** F7 switches the 3D scene between MSAA and FidelityFX Super Resolution at
   the next frame, and F8 (`--pgr4_native_fsr_debug`) shows FSR's debug view: its color, depth,
   motion vector and reactiveness inputs and its output, in a grid, with frame generation's view

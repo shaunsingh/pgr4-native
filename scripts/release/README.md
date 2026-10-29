@@ -63,7 +63,9 @@ command line overrides it: in Steam's launch options, `%command% --fullscreen=fa
 The game's Options menu has three pages of the port's own. Display holds the renderer (native or
 classic), the aspect ratio, HDR and its brightness, antialiasing (off, MSAA 2x to 8x, or FSR),
 FSR's resolution, dynamic resolution and frame generation, texture filtering, the frame rate
-(the display's refresh rate, a half or a third of it) and the frame latency. Driving holds the
+(the display's refresh rate, a half or a third of it) and the frame latency. The classic renderer
+(the Xenos plugin) draws only the game's own 16:9 frame: a game started on it is 16:9, and at
+16:10 the choice of renderer takes effect at the next start. Driving holds the
 automatic gearbox's downshifts (the game's, or earlier) and the lights of every car and bike
 (the race's, on or off). Developer holds the debug keys, the FSR debug view and the renderer's
 diagnostics. A choice marked `*` takes effect at the next start; the others apply at once. The
@@ -93,10 +95,18 @@ antialiases the scene instead and upscales it to 1280x720. The scene renders at
 | 752x423 | Balanced |
 | 640x360 | Performance |
 
-With `pgr4_native_upscaler_target_fps` set (90 for the Steam Deck OLED), the upscaler starts at
-that size and lowers it, down to a height of `pgr4_native_upscaler_min_height`, whenever the
-GPU falls behind that frame rate, then raises it again once the GPU catches up. In the same race, FSR up to 1280x720 with a target
-of 90 averaged 86.9 fps with 1% lows of 64.1 fps, against 82.9 and 52.7 at a fixed 1280x720.
+With `pgr4_native_upscaler_target_fps` set (90 for the Steam Deck OLED, which the Display
+settings' Dynamic resolution sets), the upscaler starts at that size and lowers it, down to a
+height of `pgr4_native_upscaler_min_height`, whenever the GPU falls behind, then raises it again
+once the GPU catches up. A frame has the time of one at that frame rate, or at the lower one the
+frames are shown at: the Frame rate setting's half or third of the refresh rate, or frame
+generation's half. Much of the GPU's time does not shrink with the render size (the
+post-processing, the interface and the upscaler itself), and the upscaler measures how much does
+from its own changes of size. In a Tokyo race in the rain at 90 Hz, FSR 3.1 up to 1280x800 with a
+target of 90 and a minimum of 400 rows averaged 89.1 fps with 1% lows of 41.2 fps, mostly at 400
+to 500 rows. FSR 4 through OptiScaler takes longer than a 90 fps frame on a Steam Deck even at
+400 rows (about 14 ms), so there the size stays at the minimum and the log says so; at 45 fps (the
+Frame rate setting) or with frame generation it fits at full size.
 
 F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view
 (`pgr4_native_fsr_debug`), with FSR 4 AMD's watermark of the model it runs.
@@ -109,7 +119,7 @@ for FSR 4.
 Out of the box this is FSR 3.1, from AMD's signed `amd_fidelityfx_loader_dx12.dll` and
 `amd_fidelityfx_upscaler_dx12.dll` beside the executable. The game calls only AMD's FidelityFX
 API, so the tools below can put a newer upscaler behind it. They are not part of this package,
-and none of them is tested with PGR4 yet. To see which upscaler runs, start the game once with
+and only OptiScaler and HelixSR are tested with PGR4, on a Steam Deck. To see which upscaler runs, start the game once with
 `%command% --log_level=info` and look for `PGR4 native upscaler:` in `logs/`: it names the
 upscaler's version (`3.1.5` for the packaged FSR 3.1) and the render size.
 
@@ -168,6 +178,23 @@ size in `pgr4_native_upscaler_width` and `_height`: the game renders at that siz
 OptiScaler's own ratio settings say. Insert opens OptiScaler's menu (`ShortcutKey` in
 `OptiScaler.ini` changes the key). OptiScaler upscales in a context of its own, so through it F8
 shows only AMD's watermark: the debug view is the Upscaler Debug View in OptiScaler's menu.
+
+OptiScaler turns the game's FidelityFX calls into its own DLSS (NGX) calls before it picks the
+upscaler (`inputs/FfxApi_Dx12.cpp`), so what hooks those reaches this game as well:
+
+- [HelixSR](https://github.com/lonewolf0622/HelixSR) Scaler, an OptiScaler build, runs NVIDIA's
+  DLSS Model E network (DLSS 3.7's) as compute shaders on GPUs without DLSS, the Steam Deck's
+  included. Its setup builds the network on the PC it runs on; then put the Scaler into the game
+  by hand, as its README describes for a game the setup does not list (`dxgi.dll`,
+  `OptiScaler.ini`, `OptiScaler/` and `HelixSR/` beside the executable), and pick HLX DLSS in
+  its menu (`Dx12Upscaler=dlss`). HelixSR 3.2.0 on a Steam Deck OLED, in the Tokyo race in the
+  rain with a target of 90 and a minimum of 400 rows, averaged 89.4 fps with 1% lows of 64.7 fps,
+  mostly at the minimum (about 10 ms of GPU time a frame). Its FSR drop-in puts its own FSR 4 in
+  place of the package's `amd_fidelityfx_upscaler_dx12.dll`.
+- [OptiScaler DLSS 5](https://github.com/Skynizz/optiscaler-dlss5) runs DLSS 5 Neural Rendering
+  around the upscaler (its pass in `NVSDK_NGX_D3D12_EvaluateFeature`), on NVIDIA RTX GPUs with
+  `nvngx_dlssnr.dll`. The game hands over the scene before its interface is drawn, and no exposure
+  texture (FSR's auto exposure), so the model's white point is the pass's own measurement.
 
 ## Geometry Wars
 

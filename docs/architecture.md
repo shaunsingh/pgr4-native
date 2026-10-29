@@ -65,7 +65,8 @@ next draw writes all of it into the stream, clears `gpu_skip_draws`, releases th
 reconnects ReXGlue's presenter. `NativeRenderer::Live()` then returns null and the hooks only
 forward. Taking the game back resyncs the state tracker from the device. The same hand-over
 happens while a XAM dialog is up, since ReXGlue's presenter draws those, and when a frame fails
-(`Fail`).
+(`Fail`). Neither renderer has the other's render targets, so the first frame after a switch can
+be black, and the game's eye adaptation, kept in one of them, settles again over the next second.
 
 ## Threads
 
@@ -138,7 +139,7 @@ Anything the render thread reads late must not change under it.
 
 | File | Contents |
 |---|---|
-| `renderer` | `NativeRenderer` with start-up, settings, the `On*` entry points, the render thread and its queue, the frame CSV, the log line, the renderer switch and `Fail` |
+| `renderer`, `frame_height.h` | The run's frame height (`FrameHeight`), `NativeRenderer` with start-up, settings, the `On*` entry points, the render thread and its queue, the frame CSV, the log line, the renderer switch and `Fail` |
 | `hook_args.h` | The hooked guest D3D functions and their PPC arguments |
 | `guest_d3d` | Guest D3D functions replaced in primary mode |
 | `d3d_state` | `GuestStateTracker` (register file and change log), `ReadDrawState` and the device layout |
@@ -217,3 +218,6 @@ work in a cached scratch row and copy whole rows out.
   skipped, so the query does not count its samples.
 - The game renders at 1280x800 natively (a game patch, `pgr4_render_height` in
   [development.md](development.md#native-1610)), filling the 1280x800 panel, never stretched.
+  The Xenos plugin, kept as the original renderer, draws that frame with the scene in its top 300
+  rows only, so a run that starts on the plugin renders the game's own 1280x720 frame instead
+  (`frame_height.h`), and in a 16:10 run the renderer switch stays with the native renderer.
