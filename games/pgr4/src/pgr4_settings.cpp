@@ -288,16 +288,37 @@ void Set(const Option& o, const std::string& v) {
   if (o.applied) o.applied();
 }
 
-// Every option's cvars as they are chosen now, over the file's.
+// The file's values by cvar, as Save wrote them: `cvar = value` lines.
+std::map<std::string, std::string, std::less<>> Saved() {
+  std::map<std::string, std::string, std::less<>> saved;
+  std::ifstream f(g_file, std::ios::binary);
+  for (std::string line; std::getline(f, line);)
+    if (const size_t eq = line.find(" = "); !line.starts_with('#') && eq != std::string::npos)
+      saved.emplace(line.substr(0, eq), line.substr(eq + 3));
+  return saved;
+}
+
+// Every option's cvars as they are chosen now, over the file's. A flag on the command line holds
+// for its session only: unless the menu changed it, the file keeps the value it had.
 void Save() {
   std::lock_guard lock(g_mutex);
   if (g_file.empty()) return;
   std::string toml =
       "# PGR4's settings, written by its Options menu (Display, Developer) and read after\n"
       "# pgr4_recompiled.toml at start-up. A flag on the command line overrides them.\n";
-  for (const Option& o : Options())
-    for (const Assignment& a : o.assign(Value(o)))
-      toml += std::string(a.cvar) + " = " + (a.text ? '"' + a.value + '"' : a.value) + '\n';
+  const auto saved = Saved();
+  for (const Option& o : Options()) {
+    const bool chosen = g_pending.contains(o.id);
+    for (const Assignment& a : o.assign(Value(o))) {
+      const std::string name(a.cvar);
+      if (!chosen && rex::cvar::GetFlagSource(a.cvar) == rex::cvar::Source::kCommandLine) {
+        if (const auto it = saved.find(name); it != saved.end())
+          toml += name + " = " + it->second + '\n';
+        continue;
+      }
+      toml += name + " = " + (a.text ? '"' + a.value + '"' : a.value) + '\n';
+    }
+  }
   std::error_code ec;
   std::filesystem::create_directories(g_file.parent_path(), ec);
   const std::filesystem::path temp = std::filesystem::path(g_file) += ".new";
