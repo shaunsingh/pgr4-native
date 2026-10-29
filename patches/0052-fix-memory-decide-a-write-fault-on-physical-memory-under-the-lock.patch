@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Wed, 28 Oct 2026 19:00:00 -0400
+Subject: [PATCH 52/52] fix(memory): decide a write fault on physical memory
+ under the lock it arrived with
+
+Memory::AccessViolationCallback passed its lock to
+PhysicalHeap::TriggerCallbacks, which releases it even when no watch
+covers the page, and re-took the lock only afterwards for the host
+protection check and the stale-protection recovery. When two threads
+fault on the same watched page, the second finds the watch already
+handled by the first. If a third thread re-armed the page in that gap
+(EnablePhysicalMemoryAccessCallbacks, as a GPU cache does after
+re-uploading it), the page was read-only again with its watch flag set,
+and the recovery made it writable. EnableAccessCallbacks skips a page
+whose flag is set, so the page was never protected again and its writes
+went unreported for the rest of the run: a GPU copy of dynamic vertex
+data in PGR4 went stale after hours of play, logged as "Recovered stale
+physical page protection" for the same page.
+
+The callback now checks the page's watch flag under the lock it was
+called with, goes to TriggerCallbacks only for a watched page, and keeps
+the lock through the protection check and the recovery, so no watch can
+be armed in between. Xenia's MMIOHandler held one lock across its
+protection check and the callback for the same reason.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+---diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -324,6 +324,9 @@ class PhysicalHeap : public BaseHeap {
+   bool TriggerCallbacks(rex::thread::global_unique_lock_type global_lock_locked_once,
+                         uint32_t virtual_address, uint32_t length, bool is_write,
+                         bool unwatch_exact_range, bool unprotect = true);
++  // Whether the host page holding a guest address of this heap is write-watched.
++  // Callers must hold the global critical region.
++  bool IsWriteWatched(uint32_t virtual_address) const;
+ 
+   uint32_t GetPhysicalAddress(uint32_t address) const;
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -616,14 +616,20 @@ bool Memory::AccessViolationCallback(rex::thread::global_unique_lock_type global
+   //
+   // Will be rounded to physical page boundaries internally, so just pass 1 as
+   // the length - guranteed not to cross page boundaries also.
++  //
++  // The watch is checked here because TriggerCallbacks releases the lock even
++  // when it finds none, and the rest of the fault must be decided under the
++  // lock it arrived with. A watch another thread armed in between would leave
++  // the page read-only with its flag set, the recovery below would make it
++  // writable, and EnableAccessCallbacks, which skips a page whose flag is set,
++  // would never protect it again: its writes would go unreported for good.
+   auto physical_heap = static_cast<PhysicalHeap*>(heap);
+-  if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
+-                                      is_write, false)) {
+-    return true;
++  if (is_write && physical_heap->IsWriteWatched(virtual_address)) {
++    return physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
++                                           is_write, false);
+   }
+ 
+-  // No watch covers the page. TriggerCallbacks released the global lock.
+-  auto global_lock = global_critical_region_.Acquire();
++  // No watch covers the page.
+   if (HostPageAllowsAccess(host_address, is_write)) {
+     return true;
+   }
+@@ -2418,6 +2424,14 @@ bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
+           (uint64_t(1) << (host_page_number & 63))) != 0;
+ }
+ 
++bool PhysicalHeap::IsWriteWatched(uint32_t virtual_address) const {
++  if (virtual_address < heap_base_ || virtual_address - heap_base_ >= heap_size_) {
++    return false;
++  }
++  return IsHostPageWriteWatched((virtual_address - heap_base_ + host_address_offset()) /
++                                system_page_size_);
++}
++
+ uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
+   assert_true(address >= heap_base_);
+   address -= heap_base_;
+-- 
+2.50.1
+
