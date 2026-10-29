@@ -989,6 +989,8 @@ struct DrawRenderer::Impl {
     // all unsigned, gamma RGB + unsigned A, all gamma, all signed, other; then exponent bias
     // set, LOD bias set (any signs).
     uint64_t fetch_classes[7] = {};
+    // Motion vector draws, and those matched with a draw of the previous frame (MotionHistory).
+    uint64_t motion_draws = 0, motion_matched = 0;
   } diag;
   // Where Prepare's counters go: with the render thread, which owns diag, the guest thread's own.
   PrepareDiag& PrepDiag() { return threaded ? prep_diag : diag.prep; }
@@ -2245,12 +2247,16 @@ bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
 void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcShader& vs_generic,
                                                const DxbcShader* vs,
                                                ID3D12GraphicsCommandList* list) {
-  const uint64_t key = motion_history.Key(vs_generic.ucode_data_hash() ^
-                                          (uint64_t(s.index_address) << 32 | s.count) ^
-                                          (uint64_t(s.primitive) << 58));
+  const uint64_t identity = vs_generic.ucode_data_hash() ^
+                            (uint64_t(s.index_address) << 32 | s.count) ^
+                            (uint64_t(s.primitive) << 58);
   const MotionHistory::Constants now = {vs, cb_float_vs.gpu, cb_fetch.gpu};
-  const MotionHistory::Constants* previous = motion_history.Previous(key);
-  if (!previous || previous->vs != vs) previous = &now;
+  const MotionHistory::Constants* previous = motion_history.Match(identity, now);
+  ++diag.motion_draws;
+  if (previous && previous->vs == vs)
+    ++diag.motion_matched;
+  else
+    previous = &now;
   if (bound_previous_float != previous->float_constants) {
     list->SetGraphicsRootConstantBufferView(kBindlessRoot_PreviousFloatConstantsVertex,
                                             previous->float_constants);
@@ -2261,7 +2267,6 @@ void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcSha
                                             previous->fetch_constants);
     bound_previous_fetch = previous->fetch_constants;
   }
-  motion_history.Record(key, now);
 }
 
 uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
@@ -4183,6 +4188,10 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
         "PGR4 native draw diag: textures per draw by signs: unsigned {:.3f}, gamma rgb "
         "{:.3f}, gamma {:.3f}, signed {:.3f}, other {:.3f}; exp bias {:.3f}, lod bias {:.3f}",
         per(fc[0]), per(fc[1]), per(fc[2]), per(fc[3]), per(fc[4]), per(fc[5]), per(fc[6]));
+    if (d.motion_draws)
+      REXLOG_INFO("PGR4 native draw diag: motion vector draws {:.1f}/frame, {:.2f} % matched",
+                  double(d.motion_draws) / double(d.frames),
+                  100.0 * double(d.motion_matched) / double(d.motion_draws));
     d = Impl::Diag{};
   }
   if (!impl_->debug_path.empty() && ++impl_->debug_poll >= 15) {
