@@ -10,7 +10,7 @@
 #
 #   deck-run.sh <tree|runtime dir> <tag> [--mode primary|none|oracle|release] [--extra "<flags>"]
 #               [--uncapped] [--hold 45] [--width 1280] [--height 800] [--fullscreen]
-#               [--stretch 1.0] [--cpus 0-7] [--tap] [--session gamescope|desktop]
+#               [--stretch 1.0] [--cpus 0-7] [--fgmod] [--tap] [--session gamescope|desktop]
 #               [--view window|sdl|headless] [--shots 0] [--perf 0] [--refresh 60]
 #               [--display-refresh HZ] [--limit FPS] [--limit-at "SECS FPS"] [--output NAME]
 #               [--captures "5 10 15"] [--catch]
@@ -76,7 +76,9 @@
 # or extracted in title-update/) and userdata/ beside the exe (a fresh save), with only the
 # route's keyboard input and the measurement flags added.
 # --stretch scales every delay of the route, for a machine that loads slower than the PC it was
-# timed on. --cpus pins the game with taskset. Logs: ~/pgr4-proton/logs/.
+# timed on. --cpus pins the game with taskset. --fgmod runs the game through ~/fgmod/fgmod, which
+# adds OptiScaler to the runtime dir as play.sh does (play.sh --install's runtime-fgmod/).
+# Logs: ~/pgr4-proton/logs/.
 set -euo pipefail
 # The whole script is one block: bash parses it before running any of it, so editing this file
 # during a run does not change the run.
@@ -86,6 +88,7 @@ mode=primary; extra=""; uncapped=0; hold=45; width=1280; height=800; fullscreen=
 cpus=""; tap=0; session=gamescope; view=window; shots=0; perf_secs=0; refresh=60; output=""
 display_refresh=""; limit=0; limit_at=""
 captures="5 10 15"; catch=0; keys=""; race_draws=3000; draw_log=0; pmu=0; server_trace=0; hdr=0
+fgmod=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mode) mode=$2; shift 2 ;;
@@ -97,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --fullscreen) fullscreen=1; shift ;;
     --stretch) stretch=$2; shift 2 ;;
     --cpus) cpus=$2; shift 2 ;;
+    --fgmod) fgmod=1; shift ;;
     --tap) tap=1; shift ;;
     --session) session=$2; shift 2 ;;
     --view) view=$2; shift 2 ;;
@@ -204,6 +208,7 @@ export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$top/cache/$(basename 
 [[ $VKD3D_SHADER_CACHE_PATH == 0 ]] || mkdir -p "$VKD3D_SHADER_CACHE_PATH"
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 [[ -n $cpus ]] && cmd=(taskset -c "$cpus" "${cmd[@]}")
+(( fgmod )) && cmd=("$HOME/fgmod/fgmod" "${cmd[@]}")
 echo "${cmd[*]}" > "$base-cmdline.txt"
 
 stop_game() {
