@@ -45,6 +45,7 @@
                   (StoreMenuSelection GUI.menu_ID)
                   (GothamSystem.SetMusicState 22)
                   (set Pgr4.page page)
+                  (set Pgr4.page_from :options)
                   (UIScreen.SetNextScreen "Pgr4\\Settings.lua")
                   false)
                 (game-message-update message ...)))))

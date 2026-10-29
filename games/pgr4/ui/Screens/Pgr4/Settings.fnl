@@ -2,11 +2,16 @@
 ;; made as the game's own option screens are (Options\General.lua, and the scrolling of
 ;; ContentServer\ReplaySearchVars.lua): a spinner per setting in a frame, up and down to choose
 ;; one, left and right to change it, A to apply and save the page, B to leave it unchanged. The
-;; page is Pgr4.page, set by the menu that opens the screen (patches/Screens/Options/MainMenu.fnl).
+;; page is Pgr4.page and the menu that opened the screen Pgr4.page_from, which it goes back to:
+;; the Options menu (patches/Screens/Options/MainMenu.fnl), or the pause menu
+;; (patches/Screens/InGame/PauseMenu.fnl), over whose race it is drawn as Ingame\IngameOptions.lua
+;; is.
 ;; A row with a condition (shown_with) is shown only while the row it depends on shows one of
 ;; its choices, and the rows below it close up.
 
 (local titles {:display "DISPLAY" :driving "DRIVING" :developer "DEVELOPER"})
+
+(local menus {:options "Options\\MainMenu.lua" :pause "Ingame\\PauseMenu.lua"})
 
 ;; Where a hidden row is put: inactive, a spinner still draws its label, but the frame clips it.
 (local parked-y 10000)
@@ -69,14 +74,22 @@
              (not= option.shown_selection (UIButtons.GetSelection option.ID))))))
 
 (fn leave []
-  (UIScreen.SetNextScreen "Options\\MainMenu.lua"))
+  (UIScreen.SetNextScreen (. menus GUI.from)))
 
 (global Init
         (fn []
-          (SetupFadePanel)
+          (set GUI.from (or Pgr4.page_from :options))
+          (set GUI.ingame (= GUI.from :pause))
+          ;; The Options menu's fade panel, which its rows fade with; a race has none.
+          (set GUI.panel (when (not GUI.ingame) 1))
+          (when (not GUI.ingame)
+            (SetupFadePanel))
           (SetupScreenTimers)
           (SetupInfoText UIText.IDS_CANCEL_B_SAVE_A 1 false)
           (SetupSlideMenuInfo)
+          (when GUI.ingame
+            (SetupFadedBackground UIEnums.Layer.BACKGROUND)
+            (SetupIngameSlideGroup))
           (set GUI.page (or Pgr4.page :display))
           (set GUI.options (Pgr4.Page GUI.page))
           (set GUI.by_id (collect [_ option (ipairs GUI.options)]
@@ -86,10 +99,14 @@
               (set (. GUI.by_id option.shown_with.id :controls) true)))
           (set GUI.rows [])
           (let [frame (GetDefaultFrame 113.33333333333334 UIGlobals.screen.safe_top
-                                       453.3333333333333 (- UIGlobals.screen.safe_bottom 30))
+                                       453.3333333333333 (- UIGlobals.screen.safe_bottom 30)
+                                       (when GUI.ingame GUIBank.df_alternate_style_pu))
                 width 320
                 rows (* UIGlobals.options_cr (length GUI.options))]
-            (set frame.panel 1)
+            (set frame.panel GUI.panel)
+            (when GUI.ingame
+              (set frame.background_layer UIEnums.Layer.LAYER_1)
+              (set frame.foreground_layer UIEnums.Layer.LAYER_2))
             (UIButtons.AddButton frame)
             (SetupFrameTitle frame (Pgr4.Text (or (. titles GUI.page) GUI.page)))
             (set GUI.x (- 350 (* width 0.5) 16))
@@ -102,6 +119,12 @@
                                           UIEnums.Layer.LAYER_2)
                      []))
             (SetClipToFrame GUIBank.variable_spinner frame)
+            ;; Over a race the frame slides in and out sideways, and the clip stays: it spans the
+            ;; UI's width (left and right edges) so the rows go with the frame, as
+            ;; Ingame\IngameOptions.lua's do.
+            (when GUI.ingame
+              (set GUIBank.variable_spinner.clipx 0)
+              (set GUIBank.variable_spinner.clipsizex 640))
             (set GUI.scroll_group.ID (UIButtons.AddButton GUI.scroll_group))
             (set GUIBank.spinner_y (+ UIGlobals.screen.safe_top 12))
             (set GUIBank.spinner_cr 40)
@@ -109,12 +132,14 @@
               (set option.ID
                    (SetupVariableSpinner option.label
                                          (+ GUI.top (* (- row 1) UIGlobals.options_cr)) width
-                                         GUI.x 1))
+                                         GUI.x GUI.panel))
               ;; The spinner lists its items last added first.
               (for [index (length option.choices) 1 -1]
                 (UIButtons.AddItem option.ID (- index 1) (. option.choices index) false))
               (UIButtons.SetSelection option.ID option.value)))
           (SetupGroupEnd)
+          (when GUI.ingame
+            (SetupGroupEnd))
           (let [spinner GUIBank.variable_spinner]
             (set spinner.clipx nil)
             (set spinner.clipsizex nil)
@@ -170,6 +195,9 @@
 ;; row's offset, as ReplaySearchVars' does.
 (global FrameUpdate
         (fn [delta]
+          (when (and GUI.ingame (not GUI.finished) (GothamSystem.MustLeavePauseMode))
+            (set GUI.finished true)
+            (leave))
           (when (not GUI.started)
             (set GUI.started true)
             (activate-options))

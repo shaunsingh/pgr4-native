@@ -219,6 +219,9 @@ constexpr char kSettingsScreen[] = {
 constexpr char kOptionsMainMenuPatch[] = {
 #embed "pgr4_ui/patches/Screens/Options/MainMenu.lua"
 };
+constexpr char kPauseMenuPatch[] = {
+#embed "pgr4_ui/patches/Screens/InGame/PauseMenu.lua"
+};
 constexpr char kUIGlobalsPatch[] = {
 #embed "pgr4_ui/patches/UIGlobals.lua"
 };
@@ -230,11 +233,13 @@ constexpr char kHudHelperPatch[] = {
 };
 #pragma clang diagnostic pop
 static_assert(sizeof kSettingsScreen > 0 && sizeof kOptionsMainMenuPatch > 0 &&
-              sizeof kUIGlobalsPatch > 0 && sizeof kGUIBankPatch > 0 && sizeof kHudHelperPatch > 0);
+              sizeof kPauseMenuPatch > 0 && sizeof kUIGlobalsPatch > 0 &&
+              sizeof kGUIBankPatch > 0 && sizeof kHudHelperPatch > 0);
 
 constexpr Script kScripts[] = {
     {"Screens\\Pgr4\\Settings.lua", {kSettingsScreen, sizeof kSettingsScreen}, false},
     {"Screens\\Options\\MainMenu.lua", {kOptionsMainMenuPatch, sizeof kOptionsMainMenuPatch}, true},
+    {"Screens\\InGame\\PauseMenu.lua", {kPauseMenuPatch, sizeof kPauseMenuPatch}, true},
     {"UIGlobals.lua", {kUIGlobalsPatch, sizeof kUIGlobalsPatch}, true},
     {"Screens\\GUIBank.lua", {kGUIBankPatch, sizeof kGUIBankPatch}, true},
     {"Screens\\HudHelper.lua", {kHudHelperPatch, sizeof kHudHelperPatch}, true},
