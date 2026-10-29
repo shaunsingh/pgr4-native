@@ -218,7 +218,7 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
                      (latency_waitable_ ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0);
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-  hd.NumDescriptors = kBackBuffers;
+  hd.NumDescriptors = kBackBuffers + 1;  // and the held image's
   if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(rtv_heap_.GetAddressOf())),
              "CreateDescriptorHeap(RTV)"))
     return false;
@@ -242,6 +242,7 @@ bool D3D12Device::AttachSwapchain() {
 void D3D12Device::DetachSwapchain() {
   WaitIdle();
   for (auto& b : back_buffers_) b.Reset();
+  held_image_.Reset();
   swapchain_.Reset();
   REXLOG_INFO("PGR4 native: swapchain released");
 }
@@ -330,6 +331,8 @@ bool D3D12Device::GetBackBuffers() {
     device_->CreateRenderTargetView(back_buffers_[i].Get(), nullptr, h);
   }
   back_index_ = swapchain_->GetCurrentBackBufferIndex();
+  held_image_.Reset();
+  if (present_interval_ > 1 && !CreateHeldImage()) present_interval_ = 1;
   return true;
 }
 
@@ -357,8 +360,31 @@ bool D3D12Device::FollowWindowSize() {
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {
   if (frame_image_) return frame_image_rtv_;
   D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-  h.ptr += size_t(back_index_) * rtv_stride_;
+  h.ptr += size_t(held() ? kBackBuffers : back_index_) * rtv_stride_;
   return h;
+}
+
+bool D3D12Device::set_present_interval(uint32_t refreshes) {
+  present_interval_ = std::clamp(refreshes, 1u, kMaxPresentInterval);
+  if (present_interval_ == 1 || held_image_ || !swapchain_ || CreateHeldImage()) return true;
+  present_interval_ = 1;
+  return false;
+}
+
+bool D3D12Device::CreateHeldImage() {
+  D3D12_RESOURCE_DESC desc = back_buffers_[0]->GetDesc();
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+  if (Failed(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                              D3D12_RESOURCE_STATE_PRESENT, nullptr,
+                                              IID_PPV_ARGS(held_image_.ReleaseAndGetAddressOf())),
+             "CreateCommittedResource(held image)"))
+    return false;
+  held_image_->SetName(L"pgr4 native held frame");
+  D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+  h.ptr += size_t(kBackBuffers) * rtv_stride_;
+  device_->CreateRenderTargetView(held_image_.Get(), nullptr, h);
+  return true;
 }
 
 void D3D12Device::WaitFence(uint64_t value) {
@@ -480,9 +506,15 @@ bool D3D12Device::Present() {
 bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
   const uint64_t t0 = NowNs();
   const bool shown = swapchain_ && present;
-  ID3D12Resource* const image = std::exchange(frame_image_, nullptr);
   ID3D12Resource* const generated = std::exchange(generated_frame_, nullptr);
-  // The generated frame goes first; the frame's image then into the back buffer after it.
+  ID3D12Resource* const frame_image = std::exchange(frame_image_, nullptr);
+  ID3D12Resource* const image = frame_image ? frame_image : held() ? held_image_.Get() : nullptr;
+  // The frame's presents: the back buffer it drew into; or the image it drew into, copied into a
+  // back buffer for each: after the generated frame, or present_interval_ times.
+  const uint32_t presents = !shown                  ? 0
+                            : generated             ? 2
+                            : image && !frame_image ? present_interval_
+                                                    : 1;
   if (shown && image) CopyToBackBuffer(generated ? generated : image);
   if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
   StampBusy();
@@ -492,7 +524,7 @@ bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> fir
   if (!CloseAndExecute(first)) return false;
   const uint64_t t1 = NowNs();
   bool ok = !shown || Present();
-  if (ok && shown && generated) {
+  for (uint32_t i = 1; ok && i < presents; ++i) {
     back_index_ = swapchain_->GetCurrentBackBufferIndex();
     ok = !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
     if (ok) CopyToBackBuffer(image);
@@ -502,7 +534,7 @@ bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> fir
   end_frame_times_.present_ns = NowNs() - t1;
   if (!ok) return false;
   end_frame_times_.presented = shown;
-  end_frame_times_.frame_presents = shown ? 1 + (generated != nullptr) : 0;
+  end_frame_times_.frame_presents = presents;
   end_frame_times_.presents += end_frame_times_.frame_presents;
   uint64_t v = next_fence_++;
   if (Failed(queue_->Signal(fence_.Get(), v), "CommandQueue::Signal")) return false;

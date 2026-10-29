@@ -102,6 +102,12 @@ REXCVAR_DEFINE_INT32(pgr4_native_frame_latency, 3, "PGR4 native",
                      "the pacing to the game's vblank wait (with --pgr4_native_csv the shown "
                      "presents are still logged)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(pgr4_native_present_interval, 1, "PGR4 native",
+                     "With the frames presented with vsync (the frame pacer's FIFO): each frame "
+                     "is shown for this many display refreshes (1-3), so the game runs at the "
+                     "refresh rate over it: 90, 45 or 30 fps at 90 Hz, evenly. Steam's frame "
+                     "limiter does the same through gamescope; a frame with a generated one "
+                     "before it is shown once");
 REXCVAR_DEFINE_BOOL(pgr4_native_low_latency, true, "PGR4 native",
                     "With the frames paced on the display: begin each frame as late as the "
                     "time the frames before it waited for the display allows (frame_pacer.h), "
@@ -400,6 +406,7 @@ bool NativeRenderer::Initialize() {
   }
   if (!device_->Initialize(w, h, primary ? L"PGR4 native" : L"PGR4 native (debug)", game_window))
     return false;
+  frame_rate_requested_.store(true, std::memory_order_relaxed);
   if (REXCVAR_GET(pgr4_native_gpu_timing)) {
     if (device_->EnableGpuTimer()) {
       gpu_timer_ = device_->gpu_timer();
@@ -562,6 +569,8 @@ void NativeRenderer::SwitchUpscaler(bool on) {
 }
 
 void NativeRenderer::BeginFrameModules() {
+  if (frame_rate_requested_.exchange(false, std::memory_order_relaxed))
+    device_->set_present_interval(uint32_t(std::max(1, REXCVAR_GET(pgr4_native_present_interval))));
   if (upscaler_switch_requested_.exchange(false, std::memory_order_relaxed))
     SwitchUpscaler(!upscaler_on_);
   if (upscaler_debug_requested_.exchange(false, std::memory_order_relaxed) && upscaler()) {
@@ -1031,7 +1040,7 @@ bool NativeRenderer::OwnGameWindow(bool own) {
   if (!d.AttachSwapchain()) return false;
   if (pacer_) {
     HANDLE waitable =
-        d.TakeFrameLatencyWaitable(FramePacer::kMaxFrameLatency * (frame_generation_ ? 2 : 1));
+        d.TakeFrameLatencyWaitable(FramePacer::kMaxFrameLatency * D3D12Device::kMaxFramePresents);
     if (!waitable) return false;
     pacer_->Attach(waitable, d.fence());
     paces_frames_.store(pacer_->pacing(), std::memory_order_relaxed);

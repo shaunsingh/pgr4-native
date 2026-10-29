@@ -146,6 +146,10 @@ class NativeRenderer {
   // with bind_upscaler); nullptr otherwise.
   Upscaler* upscaler() { return upscaler_on_ ? upscaler_.get() : nullptr; }
 
+  // --pgr4_native_present_interval changed, from any thread: taken at the start of the next
+  // frame.
+  void RequestFrameRate() { frame_rate_requested_.store(true, std::memory_order_relaxed); }
+
   ~NativeRenderer();
 
  private:
@@ -223,6 +227,7 @@ class NativeRenderer {
   // of the next frame. The upscaler is created at its first use and kept after.
   void SwitchUpscaler(bool on);
   std::atomic<bool> upscaler_switch_requested_{false}, upscaler_debug_requested_{false};
+  std::atomic<bool> frame_rate_requested_{false};
   bool upscaler_bound_ = false;  // primary mode
   bool upscaler_on_ = false;
   uint32_t scene_msaa_ = 2;  // --pgr4_native_msaa, as far as the GPU has it

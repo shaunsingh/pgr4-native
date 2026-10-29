@@ -60,6 +60,15 @@ class D3D12Device {
 
   // Present with sync interval 1 (vsync) instead of 0 (tearing when supported).
   void set_vsync(bool vsync) { vsync_ = vsync; }
+  // With vsync, between frames: each frame without a generated one is shown for `refreshes`
+  // display refreshes (1 to kMaxPresentInterval): it draws into an image of the device's, which
+  // EndFrame presents that many times, FIFO. DXVK presents a SyncInterval above 1 the same way;
+  // vkd3d-proton honours one only through VK_EXT_present_timing. Logs and returns false when
+  // the image cannot be created (each frame is then shown once).
+  bool set_present_interval(uint32_t refreshes);
+  static constexpr uint32_t kMaxPresentInterval = 3;
+  // The most presents a frame takes: its interval, or 2 with a generated frame.
+  static constexpr uint32_t kMaxFramePresents = kMaxPresentInterval > 2 ? kMaxPresentInterval : 2;
   // Before Initialize: every swapchain gets a frame latency waitable object (frame_pacer.h).
   void set_frame_latency_waitable(bool on) { latency_waitable_ = on; }
   // The current swapchain's frame latency waitable object, with room for `max_latency` presents
@@ -80,9 +89,11 @@ class D3D12Device {
   ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
 
   // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV, or the
-  // frame's image (SetFrameImage).
+  // frame's image (SetFrameImage, or the present interval's).
   ID3D12Resource* back_buffer() const {
-    return frame_image_ ? frame_image_ : back_buffers_[back_index_].Get();
+    return frame_image_ ? frame_image_
+           : held()     ? held_image_.Get()
+                        : back_buffers_[back_index_].Get();
   }
   D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv() const;
   // Frame generation (frame_generation.h), for the frame being recorded. SetFrameImage, before
@@ -136,7 +147,7 @@ class D3D12Device {
     uint64_t present_ns = 0;      // Present
     uint64_t fence_ns = 0;        // OpenList: waiting for the GPU to finish the slot's last frame
     bool presented = false;       // Present ran (a swapchain and a complete frame)
-    uint32_t frame_presents = 0;  // the frame's Presents: 2 with a generated frame
+    uint32_t frame_presents = 0;  // the frame's Presents: its interval, or 2 with a generated frame
     uint64_t presents = 0;        // Presents so far, the frame's included
   };
   const EndFrameTimes& end_frame_times() const { return end_frame_times_; }
@@ -175,6 +186,11 @@ class D3D12Device {
   bool FollowWindowSize();
   // Records the copy of `image` (PRESENT state) into the current back buffer.
   void CopyToBackBuffer(ID3D12Resource* image);
+  // The frame being recorded draws into held_image_ (set_present_interval).
+  bool held() const { return vsync_ && present_interval_ > 1 && held_image_; }
+  // held_image_ like the back buffers, when the present interval wants it; false (logged) on
+  // failure.
+  bool CreateHeldImage();
   // Presents the current back buffer; false (logged) on failure.
   bool Present();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -204,7 +220,9 @@ class D3D12Device {
   ID3D12Resource* frame_image_ = nullptr;  // SetFrameImage's, until EndFrame
   D3D12_CPU_DESCRIPTOR_HANDLE frame_image_rtv_ = {};
   ID3D12Resource* generated_frame_ = nullptr;  // SetGeneratedFrame's, until EndFrame
-  UINT swapchain_flags_ = 0;  // DXGI_SWAP_CHAIN_FLAG_*: creation and every ResizeBuffers
+  uint32_t present_interval_ = 1;
+  ComPtr<ID3D12Resource> held_image_;  // the back buffers' size and format; its RTV after theirs
+  UINT swapchain_flags_ = 0;           // DXGI_SWAP_CHAIN_FLAG_*: creation and every ResizeBuffers
   bool tearing_ = false;
   bool vsync_ = false;
   bool hdr_ = false;
