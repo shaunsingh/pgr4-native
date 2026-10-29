@@ -399,6 +399,29 @@ up. A different automatic altogether would be a mid-asm hook at `0x822DE250` wit
 in the same step. To test the manual without the menus, give a fresh profile the manual
 transmission by setting `XPROFILE_GAMER_RACE_TRANSMISSION` (0x10040026) to 1 in the SDK's
 `user_profile.cpp`.
+
+## Vehicle lights
+
+Whether a car has its lights on is the race lighting's, not the car's. Offsets and functions are
+Title Update #2's.
+
+- **Lighting.** A race lighting's settings carry `UseFogLights`, `UseCarNightLights` and
+  `UseBikeNightLights`, bytes at +210, +211 and +212 (their reflection descriptors are at
+  0x82A2BEC8 to 0x82A2BEF0). `sub_823CDA80` blends two lightings and takes the flags from the
+  nearer one, and `sub_823CF460` copies a lighting into the scene's, 0x82A1D220, at +52, +53
+  and +54. The copy runs about 1350 times a second, always on that lighting. In the St
+  Petersburg day race the car flag is 0 and the bike flag 1.
+- **Readers.** `sub_82415138` gives each vehicle its lights from +53, or +54 for a bike
+  (vehicle + 1712 is not 0), and `sub_82421E68` and `sub_82448990` choose the lit or unlit lamp
+  parts by +53.
+- **Override.** `Pgr4SceneLightsHook`, after the copy's `stb r11,54(r31)` at `0x823CF71C`, sets
+  both flags from `--pgr4_headlights` (race, on or off). `bind_headlights` (F5) sets them to the
+  opposite of what +53 holds and keeps that choice for the rest of the session.
+  `scripts/routes/route-stpetersburg-headlights.keys` switches them on the grid.
+- **Debug variables.** `Vehicle.Lights.OverrideNightLights0` to `7` and `Car.Lights.Enable` are
+  registered (36-byte records at 0x82AA7988 and 0x82AB5648, the value at +32), but no game code
+  reads them in the shipped build.
+
 ## Releases
 
 Pushing a `v*` tag builds on GitHub Actions (`.github/workflows/release.yml`, with the game files

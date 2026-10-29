@@ -69,6 +69,12 @@ effect at the next start; the others apply at once. The pages save to
 `userdata/pgr4_settings.toml`, which is read after `pgr4_recompiled.toml`; delete it to go back
 to the release settings.
 
+F5 switches the lights of every car on or off, from what the race gives them, until you quit.
+`pgr4_headlights` (`race`, `on` or `off`) sets them for every race. On a Steam Deck, a
+back grip in the shortcut's controller layout can send F5. The automatic gearbox shifts down
+sooner than the original, keeping the engine near the top of its range; set
+`pgr4_automatic_keep_revs = false` for the original's.
+
 ## Upscaling
 
 The release settings give the 3D scene 4x MSAA (`pgr4_native_msaa`: 1, 2 for the game's own, 4
