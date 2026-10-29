@@ -3334,16 +3334,20 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
     sys.ndc_scale[i] = vp.ndc_scale[i];
     sys.ndc_offset[i] = vp.ndc_offset[i];
   }
+  // The upscaler's scene, not the rear-view mirror in a corner of its surface.
+  const Upscaler* const scene_upscaler =
+      r.upscaler() && Upscaler::IsScene(surface_info.value) &&
+              Upscaler::IsSceneWidth(int32_t(vp.xy_offset[0]),
+                                     int32_t(vp.xy_offset[0] + vp.xy_extent[0]))
+          ? r.upscaler()
+          : nullptr;
   // The upscaler's jitter in render pixels, a translation in host clip space as FSR's docs
   // apply it to the projection (NDC y up, pixels down).
-  if (const Upscaler* upscaler = r.upscaler();
-      upscaler && Upscaler::IsScene(surface_info.value) &&
-      Upscaler::IsSceneWidth(int32_t(vp.xy_offset[0]),
-                             int32_t(vp.xy_offset[0] + vp.xy_extent[0]))) {
+  if (scene_upscaler) {
     const float w = float(std::max(vp.xy_extent[0], 1u)) * targets.scale.factor(0);
     const float h = float(std::max(vp.xy_extent[1], 1u)) * targets.scale.factor(1);
-    sys.ndc_offset[0] += 2.0f * upscaler->jitter_x() / w;
-    sys.ndc_offset[1] -= 2.0f * upscaler->jitter_y() / h;
+    sys.ndc_offset[0] += 2.0f * scene_upscaler->jitter_x() / w;
+    sys.ndc_offset[1] -= 2.0f * scene_upscaler->jitter_y() / h;
   }
   if (prim == xenos::PrimitiveType::kPointList) {
     auto minmax = regs.Get<reg::PA_SU_POINT_MINMAX>();
@@ -3373,7 +3377,11 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
   sys.sample_count_log2[0] = targets.samples >= 4 ? 1 : 0;
   sys.sample_count_log2[1] = targets.samples >= 2 ? 1 : 0;
   sys.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
-  sys.alpha_to_mask = colorcontrol.alpha_to_mask_enable ? (colorcontrol.value >> 24) | (1 << 8) : 0;
+  if (colorcontrol.alpha_to_mask_enable) {
+    const uint32_t offsets = colorcontrol.value >> 24;
+    sys.alpha_to_mask =
+        (scene_upscaler ? scene_upscaler->AlphaToMaskOffsets(offsets) : offsets) | (1 << 8);
+  }
   for (uint32_t i = 0; i < 4; ++i) {
     auto ci = regs.Get<reg::RB_COLOR_INFO>(kColorInfoRegs[i]);
     int32_t bias = ci.color_exp_bias;

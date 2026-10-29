@@ -87,6 +87,15 @@ class Upscaler {
   // This frame's sub-pixel jitter in render pixels (x right, y down), for the scene's draws.
   float jitter_x() const { return jitter_[0]; }
   float jitter_y() const { return jitter_[1]; }
+  // A scene draw's alpha to coverage dither offsets this frame, from the guest's (RB_COLORCONTROL
+  // bits 24:31, a 2-bit threshold offset for each pixel of a 2x2 quad). Single-sampled, alpha to
+  // coverage is that ordered dither alone, the same in every frame, and the upscaler's history
+  // keeps it as a screen door in the color, depth and motion. Rotated one place a frame, each
+  // pixel takes the four thresholds in turn, and the history averages them to the coverage.
+  uint32_t AlphaToMaskOffsets(uint32_t offsets) const {
+    const uint32_t shift = 2 * uint32_t(frame_ & 3);
+    return ((offsets >> shift) | (offsets << (8 - shift))) & 0xFF;
+  }
   // The scene's render size this frame on its guest size, and its largest
   // (--pgr4_native_upscaler_width/height: the size of the scene's targets).
   RenderScale scale() const {
