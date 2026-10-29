@@ -97,8 +97,9 @@ class FrameGeneration {
                            bool hudless);
 
  private:
-  // The context and images for back buffers of this size and format; false (logged) on failure.
-  bool Resize(uint32_t width, uint32_t height, bool hdr);
+  // The context and images for back buffers of this size and format, the context with FfxDebug's
+  // watermark or not (the driver reads its variable at creation); false (logged) on failure.
+  bool Resize(uint32_t width, uint32_t height, bool hdr, bool debug);
   void Destroy();
   D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t i) const;
   bool CopyAtHud(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs);
@@ -113,6 +114,7 @@ class FrameGeneration {
   uint32_t rtv_stride_ = 0;
   uint32_t width_ = 0, height_ = 0;
   bool hdr_ = false;
+  bool debug_ = false;                    // FidelityFX's debug view and the watermark
   uint64_t prepared_frame_ = UINT64_MAX;  // the last frame Prepare recorded
   ResolveParams last_resolve_;
   std::optional<ResolveParams> front_;      // the front buffer's resolve

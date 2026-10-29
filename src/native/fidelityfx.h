@@ -21,6 +21,16 @@ struct FfxApi {
 // The loader's entry points, loaded once; nullptr (logged) without them.
 const FfxApi* LoadFfxApi();
 
+// --pgr4_native_fsr_debug: FidelityFX's debug views in place of the upscaled scene and the
+// generated frames, and with FSR 4 AMD's watermark of the model it runs, as OptiScaler's Debug
+// view and Watermark show them. The upscaler and the frame generation follow it from the next
+// frame.
+bool FfxDebug();
+// AMD's driver library (amdxcffx64.dll, FSR 4) draws its watermark on the contexts created while
+// the variable `name` is in the environment: MLSR-WATERMARK for upscaling, MLFI-WATERMARK for
+// frame generation (OptiScaler's dllmain.cpp). Without FSR 4 nothing reads it.
+void SetFfxWatermark(const wchar_t* name, bool on);
+
 // The scene both effects take: PGR4's frame, 1280 wide and --pgr4_render_height tall (1280x800
 // on the Steam Deck: the game's own render size, which pgr4_hooks.cpp's hooks make it render).
 inline constexpr uint32_t kFfxSceneWidth = 1280;

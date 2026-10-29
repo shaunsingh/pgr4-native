@@ -10,8 +10,25 @@
 #include <cmath>
 
 REXCVAR_DECLARE(int32_t, pgr4_render_height);  // renderer.cpp
+REXCVAR_DEFINE_BOOL(pgr4_native_fsr_debug, false, "PGR4 native",
+                    "FidelityFX's debug views in place of the upscaled scene (its inputs and "
+                    "history) and of the generated frames, and with FSR 4 AMD's watermark of the "
+                    "model it runs; bind_upscaler_debug (F8) switches it");
 
 namespace pgr4::native {
+
+bool FfxDebug() { return REXCVAR_GET(pgr4_native_fsr_debug); }
+
+void SetFfxWatermark(const wchar_t* name, bool on) {
+  // The driver asks only whether the variable exists, of the process's environment or of its
+  // CRT's copy (ucrtbase's, which SetEnvironmentVariableW leaves as it was): both are set, as
+  // OptiScaler's Util::SetFlagEnvVar sets them.
+  SetEnvironmentVariableW(name, on ? L"1" : nullptr);
+  using Putenv = int(__cdecl*)(const wchar_t*, const wchar_t*);
+  if (HMODULE ucrt = GetModuleHandleW(L"ucrtbase.dll"))
+    if (const auto putenv = reinterpret_cast<Putenv>(GetProcAddress(ucrt, "_wputenv_s")))
+      putenv(name, on ? L"1" : L"");
+}
 
 uint32_t FfxSceneHeight() {
   return uint32_t(std::clamp<int32_t>(REXCVAR_GET(pgr4_render_height), 360, 2160));

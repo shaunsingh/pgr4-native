@@ -491,8 +491,10 @@ bool NativeRenderer::Initialize() {
         key(upscaler_switch_requested_));
     rex::ui::RegisterBind(
         "bind_upscaler_debug", "F8",
-        "PGR4 native: show FidelityFX Super Resolution's debug view (its inputs and history)",
-        key(upscaler_debug_requested_));
+        "PGR4 native: show FidelityFX's debug views (--pgr4_native_fsr_debug)", [] {
+          if (REXCVAR_GET(pgr4_native_debug_keys))
+            rex::cvar::SetFlagByName("pgr4_native_fsr_debug", FfxDebug() ? "false" : "true");
+        });
     upscaler_bound_ = true;
   }
   csv_ = std::make_unique<Csv>();
@@ -604,10 +606,10 @@ void NativeRenderer::BeginFrameModules() {
   }
   if (upscaler_switch_requested_.exchange(false, std::memory_order_relaxed))
     SwitchUpscaler(!upscaler_on_);
-  if (upscaler_debug_requested_.exchange(false, std::memory_order_relaxed) && upscaler()) {
+  if (Upscaler* u = upscaler(); u && u->debug() != FfxDebug()) {
     // The context made again: its old resources may be in the lists still running.
-    if (!upscaler_->debug_context()) device_->WaitIdle();
-    if (!upscaler_->SetDebugView(!upscaler_->debug_view())) {
+    device_->WaitIdle();
+    if (!u->SetDebug(FfxDebug())) {
       REXLOG_ERROR("PGR4 native: upscaler unavailable; the scene keeps its MSAA");
       upscaler_.reset();
       SwitchUpscaler(false);

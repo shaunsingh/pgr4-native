@@ -118,7 +118,7 @@ bool Upscaler::Initialize(ID3D12Device* device) {
     dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps));
   }
   api_ = LoadFfxApi();
-  if (!api_ || !CreateContext(false)) return false;
+  if (!api_ || !CreateContext(FfxDebug())) return false;
   ffxQueryGetProviderVersion provider = {};
   provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
   if (api_->query(&context_, &provider.header) == FFX_API_RETURN_OK && provider.versionName)
@@ -260,6 +260,7 @@ bool Upscaler::CreateContext(bool debug) {
   desc.maxRenderSize = {max_width_, max_height_};
   desc.maxUpscaleSize = {kSceneWidth, SceneHeight()};
   desc.fpMessage = Message;
+  SetFfxWatermark(L"MLSR-WATERMARK", debug);
   if (const ffxReturnCode_t rc = api_->create(&context_, &desc.header, nullptr);
       rc != FFX_API_RETURN_OK) {
     REXLOG_ERROR("PGR4 native upscaler: ffxCreateContext failed ({}){}", rc,
@@ -267,7 +268,7 @@ bool Upscaler::CreateContext(bool debug) {
     context_ = nullptr;
     return false;
   }
-  debug_context_ = debug;
+  debug_ = debug;
   reset_ = true;
   return true;
 }
@@ -342,12 +343,6 @@ bool Upscaler::BeginFrame(uint64_t frame, uint64_t gpu_busy_ns) {
   return resized;
 }
 
-bool Upscaler::SetDebugView(bool on) {
-  if (on && !debug_context_ && !CreateContext(true)) return false;
-  debug_view_ = on;
-  return true;
-}
-
 D3D12_CPU_DESCRIPTOR_HANDLE Upscaler::MotionTarget(ID3D12GraphicsCommandList* list) {
   const D3D12_CPU_DESCRIPTOR_HANDLE rtv = motion_rtv_->GetCPUDescriptorHandleForHeapStart();
   if (motion_state_ != D3D12_RESOURCE_STATE_RENDER_TARGET) {
@@ -413,8 +408,11 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   d.motionVectorScale = {float(render_width_), float(render_height_)};
   d.renderSize = {render_width_, render_height_};
   d.upscaleSize = {kSceneWidth, SceneHeight()};
-  d.enableSharpening = false;
-  if (debug_view_) d.flags = FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
+  // FSR 4 draws its debug view after the sharpening pass and crashes without it (OptiScaler's
+  // FFXFeatureDx12::EvaluateInternal): the debug view takes the least sharpening.
+  d.enableSharpening = debug_;
+  d.sharpness = debug_ ? 0.01f : 0.0f;
+  if (debug_) d.flags = FFX_UPSCALE_FLAG_DRAW_DEBUG_VIEW;
   d.frameTimeDelta = frame_ms_;
   d.preExposure = 1.0f;
   d.reset = reset_;

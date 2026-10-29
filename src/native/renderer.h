@@ -231,11 +231,11 @@ class NativeRenderer {
   }
   void HandOver(uint8_t* base, uint32_t device);
   void TakeBack();
-  // Upscaler switch. bind_upscaler (F7) switches the scene between MSAA and the upscaler and
-  // bind_upscaler_debug (F8) its debug view, requested on the UI thread and taken at the start
-  // of the next frame. The upscaler is created at its first use and kept after.
+  // Upscaler switch. bind_upscaler (F7) switches the scene between MSAA and the upscaler,
+  // requested on the UI thread and taken at the start of the next frame. The upscaler is created
+  // at its first use and kept after.
   void SwitchUpscaler(bool on);
-  std::atomic<bool> upscaler_switch_requested_{false}, upscaler_debug_requested_{false};
+  std::atomic<bool> upscaler_switch_requested_{false};
   std::atomic<bool> antialiasing_requested_{false}, frame_rate_requested_{false};
   bool upscaler_bound_ = false;  // primary mode
   bool upscaler_on_ = false;

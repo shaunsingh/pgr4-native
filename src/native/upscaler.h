@@ -73,13 +73,14 @@ class Upscaler {
     reset_ = true;
     last_ns_ = 0;
   }
-  // FSR's debug view in place of the upscaled scene: its inputs (color, depth, motion vectors,
-  // reactiveness) and what it made of them, in a grid. The first use creates the context again
-  // with debug visualization (more memory), which then stays: between frames, with the GPU idle
-  // when debug_context() is false. False (logged) when that failed.
-  bool debug_view() const { return debug_view_; }
-  bool debug_context() const { return debug_context_; }
-  bool SetDebugView(bool on);
+  // FSR's debug view in place of the upscaled scene (FfxDebug): its inputs (color, depth, motion
+  // vectors, reactiveness) and what it made of them, in a grid, and with FSR 4 AMD's watermark.
+  // Either way the context is created again, debug visualization taking more memory and the
+  // driver reading the watermark's variable at creation: between frames, with the GPU idle. False
+  // (logged) when that failed. OptiScaler upscales in a context of its own, from the inputs alone:
+  // through it the watermark shows, and the debug view is its menu's (Upscaler Debug View).
+  bool debug() const { return debug_; }
+  bool SetDebug(bool on) { return CreateContext(on); }
   // This frame's sub-pixel jitter in render pixels (x right, y down), for the scene's draws.
   float jitter_x() const { return jitter_[0]; }
   float jitter_y() const { return jitter_[1]; }
@@ -112,7 +113,8 @@ class Upscaler {
   void set_camera(const FfxCamera* camera) { camera_ = camera; }
 
  private:
-  // The upscaling context, with debug visualization or not; false (logged) on failure.
+  // The upscaling context, with debug visualization and the watermark or not; false (logged) on
+  // failure.
   bool CreateContext(bool debug);
   bool CreateTargets();
   // The render size, LOD bias and jitter phases of a DynamicResolution level; false (logged)
@@ -160,8 +162,7 @@ class Upscaler {
   int32_t phase_count_ = 0;
   float jitter_[2] = {};
   bool reset_ = true;
-  bool debug_view_ = false;
-  bool debug_context_ = false;  // context_ has debug visualization
+  bool debug_ = false;  // context_ has debug visualization and the watermark
 };
 
 }  // namespace pgr4::native
