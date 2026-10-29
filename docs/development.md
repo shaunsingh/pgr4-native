@@ -9,7 +9,7 @@ patches are kept, and the performance rules the renderer follows.
 | Path | Contents |
 |---|---|
 | `src/` | The renderer, with the D3D hooks (`pgr4_d3d_trace.cpp`, `d3d_surface.inc`) and `native/` |
-| `games/` | The game projects `pgr4/` and `gw/` (codegen manifest, CMake, app, runtime settings), and `common/` for the title handoff between them |
+| `games/` | The game projects `pgr4/` and `gw/` (codegen manifest, CMake, app, runtime settings, and PGR4's own UI scripts in `pgr4/ui/`), and `common/` for the title handoff between them |
 | `patches/` | `rexglue.lock`, which names the ReXGlue commit, and the SDK patches, applied in order |
 | `scripts/` | Build, play and benchmark scripts and samplers, with `analysis/` (log, CSV and capture tools), `routes/` (scripted inputs) and `release/` (packaging) |
 | `cmake/` | The clang-cl cross toolchain file |
@@ -24,9 +24,10 @@ trees live under `~/recomp/builds/pgr4/native-<tree>`, and Proton prefixes and l
 ## Setup
 
 The build runs on Linux and cross-compiles Windows x64 executables with clang-cl and lld-link,
-which then run under Proton. It needs clang, lld, the llvm tools, CMake, Ninja, Python 3 and
-Git. When `clang-cl` is not on `PATH`, `scripts/build.sh` runs itself in a distrobox (`pgr4dev`
-by default, or `$PGR4_DISTROBOX`).
+which then run under Proton. It needs clang, lld, the llvm tools, CMake, Ninja, Python 3, Git,
+curl and a Lua interpreter (5.1 or later, or LuaJIT, for the Fennel compiler). When `clang-cl`
+is not on `PATH`, `scripts/build.sh` runs itself in a distrobox (`pgr4dev` by default, or
+`$PGR4_DISTROBOX`).
 
 1. Run `scripts/fetch-xwin.sh` to splat the MSVC CRT and Windows SDK at pinned versions into
    `~/recomp/xwin`. Running it accepts Microsoft's license terms for those files.
@@ -117,9 +118,13 @@ to `~/pgr4-proton/play/logs/<stamp>-*`.
 - **Renderer switch.** F9 switches to the Xenos plugin and back at the next Swap. A bug that
   stays with Xenos is in the game or the SDK, and one that goes away is the renderer's.
 - **Upscaler switch.** F7 switches the 3D scene between MSAA and FidelityFX Super Resolution at
-  the next frame, and F8 shows FSR's debug view: its color, depth, motion vector and
-  reactiveness inputs and its output, in a grid. The motion vector tile shows a draw whose
-  motion is wrong (an unmatched draw is still, and ghosts). The achievements overlay is on F6.
+  the next frame, and F8 (`--pgr4_native_fsr_debug`) shows FSR's debug view: its color, depth,
+  motion vector and reactiveness inputs and its output, in a grid, with frame generation's view
+  of the generated frames and FSR 4's watermark of the model it runs. The motion vector tile
+  shows a draw whose motion is wrong (an unmatched draw is still, and ghosts). Through
+  OptiScaler only the watermark follows F8, and OptiScaler's menu has the debug view. The
+  Developer settings turn the keys off (`--pgr4_native_debug_keys`). The achievements overlay
+  is on F6.
 - **Draw logs.** `--pgr4_native_draw_log_from=<frame>` with `_draw_log_frames=<n>`, or
   `deck-run.sh --draw-log N`, logs every draw, clear, resolve and render target creation of those
   frames. Diffing a glitch frame's log against its neighbours shows what changed.
@@ -168,6 +173,7 @@ The `REXCVAR_DEFINE_*` lines in `src/` describe every setting.
 | `shots.py` | Change, sharpness and pixels of given colors per `--shots` screenshot, and a contact sheet |
 | `scan_d3d_surface.py` | Generates `src/d3d_surface.inc` from the generated code |
 | `tu_address_map.py` | Matches functions between two executables instruction by instruction |
+| `lua51_dis.py` | Extracts the game's compiled UI scripts from its image and lists them as `luac -l -l` would |
 
 `deck-run.sh` also runs the samplers in `scripts/`. `deck_sampler.py` records GPU load and
 clock, the APU's power split, busy threads and other processes. `gpu_clock_sampler.py` samples
@@ -307,6 +313,33 @@ keep their shape (square pixels, centered). The mechanism, all in `pgr4recompile
 - `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
   function; the manifest's comments name the false positives it deliberately skips (VMX byte
   offsets, allocation sizes, string calls, the 1280 widths).
+
+## In-game settings
+
+The port's settings are two pages of the game's Options menu, Display and Developer, drawn by
+the game's own UI code. The UI is Lua 5.1: 247 compiled scripts in a `BZUI` archive in the
+image, which `scripts/analysis/lua51_dis.py` extracts and lists. `games/pgr4/src/pgr4_lua.cpp`
+replaces the archive's chunk loader (`sub_82508360`), so the game also loads the scripts in
+`games/pgr4/ui/`: a screen of the port's own, and patches that run after the game's script of
+the same name (the Options menu's entry). They are written in Fennel, which the build compiles
+to Lua with the compiler `scripts/fennel.lock` pins, against the globals listed in
+`games/pgr4/CMakeLists.txt`, so a misspelt name fails the build. `pgr4_settings.cpp` holds the
+options, the cvars each choice sets, and the `Pgr4` table the scripts call.
+
+- **Text.** The game's text functions take a string ID, which its string table
+  (`sub_8289B1D0`) looks up. `Pgr4.Text` gives the port's strings IDs from 0x8000, and the
+  lookup answers them.
+- **The UI's habits.** It marks the first row only after a screen's `Init`, so the screen
+  activates its rows at its first frame. `SetActive(false)` hides a spinner's backing but not
+  its label, so hidden rows move below the clipped frame. A spinner lists its items last added
+  first, so the screen adds them in reverse.
+- **Applying.** A setting the renderer can change while it runs is set at once, through
+  `NativeRenderer`'s `Request*` taken at the next frame; the others are marked `*` until the
+  next start. Both are saved to `userdata/pgr4_settings.toml`, read after
+  `pgr4_recompiled.toml`.
+- **Testing.** `scripts/routes/route-settings.keys` opens the pages on a fresh profile, changes
+  a start-up and a live setting, saves and reopens. `--pgr4_game_debug_menus` shows the game's
+  own debug entries in its menus.
 
 ## Gearbox
 

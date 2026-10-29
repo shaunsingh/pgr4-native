@@ -60,6 +60,15 @@ Windows' display settings the game outputs HDR.
 `pgr4_recompiled.toml` beside the executable holds the settings, one per line. A flag on the
 command line overrides it: in Steam's launch options, `%command% --fullscreen=false` for one.
 
+The game's Options menu has two pages of the port's own. Display holds the renderer (native or
+classic), the aspect ratio, HDR and its brightness, antialiasing (off, MSAA 2x to 8x, or FSR),
+FSR's resolution, dynamic resolution and frame generation, texture filtering, the frame rate
+(the display's refresh rate, a half or a third of it) and the frame latency. Developer holds
+the debug keys, the FSR debug view and the renderer's diagnostics. A choice marked `*` takes
+effect at the next start; the others apply at once. The pages save to
+`userdata/pgr4_settings.toml`, which is read after `pgr4_recompiled.toml`; delete it to go back
+to the release settings.
+
 ## Upscaling
 
 The release settings give the 3D scene 4x MSAA (`pgr4_native_msaa`: 1, 2 for the game's own, 4
@@ -82,7 +91,8 @@ that size and lowers it, down to a height of `pgr4_native_upscaler_min_height`, 
 GPU falls behind that frame rate, then raises it again once the GPU catches up. In the same race, FSR up to 1280x720 with a target
 of 90 averaged 86.9 fps with 1% lows of 64.1 fps, against 82.9 and 52.7 at a fixed 1280x720.
 
-F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view.
+F7 switches between MSAA and the upscaler while you play, and F8 shows the upscaler's debug view
+(`pgr4_native_fsr_debug`), with FSR 4 AMD's watermark of the model it runs.
 Both start off. The interface always stays at full resolution, and no sharpening is added.
 
 On a Steam Deck OLED, MSAA is still the fastest at 90 fps. In a St Petersburg race, MSAA averaged
@@ -107,8 +117,8 @@ into every frame, never interpolated. In the St Petersburg race, FSR at 1280x720
 generation held 45.0 fps with 1% lows of 44.5 fps and no frame shown late (GPU 83 % busy), and
 FSR 4 Lite at 960x540 through OptiScaler held 45.0 fps. Frame generation adds input latency: a
 frame takes about 66 ms from its start to the display, against about 33 ms without it.
-`pgr4_native_frame_generation_debug` shows its debug views (1 tear lines, 2 the generated frames
-alone, 3 FidelityFX's own view).
+`pgr4_native_fsr_debug` (F8, or FSR debug view in the Developer settings) shows FidelityFX's debug
+view of it, as of the upscaler.
 
 ### FSR 4 on a Steam Deck (Proton)
 
@@ -149,7 +159,8 @@ an OptiScaler that knows the Lite model (its current source does) with `Fsr4GpuS
 OptiScaler then answers AMD's GPU query itself, without FSR4Injector's shim. Keep the render
 size in `pgr4_native_upscaler_width` and `_height`: the game renders at that size whatever
 OptiScaler's own ratio settings say. Insert opens OptiScaler's menu (`ShortcutKey` in
-`OptiScaler.ini` changes the key).
+`OptiScaler.ini` changes the key). OptiScaler upscales in a context of its own, so through it F8
+shows only AMD's watermark: the debug view is the Upscaler Debug View in OptiScaler's menu.
 
 ## Geometry Wars
 

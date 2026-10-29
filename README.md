@@ -39,13 +39,17 @@ STFS packages goes in the game folder's `Content\`, next to the title update's p
 ## Flags
 
 Settings go on the command line (`--name=value`) or in `pgr4_recompiled.toml` next to the
-executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings.
+executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings. The game's Options
+menu has the port's own Display and Developer pages, which save to `userdata/pgr4_settings.toml`
+over `pgr4_recompiled.toml`.
 
 | Flag | Default | Effect |
 |---|---|---|
 | `--pgr4_native` | false | Run the native renderer beside the Xenos plugin, in a debug window |
 | `--pgr4_native_primary` | false | Make the native renderer the game's output (implies `--pgr4_native`, sets `--gpu_skip_draws`) |
 | `--pgr4_native_renderer_switch` | true | In primary mode, F9 (`bind_renderer_switch`) switches between the native renderer and the Xenos plugin |
+| `--pgr4_native_classic` | false | In primary mode, start on the Xenos plugin, as after F9 (the Display settings' Renderer) |
+| `--pgr4_native_debug_keys` | true | Let F7, F8 and F9 do what they do (the Developer settings' Debug keys) |
 | `--pgr4_native_replace_draws` | true | In primary mode, the guest D3D's DrawIndexedVertices builds no command packets |
 | `--pgr4_native_render_thread` | true | Record and submit on a render thread, so the game thread only captures each call |
 | `--pgr4_native_submit_draws=<n>` | 256 | Submit the frame so far every n draws (0 submits once per frame) |
@@ -61,21 +65,23 @@ executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings.
 | `--pgr4_native_texture_memory_soft_mb=<n>` | 512 | Above this much texture memory, destroy textures unused for `_soft_lifetime_s` (30) seconds (0 means no limit) |
 | `--pgr4_native_texture_memory_hard_mb=<n>` | 1024 | Above this much texture memory, destroy the least recently used textures (0 means no limit) |
 | `--pgr4_native_msaa=<n>` | 2 | Samples per pixel of the 3D scene's MSAA when the upscaler is off: 1, 2 (the game's own), 4 or 8 (fewer if the GPU lacks them) |
-| `--pgr4_native_upscaler` | false | Antialias and upscale the 3D scene with FidelityFX Super Resolution instead of MSAA (F7 switches, F8 shows its debug view). OptiScaler and FSR 4: `scripts/release/README.md`, "Upscaling" |
+| `--pgr4_native_upscaler` | false | Antialias and upscale the 3D scene with FidelityFX Super Resolution instead of MSAA (F7 switches, F8 shows its debug view: `--pgr4_native_fsr_debug`). OptiScaler and FSR 4: `scripts/release/README.md`, "Upscaling" |
 | `--pgr4_native_upscaler_width=<n>` | 1280 | Width the upscaler's scene renders at, 320 to 1280 (853 for FSR's Quality, 640 for Performance) |
 | `--pgr4_native_upscaler_height=<n>` | 720 | Height the upscaler's scene renders at, up to the render height (720 for Quality at 800, 400 for Performance) |
 | `--pgr4_native_upscaler_target_fps=<n>` | 0 | Lower the upscaler's render size each frame, from the width and height down to `_min_height`, while the GPU's time per frame is above 90 % of this frame rate's (0 keeps a fixed size) |
 | `--pgr4_native_upscaler_min_height=<n>` | 360 | With a target frame rate, the least height the upscaler's scene renders at, down to a quarter of the render height |
 | `--pgr4_native_frame_generation` | false | With the upscaler on and the frames paced (`--pgr4_native_frame_latency` above 0), show a frame FidelityFX Frame Generation makes between each two, the game at half the display's refresh rate. `scripts/release/README.md`, "Frame generation" |
-| `--pgr4_native_frame_generation_debug=<n>` | 0 | Frame generation's debug views: 1 its tear lines and reset indicators, 2 also only the generated frames, 3 FidelityFX's own view |
+| `--pgr4_native_fsr_debug` | false | FidelityFX's debug views of the upscaled scene and the generated frames, and with FSR 4 AMD's watermark of the model it runs (F8 switches; the Developer settings' FSR debug view) |
 | `--pgr4_native_anisotropy=<n>` | 1 | Minimum anisotropic filtering (2, 4, 8 or 16) for linearly filtered textures with mips. 1 keeps the game's own, and the release settings use 16 |
 | `--pgr4_native_frame_latency=<n>` | 3 | In primary mode, begin a frame once the display has shown the frame n before it (1 to 3, or 0 for the game's own vblank pacing) |
+| `--pgr4_native_present_interval=<n>` | 1 | With vsync, show each frame for n display refreshes (1 to 3), so the game runs evenly at the refresh rate over n: 90, 45 or 30 fps at 90 Hz (the Display settings' Frame rate) |
 | `--pgr4_native_low_latency` | true | Begin each frame as late as the time recent frames waited for the display allows |
 | `--pgr4_native_latency_margin_us=<n>` | 4000 | With low latency on, how long before its display slot the GPU should finish a frame |
 | `--pgr4_native_hdr` | true | Output HDR10 when the display supports it (under Proton, set `DXVK_HDR=1`) |
 | `--pgr4_native_hdr_peak_nits=<n>` | 0 | Peak luminance the HDR highlights are fitted to (0 uses the display's, or 1000 if it reports none) |
 | `--pgr4_native_hdr_paper_white=<n>` | 400 | Luminance of SDR white in HDR output, in nits |
 | `--pgr4_60fps` | false | Present every vblank instead of at the game's 30 FPS interval, when the native renderer does not pace the frames |
+| `--pgr4_game_debug_menus` | false | Show the debug entries of the game's own menus |
 | `--content_root=<dir>` | `<game>\Content` | Folder of content packages (title update, DLC) installed at startup |
 | `--user_language=<n>` | 1 | The game's language: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Traditional Chinese, 10 Simplified Chinese, 11 Polish, 12 Russian |
 | `--pgr4_native_csv=<file>` | off | Write per-frame counters and CPU times to this file |
