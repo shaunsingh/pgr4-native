@@ -7,6 +7,9 @@
 #include "pgr4_settings.h"
 #include "title_launch.h"
 
+// pgr4_hooks.cpp: the port's keys for the game (bind_headlights).
+void Pgr4RegisterBinds();
+
 class Pgr4RecompiledApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -20,6 +23,7 @@ class Pgr4RecompiledApp : public rex::ReXApp {
   void OnPostInitLogging() override {
     pgr4::settings::LoadSettings(user_data_root() / "pgr4_settings.toml");
   }
+  void OnPostSetup() override { Pgr4RegisterBinds(); }
   void OnPostLoadXexImage() override { title_launch::Restore(runtime()); }
   // The garage's arcade cabinet launches gw.xex.
   void OnGuestThreadExit(rex::system::XThread*) override { title_launch::Continue(runtime()); }

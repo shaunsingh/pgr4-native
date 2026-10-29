@@ -401,3 +401,11 @@ address = 0x822DE400
 name = "Pgr4AutomaticDownshiftHook"
 registers = ["r10", "f31"]
 after_instruction = true
+
+# The scene's lighting takes the race lighting's car and bike lights (sub_823CF460, after
+# stb r11,54(r31)): Pgr4SceneLightsHook applies pgr4_headlights and bind_headlights.
+[[entrypoint.midasm_hook]]
+address = 0x823CF71C
+name = "Pgr4SceneLightsHook"
+registers = ["r31"]
+after_instruction = true
