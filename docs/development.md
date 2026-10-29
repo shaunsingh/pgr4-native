@@ -90,7 +90,11 @@ installed, both play `runtime-fgmod/`, a copy of the build with AMD's `amdxcffx6
 through fgmod, so OptiScaler is loaded and the upscaler, once the Display page or F7 turns it on,
 is FSR 4's Lite model (`--no-fgmod` plays `runtime/` without it). Loaded with the scene on
 MSAA, OptiScaler costs nothing measurable (`deck-run.sh --fgmod`: 9.19 against 9.23 ms of GPU
-time a frame in the Tokyo race in the rain, td-472 and td-470).
+time a frame in the Tokyo race in the rain, td-472 and td-470). With a HelixSR release folder
+whose setup has built HLX DLSS's network (`~/helixsr`, or `PGR4_HELIXSR`), `--install` also makes
+`runtime-helixsr/`, the build with HelixSR Scaler as `dxgi.dll` and `helixsr-optiscaler.ini`'s
+settings, and both entries play that instead: the upscaler is HLX DLSS (`--no-helixsr` plays as
+without it). The network is built from NVIDIA's DLL for that PC, so only its setup makes it.
 
 `deck-run.sh` keeps a prefix of its own and starts each run with a fresh save. It drives a
 scripted route from boot to a race (`scripts/routes/route-stpetersburg.keys` by default, played
