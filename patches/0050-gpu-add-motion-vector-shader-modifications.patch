@@ -25,13 +25,19 @@ memexport; the host renderer chooses the draws and supplies the previous
 constants. The new bits are zero in existing modifications, which
 translate as before.
 
+The motion is bounded to two screens either way, and a previous position
+behind the camera (W <= 0, where the division flips it onto the screen)
+moves by the bound: it was not on screen. A position just in front of the
+camera divides to beyond what R16G16_FLOAT holds, and an infinity or a NaN
+in a temporal upscaler's motion spreads through its history.
+
 ShaderTranslator::TranslateUcode is split out of TranslateAnalyzedShader
 so that an implementation can emit the code more than once, and the DXBC
 translator's main loop and position conversions become functions of their
 own.
 
 Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
----
+
 diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
 index 9c112af..7450906 100644
 --- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
@@ -673,10 +679,10 @@ index bdce483..1f732ec 100644
                      (instr.operands[1].storage_index & 1) ? 0b10101110 : 0b00000100));
  
 diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
-index a7d508a..1868438 100644
+index a7d508a..9d6be88 100644
 --- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
 +++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
-@@ -1570,6 +1570,22 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
+@@ -1570,6 +1570,32 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
    PopSystemTemp();
  }
  
@@ -691,15 +697,25 @@ index a7d508a..1868438 100644
 +           dxbc::Src::V1D(positions + 1, dxbc::Src::kWWWW));
 +  a_.OpAdd(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp, 0b1110), -dxbc::Src::R(temp));
 +  // NDC to UV: half the extent, Y down.
-+  a_.OpMul(dxbc::Dest::O(kMotionVectorRenderTarget, 0b0011), dxbc::Src::R(temp),
-+           dxbc::Src::LF(0.5f, -0.5f, 0.0f, 0.0f));
++  a_.OpMul(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp), dxbc::Src::LF(0.5f, -0.5f, 0.0f, 0.0f));
++  // A previous position behind the camera (W <= 0, which the division flips) was not on screen:
++  // it moves by the bound, two screens. The bound also keeps a position just in front of the
++  // camera, and NaN (max returns the other operand), finite in the half-float target, where an
++  // infinity would spread through a temporal upscaler's history.
++  a_.OpLT(dxbc::Dest::R(temp, 0b0100), dxbc::Src::LF(0.0f),
++          dxbc::Src::V1D(positions + 1, dxbc::Src::kWWWW));
++  a_.OpMovC(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp, dxbc::Src::kZZZZ), dxbc::Src::R(temp),
++            dxbc::Src::LF(2.0f));
++  a_.OpMax(dxbc::Dest::R(temp, 0b0011), dxbc::Src::R(temp), dxbc::Src::LF(-2.0f));
++  a_.OpMin(dxbc::Dest::O(kMotionVectorRenderTarget, 0b0011), dxbc::Src::R(temp),
++           dxbc::Src::LF(2.0f));
 +  PopSystemTemp();
 +}
 +
  void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
    bool shader_writes_depth = current_shader().writes_depth();
  
-@@ -2755,6 +2771,9 @@ void DxbcShaderTranslator::CompletePixelShader() {
+@@ -2755,6 +2781,9 @@ void DxbcShaderTranslator::CompletePixelShader() {
      CompletePixelShader_WriteToROV();
    } else {
      CompletePixelShader_WriteToRTVs();
@@ -766,5 +782,5 @@ index e472251..a4a52e0 100644
    Shader::Error error;
    error.is_fatal = is_fatal;
 -- 
-2.47.0
+2.55.0
 
