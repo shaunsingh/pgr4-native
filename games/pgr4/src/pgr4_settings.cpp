@@ -5,6 +5,7 @@
 // the settings file (LoadSettings), loaded after the configuration file at start-up.
 #include "pgr4_settings.h"
 
+#include "native/frame_height.h"
 #include "native/renderer.h"
 #include "pgr4_lua.h"
 
@@ -24,7 +25,6 @@ REXCVAR_DEFINE_BOOL(pgr4_game_debug_menus, false, "PGR4",
                     "The game's own debug menus: GothamSystem.IsFinalBuild answers false, and "
                     "the menus that test it show their debug entries");
 
-REXCVAR_DECLARE(int32_t, pgr4_render_height);
 REXCVAR_DECLARE(bool, pgr4_native_classic);
 
 // pgr4_hooks.cpp: the scene's lights after pgr4_headlights changed.
@@ -33,6 +33,8 @@ void Pgr4HeadlightsChanged();
 namespace pgr4::settings {
 namespace {
 
+using pgr4::native::FrameHeight;
+using pgr4::native::kGameFrameHeight;
 using pgr4::native::NativeRenderer;
 
 struct Choice {
@@ -77,8 +79,8 @@ std::string Nearest(const Option& o, double n) {
 const std::vector<Option>& Options();
 const Option& Find(std::string_view id) { return *std::ranges::find(Options(), id, &Option::id); }
 
-// The scene's height at start-up, and the extent of `percent` of it.
-uint32_t SceneHeight() { return uint32_t(REXCVAR_GET(pgr4_render_height)); }
+// The scene's height in this run, and the extent of `percent` of it.
+uint32_t SceneHeight() { return FrameHeight(); }
 std::string Percent(uint32_t extent, int percent) {
   return std::to_string(uint32_t(std::lround(extent * percent / 100.0)));
 }
@@ -97,12 +99,13 @@ std::vector<Option> MakeOptions() {
   const Condition native = {"renderer", {"false"}};
   const Condition fsr = {"antialiasing", {"fsr"}};
   std::vector<Option> o;
-  // Display.
+  // Display. The Xenos plugin draws only the game's 16:9 frame (native/frame_height.h): at 16:10
+  // the renderer changes with the next start, which takes the aspect ratio with it.
   o.push_back({"display",
                "renderer",
                "Renderer",
                {{"Native", "false"}, {"Classic", "true"}},
-               false,
+               FrameHeight() != kGameFrameHeight,
                [] { return Flag("pgr4_native_classic"); },
                [](const std::string& v) { return Bool("pgr4_native_classic", v); },
                [] {
@@ -114,7 +117,7 @@ std::vector<Option> MakeOptions() {
                "Aspect ratio",
                {{"16:10", "800"}, {"16:9", "720"}},
                true,
-               [] { return std::to_string(SceneHeight()); },
+               [] { return Flag("pgr4_render_height"); },
                [](const std::string& v) { return Assignments{{"pgr4_render_height", v}}; }});
   o.push_back({"display", "hdr", "HDR", on_off, true, [] { return Flag("pgr4_native_hdr"); },
                [](const std::string& v) { return Bool("pgr4_native_hdr", v); }, nullptr, native});

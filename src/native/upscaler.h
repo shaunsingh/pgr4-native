@@ -47,7 +47,7 @@ class Upscaler {
     return (surface_info & kSceneSurfaceMask) == kSceneSurface;
   }
   static constexpr uint32_t kSceneWidth = kFfxSceneWidth;
-  static uint32_t SceneHeight() { return FfxSceneHeight(); }
+  static uint32_t SceneHeight() { return FrameHeight(); }
   // Whether a span of the scene surface (a resolve's, a viewport's) is the scene's width: the
   // scene resolves in tiles of its whole width, while the rear-view mirror renders into a corner
   // of the scene surface and resolves that corner on its own (neither upscaled nor jittered).

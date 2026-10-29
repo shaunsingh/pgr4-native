@@ -135,7 +135,7 @@ bool FrameGeneration::Resize(uint32_t width, uint32_t height, bool hdr, bool deb
   cd.flags = FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED |
              (hdr ? FFX_FRAMEGENERATION_ENABLE_HIGH_DYNAMIC_RANGE : 0u);
   cd.displaySize = {width, height};
-  cd.maxRenderSize = {kFfxSceneWidth, FfxSceneHeight()};
+  cd.maxRenderSize = {kFfxSceneWidth, FrameHeight()};
   cd.backBufferFormat = ffxApiGetSurfaceFormatDX12(format);
   SetFfxWatermark(L"MLFI-WATERMARK", debug);
   if (const ffxReturnCode_t rc = api_->create(&context_, &cd.header, nullptr);

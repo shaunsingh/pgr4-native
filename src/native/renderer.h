@@ -229,6 +229,9 @@ class NativeRenderer {
     return switch_requested_.load(std::memory_order_relaxed) &&
            switch_requested_.exchange(false, std::memory_order_relaxed);
   }
+  // SwitchRequested, while the native renderer draws: false (logged) when the frame is one the
+  // plugin does not draw (frame_height.h).
+  bool HandOverRequested();
   void HandOver(uint8_t* base, uint32_t device);
   void TakeBack();
   // Upscaler switch. bind_upscaler (F7) switches the scene between MSAA and the upscaler,

@@ -7,6 +7,7 @@
 #include "d3d_state.h"
 #include "draw.h"
 #include "frame_generation.h"
+#include "frame_height.h"
 #include "frame_pacer.h"
 #include "gpu_timer.h"
 #include "guest_memory.h"
@@ -58,7 +59,9 @@ REXCVAR_DEFINE_INT32(pgr4_native_msaa, 2, "PGR4 native",
                      "Samples of the 3D scene's MSAA without the upscaler: 1, 2 (the game's), 4 "
                      "or 8 (fewer if the GPU lacks them)");
 REXCVAR_DEFINE_INT32(pgr4_render_height, 800, "PGR4",
-                     "The render height the 16:10 patch gives every hooked 720 (720 disables it)")
+                     "The render height the 16:10 patch gives every hooked 720 while the native "
+                     "renderer draws from the start (720 disables it; the Xenos plugin always "
+                     "draws the game's 720, frame_height.h)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");
@@ -358,6 +361,14 @@ struct NativeRenderer::Queue {
     return NowNs() - t0;
   }
 };
+
+uint32_t FrameHeight() {
+  static const uint32_t height =
+      REXCVAR_GET(pgr4_native_primary) && !REXCVAR_GET(pgr4_native_classic)
+          ? uint32_t(std::clamp<int32_t>(REXCVAR_GET(pgr4_render_height), 360, 2160))
+          : kGameFrameHeight;
+  return height;
+}
 
 NativeRenderer* NativeRenderer::Get() {
   if (!(REXCVAR_GET(pgr4_native) || REXCVAR_GET(pgr4_native_primary)) || g_failed) return nullptr;
@@ -801,7 +812,7 @@ void NativeRenderer::QueueSwap(uint8_t* base, const HookArgs& args) {
   s.hook_max_ns = std::max({q.hook_max_ns, TicksToNs(q.hook_max_ticks), t1 - t0 - wait});
   s.track_calls = profile::g.track_calls;
   s.pad = rex_xam_take_frame_pad();
-  const bool hand_over = s.call.hand_over = SwitchRequested();
+  const bool hand_over = s.call.hand_over = HandOverRequested();
   std::memcpy(s.ticks, profile::g.ticks, sizeof(s.ticks));
   for (uint64_t& t : profile::g.ticks) t = 0;
   profile::g.track_calls = 0;
@@ -864,7 +875,7 @@ void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
   SwapCall swap;
   Presenter::ReadSwap(base, args, &swap);
   stats_.pad = rex_xam_take_frame_pad();
-  swap.hand_over = SwitchRequested();
+  swap.hand_over = HandOverRequested();
   ExecuteSwap(swap);
   // stats_ is the next frame's from here.
   stats_.pace_wait_ns = pacer_ ? pacer_->WaitToBegin() : 0;
@@ -897,6 +908,16 @@ void NativeRenderer::OnSwapSuspended() {
 
 // ---------------------------------------------------------------------------------------------
 // Renderer switch (primary mode)
+
+bool NativeRenderer::HandOverRequested() {
+  if (!SwitchRequested()) return false;
+  if (FrameHeight() == kGameFrameHeight) return true;
+  REXLOG_WARN(
+      "PGR4 native: renderer switch: the Xenos plugin draws only the game's {}-row frame, not "
+      "this {}-row one (frame_height.h); it draws from the start with the Classic renderer",
+      kGameFrameHeight, FrameHeight());
+  return false;
+}
 
 void NativeRenderer::HandOver(uint8_t* base, uint32_t device) {
   // Beside the Xenos plugin (debug window) it never stopped drawing; Fail cleared live_ already.

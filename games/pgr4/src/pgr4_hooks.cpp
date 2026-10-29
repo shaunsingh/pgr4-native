@@ -1,6 +1,8 @@
 // Game patches for Project Gotham Racing 4, Title Update #2: the mid-asm hooks the manifest
 // (pgr4recompiled_manifest.toml) places in the generated code.
 
+#include "native/frame_height.h"
+
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
@@ -33,11 +35,11 @@ void Pgr4MotionBlurStepHook(PPCRegister& f0) { f0.f64 = double(Pgr4MotionBlurSte
 // game's hardcoded 1280x720 frame; each gets the new render height instead. The boundary hooks
 // below cover the copies the loads cannot: structs the game fills itself and hands to the D3D
 // (viewport, scissor and resolve rects) and the surface creators whose packed sizes the
-// viewport clamp reads back (sub_826C6100).
-REXCVAR_DECLARE(int32_t, pgr4_render_height);  // native/renderer.cpp: the FFX effects size from it
+// viewport clamp reads back (sub_826C6100). The height is the run's (native/frame_height.h).
+using pgr4::native::FrameHeight;
 
 void Pgr4RenderHeightHook(PPCRegister& r) {
-  if (r.u32 == 720) r.u64 = uint32_t(REXCVAR_GET(pgr4_render_height));
+  if (r.u32 == 720) r.u64 = FrameHeight();
 }
 
 uint32_t GuestLoad32(uint32_t a) {
@@ -54,13 +56,13 @@ void GuestStore32(uint32_t a, uint32_t v) {
 void Pgr4ResolveRectHook(PPCRegister& r5) {
   if (!r5.u32) return;
   if (GuestLoad32(r5.u32 + 8) == 1280 && GuestLoad32(r5.u32 + 12) == 720)
-    GuestStore32(r5.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+    GuestStore32(r5.u32 + 12, FrameHeight());
 }
 
 void Pgr4ViewportHook(PPCRegister& r4) {
   if (!r4.u32) return;
   if (GuestLoad32(r4.u32 + 8) == 1280 && GuestLoad32(r4.u32 + 12) == 720)
-    GuestStore32(r4.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+    GuestStore32(r4.u32 + 12, FrameHeight());
 }
 
 // The float viewport setter (sub_826C63F8, the one the scene's views use): r4 points at
@@ -70,21 +72,20 @@ void Pgr4ViewportFHook(PPCRegister& r4) {
   constexpr uint32_t kW = 0x44A00000;  // 1280.0f
   constexpr uint32_t kH = 0x44340000;  // 720.0f
   if (GuestLoad32(r4.u32 + 8) == kW && GuestLoad32(r4.u32 + 12) == kH) {
-    const float h = float(REXCVAR_GET(pgr4_render_height));
-    GuestStore32(r4.u32 + 12, std::bit_cast<uint32_t>(h));
+    GuestStore32(r4.u32 + 12, std::bit_cast<uint32_t>(float(FrameHeight())));
   }
 }
 
 // Vertex constant c45, the HUD's orthographic projection, in the device's shadow constants
 // (device + 1920, c0 on) at the end of SetVertexShaderConstantF (sub_826C9908, r3 the device):
 // the game maps its 640x480 HUD space into the central 960x720 of its 720-tall frame (4:3-safe,
-// the pixel scale 1.5). With the frame pgr4_render_height tall, the y scale and offset still
+// the pixel scale 1.5). With the frame FrameHeight() tall, the y scale and offset still
 // divide by 720 and every c45 draw (the dials, the HUD text, the menus) stretches by
 // height/720. Rewrite the game's own value to the same mapping of the taller frame: the central
 // 960x720 of it, centered, as the 960-wide area already is. A rewritten value no longer
 // matches, so uploads of other registers leave it be.
 void Pgr4HudOrthoHook(PPCRegister& r3) {
-  const float h = float(REXCVAR_GET(pgr4_render_height));
+  const float h = float(FrameHeight());
   if (h == 720.0f) return;                      // the 16:10 patch is off
   const uint32_t c = r3.u32 + (120 + 45) * 16;  // c45 of the device's shadow
   if (std::bit_cast<float>(GuestLoad32(c)) != 3.0f / 1280.0f ||
@@ -121,7 +122,7 @@ void Pgr4AutomaticDownshiftHook(PPCRegister& r10, PPCRegister& f31) {
 void Pgr4ScissorRectHook(PPCRegister& r4) {
   if (!r4.u32) return;
   if (GuestLoad32(r4.u32 + 8) == 1280 && GuestLoad32(r4.u32 + 12) == 720)
-    GuestStore32(r4.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+    GuestStore32(r4.u32 + 12, FrameHeight());
 }
 
 namespace {

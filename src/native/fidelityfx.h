@@ -4,6 +4,8 @@
 // intercepts the loader), which is how other upscalers and frame generators replace AMD's.
 #pragma once
 
+#include "frame_height.h"
+
 #include <ffx_api.h>
 
 #include <cstdint>
@@ -31,10 +33,8 @@ bool FfxDebug();
 // frame generation (OptiScaler's dllmain.cpp). Without FSR 4 nothing reads it.
 void SetFfxWatermark(const wchar_t* name, bool on);
 
-// The scene both effects take: PGR4's frame, 1280 wide and --pgr4_render_height tall (1280x800
-// on the Steam Deck: the game's own render size, which pgr4_hooks.cpp's hooks make it render).
+// The scene both effects take: PGR4's frame, 1280 wide and FrameHeight() tall.
 inline constexpr uint32_t kFfxSceneWidth = 1280;
-uint32_t FfxSceneHeight();
 
 // The scene's camera: near and far planes and vertical field of view, by which FidelityFX scales
 // its disocclusion thresholds. NativeRenderer reads it each frame from the clip transform in the
