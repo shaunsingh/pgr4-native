@@ -393,3 +393,11 @@ address = 0x822C56F0
 name = "Pgr4CarPreviewChainHook"
 registers = ["r3", "r10"]
 jump_address_on_true = 0x822C5740
+
+# The automatic's downshift threshold (sub_822DE250: fmuls f31,f10,f12, the lower gear's
+# limit in rad/s) for the player's car: Pgr4AutomaticDownshiftHook keeps the revs up.
+[[entrypoint.midasm_hook]]
+address = 0x822DE400
+name = "Pgr4AutomaticDownshiftHook"
+registers = ["r10", "f31"]
+after_instruction = true

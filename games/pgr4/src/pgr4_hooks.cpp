@@ -6,6 +6,7 @@
 #include <rex/ppc/context.h>
 #include <rex/system/kernel_state.h>
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <cstdint>
@@ -91,6 +92,27 @@ void Pgr4HudOrthoHook(PPCRegister& r3) {
     return;  // not the game's HUD ortho (another mode's): leave it
   GuestStore32(c + 4, std::bit_cast<uint32_t>(-3.0f / h));
   GuestStore32(c + 12, std::bit_cast<uint32_t>(720.0f / h));
+}
+
+REXCVAR_DEFINE_BOOL(pgr4_automatic_keep_revs, true, "PGR4",
+                    "The automatic transmission of the player's car takes the lower gear as soon "
+                    "as the engine would run under 90 % of the car's upshift point in it (the "
+                    "game's own limit is 82 to 90 % by car), so it shifts down at a higher speed "
+                    "and keeps the engine, and a turbo's boost, higher in its range");
+
+// The automatic (sub_822DE250, development.md's "Gearbox") shifts down while the next lower gear,
+// estimated from the wheel speeds, stays under car data + 440 (0.82 to 0.9 by car) times the
+// upshift point at car data + 408 (rpm), in rad/s: f31 after 0x822DE400. Raising the factor to
+// 0.9 keeps a tenth of the speed between the two shifts, so a downshift never re-upshifts at
+// once. Only for the player's car (car + 20 is 0; the opponents are 1, and their automatic stays
+// the one the game balanced them with).
+void Pgr4AutomaticDownshiftHook(PPCRegister& r10, PPCRegister& f31) {
+  constexpr double kKeepRevs = 0.9;
+  constexpr double kRpmToRadPerS = 3.14159265358979323846 / 30.0;
+  const uint32_t car = r10.u32;
+  if (!REXCVAR_GET(pgr4_automatic_keep_revs) || GuestLoad32(car + 20) != 0) return;
+  const double upshift = std::bit_cast<float>(GuestLoad32(GuestLoad32(car + 804) + 408));
+  f31.f64 = std::max(f31.f64, double(float(kKeepRevs * upshift * kRpmToRadPerS)));
 }
 
 // SetScissorRect (fn_826C59D8): r4 points at {x1, y1, x2, y2}.
