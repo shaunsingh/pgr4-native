@@ -25,6 +25,7 @@
 #include <rex/runtime.h>
 #include <rex/system/interfaces/graphics.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/flags.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
@@ -630,8 +631,14 @@ void NativeRenderer::BeginFrameModules() {
   rt_->BeginFrame(frame_index_, fence, done);
   resolver_->set_linear_output(device_->hdr());
   resolver_->BeginFrame(frame_index_, fence, done);
-  if (Upscaler* u = upscaler(); u && u->BeginFrame(frame_index_, device_->gpu_busy_ns()))
-    rt_->SetSceneScale(u->scale());
+  if (Upscaler* u = upscaler()) {
+    // A frame's time on the display: refreshes at the rate the guest's vblanks run at (as
+    // ReXGlue's xboxkrnl_video clamps it), two with a generated frame before it.
+    const double hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 240.0);
+    const uint32_t presents = frame_generation_ ? 2 : device_->present_interval();
+    if (u->BeginFrame(frame_index_, device_->gpu_busy_ns(), uint64_t(1e9 * presents / hz)))
+      rt_->SetSceneScale(u->scale());
+  }
   frame_begun_ = true;
 }
 

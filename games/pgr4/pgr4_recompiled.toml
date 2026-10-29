@@ -31,7 +31,9 @@ pgr4_native_upscaler = false
 pgr4_native_upscaler_width = 1280
 pgr4_native_upscaler_height = 720
 # A frame rate (90: the Steam Deck OLED's) has the upscaler lower its render size each frame, down
-# to a height of pgr4_native_upscaler_min_height, while the GPU falls behind it. 0: a fixed size.
+# to a height of pgr4_native_upscaler_min_height, while the GPU falls behind it, or behind the lower
+# frame rate the frames are shown at (pgr4_native_present_interval, frame generation). 0: a fixed
+# size.
 pgr4_native_upscaler_target_fps = 0
 pgr4_native_upscaler_min_height = 360
 

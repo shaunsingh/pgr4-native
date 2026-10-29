@@ -28,7 +28,8 @@ REXCVAR_DEFINE_INT32(pgr4_native_upscaler_height, 720, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_upscaler_target_fps, 0, "PGR4 native",
                      "Vary the upscaler's render size each frame, from the width and height "
                      "down to --pgr4_native_upscaler_min_height, so that the GPU keeps up with "
-                     "this frame rate (0: a fixed size)");
+                     "this frame rate, or with the lower one the frames are shown at "
+                     "(--pgr4_native_present_interval, frame generation; 0: a fixed size)");
 REXCVAR_DEFINE_INT32(pgr4_native_upscaler_min_height, 360, "PGR4 native",
                      "With --pgr4_native_upscaler_target_fps: the least height the scene renders "
                      "at (180-720)");
@@ -115,7 +116,7 @@ bool Upscaler::Initialize(ID3D12Device* device) {
         RenderExtent(REXCVAR_GET(pgr4_native_upscaler_min_height), SceneHeight());
     const uint32_t min_level =
         (min_height * DynamicResolution::kSteps + max_height_ - 1) / max_height_;
-    dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps));
+    dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps), D3D12Device::kFramesInFlight);
   }
   api_ = LoadFfxApi();
   if (!api_ || !CreateContext(FfxDebug())) return false;
@@ -320,15 +321,21 @@ bool Upscaler::CreateTargets() {
   return true;
 }
 
-bool Upscaler::BeginFrame(uint64_t frame, uint64_t gpu_busy_ns) {
+bool Upscaler::BeginFrame(uint64_t frame, uint64_t gpu_busy_ns, uint64_t paced_ns) {
   frame_ = frame;
   bool resized = false;
   if (dynamic_) {
     const uint32_t level = dynamic_->level();
-    if (dynamic_->Update(gpu_busy_ns) != level) {
+    if (dynamic_->Update(gpu_busy_ns, paced_ns) != level) {
       SetLevel(dynamic_->level());  // without a phase count, the jitter keeps the old size's
       resized = true;
     }
+    if (dynamic_->out_of_reach())
+      PGR4_WARN_ONCE(
+          "PGR4 native upscaler: {:.1f} ms of GPU time a frame at the least height "
+          "({} rows), over the budget of a frame shown for {:.1f} ms; a lower frame "
+          "rate or frame generation gives each frame more",
+          dynamic_->run_ns() * 1e-6, render_height_, double(paced_ns) * 1e-6);
   }
   const uint64_t now = NowNs();
   frame_ms_ = last_ns_ ? float(double(now - last_ns_) * 1e-6) : 0.0f;

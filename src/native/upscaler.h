@@ -65,13 +65,16 @@ class Upscaler {
 
   // Once per frame before recording it: the frame's jitter, and with
   // --pgr4_native_upscaler_target_fps its render size from the GPU's time (D3D12Device::
-  // gpu_busy_ns). True when the render size changed: the scene's targets take the new scale()
-  // (RenderTargets::SetSceneScale) before the frame's draws.
-  bool BeginFrame(uint64_t frame, uint64_t gpu_busy_ns);
-  // The history is not this scene's (the upscaler was off): the next upscaling starts over.
+  // gpu_busy_ns) and the time in ns of a frame at the pace the display shows them
+  // (DynamicResolution::Update). True when the render size changed: the scene's targets take the
+  // new scale() (RenderTargets::SetSceneScale) before the frame's draws.
+  bool BeginFrame(uint64_t frame, uint64_t gpu_busy_ns, uint64_t paced_ns);
+  // The history is not this scene's (the upscaler was off): the next upscaling starts over, and
+  // the GPU times of the frames before are not counted toward the render size.
   void Reset() {
     reset_ = true;
     last_ns_ = 0;
+    if (dynamic_) dynamic_->Restart();
   }
   // FSR's debug view in place of the upscaled scene (FfxDebug): its inputs (color, depth, motion
   // vectors, reactiveness) and what it made of them, in a grid, and with FSR 4 AMD's watermark.

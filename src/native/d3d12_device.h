@@ -66,6 +66,7 @@ class D3D12Device {
   // vkd3d-proton honours one only through VK_EXT_present_timing. Logs and returns false when
   // the image cannot be created (each frame is then shown once).
   bool set_present_interval(uint32_t refreshes);
+  uint32_t present_interval() const { return vsync_ ? present_interval_ : 1; }
   static constexpr uint32_t kMaxPresentInterval = 3;
   // The most presents a frame takes: its interval, or 2 with a generated frame.
   static constexpr uint32_t kMaxFramePresents = kMaxPresentInterval > 2 ? kMaxPresentInterval : 2;
