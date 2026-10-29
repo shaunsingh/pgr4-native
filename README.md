@@ -26,22 +26,22 @@ data, and the C++ that the build generates from the game's executables must not 
 scripts/fetch-xwin.sh          # MSVC CRT and Windows SDK (accepts Microsoft's license)
 scripts/build.sh --game <disc folder> --update <title update package or folder>
 scripts/play.sh --install      # install the build and write the Steam desktop entries
-scripts/play.sh                # play
+scripts/play.sh                # play (with fgmod installed, FSR is FSR 4 Lite through OptiScaler)
 scripts/play.sh --debug        # play with logs, the frame CSV, marks (F12) and a CPU profile
-scripts/play.sh --fgmod        # play with FSR 4's Lite model through OptiScaler (Insert: its menu)
 scripts/deck-run.sh deck <tag> --refresh 90 --hold 45 --output eDP-1   # scripted race with timings
 ```
 
-After `play.sh --install`, Steam's "Add a Non-Steam Game" lists "PGR4 (native renderer)". Add it
-without a compatibility tool, since the script starts Proton itself. DLC copied off a console as
+After `play.sh --install`, Steam's "Add a Non-Steam Game" lists "PGR4 (native renderer)" and
+"PGR4 (native renderer, debug)". Add them without a compatibility tool, since the script starts
+Proton itself. DLC copied off a console as
 STFS packages goes in the game folder's `Content\`, next to the title update's package.
 
 ## Flags
 
 Settings go on the command line (`--name=value`) or in `pgr4_recompiled.toml` next to the
 executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings. The game's Options
-menu has the port's own Display and Developer pages, which save to `userdata/pgr4_settings.toml`
-over `pgr4_recompiled.toml`.
+menu has the port's own Display, Driving and Developer pages, which save to
+`userdata/pgr4_settings.toml` over `pgr4_recompiled.toml`.
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -82,7 +82,7 @@ over `pgr4_recompiled.toml`.
 | `--pgr4_native_hdr_paper_white=<n>` | 400 | Luminance of SDR white in HDR output, in nits |
 | `--pgr4_60fps` | false | Present every vblank instead of at the game's 30 FPS interval, when the native renderer does not pace the frames |
 | `--pgr4_automatic_keep_revs` | true | The automatic transmission shifts down once the engine would run under 90 % of the car's upshift point in the lower gear (the game's own factor is 0.82 to 0.9), keeping the revs and a turbo's boost up |
-| `--pgr4_headlights=<race\|on\|off>` | race | The lights of every car and bike: as the race's lighting has them, on or off. F5 (`bind_headlights`) switches them from what they show, for the rest of the session |
+| `--pgr4_headlights=<race\|on\|off>` | race | The lights of every car and bike: as the race's lighting has them, on or off. F5 (`bind_headlights`) switches them from what they show, until the setting changes |
 | `--pgr4_game_debug_menus` | false | Show the debug entries of the game's own menus |
 | `--content_root=<dir>` | `<game>\Content` | Folder of content packages (title update, DLC) installed at startup |
 | `--user_language=<n>` | 1 | The game's language: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, 7 Korean, 8 Traditional Chinese, 10 Simplified Chinese, 11 Polish, 12 Russian |

@@ -60,20 +60,21 @@ Windows' display settings the game outputs HDR.
 `pgr4_recompiled.toml` beside the executable holds the settings, one per line. A flag on the
 command line overrides it: in Steam's launch options, `%command% --fullscreen=false` for one.
 
-The game's Options menu has two pages of the port's own. Display holds the renderer (native or
+The game's Options menu has three pages of the port's own. Display holds the renderer (native or
 classic), the aspect ratio, HDR and its brightness, antialiasing (off, MSAA 2x to 8x, or FSR),
 FSR's resolution, dynamic resolution and frame generation, texture filtering, the frame rate
-(the display's refresh rate, a half or a third of it) and the frame latency. Developer holds
-the debug keys, the FSR debug view and the renderer's diagnostics. A choice marked `*` takes
-effect at the next start; the others apply at once. The pages save to
-`userdata/pgr4_settings.toml`, which is read after `pgr4_recompiled.toml`; delete it to go back
-to the release settings.
+(the display's refresh rate, a half or a third of it) and the frame latency. Driving holds the
+automatic gearbox's downshifts (the game's, or earlier) and the lights of every car and bike
+(the race's, on or off). Developer holds the debug keys, the FSR debug view and the renderer's
+diagnostics. A choice marked `*` takes effect at the next start; the others apply at once. The
+pages save to `userdata/pgr4_settings.toml`, which is read after `pgr4_recompiled.toml`; delete
+it to go back to the release settings.
 
-F5 switches the lights of every car on or off, from what the race gives them, until you quit.
-`pgr4_headlights` (`race`, `on` or `off`) sets them for every race. On a Steam Deck, a
-back grip in the shortcut's controller layout can send F5. The automatic gearbox shifts down
-sooner than the original, keeping the engine near the top of its range; set
-`pgr4_automatic_keep_revs = false` for the original's.
+F5 switches the lights of every car on or off, from what the race gives them, until you change
+the Driving page's setting (`pgr4_headlights`: `race`, `on` or `off`), which holds for every
+race. On a Steam Deck, a back grip in the shortcut's controller layout can send F5. The
+automatic gearbox shifts down sooner than the original, keeping the engine near the top of its
+range; the Driving page (or `pgr4_automatic_keep_revs = false`) gives back the original's.
 
 ## Upscaling
 

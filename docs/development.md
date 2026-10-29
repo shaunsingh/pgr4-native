@@ -85,7 +85,12 @@ scripts/deck-run.sh <tree> <tag> --refresh 90 --hold 45 --output eDP-1   # scrip
 `play.sh --install` writes two desktop entries, "PGR4 (native renderer)" and its debugging
 variant, which Steam's "Add a Non-Steam Game" lists. Add them without a compatibility tool, since
 the script starts Proton itself. Everything it uses lives under `~/pgr4-proton/play`, in
-`runtime/`, `prefix/`, `userdata/`, `logs/` and `captures/`.
+`runtime/`, `prefix/`, `userdata/`, `logs/` and `captures/`. With Decky Framegen's `~/fgmod`
+installed, both play `runtime-fgmod/`, a copy of the build with AMD's `amdxcffx64.dll` 4.1.2,
+through fgmod, so OptiScaler is loaded and the upscaler, once the Display page or F7 turns it on,
+is FSR 4's Lite model (`--no-fgmod` plays `runtime/` without it). Loaded with the scene on
+MSAA, OptiScaler costs nothing measurable (`deck-run.sh --fgmod`: 9.39 against 9.43 ms of GPU
+time a frame in St Petersburg).
 
 `deck-run.sh` keeps a prefix of its own and starts each run with a fresh save. It drives a
 scripted route from boot to a race (`scripts/routes/route-stpetersburg.keys` by default, played
@@ -326,14 +331,14 @@ keep their shape (square pixels, centered). The mechanism, all in `pgr4recompile
 
 ## In-game settings
 
-The port's settings are two pages of the game's Options menu, Display and Developer, drawn by
-the game's own UI code. The UI is Lua 5.1: 247 compiled scripts in a `BZUI` archive in the
-image, which `scripts/analysis/lua51_dis.py` extracts and lists. `games/pgr4/src/pgr4_lua.cpp`
-replaces the archive's chunk loader (`sub_82508360`), so the game also loads the scripts in
-`games/pgr4/ui/`: a screen of the port's own, and patches that run after the game's script of
-the same name (the Options menu's entry). They are written in Fennel, which the build compiles
-to Lua with the compiler `scripts/fennel.lock` pins, against the globals listed in
-`games/pgr4/CMakeLists.txt`, so a misspelt name fails the build. `pgr4_settings.cpp` holds the
+The port's settings are three pages of the game's Options menu, Display, Driving and
+Developer, drawn by the game's own UI code. The UI is Lua 5.1: 247 compiled scripts in a `BZUI`
+archive in the image, which `scripts/analysis/lua51_dis.py` extracts and lists.
+`games/pgr4/src/pgr4_lua.cpp` replaces the archive's chunk loader (`sub_82508360`), so the game
+also loads the scripts in `games/pgr4/ui/`: a screen of the port's own, and patches that run
+after the game's script of the same name (the Options menu's entry). They are written in Fennel,
+which the build compiles to Lua with the compiler `scripts/fennel.lock` pins, against the
+globals listed in `games/pgr4/CMakeLists.txt`, so a misspelt name fails the build. `pgr4_settings.cpp` holds the
 options, the cvars each choice sets, and the `Pgr4` table the scripts call.
 
 - **Text.** The game's text functions take a string ID, which its string table
@@ -346,10 +351,11 @@ options, the cvars each choice sets, and the `Pgr4` table the scripts call.
 - **Applying.** A setting the renderer can change while it runs is set at once, through
   `NativeRenderer`'s `Request*` taken at the next frame; the others are marked `*` until the
   next start. Both are saved to `userdata/pgr4_settings.toml`, read after
-  `pgr4_recompiled.toml`.
+  `pgr4_recompiled.toml`. A flag on the command line holds for its session only: the file keeps
+  its own value for that cvar until the menu changes the option.
 - **Testing.** `scripts/routes/route-settings.keys` opens the pages on a fresh profile, changes
-  a start-up and a live setting, saves and reopens. `--pgr4_game_debug_menus` shows the game's
-  own debug entries in its menus.
+  a start-up and a live setting on Display and both of Driving's, saves and reopens.
+  `--pgr4_game_debug_menus` shows the game's own debug entries in its menus.
 
 ## Gearbox
 
@@ -415,8 +421,10 @@ Title Update #2's.
   (vehicle + 1712 is not 0), and `sub_82421E68` and `sub_82448990` choose the lit or unlit lamp
   parts by +53.
 - **Override.** `Pgr4SceneLightsHook`, after the copy's `stb r11,54(r31)` at `0x823CF71C`, sets
-  both flags from `--pgr4_headlights` (race, on or off). `bind_headlights` (F5) sets them to the
-  opposite of what +53 holds and keeps that choice for the rest of the session.
+  both flags from `--pgr4_headlights` (race, on or off), the Driving page's Vehicle lights.
+  `bind_headlights` (F5) sets them to the opposite of what +53 holds and keeps that choice until
+  the setting changes. The hook reads the choice from an atomic, not the cvar's string, which the
+  menu's thread writes.
   `scripts/routes/route-stpetersburg-headlights.keys` switches them on the grid.
 - **Debug variables.** `Vehicle.Lights.OverrideNightLights0` to `7` and `Car.Lights.Enable` are
   registered (36-byte records at 0x82AA7988 and 0x82AB5648, the value at +32), but no game code
