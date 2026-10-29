@@ -85,15 +85,16 @@ or 8). More samples cost GPU time: on a Steam Deck OLED at 90 Hz in the St Peter
 16x anisotropic filtering, 4x averages 89.7 fps with 1% lows of 62.6 fps (GPU 86 % busy), and 8x
 about 88 fps with 1% lows near 47 fps. With
 `pgr4_native_upscaler = true` in `pgr4_recompiled.toml`, AMD's FidelityFX Super Resolution
-antialiases the scene instead and upscales it to 1280x720. The scene renders at
-`pgr4_native_upscaler_width` x `pgr4_native_upscaler_height`:
+antialiases the scene instead and upscales it to the frame's 1280x800. The scene renders at
+`pgr4_native_upscaler_width` x `pgr4_native_upscaler_height` (the Display settings' FSR
+resolution):
 
 | Size | FSR's name for it |
 |---|---|
-| 1280x720 (default) | Native AA: antialiasing only |
-| 853x480 | Quality |
-| 752x423 | Balanced |
-| 640x360 | Performance |
+| 1280x800 (default) | Native AA: antialiasing only |
+| 853x533 | Quality |
+| 753x471 | Balanced |
+| 640x400 | Performance |
 
 With `pgr4_native_upscaler_target_fps` set (90 for the Steam Deck OLED, which the Display
 settings' Dynamic resolution sets), the upscaler starts at that size and lowers it, down to a
