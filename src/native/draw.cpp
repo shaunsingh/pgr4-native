@@ -3255,6 +3255,36 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
 }
 
 // UpdateSystemConstantValues, host render targets, no ROV.
+namespace {
+
+// The range of a color render target format, {low color, low alpha, high color, high alpha}, that
+// the translator clamps the color to before blending (patches/0053) as the EDRAM does, from
+// Xenia's RenderTargetCache::GetPSIColorFormatInfo. NaN bounds leave the color as it is. A 7e3
+// target holds up to 31.875, and its R16G16B16A16_FLOAT host target more.
+std::array<float, 4> ColorClamp(xenos::ColorRenderTargetFormat format) {
+  using F = xenos::ColorRenderTargetFormat;
+  switch (format) {
+    case F::k_8_8_8_8:
+    case F::k_8_8_8_8_GAMMA:
+    case F::k_2_10_10_10:
+    case F::k_2_10_10_10_AS_10_10_10_10:
+      return {0.0f, 0.0f, 1.0f, 1.0f};
+    case F::k_2_10_10_10_FLOAT:
+    case F::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+      return {0.0f, 0.0f, 31.875f, 1.0f};
+    case F::k_16_16:
+    case F::k_16_16_16_16:
+      return {-32.0f, -32.0f, 32.0f, 32.0f};
+    case F::k_16_16_FLOAT:
+    case F::k_16_16_16_16_FLOAT:
+      return {-65504.0f, -65504.0f, 65504.0f, 65504.0f};
+    default:
+      return {NAN, NAN, NAN, NAN};
+  }
+}
+
+}  // namespace
+
 void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterFile& regs,
                                              xenos::PrimitiveType prim, bool polygonal,
                                              xenos::Endian index_endian, const ViewportInfo& vp,
@@ -3353,6 +3383,8 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
       bias -= 5;
     uint32_t bits = uint32_t(0x3F800000 + (bias << 23));
     std::memcpy(&sys.color_exp_bias[i], &bits, 4);
+    const std::array<float, 4> clamp = ColorClamp(ci.color_format);
+    std::memcpy(sys.edram_rt_clamp[i], clamp.data(), sizeof(sys.edram_rt_clamp[i]));
   }
 }
 

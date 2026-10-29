@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shaurizard <contact@nyoom.engineering>
+Date: Thu, 29 Oct 2026 10:12:26 -0400
+Subject: [PATCH 53/53] fix(gpu): clamp RTV-path colors to the render target
+ format's range
+
+On the Xbox 360 the color a pixel shader writes is clamped to the range of
+the render target's format before blending: [0, 31.875] for the 7e3
+formats, [-32, 32] for the 16-bit fixed formats, the half-float range for
+the 16-bit float ones. The ROV path does this with edram_rt_clamp (Xenia,
+RenderTargetCache::GetPSIColorFormatInfo); the RTV path wrote the color
+as it came. Its host targets for 7e3 are R16G16B16A16_FLOAT, which keep
+values up to 65504 and NaNs that the guest's never holds: a value that
+overflows to infinity there turns into NaN when a later blend multiplies
+it by zero, and a resolve of the target, which packs it into 7e3, then
+shows that channel as 0 (magenta and black patches in a game's sky).
+
+The RTV path now clamps each color after the exponent bias as the ROV
+path does, a max and a min against edram_rt_clamp, NaN going to the low
+bound. The D3D12 command processor gets the clamp for both paths, and for
+the formats whose host targets clamp the same way (8888, 2_10_10_10,
+16_16 whose bias maps -32...32 to -1...1) the result does not change.
+The SPIR-V translator's RTV path is left as it was.
+
+Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 797ae87..baa27b4 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3665,11 +3665,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+   for (uint32_t i = 0; i < 4; ++i) {
+     auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
+     color_infos[i] = color_info;
+-    if (edram_rov_used) {
+-      RenderTargetCache::GetPSIColorFormatInfo(
+-          color_info.color_format, (normalized_color_mask >> (i * 4)) & 0b1111, rt_clamp[i][0],
+-          rt_clamp[i][1], rt_clamp[i][2], rt_clamp[i][3], rt_keep_masks[i][0], rt_keep_masks[i][1]);
+-    }
++    // The clamp for both paths, the keep masks for ROV.
++    RenderTargetCache::GetPSIColorFormatInfo(
++        color_info.color_format, (normalized_color_mask >> (i * 4)) & 0b1111, rt_clamp[i][0],
++        rt_clamp[i][1], rt_clamp[i][2], rt_clamp[i][3], rt_keep_masks[i][0], rt_keep_masks[i][1]);
+   }
+ 
+   // Disable depth and stencil if it aliases a color render target (for
+@@ -3909,7 +3908,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+     system_constants_.edram_32bpp_tile_pitch_dwords_scaled = edram_32bpp_tile_pitch_dwords_scaled;
+   }
+ 
+-  // Color exponent bias and ROV render target writing.
++  // Color exponent bias, clamping and ROV render target writing.
+   for (uint32_t i = 0; i < 4; ++i) {
+     reg::RB_COLOR_INFO color_info = color_infos[i];
+     // Exponent bias is in bits 20:25 of RB_COLOR_INFO.
+@@ -3927,6 +3926,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+         rex::memory::Reinterpret<float>(int32_t(0x3F800000 + (color_exp_bias << 23)));
+     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
+     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
++    // Can't do float comparisons here because NaNs would result in always
++    // setting the dirty flag.
++    dirty |= std::memcmp(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float)) != 0;
++    std::memcpy(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float));
+     if (edram_rov_used) {
+       dirty |= system_constants_.edram_rt_keep_mask[i][0] != rt_keep_masks[i][0];
+       system_constants_.edram_rt_keep_mask[i][0] = rt_keep_masks[i][0];
+@@ -3939,11 +3942,6 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+         uint32_t format_flags = RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
+         dirty |= system_constants_.edram_rt_format_flags[i] != format_flags;
+         system_constants_.edram_rt_format_flags[i] = format_flags;
+-        // Can't do float comparisons here because NaNs would result in always
+-        // setting the dirty flag.
+-        dirty |=
+-            std::memcmp(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float)) != 0;
+-        std::memcpy(system_constants_.edram_rt_clamp[i], rt_clamp[i], 4 * sizeof(float));
+         uint32_t blend_factors_ops =
+             regs[reg::RB_BLENDCONTROL::rt_register_indices[i]] & 0x1FFF1FFF;
+         dirty |= system_constants_.edram_rt_blend_factors_ops[i] != blend_factors_ops;
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+index 40ff205..1294267 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+@@ -1548,6 +1548,17 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
+              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
+                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
+                                 dxbc::Src::kXXXX));
++    // Clamp the color to the range of the guest's format before blending, as the ROV path does:
++    // a host target wider than the format, such as R16G16B16A16_FLOAT for 7e3, would otherwise
++    // keep values and NaNs the guest's never holds, and blending can turn an overflow to infinity
++    // into NaNs. NaNs become the low bound (max returns the other operand).
++    dxbc::Src rt_clamp_src(LoadSystemConstant(
++        SystemConstants::Index::kEdramRTClamp,
++        offsetof(SystemConstants, edram_rt_clamp) + sizeof(float) * 4 * i, dxbc::Src::kXYZW));
++    a_.OpMax(dxbc::Dest::R(system_temp_color), dxbc::Src::R(system_temp_color),
++             rt_clamp_src.Swizzle(0b01000000));
++    a_.OpMin(dxbc::Dest::R(system_temp_color), dxbc::Src::R(system_temp_color),
++             rt_clamp_src.Swizzle(0b11101010));
+     if (gamma_render_target_as_unorm8_) {
+       // Convert to gamma space - this is incorrect, since it must be done after
+       // blending on the Xbox 360, but this is just one of many blending issues
+-- 
+2.55.0
+
