@@ -89,7 +89,14 @@ target_include_directories(pgr4_recompiled SYSTEM PRIVATE
     "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/upscalers/include"
     "${PGR4_FIDELITYFX_SDK}/Kits/FidelityFX/framegeneration/include")
 rexglue_setup_target(pgr4_recompiled)
-target_link_libraries(pgr4_recompiled PRIVATE d3d12 dxgi dxguid)
+# d3d12.dll loads at the first D3D12 call, as in Geometry Wars (whose D3D12 is all the SDK's,
+# loaded at run time), not with the executable. OptiScaler (play.sh --fgmod), loaded as dxgi.dll,
+# probes the GPU on a thread of its own with a D3D12 device when d3d12.dll is already loaded as
+# it starts; vkd3d-proton returns that device to the game's D3D12CreateDevice too (one device per
+# adapter), and about one start in four then crashed in vkd3d-proton at the presenter's first
+# CreateGraphicsPipelineState.
+target_link_libraries(pgr4_recompiled PRIVATE d3d12 dxgi dxguid delayimp)
+target_link_options(pgr4_recompiled PRIVATE /DELAYLOAD:d3d12.dll)
 include("${PGR4_NATIVE_SRC}/native/shader_xlate.cmake")
 target_link_libraries(pgr4_recompiled PRIVATE pgr4_shader_xlate)
 # pgr4_recompiled.map: function addresses for profiles of the PE image (scripts/analysis/perf_symbols.py).
