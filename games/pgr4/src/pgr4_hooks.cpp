@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -106,6 +107,71 @@ void Pgr4HudWidgetHook(PPCRegister& r3, PPCRegister& r4, PPCRegister& f2) {
 
 void Pgr4HudWidgetBHook(PPCRegister& r3, PPCRegister& r4, PPCRegister& f2) {
   AnchorHudWidget(r3.u32 + 88, r4.u32, f2.f64);
+}
+
+// A view's projection (sub_822C2410 to sub_826E32F0): vertical field of view f1, aspect f2, for
+// the view r31 of width +8 and height +12. The game's views of its 16:9 frame give the aspect as
+// 16/9: the scene's through their pixel aspect (+440 = height * 16/9 / width), the UI's 3D models
+// (the arcade's medals, the HUD's route arrow) as their width / height, the view constructor's
+// default (sub_822C0078: the frame's size, pixel aspect 1, field of view 1 rad). In a frame
+// FrameHeight() tall the first stretches the scene by height / 720 and the second narrows the
+// models by as much against the 2D UI beside them. Either way a view of the frame's shape keeps
+// the 16:9 frame's horizontal field of view and gains the vertical: the frame's aspect, and
+// tan(fov / 2) scaled by height / 720. Square views (shadows, reflections) keep theirs.
+void Pgr4ViewProjectionHook(PPCRegister& r31, PPCRegister& f1, PPCRegister& f2) {
+  constexpr double kGameAspect = 1280.0 / pgr4::native::kGameFrameHeight;
+  const uint32_t height = FrameHeight();
+  if (height == pgr4::native::kGameFrameHeight) return;
+  const uint32_t w = GuestLoad32(r31.u32 + 8), h = GuestLoad32(r31.u32 + 12);
+  if (!w || !h || uint64_t(w) * height != uint64_t(h) * 1280) return;
+  const double frame_aspect = 1280.0 / height;
+  if (std::abs(f2.f64 - kGameAspect) > 1e-3 && std::abs(f2.f64 - frame_aspect) > 1e-3) return;
+  const double scale = double(height) / pgr4::native::kGameFrameHeight;
+  f1.f64 = double(float(2.0 * std::atan(std::tan(f1.f64 / 2.0) * scale)));
+  f2.f64 = double(float(frame_aspect));
+}
+
+// The UI's clip rectangles, which its renderers hand to SetScissorRect: the 2D items'
+// (sub_824D0840, at 0x824D09B0) and the 3D models' (sub_826400B8, at 0x82640230) take the rows
+// of the UI's 480 to the frame's as y * scale + offset, scale the frame's height / 480 and offset
+// 0 (or, in the game's letterboxed mode, a fraction of both). The HUD's projection maps the 480 to
+// the game's 720 rows centered in a taller frame (FrameHudProjection), so the clips take the
+// 720-row frame's scale and offset, moved down by the rows the frame adds above them.
+namespace {
+void ClipRows(double& scale, double& offset) {
+  const double height = FrameHeight();
+  const double game = pgr4::native::kGameFrameHeight / height;
+  scale = double(float(scale * game));
+  offset = double(float(offset * game + (height - pgr4::native::kGameFrameHeight) / 2));
+}
+}  // namespace
+
+// sub_824D0840 keeps the scale in f25 and at r1 + 160 too, the offset at r1 + 152.
+void Pgr4UiClipHook(PPCRegister& r1, PPCRegister& f25) {
+  if (FrameHeight() == pgr4::native::kGameFrameHeight) return;
+  double offset = GuestLoadF(r1.u32 + 152);
+  ClipRows(f25.f64, offset);
+  GuestStore32(r1.u32 + 160, std::bit_cast<uint32_t>(float(f25.f64)));
+  GuestStore32(r1.u32 + 152, std::bit_cast<uint32_t>(float(offset)));
+}
+
+// sub_826400B8 keeps the scale in f21, the offset in f17.
+void Pgr4UiModelClipHook(PPCRegister& f21, PPCRegister& f17) {
+  if (FrameHeight() == pgr4::native::kGameFrameHeight) return;
+  ClipRows(f21.f64, f17.f64);
+}
+
+// The two renderers' SetScissorRect calls (0x824D11AC, 0x8264047C; r4 = {x1, y1, x2, y2}). A clip
+// to the game's screen edge (row 0 or 480 of the UI's, which the HUD's projection puts at the
+// game's 720 rows' first and last) or beyond it ends at the screen's edge, which in a taller frame
+// is the frame's.
+void Pgr4UiClipRectHook(PPCRegister& r4) {
+  const uint32_t height = FrameHeight();
+  if (height == pgr4::native::kGameFrameHeight) return;
+  const int32_t top = int32_t(height - pgr4::native::kGameFrameHeight) / 2;
+  const int32_t bottom = top + int32_t(pgr4::native::kGameFrameHeight);
+  if (int32_t(GuestLoad32(r4.u32 + 4)) <= top) GuestStore32(r4.u32 + 4, 0);
+  if (int32_t(GuestLoad32(r4.u32 + 12)) >= bottom) GuestStore32(r4.u32 + 12, height);
 }
 
 REXCVAR_DEFINE_BOOL(pgr4_automatic_keep_revs, true, "PGR4",

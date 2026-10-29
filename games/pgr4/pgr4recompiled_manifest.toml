@@ -352,6 +352,42 @@ address = 0x826C8B18
 name = "Pgr4RenderHeightHook"
 registers = ["r4"]
 
+# The UI's clip rectangles (development.md's "Native 16:10"): where the 2D items' renderer
+# (sub_824D0840) and the 3D models' (sub_826400B8) have their rows-to-pixels scale and offset,
+# after both of their paths (the game's letterboxed mode among them) meet, and their calls of
+# SetScissorRect (r4: x1, y1, x2, y2).
+[[entrypoint.midasm_hook]]
+address = 0x824D09B0
+name = "Pgr4UiClipHook"
+registers = ["r1", "f25"]
+
+[[entrypoint.midasm_hook]]
+address = 0x82640230
+name = "Pgr4UiModelClipHook"
+registers = ["f21", "f17"]
+
+[[entrypoint.midasm_hook]]
+address = 0x824D11AC
+name = "Pgr4UiClipRectHook"
+registers = ["r4"]
+
+[[entrypoint.midasm_hook]]
+address = 0x8264047C
+name = "Pgr4UiClipRectHook"
+registers = ["r4"]# A view's perspective (sub_822C2410, view r31): its two calls of the projection builder
+# (sub_826E32F0: vertical field of view f1, aspect f2), with the field of view from the camera
+# object (0x822C24C0) or the view's own (0x822C2540). A view of the frame's shape at the game's
+# 16:9 keeps its horizontal field of view and gains the vertical.
+[[entrypoint.midasm_hook]]
+address = 0x822C24C0
+name = "Pgr4ViewProjectionHook"
+registers = ["r31", "f1", "f2"]
+
+[[entrypoint.midasm_hook]]
+address = 0x822C2540
+name = "Pgr4ViewProjectionHook"
+registers = ["r31", "f1", "f2"]
+
 [[entrypoint.midasm_hook]]
 address = 0x822B3FC8
 name = "Pgr4RenderHeightHook"
