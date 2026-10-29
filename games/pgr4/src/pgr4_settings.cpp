@@ -27,6 +27,9 @@ REXCVAR_DEFINE_BOOL(pgr4_game_debug_menus, false, "PGR4",
 REXCVAR_DECLARE(int32_t, pgr4_render_height);
 REXCVAR_DECLARE(bool, pgr4_native_classic);
 
+// pgr4_hooks.cpp: the scene's lights after pgr4_headlights changed.
+void Pgr4HeadlightsChanged();
+
 namespace pgr4::settings {
 namespace {
 
@@ -225,6 +228,22 @@ std::vector<Option> MakeOptions() {
                [](const std::string& v) { return Assignments{{"pgr4_native_frame_latency", v}}; },
                nullptr,
                native});
+  // Driving: the player's car's automatic (development.md's "Gearbox") and every vehicle's lights.
+  o.push_back({"driving",
+               "automatic",
+               "Automatic downshifts",
+               {{"Game's", "false"}, {"Earlier", "true"}},
+               false,
+               [] { return Flag("pgr4_automatic_keep_revs"); },
+               [](const std::string& v) { return Bool("pgr4_automatic_keep_revs", v); }});
+  o.push_back({"driving",
+               "headlights",
+               "Vehicle lights",
+               {{"Game's", "race"}, {"On", "on"}, {"Off", "off"}},
+               false,
+               [] { return Flag("pgr4_headlights"); },
+               [](const std::string& v) { return Assignments{{"pgr4_headlights", v, true}}; },
+               Pgr4HeadlightsChanged});
   // Developer.
   o.push_back({"developer", "debug_keys", "Debug keys", on_off, false,
                [] { return Flag("pgr4_native_debug_keys"); },
@@ -304,8 +323,8 @@ void Save() {
   std::lock_guard lock(g_mutex);
   if (g_file.empty()) return;
   std::string toml =
-      "# PGR4's settings, written by its Options menu (Display, Developer) and read after\n"
-      "# pgr4_recompiled.toml at start-up. A flag on the command line overrides them.\n";
+      "# PGR4's settings, written by its Options menu (Display, Driving, Developer) and read\n"
+      "# after pgr4_recompiled.toml at start-up. A flag on the command line overrides them.\n";
   const auto saved = Saved();
   for (const Option& o : Options()) {
     const bool chosen = g_pending.contains(o.id);

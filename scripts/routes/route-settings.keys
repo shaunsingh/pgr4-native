@@ -1,5 +1,6 @@
 # route-settings.keys: fresh profile -> Main Menu -> OPTIONS -> the port's DISPLAY page: change
-# a start-up setting (Aspect ratio) and a live one (Antialiasing), save, reopen, then DEVELOPER.
+# a start-up setting (Aspect ratio) and a live one (Antialiasing), save, reopen, then DRIVING:
+# the automatic and the lights, save, reopen, then DEVELOPER.
 # Shots at each step. Fresh save (deck-run.sh starts each run with one).
 30000 return          # skip the intro FMV
 +12000 return         # title: PRESS START -> Gamer Profiles "Welcome to PGR4!"
@@ -44,9 +45,23 @@
 +2500 mark shot display-again
 +300 backspace        # B: leave unchanged
 +4000 mark shot back
++500 d 120            # right: -> DRIVING
++1000 space           # open DRIVING
++2500 mark shot driving
++300 a 120            # Automatic downshifts: left -> Game's
++800 mark shot driving-automatic
++300 s 120            # Vehicle lights
++600 d 120            # -> On, applied at once
++800 mark shot driving-lights
++300 space            # A: apply and save
++4000 mark shot driving-saved
++500 space            # open DRIVING again
++2500 mark shot driving-again
++300 backspace        # B: leave unchanged
++4000 mark shot back2
 +500 d 120            # right: -> DEVELOPER
 +1000 space           # open DEVELOPER
 +2500 mark shot developer
 +300 backspace        # B
-+4000 mark shot back2
++4000 mark shot back3
 +0 e 20000

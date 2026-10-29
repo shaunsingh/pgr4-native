@@ -1,9 +1,10 @@
-;; Options\MainMenu.lua, after the game's: the port's settings pages, Display and Developer,
-;; before Game Credits. Each opens Pgr4\Settings.lua (Screens/Pgr4/Settings.fnl) with its page.
+;; Options\MainMenu.lua, after the game's: the port's settings pages, Display, Driving and
+;; Developer, before Game Credits. Each opens Pgr4\Settings.lua (Screens/Pgr4/Settings.fnl) with its page.
 
 (local display 100)
 (local developer 101)
-(local pages {display :display developer :developer})
+(local driving 102)
+(local pages {display :display driving :driving developer :developer})
 (local credits 7) ; the game's item id of Game Credits
 
 (local game-init Init)
@@ -21,6 +22,9 @@
                      (UIButtons.AddItemHelp menu
                                             (Pgr4.Text "Renderer, antialiasing, resolution and frame pacing"))
                      (set (. GUI.sticker_types display) UIEnums.Stickers.OP_GRAPHICS)
+                     (add-item menu driving (Pgr4.Text "DRIVING") false)
+                     (UIButtons.AddItemHelp menu (Pgr4.Text "The automatic's downshifts and the vehicle lights"))
+                     (set (. GUI.sticker_types driving) UIEnums.Stickers.OP_CONTROLLERS)
                      (add-item menu developer (Pgr4.Text "DEVELOPER") false)
                      (UIButtons.AddItemHelp menu (Pgr4.Text "Debug keys, views and logs"))
                      (set (. GUI.sticker_types developer) UIEnums.Stickers.OP_GENERAL))

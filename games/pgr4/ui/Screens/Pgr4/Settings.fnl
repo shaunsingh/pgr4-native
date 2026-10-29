@@ -6,7 +6,7 @@
 ;; A row with a condition (shown_with) is shown only while the row it depends on shows one of
 ;; its choices, and the rows below it close up.
 
-(local titles {:display "DISPLAY" :developer "DEVELOPER"})
+(local titles {:display "DISPLAY" :driving "DRIVING" :developer "DEVELOPER"})
 
 ;; Where a hidden row is put: inactive, a spinner still draws its label, but the frame clips it.
 (local parked-y 10000)

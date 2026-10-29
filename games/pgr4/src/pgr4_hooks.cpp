@@ -180,7 +180,7 @@ bool Pgr4CarPreviewChainHook(PPCRegister& r3, PPCRegister& r10) {
 REXCVAR_DEFINE_STRING(pgr4_headlights, "race", "PGR4",
                       "The lights of every car and bike: race (as the race's lighting has them, "
                       "the cars' at night and the bikes' by day too), on or off. bind_headlights "
-                      "(F5) switches them from what they show, for the rest of the session");
+                      "(F5) switches them from what they show, until this setting changes");
 
 // The scene's lighting (0x82A1D220) holds the race lighting's UseFogLights, UseCarNightLights and
 // UseBikeNightLights at +52, +53 and +54 (sub_823CF460 copies them in, sub_823CDA80 blends two
@@ -188,15 +188,16 @@ REXCVAR_DEFINE_STRING(pgr4_headlights, "race", "PGR4",
 // lamp parts are chosen by +53 (sub_82421E68, sub_82448990).
 namespace {
 constexpr uint32_t kSceneLighting = 0x82A1D220;
-// bind_headlights' choice: -1 none (pgr4_headlights decides), 0 off, 1 on.
-std::atomic<int> g_headlights_switched{-1};
+// The lights forced: -1 none (the race's), 0 off, 1 on. pgr4_headlights sets it at start-up and
+// from the Options menu, bind_headlights from then on. The hook reads this, not the cvar's
+// string, which the menu's thread may be writing.
+std::atomic<int> g_headlights{-1};
 
 uint8_t* GuestByte(uint32_t a) {
   return rex::system::kernel_memory()->TranslateVirtual<uint8_t*>(a);
 }
 
-int ForcedHeadlights() {
-  if (const int s = g_headlights_switched.load(std::memory_order_relaxed); s >= 0) return s;
+int HeadlightsSetting() {
   const std::string& v = REXCVAR_GET(pgr4_headlights);
   return v == "on" ? 1 : v == "off" ? 0 : -1;
 }
@@ -209,14 +210,23 @@ void ForceHeadlights(uint32_t lighting, int on) {
 
 // After sub_823CF460's stb r11,54(r31): r31 is the lighting just copied in.
 void Pgr4SceneLightsHook(PPCRegister& r31) {
-  if (const int on = ForcedHeadlights(); on >= 0) ForceHeadlights(r31.u32, on);
+  if (const int on = g_headlights.load(std::memory_order_relaxed); on >= 0)
+    ForceHeadlights(r31.u32, on);
 }
 
-void Pgr4RegisterBinds() {
+// "race" leaves the scene's lights as they are until the next race lighting is copied in.
+void Pgr4HeadlightsChanged() {
+  const int on = HeadlightsSetting();
+  g_headlights.store(on, std::memory_order_relaxed);
+  if (on >= 0) ForceHeadlights(kSceneLighting, on);
+}
+
+void Pgr4Setup() {
+  g_headlights.store(HeadlightsSetting(), std::memory_order_relaxed);
   rex::ui::RegisterBind("bind_headlights", "F5",
                         "PGR4: switch the lights of every car and bike on or off", [] {
                           const int on = *GuestByte(kSceneLighting + 53) ? 0 : 1;
-                          g_headlights_switched.store(on, std::memory_order_relaxed);
+                          g_headlights.store(on, std::memory_order_relaxed);
                           ForceHeadlights(kSceneLighting, on);
                           REXLOG_INFO("PGR4: headlights {}", on ? "on" : "off");
                         });
