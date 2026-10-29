@@ -326,24 +326,32 @@ keep their shape (square pixels, centered). The mechanism, all in `pgr4recompile
   target's packed size and would otherwise clamp the scene back to 720.
 - The HUD and the menus share one orthographic projection, vertex constant c45: 640x480 mapped
   into the central 960x720 of the frame (4:3-safe, the pixel scale 1.5). Its y scale and offset
-  are the one 720 the loads cannot reach (the game computes them). The state apply
-  (`sub_82871A20`) uploads it with its block and the dials with calls of their own, all through
-  SetVertexShaderConstantF (`sub_826C9908`), so `Pgr4HudOrthoHook` rewrites the game's own
-  value in the device's shadow constants at the end of that function: the central 960x720 of the
-  taller frame, centered, square pixels. The text items anchor to the frame's edges through the
-  UI scripts' layout; the dials keep their place in the central 960x720.
+  are the one 720 the loads cannot reach (the game computes them). The game writes c45 through
+  SetVertexShaderConstantF (`sub_826C9908`) and also with stores of its own (the text draws,
+  `sub_824D0840`), so the renderer replaces the game's value where every draw flushes it
+  (`GuestStateTracker::FrameHudProjection`, `src/native/d3d_state.cpp`): the central 960x720
+  of the taller frame, centered, square pixels. The UI's space is then 640 by 480 x height / 720
+  rows (533 at 800), its 480 rows in the middle.
+- The UI scripts lay out in that space (`games/pgr4/ui/patches/`). `UIGlobals.fnl` makes the
+  screen and its safe area as tall as the frame, so the menus' items at the edges reach the
+  frame's top and bottom. `GUIBank.fnl` keeps the race's viewports on rows 0 to 480, because
+  the HUD places itself by fractions of their height. `HudHelper.fnl` then moves each HUD item
+  above its viewport's middle up with the frame's top, and each below it down with the bottom.
+  The widgets that place themselves in the game's code (the rev counter: `sub_8245C2A8`,
+  `sub_8245C310`) move the same way through `Pgr4HudWidgetHook` and `Pgr4HudWidgetBHook`.
 - `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
   function; the manifest's comments name the false positives it deliberately skips (VMX byte
   offsets, allocation sizes, string calls, the 1280 widths).
 
 ## In-game settings
 
-The port's settings are three pages of the game's Options menu, Display, Driving and
-Developer, drawn by the game's own UI code. The UI is Lua 5.1: 247 compiled scripts in a `BZUI`
-archive in the image, which `scripts/analysis/lua51_dis.py` extracts and lists.
+The port's settings are three pages, Display, Driving and Developer, in the game's Options
+menu and in the pause menu of a race, drawn by the game's own UI code. The UI is Lua 5.1: 247
+compiled scripts in a `BZUI` archive in the image, which `scripts/analysis/lua51_dis.py`
+extracts and lists.
 `games/pgr4/src/pgr4_lua.cpp` replaces the archive's chunk loader (`sub_82508360`), so the game
 also loads the scripts in `games/pgr4/ui/`: a screen of the port's own, and patches that run
-after the game's script of the same name (the Options menu's entry). They are written in Fennel,
+after the game's script of the same name (the menus' entries). They are written in Fennel,
 which the build compiles to Lua with the compiler `scripts/fennel.lock` pins, against the
 globals listed in `games/pgr4/CMakeLists.txt`, so a misspelt name fails the build. `pgr4_settings.cpp` holds the
 options, the cvars each choice sets, and the `Pgr4` table the scripts call.
@@ -362,6 +370,7 @@ options, the cvars each choice sets, and the `Pgr4` table the scripts call.
   its own value for that cvar until the menu changes the option.
 - **Testing.** `scripts/routes/route-settings.keys` opens the pages on a fresh profile, changes
   a start-up and a live setting on Display and both of Driving's, saves and reopens.
+  `route-pause-settings.keys` opens them from the pause menu of a race.
   `--pgr4_game_debug_menus` shows the game's own debug entries in its menus.
 
 ## Gearbox
