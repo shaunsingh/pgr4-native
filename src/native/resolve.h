@@ -130,11 +130,11 @@ class Resolver {
   // thread (the default) the guest runs on and the copies may hold a later frame.
   void AfterSwap();
 
-  bool Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p);
+  bool Resolve(CommandStream* list, const ResolveParams& p);
   // The copy of `p` into the Resolver's own image instead of p.dest_base, without its clears:
   // the texels the guest's resolve would write there now (frame_generation.h's HUD-less copy of
   // the front buffer). No texture sees it. Returns the image, nullptr on failure (logged).
-  const ResolvedImage* ResolveCopy(ID3D12GraphicsCommandList* list, const ResolveParams& p);
+  const ResolvedImage* ResolveCopy(CommandStream* list, const ResolveParams& p);
 
   // The last resolve into this guest physical address, or nullptr.
   const ResolvedImage* Find(uint32_t guest_phys_base) const;
@@ -174,19 +174,19 @@ class Resolver {
   };
   bool CreatePipelines();
   // Resolve into `own` (ResolveCopy, no clears), or with own null into p.dest_base.
-  bool Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, Destination* own);
+  bool Resolve(CommandStream* list, const ResolveParams& p, Destination* own);
   // The image of `dest` for p's format and size, created if missing.
   Image* GetImage(const ResolveParams& p, Destination& dest);
   // Copies the clipped rectangle `src` of rt to (dx, dy) in an image of `dest` (p.dest_base's or
   // own_), with the alpha of `alpha` when not null (rt is the upscaler's output, alpha the scene
   // target it upscaled).
-  bool Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
-            RenderTarget* alpha, const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest);
+  bool Copy(CommandStream* list, const ResolveParams& p, RenderTarget* rt, RenderTarget* alpha,
+            const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest);
 
   // Oracle dumps and the self test (resolve_debug.cpp), and what they use of resolve.cpp.
   void InitializeOracles(ID3D12CommandQueue* queue);  // as their cvars ask
   // While a dump records, reads back `img`'s texels from (0, 0) to (width, height).
-  void DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p, const ResolvedImage& img,
+  void DumpRecord(CommandStream* list, const ResolveParams& p, const ResolvedImage& img,
                   uint32_t width, uint32_t height);
   void DumpBeginFrame(uint64_t completed_fence);
   static DXGI_FORMAT DestResourceFormat(uint32_t dest_format);  // of the host image

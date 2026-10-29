@@ -62,8 +62,7 @@ void FrameGeneration::OnSwap(uint32_t front_base) {
     front_.reset();
 }
 
-bool FrameGeneration::CopyAtHud(ID3D12GraphicsCommandList* list, uint64_t frame,
-                                const uint32_t* regs) {
+bool FrameGeneration::CopyAtHud(CommandStream* list, uint64_t frame, const uint32_t* regs) {
   using enum rex::graphics::Register;
   const SurfaceRegs& f = front_->regs;
   // RT 0 of the draw is the front buffer's surface (pitch, MSAA, EDRAM data), written.
@@ -153,18 +152,16 @@ bool FrameGeneration::Resize(uint32_t width, uint32_t height, bool hdr, bool deb
   return true;
 }
 
-void FrameGeneration::Prepare(uint64_t frame, ID3D12GraphicsCommandList* list,
-                              const FfxApiResource& depth, const FfxApiResource& motion,
-                              FfxApiDimensions2D render_size, FfxApiFloatCoords2D jitter,
-                              FfxApiFloatCoords2D motion_scale, const FfxCamera& camera,
-                              float frame_ms, bool reset) {
+void FrameGeneration::Prepare(uint64_t frame, CommandStream* list, const FfxApiResource& depth,
+                              const FfxApiResource& motion, FfxApiDimensions2D render_size,
+                              FfxApiFloatCoords2D jitter, FfxApiFloatCoords2D motion_scale,
+                              const FfxCamera& camera, float frame_ms, bool reset) {
   if (!device_.has_swapchain() ||
       !Resize(device_.width(), device_.height(), device_.hdr(), FfxDebug()))
     return;
   ffxDispatchDescFrameGenerationPrepareV2 d = {};
   d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
   d.frameID = frame;
-  d.commandList = list;
   d.renderSize = render_size;
   d.jitterOffset = jitter;
   d.motionVectorScale = motion_scale;
@@ -176,15 +173,17 @@ void FrameGeneration::Prepare(uint64_t frame, ID3D12GraphicsCommandList* list,
   d.viewSpaceToMetersFactor = 1.0f;
   d.depth = depth;
   d.motionVectors = motion;
-  if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK) {
-    PGR4_WARN_ONCE("PGR4 native frame generation: prepare failed ({})", rc);
-    return;
-  }
+  // On the stream's thread, which records the list (as Generate's).
+  list->Call([this, d](CommandStream::List* l) mutable {
+    d.commandList = l;
+    if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK)
+      PGR4_WARN_ONCE("PGR4 native frame generation: prepare failed ({})", rc);
+  });
   prepared_frame_ = frame;
 }
 
-ID3D12Resource* FrameGeneration::Generate(ID3D12GraphicsCommandList* list, uint64_t frame,
-                                          FfxApiRect2D rect, bool hudless) {
+ID3D12Resource* FrameGeneration::Generate(CommandStream* list, uint64_t frame, FfxApiRect2D rect,
+                                          bool hudless) {
   ffxConfigureDescFrameGeneration c = {};
   c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
   c.frameGenerationEnabled = true;
@@ -196,7 +195,6 @@ ID3D12Resource* FrameGeneration::Generate(ID3D12GraphicsCommandList* list, uint6
     c.HUDLessColor = ffxApiGetResourceDX12(hudless_.Get(), FFX_API_RESOURCE_STATE_PRESENT);
   ffxDispatchDescFrameGeneration d = {};
   d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
-  d.commandList = list;
   d.presentColor = ffxApiGetResourceDX12(image_.Get(), FFX_API_RESOURCE_STATE_PRESENT);
   d.outputs[0] = ffxApiGetResourceDX12(output_.Get(), FFX_API_RESOURCE_STATE_PRESENT);
   d.numGeneratedFrames = 1;
@@ -205,12 +203,15 @@ ID3D12Resource* FrameGeneration::Generate(ID3D12GraphicsCommandList* list, uint6
   d.minMaxLuminance[1] = device_.hdr_peak_nits();
   d.generationRect = rect;
   d.frameID = frame;
-  ffxReturnCode_t rc = api_->configure(&context_, &c.header);
-  if (rc == FFX_API_RETURN_OK) rc = api_->dispatch(&context_, &d.header);
-  if (rc != FFX_API_RETURN_OK) {
-    PGR4_WARN_ONCE("PGR4 native frame generation: ffxDispatch failed ({})", rc);
-    return nullptr;
-  }
+  // On the stream's thread, which records the list: a failure leaves the output unwritten, and
+  // shows from the next frame on.
+  list->Call([this, c, d](CommandStream::List* l) mutable {
+    d.commandList = l;
+    ffxReturnCode_t rc = api_->configure(&context_, &c.header);
+    if (rc == FFX_API_RETURN_OK) rc = api_->dispatch(&context_, &d.header);
+    if (rc != FFX_API_RETURN_OK)
+      PGR4_WARN_ONCE("PGR4 native frame generation: ffxDispatch failed ({})", rc);
+  });
   return output_.Get();
 }
 

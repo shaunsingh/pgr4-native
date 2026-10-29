@@ -4,6 +4,7 @@
 
 #include "clock.h"
 #include "gpu_timer.h"
+#include "log.h"
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -63,6 +64,7 @@ pD3DCompile D3DCompiler() {
 
 D3D12Device::~D3D12Device() {
   WaitIdle();
+  stream_.Stop();
   if (HWND h = hwnd_.load()) PostMessageW(h, WM_CLOSE, 1, 0);
   if (window_thread_.joinable()) window_thread_.join();
 }
@@ -193,8 +195,9 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
           "CreateFence(idle)"))
     return false;
   fence_event_ = CreateAutoResetEvent();
+  stream_event_ = CreateAutoResetEvent();
   idle_event_ = CreateAutoResetEvent();
-  if (!fence_event_ || !idle_event_) {
+  if (!fence_event_ || !stream_event_ || !idle_event_) {
     REXLOG_ERROR("PGR4 native: CreateEvent failed: error {}", GetLastError());
     return false;
   }
@@ -208,6 +211,7 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
              "CreateCommandList"))
     return false;
   list_->SetName(L"pgr4 native frame");
+  stream_.Start(list_.Get(), L"PGR4 native list");
   if (!CreateBusyTimer()) return false;
   StampBusy();
 
@@ -230,6 +234,7 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
 }
 
 bool D3D12Device::AttachSwapchain() {
+  stream_.Sync();  // the swapchain is made on the queue the stream's thread submits to
   RECT r = {};
   GetClientRect(game_window_, &r);
   width_ = uint32_t((std::max)(LONG(64), r.right - r.left));
@@ -389,6 +394,7 @@ bool D3D12Device::CreateHeldImage() {
 
 void D3D12Device::WaitFence(uint64_t value) {
   if (fence_->GetCompletedValue() >= value) return;
+  stream_.Flush();  // the value's Signal, if the stream holds it
   fence_->SetEventOnCompletion(value, fence_event_.get());
   WaitForSingleObject(fence_event_.get(), INFINITE);
 }
@@ -397,6 +403,7 @@ void D3D12Device::WaitIdle() {
   // A fence of its own: the frame fence's next value belongs to the frame still being recorded,
   // whose resources would count as done before it is submitted.
   if (!queue_ || !idle_fence_ || !idle_event_) return;
+  stream_.Sync();
   const uint64_t v = ++idle_fence_value_;
   if (FAILED(queue_->Signal(idle_fence_.Get(), v)) || idle_fence_->GetCompletedValue() >= v) return;
   idle_fence_->SetEventOnCompletion(v, idle_event_.get());
@@ -406,7 +413,7 @@ void D3D12Device::WaitIdle() {
 bool D3D12Device::EnableGpuTimer() {
   auto timer = std::make_unique<GpuTimer>();
   if (!timer->Initialize(device_.Get(), queue_.Get(), kFramesInFlight)) return false;
-  timer->BeginFrame(list_.Get(), slot_);
+  timer->BeginFrame(&stream_, slot_);
   gpu_timer_ = std::move(timer);
   return true;
 }
@@ -426,8 +433,8 @@ bool D3D12Device::CreateBusyTimer() {
 }
 
 void D3D12Device::StampBusy() {
-  list_->EndQuery(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                  slot_ * kBusySpans * 2 + busy_stamps_[slot_]++);
+  stream_.EndQuery(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                   slot_ * kBusySpans * 2 + busy_stamps_[slot_]++);
 }
 
 void D3D12Device::ReadBusy() {
@@ -445,53 +452,43 @@ void D3D12Device::ReadBusy() {
   gpu_busy_ns_ = uint64_t(double(ticks) * busy_ns_per_tick_);
 }
 
-bool D3D12Device::OpenList() {
-  const uint64_t t0 = NowNs();
-  WaitFence(slot_fence_[slot_]);
-  end_frame_times_.fence_ns = NowNs() - t0;
-  ReadBusy();
-  if (Failed(allocators_[slot_]->Reset(), "CommandAllocator::Reset") ||
-      Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
-    return false;
-  StampBusy();
-  if (gpu_timer_) gpu_timer_->BeginFrame(list_.Get(), slot_);
-  return true;
-}
-
-bool D3D12Device::CloseAndExecute(std::span<ID3D12CommandList* const> first) {
-  if (Failed(list_->Close(), "CommandList::Close")) return false;
+bool D3D12Device::ExecuteLists(List* list, std::span<ID3D12CommandList* const> first) {
+  if (Failed(list->Close(), "CommandList::Close")) return false;
   submit_lists_.assign(first.begin(), first.end());
-  submit_lists_.push_back(list_.Get());
-  // The constant uploads are streaming stores, which are weakly ordered: make them visible
-  // before the GPU can read them.
-  simde_mm_sfence();
+  submit_lists_.push_back(list);
   queue_->ExecuteCommandLists(UINT(submit_lists_.size()), submit_lists_.data());
   return true;
 }
 
 bool D3D12Device::Submit(std::span<ID3D12CommandList* const> first) {
-  if (gpu_timer_) gpu_timer_->Pass(list_.Get(), GpuTimer::KeySubmit());
+  if (stream_failed_.load(std::memory_order_acquire)) return false;
+  if (gpu_timer_) gpu_timer_->Pass(&stream_, GpuTimer::KeySubmit());
   // Room for this submission's end, the next one's start and the frame's end.
   const bool timed = busy_stamps_[slot_] + 3 <= kBusySpans * 2;
   if (timed) StampBusy();
-  // A list may be reset while its submission runs; the allocator only once the frame's fence
-  // completed (OpenList).
-  if (!CloseAndExecute(first) ||
-      Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset"))
-    return false;
+  stream_.Call([this, lists = std::vector<ID3D12CommandList*>(first.begin(), first.end()),
+                slot = slot_](List* list) {
+    if (stream_failed_.load(std::memory_order_relaxed)) return;
+    // A list may be reset while its submission runs; the allocator only once the frame's fence
+    // completed (FinishFrame).
+    if (!ExecuteLists(list, lists) ||
+        Failed(list->Reset(allocators_[slot].Get(), nullptr), "CommandList::Reset"))
+      stream_failed_.store(true, std::memory_order_release);
+  });
+  stream_.Flush();
   if (timed) StampBusy();
   return true;
 }
 
-void D3D12Device::CopyToBackBuffer(ID3D12Resource* image) {
+void D3D12Device::CopyToBackBuffer(List* list, ID3D12Resource* image) {
+  ID3D12Resource* const back = back_buffers_[swapchain_->GetCurrentBackBufferIndex()].Get();
   D3D12_RESOURCE_BARRIER bs[2] = {
       TransitionBarrier(image, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-      TransitionBarrier(back_buffers_[back_index_].Get(), D3D12_RESOURCE_STATE_PRESENT,
-                        D3D12_RESOURCE_STATE_COPY_DEST)};
-  list_->ResourceBarrier(2, bs);
-  list_->CopyResource(back_buffers_[back_index_].Get(), image);
+      TransitionBarrier(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)};
+  list->ResourceBarrier(2, bs);
+  list->CopyResource(back, image);
   for (D3D12_RESOURCE_BARRIER& b : bs) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-  list_->ResourceBarrier(2, bs);
+  list->ResourceBarrier(2, bs);
 }
 
 bool D3D12Device::Present() {
@@ -503,47 +500,83 @@ bool D3D12Device::Present() {
   return false;
 }
 
-bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
+void D3D12Device::FinishFrame(List* list, const FrameEnd& f) {
+  if (stream_failed_.load(std::memory_order_relaxed)) return;
   const uint64_t t0 = NowNs();
-  const bool shown = swapchain_ && present;
-  ID3D12Resource* const generated = std::exchange(generated_frame_, nullptr);
-  ID3D12Resource* const frame_image = std::exchange(frame_image_, nullptr);
-  ID3D12Resource* const image = frame_image ? frame_image : held() ? held_image_.Get() : nullptr;
-  // The frame's presents: the back buffer it drew into; or the image it drew into, copied into a
-  // back buffer for each: after the generated frame, or present_interval_ times.
-  const uint32_t presents = !shown                  ? 0
-                            : generated             ? 2
-                            : image && !frame_image ? present_interval_
-                                                    : 1;
-  if (shown && image) CopyToBackBuffer(generated ? generated : image);
-  if (gpu_timer_) gpu_timer_->EndFrame(list_.Get());
-  StampBusy();
-  list_->ResolveQueryData(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * kBusySpans * 2,
-                          busy_stamps_[slot_], busy_readback_.Get(),
-                          uint64_t(slot_) * kBusySpans * 2 * 8);
-  if (!CloseAndExecute(first)) return false;
-  const uint64_t t1 = NowNs();
-  bool ok = !shown || Present();
-  for (uint32_t i = 1; ok && i < presents; ++i) {
-    back_index_ = swapchain_->GetCurrentBackBufferIndex();
-    ok = !Failed(list_->Reset(allocators_[slot_].Get(), nullptr), "CommandList::Reset");
-    if (ok) CopyToBackBuffer(image);
-    ok = ok && CloseAndExecute({}) && Present();
+  if (f.presents && f.image) {
+    CopyToBackBuffer(list, f.generated ? f.generated : f.image);
+  } else if (f.presents && f.drawn != swapchain_->GetCurrentBackBufferIndex()) {
+    PGR4_LOG_FIRST(1, ERROR,
+                   "PGR4 native: the frame drew into back buffer {}, the swapchain's is {}",
+                   f.drawn, swapchain_->GetCurrentBackBufferIndex());
   }
-  end_frame_times_.submit_ns = t1 - t0;
-  end_frame_times_.present_ns = NowNs() - t1;
-  if (!ok) return false;
-  end_frame_times_.presented = shown;
-  end_frame_times_.frame_presents = presents;
-  end_frame_times_.presents += end_frame_times_.frame_presents;
-  uint64_t v = next_fence_++;
-  if (Failed(queue_->Signal(fence_.Get(), v), "CommandQueue::Signal")) return false;
-  slot_fence_[slot_] = v;
-  if (REXCVAR_GET(pgr4_native_gpu_serialize)) WaitFence(v);
-  slot_ = (slot_ + 1) % kFramesInFlight;
-  if (swapchain_) back_index_ = swapchain_->GetCurrentBackBufferIndex();
-  if (!FollowWindowSize()) return false;
-  return OpenList();
+  bool ok = ExecuteLists(list, f.first);
+  const uint64_t t1 = NowNs();
+  ok = ok && (!f.presents || Present());
+  for (uint32_t i = 1; ok && i < f.presents; ++i) {
+    ok = !Failed(list->Reset(allocators_[f.slot].Get(), nullptr), "CommandList::Reset");
+    if (ok) CopyToBackBuffer(list, f.image);
+    ok = ok && ExecuteLists(list, {}) && Present();
+  }
+  submit_ns_.store(t1 - t0, std::memory_order_relaxed);
+  present_ns_.store(NowNs() - t1, std::memory_order_relaxed);
+  ok = ok && !Failed(queue_->Signal(fence_.Get(), f.fence), "CommandQueue::Signal");
+  // The next frame's list, on its slot's allocator once the GPU finished the slot's last frame.
+  if (ok && fence_->GetCompletedValue() < f.next_slot_fence) {
+    const uint64_t w0 = NowNs();
+    fence_->SetEventOnCompletion(f.next_slot_fence, stream_event_.get());
+    WaitForSingleObject(stream_event_.get(), INFINITE);
+    stream_wait_ns_.fetch_add(NowNs() - w0, std::memory_order_relaxed);
+  }
+  ok = ok && !Failed(allocators_[f.next_slot]->Reset(), "CommandAllocator::Reset") &&
+       !Failed(list->Reset(allocators_[f.next_slot].Get(), nullptr), "CommandList::Reset");
+  if (!ok) stream_failed_.store(true, std::memory_order_release);
 }
 
+bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
+  if (stream_failed_.load(std::memory_order_acquire)) return false;
+  const bool shown = swapchain_ && present;
+  FrameEnd f;
+  f.first.assign(first.begin(), first.end());
+  f.generated = std::exchange(generated_frame_, nullptr);
+  ID3D12Resource* const frame_image = std::exchange(frame_image_, nullptr);
+  f.image = frame_image ? frame_image : held() ? held_image_.Get() : nullptr;
+  // The frame's presents: the back buffer it drew into; or the image it drew into, copied into a
+  // back buffer for each: after the generated frame, or present_interval_ times.
+  f.presents = !shown ? 0 : f.generated ? 2 : f.image && !frame_image ? present_interval_ : 1;
+  f.drawn = back_index_;
+  if (gpu_timer_) gpu_timer_->EndFrame(&stream_);
+  StampBusy();
+  stream_.ResolveQueryData(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * kBusySpans * 2,
+                           busy_stamps_[slot_], busy_readback_.Get(),
+                           uint64_t(slot_) * kBusySpans * 2 * 8);
+  f.fence = next_fence_++;
+  f.slot = slot_;
+  f.next_slot = (slot_ + 1) % kFramesInFlight;
+  f.next_slot_fence = slot_fence_[f.next_slot];
+  slot_fence_[slot_] = f.fence;
+  // Each Present takes the next back buffer (flip model).
+  back_index_ = (back_index_ + f.presents) % kBackBuffers;
+  end_frame_times_.presented = shown;
+  end_frame_times_.frame_presents = f.presents;
+  end_frame_times_.presents += f.presents;
+  stream_.Call([this, f = std::move(f)](List* list) { FinishFrame(list, f); });
+  stream_.Flush();
+  end_frame_times_.submit_ns = submit_ns_.load(std::memory_order_relaxed);
+  end_frame_times_.present_ns = present_ns_.load(std::memory_order_relaxed);
+  end_frame_times_.stream_ns = stream_.TakeBusyNs();
+  end_frame_times_.stream_wait_ns = stream_wait_ns_.exchange(0, std::memory_order_relaxed);
+  if (REXCVAR_GET(pgr4_native_gpu_serialize)) WaitFence(slot_fence_[slot_]);
+  slot_ = (slot_ + 1) % kFramesInFlight;
+  if (!FollowWindowSize()) return false;
+  // The next frame's slot: its upload memory and timestamps are free once the GPU finished the
+  // slot's last frame.
+  const uint64_t t0 = NowNs();
+  WaitFence(slot_fence_[slot_]);
+  end_frame_times_.fence_ns = NowNs() - t0;
+  ReadBusy();
+  StampBusy();
+  if (gpu_timer_) gpu_timer_->BeginFrame(&stream_, slot_);
+  return !stream_failed_.load(std::memory_order_acquire);
+}
 }  // namespace pgr4::native

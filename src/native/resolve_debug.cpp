@@ -91,8 +91,8 @@ void Resolver::InitializeOracles(ID3D12CommandQueue* queue) {
 // ---------------------------------------------------------------------------------------------
 // Oracle dumps
 
-void Resolver::DumpRecord(ID3D12GraphicsCommandList* list, const ResolveParams& p,
-                          const ResolvedImage& img, uint32_t width, uint32_t height) {
+void Resolver::DumpRecord(CommandStream* list, const ResolveParams& p, const ResolvedImage& img,
+                          uint32_t width, uint32_t height) {
   Dump& d = *dump_;
   if (!d.recording) return;
   Dump::Entry e;
@@ -219,6 +219,9 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
              "selftest fence"))
     return false;
   list->Close();
+  // The resolver records into a stream, made on the list while this thread waits (Sync).
+  CommandStream stream;
+  stream.Start(list.Get(), L"PGR4 native resolve self test");
   struct Case {
     const char* name;
     bool depth;
@@ -464,8 +467,8 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
       std::memcpy(cp.color, c.color, sizeof(cp.color));
       cp.depth = c.z;
       cp.stencil = c.stencil;
-      targets_->Clear(list.Get(), p.regs, 1, c.depth, kDestH * 2, cp);
-      bool ok = Resolve(list.Get(), p);
+      targets_->Clear(&stream, p.regs, 1, c.depth, kDestH * 2, cp);
+      bool ok = Resolve(&stream, p);
       const ResolvedImage* img = ok ? Find(p.dest_base) : nullptr;
       const uint32_t bpp = DestBytesPerTexel(c.dest_format);
       const uint32_t w = uint32_t(rx1 - rx0), h = uint32_t(ry1 - ry0);
@@ -484,9 +487,10 @@ bool Resolver::SelfTest(ID3D12CommandQueue* queue) {
           dst.PlacedFootprint.Footprint = {
               k ? DXGI_FORMAT_R32_FLOAT : DestResourceFormat(c.dest_format), kDestW, kDestH, 1,
               row_pitch};
-          list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+          stream.CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
       }
+      stream.Sync();
       list->Close();
       ID3D12CommandList* lists[] = {list.Get()};
       queue->ExecuteCommandLists(1, lists);

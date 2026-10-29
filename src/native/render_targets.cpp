@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace pgr4::native {
 namespace {
@@ -154,8 +155,8 @@ size_t ScaleRects(const RenderTarget& rt, const D3D12_RECT* rects, size_t n, D3D
 }
 
 // One clear call of `v` over `rects` (host pixels; none: the whole target).
-void Record(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
-            const D3D12_RECT* rects, UINT n) {
+void Record(CommandStream* list, RenderTarget* rt, const ClearValue& v, const D3D12_RECT* rects,
+            UINT n) {
   if (rt->depth) {
     RenderTargets::Transition(list, rt, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     list->ClearDepthStencilView(rt->view, D3D12_CLEAR_FLAGS(v.flags), v.depth, v.stencil, n,
@@ -260,8 +261,9 @@ uint32_t RenderTargets::AllocView(bool depth) {
   return i;
 }
 
-void RenderTargets::Retire(ComPtr<ID3D12Resource> resource) {
-  if (resource) retired_.push_back({std::move(resource), frame_fence_});
+void RenderTargets::Retire(ComPtr<ID3D12Resource> resource, uint32_t view_index, bool depth) {
+  if (resource || view_index != UINT32_MAX)
+    retired_.push_back({std::move(resource), frame_fence_, view_index, depth});
 }
 
 bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
@@ -280,31 +282,32 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   const D3D12_RESOURCE_STATES initial =
       rt->depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+  // A view of its own: the old one may be in calls the command stream has not made yet, which
+  // read it then.
+  const uint32_t view_index = AllocView(rt->depth);
+  if (view_index == UINT32_MAX) {
+    REXLOG_ERROR("PGR4 native RT: out of {} views", rt->depth ? "depth" : "color");
+    return false;
+  }
   ComPtr<ID3D12Resource> res;
   HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, initial, nullptr,
                                                 IID_PPV_ARGS(&res));
   if (FAILED(hr)) {
     REXLOG_ERROR("PGR4 native RT: CreateCommittedResource {}x{} fmt {} x{} failed: {:08X}", d.Width,
                  d.Height, int(d.Format), rt->samples, uint32_t(hr));
+    (rt->depth ? free_dsv_ : free_rtv_).push_back(view_index);
     return false;
   }
   if (log_)
     std::fprintf(log_, "rt created %s base %u pitch %u x%u format %d %ux%u%s\n",
                  rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
                  int(rt->view_format), uint32_t(d.Width), d.Height, rt->resource ? " (grown)" : "");
-  Retire(std::move(rt->resource));
+  Retire(std::move(rt->resource), std::exchange(rt->view_index, view_index), rt->depth);
   rt->resource = std::move(res);
   rt->state = initial;
   rt->width = std::max(1u, rt->pitch);
   rt->height = height;
   rt->pending_count = 0;  // a grown target loses the old one's content
-  if (rt->view_index == UINT32_MAX) {
-    rt->view_index = AllocView(rt->depth);
-    if (rt->view_index == UINT32_MAX) {
-      REXLOG_ERROR("PGR4 native RT: out of {} views", rt->depth ? "depth" : "color");
-      return false;
-    }
-  }
   if (rt->depth) {
     D3D12_DEPTH_STENCIL_VIEW_DESC v = {};
     v.Format = rt->view_format;
@@ -391,10 +394,7 @@ RenderTarget* RenderTargets::Get(bool depth, uint32_t surface_info, uint32_t inf
     rt->srv_format = srv;
     rt->stencil_srv_format = stencil_srv;
     rt->view_index = UINT32_MAX;
-    if (!Create(rt, want)) {
-      if (rt->view_index != UINT32_MAX) (depth ? free_dsv_ : free_rtv_).push_back(rt->view_index);
-      return nullptr;
-    }
+    if (!Create(rt, want)) return nullptr;
     targets_.emplace(key, std::move(owned));
   } else {
     rt = it->second.get();
@@ -420,16 +420,15 @@ RenderTarget* RenderTargets::GetDepth(const SurfaceRegs& regs, uint32_t height) 
   return Get(true, regs.surface_info, regs.depth_info, height);
 }
 
-void RenderTargets::Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt,
-                               D3D12_RESOURCE_STATES state) {
+void RenderTargets::Transition(CommandStream* list, RenderTarget* rt, D3D12_RESOURCE_STATES state) {
   if (!rt || rt->state == state) return;
   D3D12_RESOURCE_BARRIER b = TransitionBarrier(rt->resource.Get(), rt->state, state);
   list->ResourceBarrier(1, &b);
   rt->state = state;
 }
 
-bool RenderTargets::Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
-                         uint32_t color_mask, bool depth_used, uint32_t height, BoundTargets* out) {
+bool RenderTargets::Bind(CommandStream* list, const SurfaceRegs& regs, uint32_t color_mask,
+                         bool depth_used, uint32_t height, BoundTargets* out) {
   *out = BoundTargets{};
   const uint32_t samples = HostSamples(regs.surface_info);
   out->samples = samples;
@@ -545,9 +544,8 @@ bool RenderTargets::DecodeClear(const uint8_t* base, const HookArgs& args, Clear
   return true;
 }
 
-void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs,
-                          uint32_t bound_colors, bool depth_bound, uint32_t height,
-                          const ClearParams& p) {
+void RenderTargets::Clear(CommandStream* list, const SurfaceRegs& regs, uint32_t bound_colors,
+                          bool depth_bound, uint32_t height, const ClearParams& p) {
   // What the clear leaves in the EDRAM, in pixels from the surface's base. A whole-surface
   // clear covers the rows of the call's height hint (the target itself may be taller).
   const std::vector<D3D12_RECT>& edram = p.edram_rects.empty() ? p.rects : p.edram_rects;
@@ -588,7 +586,7 @@ void RenderTargets::Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& re
   }
 }
 
-void RenderTargets::Defer(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
+void RenderTargets::Defer(CommandStream* list, RenderTarget* rt, const ClearValue& v,
                           const std::vector<D3D12_RECT>& guest_rects) {
   D3D12_RECT rects[kMaxClearRects];
   const size_t count = ScaleRects(*rt, guest_rects.data(),
@@ -630,7 +628,7 @@ void RenderTargets::DropCovered(RenderTarget* rt, uint32_t flags, const D3D12_RE
   rt->pending_count = kept;
 }
 
-void RenderTargets::Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
+void RenderTargets::Flush(CommandStream* list, RenderTarget* rt) {
   // Neighbours of one value (a tiled clear's tiles) go in one call.
   D3D12_RECT rects[kMaxPendingClears];
   uint32_t calls = 0;
@@ -654,8 +652,7 @@ void RenderTargets::Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
   rt->pending_count = 0;
 }
 
-void RenderTargets::PrepareRead(ID3D12GraphicsCommandList* list, RenderTarget* rt,
-                                const D3D12_RECT& r) {
+void RenderTargets::PrepareRead(CommandStream* list, RenderTarget* rt, const D3D12_RECT& r) {
   if (!rt->depth) SyncEdram(list, rt);
   const D3D12_RECT host = rt->scale.Rect(r);
   if (std::any_of(
@@ -700,7 +697,7 @@ void RenderTargets::DropFills(const RenderTarget& rt, uint32_t rows) {
                fills_.end());
 }
 
-void RenderTargets::SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt) {
+void RenderTargets::SyncEdram(CommandStream* list, RenderTarget* rt) {
   const uint64_t since = rt->fill_seq;
   rt->fill_seq = fill_seq_;
   if (rt->depth || since == fill_seq_) return;
@@ -764,7 +761,12 @@ void RenderTargets::BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t co
   frame_ = frame;
   frame_fence_ = frame_fence;
   retired_.erase(std::remove_if(retired_.begin(), retired_.end(),
-                                [&](const Retired& r) { return r.fence <= completed_fence; }),
+                                [&](const Retired& r) {
+                                  if (r.fence > completed_fence) return false;
+                                  if (r.view_index != UINT32_MAX)
+                                    (r.depth ? free_dsv_ : free_rtv_).push_back(r.view_index);
+                                  return true;
+                                }),
                  retired_.end());
   for (auto it = targets_.begin(); it != targets_.end();) {
     RenderTarget* rt = it->second.get();
@@ -775,8 +777,7 @@ void RenderTargets::BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t co
         std::fprintf(log_, "rt dropped %s base %u pitch %u x%u (last used frame %llu)\n",
                      rt->depth ? "depth" : "color", rt->edram_base, rt->pitch, rt->samples,
                      (unsigned long long)rt->last_frame);
-      Retire(std::move(rt->resource));
-      (rt->depth ? free_dsv_ : free_rtv_).push_back(rt->view_index);
+      Retire(std::move(rt->resource), rt->view_index, rt->depth);
       it = targets_.erase(it);
       for (GetMemo& m : get_memo_) m = {};
     } else {

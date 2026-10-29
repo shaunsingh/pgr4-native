@@ -860,16 +860,15 @@ void Resolver::BeginFrame(uint64_t frame, uint64_t frame_fence, uint64_t complet
   if (dump_) DumpBeginFrame(completed_fence);
 }
 
-bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p) {
+bool Resolver::Resolve(CommandStream* list, const ResolveParams& p) {
   return Resolve(list, p, nullptr);
 }
 
-const ResolvedImage* Resolver::ResolveCopy(ID3D12GraphicsCommandList* list,
-                                           const ResolveParams& p) {
+const ResolvedImage* Resolver::ResolveCopy(CommandStream* list, const ResolveParams& p) {
   return Resolve(list, p, &own_) && own_.current ? &own_.current->view : nullptr;
 }
 
-bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, Destination* own) {
+bool Resolver::Resolve(CommandStream* list, const ResolveParams& p, Destination* own) {
   const bool depth = p.source == 4;
   if (!GetDestStorage(p.dest_format)) return false;
   RenderTarget* rt = depth ? targets_->GetDepth(p.regs, uint32_t(std::max(p.y1, 0)))
@@ -922,7 +921,7 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, 
   return ok;
 }
 
-bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
+bool Resolver::Copy(CommandStream* list, const ResolveParams& p, RenderTarget* rt,
                     RenderTarget* alpha, const D3D12_RECT& src, int32_t dx, int32_t dy,
                     Destination& dest) {
   const bool depth = p.source == 4;

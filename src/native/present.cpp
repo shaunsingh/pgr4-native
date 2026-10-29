@@ -483,7 +483,7 @@ void Presenter::Impl::FinishCapture() {
 
 void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* copy) {
   D3D12Device& d = r.device();
-  ID3D12GraphicsCommandList* list = d.command_list();
+  CommandStream* list = d.command_list();
   ID3D12Device* device = r.d3d12();
 
   const uint32_t tex = swap.texture;

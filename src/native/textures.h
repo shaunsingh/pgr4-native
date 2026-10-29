@@ -22,6 +22,7 @@
 // thread that faults on a watched page.
 #pragma once
 
+#include "command_stream.h"
 #include "resolve.h"  // ResolvedImage
 #include "texture_layout.h"
 #include "upload_pool.h"
@@ -140,8 +141,8 @@ class TextureCache {
   // belongs to (upload buffers are kept until then). captured: the draw's MarkCapture stamp.
   // False: no data, unsupported format, or a D3D12 failure (each logged once per format or
   // reason; the key is remembered and not retried).
-  bool Get(const uint32_t fetch[6], ID3D12GraphicsCommandList* list, uint64_t frame_fence,
-           TextureBinding* out, uint64_t captured = kCapturedNow);
+  bool Get(const uint32_t fetch[6], CommandStream* list, uint64_t frame_fence, TextureBinding* out,
+           uint64_t captured = kCapturedNow);
 
   // In the game, untiling runs on worker threads: Upload records the GPU copies on the frame's
   // list or defers them (CloseUploadLists), and queues the untile into their upload memory
@@ -219,7 +220,7 @@ class TextureCache {
   // Unlinks t from every structure that refers to it, frees its memory and its slot.
   void Destroy(Texture& t);
   // defer: on an upload list instead of `list` (CloseUploadLists); t ends in shader-read state.
-  bool Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence, bool defer);
+  bool Upload(Texture& t, CommandStream* list, uint64_t frame_fence, bool defer);
   // An upload's copies from its upload memory into the texture, one per footprint.
   struct UploadCopies {
     ID3D12Resource* texture = nullptr;
@@ -229,7 +230,9 @@ class TextureCache {
     uint32_t block_width = 1, block_height = 1;
     uint32_t mip_levels = 1;
   };
-  static void RecordCopies(ID3D12GraphicsCommandList* list, const UploadCopies& copies,
+  // On the frame's list (a CommandStream) or an upload list.
+  template <class List>
+  static void RecordCopies(List* list, const UploadCopies& copies,
                            const std::vector<HostSubresource>& footprints);
   // A texture resource in COPY_DEST state, placed in a pooled heap at *placed (kCommitted if it
   // does not fit one or a heap cannot be created); *bytes: its allocation size. small_placement:
@@ -249,14 +252,14 @@ class TextureCache {
   static constexpr uint32_t kMemorySize = (512u << 20);
   // [start, *end) of [start, start + length) within kMemorySize; false if that is empty.
   static bool ClampRange(uint32_t start, uint32_t length, uint32_t* end);
-  bool CopyResolved(Texture& t, ID3D12GraphicsCommandList* list);
+  bool CopyResolved(Texture& t, CommandStream* list);
   // The resolved image CopyResolved copies into t from `image`, or null if its format family
   // does not match.
   ID3D12Resource* ResolvedSource(const Texture& t, const ResolvedImage& image) const;
   // Whether CopyResolved would overwrite every subresource of t in full, so an upload's data
   // would never be read.
   bool ResolvesCoverAll(const Texture& t) const;
-  void Transition(Texture& t, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES to);
+  void Transition(Texture& t, CommandStream* list, D3D12_RESOURCE_STATES to);
   void WatchRange(Texture& t, uint32_t start, uint32_t length);
   // Arms the watches on the guest pages of a texture's base and mips: after its dirty flag is
   // cleared, before its data is read.
@@ -286,15 +289,18 @@ class TextureCache {
   };
   // An untiling thread's upload list: the deferred uploads it untiled since the last
   // CloseUploadLists. Its command allocators are pooled by the frame fence of the lists recorded
-  // on them and reset once the GPU passed it, as Xenia's D3D12CommandProcessor pools its own.
+  // on them and reset once the GPU passed it, as Xenia's D3D12CommandProcessor pools its own; so
+  // are its closed lists, which the device's command stream submits some time after
+  // CloseUploadLists, and which are only reset again once the frame they went with completed.
   // While untiles run only its thread touches it, CloseUploadLists only while none run.
   struct UploadList {
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    template <class T>
+    using Pool = std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<T>>>;  // oldest first
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;                   // open, or null
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;  // the frame's, from the first open
     uint64_t allocator_fence = 0;
-    // (frame fence, allocator), oldest first.
-    std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12CommandAllocator>>> retired;
-    bool open = false;
+    Pool<ID3D12CommandAllocator> retired;
+    Pool<ID3D12GraphicsCommandList> closed;
   };
   // Untiles one job; returns its time in ns.
   static uint64_t RunUntile(const UntileJob& job, std::vector<uint8_t>* scratch);

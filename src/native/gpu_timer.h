@@ -45,14 +45,14 @@ class GpuTimer {
 
   // The frame's command list was opened on allocator `slot`: collects the frame that slot
   // held last (complete, its fence was waited for) and writes the new frame's first timestamp.
-  void BeginFrame(ID3D12GraphicsCommandList* list, uint32_t slot);
+  void BeginFrame(CommandStream* list, uint32_t slot);
   // The commands recorded next belong to pass `key`.
-  void Pass(ID3D12GraphicsCommandList* list, uint64_t key) {
+  void Pass(CommandStream* list, uint64_t key) {
     if (key != current_) Switch(list, key);
     ++frames_[slot_].spans.back().commands;
   }
   // Before the list is closed: the last timestamp, and the copy into the readback slot.
-  void EndFrame(ID3D12GraphicsCommandList* list);
+  void EndFrame(CommandStream* list);
 
   // Pass keys. Draws: render target registers and which targets the draw writes.
   static uint64_t KeyDraw(const uint32_t* regs);
@@ -108,8 +108,8 @@ class GpuTimer {
     uint64_t ticks = 0, spans = 0, commands = 0, position = 0;
   };
 
-  void Switch(ID3D12GraphicsCommandList* list, uint64_t key);
-  void Stamp(ID3D12GraphicsCommandList* list);
+  void Switch(CommandStream* list, uint64_t key);
+  void Stamp(CommandStream* list);
   void Collect(uint32_t slot);
   bool IsSpike(uint64_t ticks);
   void LogSpike(const Frame& f, uint64_t ticks);

@@ -929,8 +929,6 @@ struct DrawRenderer::Impl {
   // D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS and keyed with a zero bias, and draws set it
   // with RSSetDepthBias.
   bool dynamic_depth_bias = false;
-  ComPtr<ID3D12GraphicsCommandList9> list9;
-  ID3D12GraphicsCommandList* list9_of = nullptr;
   std::filesystem::path library_path;
   size_t prewarm_next = 0;  // into store.loaded_pipelines()
   uint32_t prewarm_failed = 0, prewarm_frames = 0;
@@ -1056,9 +1054,8 @@ struct DrawRenderer::Impl {
   std::vector<Snap> snaps;
   uint64_t snap_fence = 0;
   uint32_t snap_pending = 0;  // bit i: listed hash i (bit 31: draw skip_from) still to snapshot
-  void SnapshotTargets(ID3D12GraphicsCommandList* list, const BoundTargets& targets,
-                       uint32_t draw_index);
-  void Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt, const std::string& stem);
+  void SnapshotTargets(CommandStream* list, const BoundTargets& targets, uint32_t draw_index);
+  void Snapshot(CommandStream* list, RenderTarget* rt, const std::string& stem);
   void WriteSnapshots(uint64_t completed_fence);
 
   Impl(NativeRenderer& renderer, DrawRenderer::Stats& s) : r(renderer), stats(s) {}
@@ -1121,7 +1118,7 @@ struct DrawRenderer::Impl {
   struct TextureBindContext {
     const DrawState& s;
     const RegisterFile& regs;
-    ID3D12GraphicsCommandList* list;
+    CommandStream* list;
     TextureCache& texture_cache;
     uint64_t frame_fence;
     uint64_t captured;  // TextureCache::MarkCapture stamp
@@ -1177,16 +1174,16 @@ struct DrawRenderer::Impl {
   // Gives the shared buffer memory under [start, start + length) if it is reserved. Any thread;
   // the tile mappings are queued ahead of the copies the caller records afterwards.
   bool MapShared(uint32_t start, uint32_t length);
-  void FlushCopies(ID3D12GraphicsCommandList* list);
-  void TransitionShared(ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES to);
+  void FlushCopies(CommandStream* list);
+  void TransitionShared(CommandStream* list, D3D12_RESOURCE_STATES to);
   // Uploads cb.size bytes of cb.last unless cb.gpu is current, and binds it at `root_index`.
-  bool CommitCbv(CachedCbv& cb, uint32_t root_index, ID3D12GraphicsCommandList* list);
+  bool CommitCbv(CachedCbv& cb, uint32_t root_index, CommandStream* list);
   // A motion vector draw's previous float and vertex fetch constants (b5, b6), after its own
   // are committed: the matching draw's of the previous frame (MotionHistory), or its own.
   void BindPreviousConstants(const DrawState& s, const DxbcShader& vs_generic, const DxbcShader* vs,
-                             ID3D12GraphicsCommandList* list);
+                             CommandStream* list);
   bool UploadCbv(CachedCbv& cb, const void* data, uint32_t size, uint32_t root_index,
-                 ID3D12GraphicsCommandList* list) {
+                 CommandStream* list) {
     if (cb.size != size || !Equal(cb.last, data, size)) {
       std::memcpy(cb.last, data, size);
       cb.size = size;
@@ -1433,7 +1430,7 @@ struct DrawRenderer::Impl {
   std::unique_ptr<AuditJob> audit_job;
   std::deque<std::unique_ptr<AuditJob>> audit_inflight;
   std::vector<ComPtr<ID3D12Resource>> audit_readbacks;  // free, kAuditReadback each
-  void AuditDraw(ID3D12GraphicsCommandList* list, const DrawPrep& prep);
+  void AuditDraw(CommandStream* list, const DrawPrep& prep);
   void CheckAuditJobs(uint64_t completed_fence);
 };
 
@@ -1670,8 +1667,7 @@ void DrawRenderer::Impl::ResetListState() {
   bound_previous_float = bound_previous_fetch = 0;
 }
 
-void DrawRenderer::Impl::TransitionShared(ID3D12GraphicsCommandList* list,
-                                          D3D12_RESOURCE_STATES to) {
+void DrawRenderer::Impl::TransitionShared(CommandStream* list, D3D12_RESOURCE_STATES to) {
   if (shared_state == to) return;
   const D3D12_RESOURCE_BARRIER b = TransitionBarrier(shared.Get(), shared_state, to);
   list->ResourceBarrier(1, &b);
@@ -2018,7 +2014,7 @@ void DrawRenderer::Impl::AuditShader(const ShaderRef& ref, const DxbcShader* sha
                  ref.immediate ? ", immediate" : "", hash, shader->ucode_data_hash());
 }
 
-void DrawRenderer::Impl::AuditDraw(ID3D12GraphicsCommandList* list, const DrawPrep& prep) {
+void DrawRenderer::Impl::AuditDraw(CommandStream* list, const DrawPrep& prep) {
   if (!audit_job) {
     audit_job = std::make_unique<AuditJob>();
     audit_job->frame = r.frame_index();
@@ -2205,7 +2201,7 @@ bool DrawRenderer::Impl::MapShared(uint32_t start, uint32_t length) {
   return true;
 }
 
-void DrawRenderer::Impl::FlushCopies(ID3D12GraphicsCommandList* list) {
+void DrawRenderer::Impl::FlushCopies(CommandStream* list) {
   if (copies.empty()) {
     TransitionShared(list, kSharedReadState);
     return;
@@ -2219,8 +2215,7 @@ void DrawRenderer::Impl::FlushCopies(ID3D12GraphicsCommandList* list) {
   TransitionShared(list, kSharedReadState);
 }
 
-bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
-                                   ID3D12GraphicsCommandList* list) {
+bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index, CommandStream* list) {
   if (!cb.gpu) {
     // Whole float4s (a CBV is read in them; `last` has room). Streaming stores: each upload
     // takes fresh lines that only the GPU reads, so they bypass the caches instead of being
@@ -2245,8 +2240,7 @@ bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
 }
 
 void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcShader& vs_generic,
-                                               const DxbcShader* vs,
-                                               ID3D12GraphicsCommandList* list) {
+                                               const DxbcShader* vs, CommandStream* list) {
   const uint64_t identity = vs_generic.ucode_data_hash() ^
                             (uint64_t(s.index_address) << 32 | s.count) ^
                             (uint64_t(s.primitive) << 58);
@@ -3402,7 +3396,7 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
 }
 
 void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
-  ID3D12GraphicsCommandList* list = r.command_list();
+  CommandStream* list = r.command_list();
   SyncListFrame();
   if (prep && prep->regs_hash[0]) {
     uint64_t now[5];
@@ -3804,12 +3798,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     }
   }
   if (dynamic_depth_bias && (depth_bias != bound_depth_bias || slope_bias != bound_slope_bias)) {
-    if (list9_of != list) {
-      list9.Reset();
-      list->QueryInterface(IID_PPV_ARGS(&list9));
-      list9_of = list;
-    }
-    if (list9) list9->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
+    list->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
     bound_depth_bias = depth_bias;
     bound_slope_bias = slope_bias;
   }
@@ -3922,8 +3911,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   profile::Mark(profile::kRecord);
 }
 
-void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list,
-                                         const BoundTargets& targets, uint32_t draw_index) {
+void DrawRenderer::Impl::SnapshotTargets(CommandStream* list, const BoundTargets& targets,
+                                         uint32_t draw_index) {
   const std::string stem =
       (std::filesystem::path(REXCVAR_GET(pgr4_native_capture_dir)) / "snap-f").string() +
       std::to_string(r.frame_index()) + "-d" + std::to_string(draw_index);
@@ -3936,8 +3925,7 @@ void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list,
   ResetListState();  // the barriers moved the targets out of their bound states
 }
 
-void DrawRenderer::Impl::Snapshot(ID3D12GraphicsCommandList* list, RenderTarget* rt,
-                                  const std::string& stem) {
+void DrawRenderer::Impl::Snapshot(CommandStream* list, RenderTarget* rt, const std::string& stem) {
   if (!rt || rt->samples != 1) return;
   const D3D12_RESOURCE_DESC desc = rt->resource->GetDesc();
   Snap s;
@@ -4069,7 +4057,7 @@ void DrawRenderer::BeforeSubmit() {
                       D3D12_RESOURCE_STATE_COPY_DEST, "coherency readback", &job->readback))
       return;
   }
-  ID3D12GraphicsCommandList* list = m.r.command_list();
+  CommandStream* list = m.r.command_list();
   m.SyncListFrame();  // a frame without draws
   m.TransitionShared(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
   uint64_t offset = 0;

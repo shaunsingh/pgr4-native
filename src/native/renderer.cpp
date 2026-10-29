@@ -390,6 +390,8 @@ NativeRenderer* NativeRenderer::Get() {
 }
 
 NativeRenderer::~NativeRenderer() {
+  // The lists in flight and the calls the command stream holds use the modules' objects.
+  if (device_) device_->WaitIdle();
   if (switch_bound_) rex::ui::UnregisterBind("bind_renderer_switch");
   if (upscaler_bound_) {
     rex::ui::UnregisterBind("bind_upscaler");
@@ -557,7 +559,7 @@ bool NativeRenderer::Initialize() {
 
 ID3D12Device* NativeRenderer::d3d12() const { return device_->device(); }
 ID3D12CommandQueue* NativeRenderer::command_queue() const { return device_->command_queue(); }
-ID3D12GraphicsCommandList* NativeRenderer::command_list() const { return device_->command_list(); }
+CommandStream* NativeRenderer::command_list() const { return device_->command_list(); }
 uint64_t NativeRenderer::frame_fence() const { return device_->frame_fence(); }
 
 void NativeRenderer::SwitchUpscaler(bool on) {
@@ -1151,6 +1153,8 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   stats_.swap_submit_ns = et.submit_ns;
   stats_.swap_present_ns = et.present_ns;
   stats_.swap_fence_ns = et.fence_ns;
+  stats_.stream_ns = et.stream_ns;
+  stats_.stream_wait_ns = et.stream_wait_ns;
   stats_.present = et.presented ? et.presents : 0;
   if (pacer_ && et.presented)
     pacer_->Presented(fence, et.frame_presents);
@@ -1263,6 +1267,8 @@ void NativeRenderer::AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bo
       Uint("present", s.present),
       Fix3("gpu_busy_ms", device_->gpu_busy_ns() / 1e6),
       Uint("render_height", upscaler() ? upscaler()->render_height() : 0),
+      Fix1("stream_us", s.stream_ns / 1000.0),
+      Fix1("stream_wait_us", s.stream_wait_ns / 1000.0),
   };
   AppendCsvCells(cells, header, false, line);
 }

@@ -21,12 +21,13 @@
 #include <thread>
 #include <vector>
 
-REXCVAR_DEFINE_STRING(pgr4_native_glitch_catch, "", "PGR4 native",
-                      "Keep the frames shown, at half size and after the gamma ramp, in memory "
-                      "and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump away "
-                      "from the image and back, and <prefix>mark-<frame>.rec with the last 5 s "
-                      "at a mark (F12, with --pgr4_native_capture_dir); scripts/analysis/flicker.py "
-                      "and marks.py show them");
+REXCVAR_DEFINE_STRING(
+    pgr4_native_glitch_catch, "", "PGR4 native",
+    "Keep the frames shown, at half size and after the gamma ramp, in memory "
+    "and write <this prefix>glitch-<frame>.rec when 1 to 4 frames jump away "
+    "from the image and back, and <prefix>mark-<frame>.rec with the last 5 s "
+    "at a mark (F12, with --pgr4_native_capture_dir); scripts/analysis/flicker.py "
+    "and marks.py show them");
 
 namespace pgr4::native::present_debug {
 
@@ -415,8 +416,8 @@ void GlitchCatch::Collect(uint32_t slot) {
   g.Push(g.slots[slot], slot);
 }
 
-void GlitchCatch::Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, uint32_t slot,
-                         float iw, float ih, uint32_t ramp_mode, uint64_t frame) {
+void GlitchCatch::Record(ID3D12Device* device, CommandStream* list, uint32_t slot, float iw,
+                         float ih, uint32_t ramp_mode, uint64_t frame) {
   State& g = *state_;
   if (g.failed) return;
   const uint32_t w = uint32_t(iw) / 2, h = uint32_t(ih) / 2;
@@ -473,7 +474,7 @@ struct LumaProbeReadback::State {
 LumaProbeReadback::LumaProbeReadback() = default;
 LumaProbeReadback::~LumaProbeReadback() = default;
 
-void LumaProbeReadback::Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, uint32_t slot,
+void LumaProbeReadback::Record(ID3D12Device* device, CommandStream* list, uint32_t slot,
                                ID3D12Resource* texture, uint32_t width, uint32_t height,
                                uint32_t mapping, bool rgb10a2, uint64_t frame) {
   using S = State;

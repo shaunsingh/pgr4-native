@@ -33,6 +33,7 @@
 #include <thread>
 #include <vector>
 
+#include "command_stream.h"
 #include "win_handle.h"
 
 namespace pgr4::native {
@@ -87,7 +88,10 @@ class D3D12Device {
 
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* command_queue() const { return queue_.Get(); }
-  ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
+  // The frame's command list, recorded on the stream's thread (command_stream.h). The queue takes
+  // no work but the stream's from the thread recording: what it submits runs after the calls
+  // recorded before it, once the stream has made them.
+  CommandStream* command_list() { return &stream_; }
 
   // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV, or the
   // frame's image (SetFrameImage, or the present interval's).
@@ -116,7 +120,8 @@ class D3D12Device {
   // With hdr(): the luminance, in nits, that the presented image peaks at (the HDR10 metadata).
   float hdr_peak_nits() const { return hdr_peak_nits_; }
 
-  // Fence value EndFrame signals for the frame being recorded; last value the GPU reached.
+  // Fence value EndFrame signals for the frame being recorded; last value the GPU reached. The
+  // stream's thread signals it after the frame's calls, so a wait (WaitFence) flushes the stream.
   uint64_t frame_fence() const { return next_fence_; }
   uint64_t completed_fence() const { return fence_->GetCompletedValue(); }
   ID3D12Fence* fence() const { return fence_.Get(); }
@@ -128,13 +133,14 @@ class D3D12Device {
   // Closes and submits the frame's command list (the caller recorded into the back buffer;
   // EndFrame adds no barriers but the frame image's copy), presents (unless `present` is false or
   // there is no swapchain: the window keeps the previous frame; after the generated frame, if
-  // any), signals the frame fence, follows the game window's
-  // client size, then waits for the slot kFramesInFlight frames back and opens the next frame's
-  // list.
+  // any), signals the frame fence and opens the next frame's list, all on the stream's thread
+  // (FinishFrame); then follows the game window's client size and waits for the slot
+  // kFramesInFlight frames back.
   // `first`: closed lists that run ahead of the frame's in the same ExecuteCommandLists, for
   // work that would otherwise split its render passes (TextureCache::CloseUploadLists); the
   // frame's fence covers them, GpuTimer passes do not.
-  // Returns false once the device or swapchain failed (logged once); the caller stops.
+  // Returns false once the device or swapchain failed (logged once; on the stream's thread, seen
+  // at the next EndFrame or Submit); the caller stops.
   bool EndFrame(bool present = true, std::span<ID3D12CommandList* const> first = {});
   // Submits what the frame recorded so far (after `first`, as in EndFrame) and continues it in
   // the same list, reset on the frame's allocator, so the GPU starts on it while the rest of the
@@ -144,9 +150,13 @@ class D3D12Device {
   bool Submit(std::span<ID3D12CommandList* const> first = {});
   // Where the last EndFrame spent its time.
   struct EndFrameTimes {
-    uint64_t submit_ns = 0;       // Close + ExecuteCommandLists
-    uint64_t present_ns = 0;      // Present
-    uint64_t fence_ns = 0;        // OpenList: waiting for the GPU to finish the slot's last frame
+    // On the stream's thread, for the last frame it finished.
+    uint64_t submit_ns = 0;   // Close + ExecuteCommandLists
+    uint64_t present_ns = 0;  // Present
+    uint64_t fence_ns = 0;    // waiting for the GPU to finish the slot's last frame
+    // The stream's thread since the last EndFrame: its time making calls (submits and presents
+    // included), and the part of it waiting for the GPU to free the next frame's allocator.
+    uint64_t stream_ns = 0, stream_wait_ns = 0;
     bool presented = false;       // Present ran (a swapchain and a complete frame)
     uint32_t frame_presents = 0;  // the frame's Presents: its interval, or 2 with a generated frame
     uint64_t presents = 0;        // Presents so far, the frame's included
@@ -157,8 +167,8 @@ class D3D12Device {
   // reads it).
   void SetTitleFrame(uint64_t frame) { title_frame_.store(frame, std::memory_order_relaxed); }
 
-  // Waits for the GPU to finish everything submitted so far, mid-frame Submits included; the
-  // frame being recorded keeps its frame_fence.
+  // Waits for the GPU to finish everything submitted so far, mid-frame Submits included (and the
+  // stream to submit what it holds); the frame being recorded keeps its frame_fence.
   void WaitIdle();
 
   // The GPU's time on the last frame it completed (kFramesInFlight frames back): the time from
@@ -177,22 +187,35 @@ class D3D12Device {
   bool CreateSwapchain(HWND hwnd);
   // Switches the new swapchain to HDR10 if wanted and supported, else to kBackBufferFormat.
   bool SetUpColorSpace();
-  bool OpenList();
-  bool CloseAndExecute(std::span<ID3D12CommandList* const> first);
+  using List = ID3D12GraphicsCommandList;
+  // The stream's thread: closes `list` and submits it after `first`.
+  bool ExecuteLists(List* list, std::span<ID3D12CommandList* const> first);
+  // What EndFrame leaves to the stream's thread.
+  struct FrameEnd {
+    std::vector<ID3D12CommandList*> first;
+    ID3D12Resource* image = nullptr;      // copied into the back buffers, or null
+    ID3D12Resource* generated = nullptr;  // presented before it, or null
+    uint32_t presents = 0;
+    uint32_t drawn = 0;  // the back buffer the frame drew into (without an image)
+    uint64_t fence = 0;
+    uint32_t slot = 0, next_slot = 0;
+    uint64_t next_slot_fence = 0;  // the next slot's last frame's
+  };
+  void FinishFrame(List* list, const FrameEnd& f);
   // gpu_busy_ns: the timestamps around the frame's submissions. False (logged) on failure.
   bool CreateBusyTimer();
   void StampBusy();
   void ReadBusy();
   bool GetBackBuffers();
   bool FollowWindowSize();
-  // Records the copy of `image` (PRESENT state) into the current back buffer.
-  void CopyToBackBuffer(ID3D12Resource* image);
+  // The stream's thread: the copy of `image` (PRESENT state) into the current back buffer.
+  void CopyToBackBuffer(List* list, ID3D12Resource* image);
   // The frame being recorded draws into held_image_ (set_present_interval).
   bool held() const { return vsync_ && present_interval_ > 1 && held_image_; }
   // held_image_ like the back buffers, when the present interval wants it; false (logged) on
   // failure.
   bool CreateHeldImage();
-  // Presents the current back buffer; false (logged) on failure.
+  // The stream's thread: presents the current back buffer; false (logged) on failure.
   bool Present();
   static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
@@ -210,14 +233,20 @@ class D3D12Device {
   uint64_t slot_fence_[kFramesInFlight] = {};
   uint32_t slot_ = 0;
   ComPtr<ID3D12GraphicsCommandList> list_;
-  std::vector<ID3D12CommandList*> submit_lists_;  // CloseAndExecute's
+  // Records list_ (after it: stopped first).
+  CommandStream stream_;
+  // The stream's thread's.
+  std::vector<ID3D12CommandList*> submit_lists_;  // ExecuteLists'
+  UniqueHandle stream_event_;
+  std::atomic<bool> stream_failed_{false};
+  std::atomic<uint64_t> submit_ns_{0}, present_ns_{0}, stream_wait_ns_{0};
   EndFrameTimes end_frame_times_;
 
   ComPtr<IDXGISwapChain3> swapchain_;
   ComPtr<ID3D12Resource> back_buffers_[kBackBuffers];
   ComPtr<ID3D12DescriptorHeap> rtv_heap_;
   uint32_t rtv_stride_ = 0;
-  uint32_t back_index_ = 0;
+  uint32_t back_index_ = 0;                // the back buffer the frame being recorded draws into
   ID3D12Resource* frame_image_ = nullptr;  // SetFrameImage's, until EndFrame
   D3D12_CPU_DESCRIPTOR_HANDLE frame_image_rtv_ = {};
   ID3D12Resource* generated_frame_ = nullptr;  // SetGeneratedFrame's, until EndFrame

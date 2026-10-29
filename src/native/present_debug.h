@@ -9,8 +9,11 @@
 #include <vector>
 
 struct ID3D12Device;
-struct ID3D12GraphicsCommandList;
 struct ID3D12Resource;
+
+namespace pgr4::native {
+class CommandStream;
+}
 
 namespace pgr4::native::present_debug {
 
@@ -49,8 +52,8 @@ class GlitchCatch {
   void Collect(uint32_t slot);
   // In the SDR blit's state (root signature, pipeline, source and ramp bound): records this
   // frame.
-  void Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, uint32_t slot, float iw,
-              float ih, uint32_t ramp_mode, uint64_t frame);
+  void Record(ID3D12Device* device, CommandStream* list, uint32_t slot, float iw, float ih,
+              uint32_t ramp_mode, uint64_t frame);
   // A mark at `frame`: the ring is written with the next frame handed over.
   void Mark(uint64_t frame);
 
@@ -70,9 +73,8 @@ class LumaProbeReadback {
 
   // Reads the slot's previous rows into result(), then records the copies of this frame's
   // `width` x `height` image at the top left of `texture` (in COPY_SOURCE).
-  void Record(ID3D12Device* device, ID3D12GraphicsCommandList* list, uint32_t slot,
-              ID3D12Resource* texture, uint32_t width, uint32_t height, uint32_t mapping,
-              bool rgb10a2, uint64_t frame);
+  void Record(ID3D12Device* device, CommandStream* list, uint32_t slot, ID3D12Resource* texture,
+              uint32_t width, uint32_t height, uint32_t mapping, bool rgb10a2, uint64_t frame);
   const LumaProbe& result() const { return result_; }
 
  private:

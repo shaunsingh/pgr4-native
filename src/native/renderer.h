@@ -40,12 +40,12 @@
 struct ID3D12Device;
 struct ID3D12CommandList;
 struct ID3D12CommandQueue;
-struct ID3D12GraphicsCommandList;
 
 REXCVAR_DECLARE(bool, pgr4_native_render_thread);  // record on a render thread (see above)
 
 namespace pgr4::native {
 
+class CommandStream;
 class D3D12Device;
 class DrawRenderer;
 class FrameGeneration;
@@ -78,6 +78,7 @@ struct FrameStats {
   uint64_t reg_writes = 0;   // render thread mode: register values replayed
   // Parts of swap_ns: waiting for the texture untile workers, then D3D12Device::EndFrameTimes.
   uint64_t swap_untile_ns = 0, swap_submit_ns = 0, swap_present_ns = 0, swap_fence_ns = 0;
+  uint64_t stream_ns = 0, stream_wait_ns = 0;  // D3D12Device::EndFrameTimes'
   uint64_t frames_held = 0;  // Swaps not presented (DrawRenderer::FrameIncomplete)
   uint64_t submits = 0;      // lists submitted before the Swap's (--pgr4_native_submit_draws)
   // The guest's pad reads since the Swap before (rex_xam_take_frame_pad, taken at the Swap).
@@ -128,9 +129,10 @@ class NativeRenderer {
   D3D12Device& device() { return *device_; }
   ID3D12Device* d3d12() const;
   ID3D12CommandQueue* command_queue() const;
-  // The frame's direct command list: open from the previous Swap until OnSwap closes and
-  // submits it. Record into it from the On* calls only (the render thread, in that mode).
-  ID3D12GraphicsCommandList* command_list() const;
+  // The frame's direct command list, through the device's command stream: open from the previous
+  // Swap until OnSwap closes and submits it. Record into it from the On* calls only (the render
+  // thread, in that mode).
+  CommandStream* command_list() const;
   // Swaps recorded so far (= index of the frame being recorded).
   uint64_t frame_index() const { return frame_index_; }
   // Fence value OnSwap will signal for the frame being recorded; a resource last used in this

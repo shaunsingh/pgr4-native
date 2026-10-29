@@ -661,16 +661,14 @@ void TextureCache::StartSpareHeap() {
   });
 }
 
-void TextureCache::Transition(Texture& t, ID3D12GraphicsCommandList* list,
-                              D3D12_RESOURCE_STATES to) {
+void TextureCache::Transition(Texture& t, CommandStream* list, D3D12_RESOURCE_STATES to) {
   if (t.state == to) return;
   const D3D12_RESOURCE_BARRIER b = TransitionBarrier(t.resource.Get(), t.state, to);
   list->ResourceBarrier(1, &b);
   t.state = to;
 }
 
-bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence,
-                          bool defer) {
+bool TextureCache::Upload(Texture& t, CommandStream* list, uint64_t frame_fence, bool defer) {
   const TextureKey& key = t.key;
   uint64_t size = GetHostFootprints(key, true, &footprints_);
   if (!size) return false;
@@ -781,7 +779,7 @@ bool TextureCache::ResolvesCoverAll(const Texture& t) const {
   return all && covered == t.resolved_seq.size();
 }
 
-bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
+bool TextureCache::CopyResolved(Texture& t, CommandStream* list) {
   const TextureKey& key = t.key;
   // A 2D texture with one subresource that a resolved image of its format family covers
   // exactly binds that image in place of its resource: no copy, and the draws read the texels
@@ -848,8 +846,8 @@ bool TextureCache::CopyResolved(Texture& t, ID3D12GraphicsCommandList* list) {
   return any;
 }
 
-bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList* list,
-                       uint64_t frame_fence, TextureBinding* out, uint64_t captured) {
+bool TextureCache::Get(const uint32_t fetch_dwords[6], CommandStream* list, uint64_t frame_fence,
+                       TextureBinding* out, uint64_t captured) {
   ++stats_.gets;
   uint32_t hash = 0;
   for (int i = 0; i < 6; ++i) hash = (hash ^ fetch_dwords[i]) * 0x9E3779B1u;
@@ -977,7 +975,8 @@ bool TextureCache::Get(const uint32_t fetch_dwords[6], ID3D12GraphicsCommandList
   return true;
 }
 
-void TextureCache::RecordCopies(ID3D12GraphicsCommandList* list, const UploadCopies& copies,
+template <class List>
+void TextureCache::RecordCopies(List* list, const UploadCopies& copies,
                                 const std::vector<HostSubresource>& footprints) {
   for (const HostSubresource& s : footprints) {
     D3D12_TEXTURE_COPY_LOCATION dst = {};
@@ -1021,13 +1020,13 @@ uint64_t TextureCache::RecordDeferredUpload(const UntileJob& job, UploadList* up
 
 ID3D12GraphicsCommandList* TextureCache::OpenUploadList(UploadList* uploads, uint64_t frame_fence) {
   UploadList& u = *uploads;
-  if (u.open) return u.list.Get();
+  if (u.list) return u.list.Get();
+  const uint64_t completed = completed_fence_.load(std::memory_order_relaxed);
   if (u.allocator && u.allocator_fence != frame_fence)
     u.retired.emplace_back(u.allocator_fence, std::move(u.allocator));
   HRESULT hr = S_OK;
   if (!u.allocator) {
-    if (!u.retired.empty() &&
-        u.retired.front().first <= completed_fence_.load(std::memory_order_relaxed)) {
+    if (!u.retired.empty() && u.retired.front().first <= completed) {
       u.allocator = std::move(u.retired.front().second);
       u.retired.pop_front();
       hr = u.allocator->Reset();
@@ -1042,7 +1041,9 @@ ID3D12GraphicsCommandList* TextureCache::OpenUploadList(UploadList* uploads, uin
     }
     u.allocator_fence = frame_fence;
   }
-  if (u.list) {
+  if (!u.closed.empty() && u.closed.front().first <= completed) {
+    u.list = std::move(u.closed.front().second);
+    u.closed.pop_front();
     hr = u.list->Reset(u.allocator.Get(), nullptr);
   } else {
     hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, u.allocator.Get(), nullptr,
@@ -1051,22 +1052,22 @@ ID3D12GraphicsCommandList* TextureCache::OpenUploadList(UploadList* uploads, uin
   }
   if (FAILED(hr)) {
     REXLOG_ERROR("PGR4 native textures: upload list reset failed: {:08X}", uint32_t(hr));
+    u.list.Reset();
     return nullptr;
   }
-  u.open = true;
   return u.list.Get();
 }
 
 bool TextureCache::CloseUploadLists(std::vector<ID3D12CommandList*>* lists) {
   for (UploadList& u : upload_lists_) {
-    if (!u.open) continue;
-    u.open = false;
+    if (!u.list) continue;
     const HRESULT hr = u.list->Close();
     if (FAILED(hr)) {
       REXLOG_ERROR("PGR4 native textures: upload list close failed: {:08X}", uint32_t(hr));
       return false;
     }
     lists->push_back(u.list.Get());
+    u.closed.emplace_back(u.allocator_fence, std::move(u.list));
   }
   return !upload_list_failed_.load(std::memory_order_relaxed);
 }

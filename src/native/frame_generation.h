@@ -31,7 +31,9 @@
 // loading screen) is presented alone, and the next one starts the generation over: a frame ID not
 // one more than the last resets it.
 //
-// Threading: the thread that records the frames (NativeRenderer::Execute*).
+// Threading: the thread that records the frames (NativeRenderer::Execute*) but the FidelityFX
+// dispatches, which run on the device's command stream (command_stream.h); the context is made
+// again only with the stream idle (Resize).
 #pragma once
 
 #include "d3d12_device.h"
@@ -61,7 +63,7 @@ class FrameGeneration {
   // Upscaler::Upscale, after the upscaling of frame `frame`: records the preparation of its depth
   // and motion (in COMPUTE_READ) into `list`. The context and images follow the back buffers'
   // size and format first, with the GPU idle.
-  void Prepare(uint64_t frame, ID3D12GraphicsCommandList* list, const FfxApiResource& depth,
+  void Prepare(uint64_t frame, CommandStream* list, const FfxApiResource& depth,
                const FfxApiResource& motion, FfxApiDimensions2D render_size,
                FfxApiFloatCoords2D jitter, FfxApiFloatCoords2D motion_scale,
                const FfxCamera& camera, float frame_ms, bool reset);
@@ -80,7 +82,7 @@ class FrameGeneration {
   void OnSwap(uint32_t front_base);
   // Before each draw of frame `frame` (`regs` its register file): when the draw is the HUD's first,
   // records the copy into `list` and returns true (the list's compute state changed).
-  bool BeforeDraw(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs) {
+  bool BeforeDraw(CommandStream* list, uint64_t frame, const uint32_t* regs) {
     if (!front_ || prepared_frame_ != frame || copy_frame_ == frame) [[likely]]
       return false;
     return CopyAtHud(list, frame, regs);
@@ -92,9 +94,8 @@ class FrameGeneration {
 
   // After frame `frame` was drawn into image() and, with `hudless`, into hudless(), `rect` the
   // scene's part of it: records the generation of the frame before it into `list`. Returns that
-  // frame (image()'s size, format and state), nullptr (logged once) on failure.
-  ID3D12Resource* Generate(ID3D12GraphicsCommandList* list, uint64_t frame, FfxApiRect2D rect,
-                           bool hudless);
+  // frame (image()'s size, format and state); a failure, on the stream's thread, is logged once.
+  ID3D12Resource* Generate(CommandStream* list, uint64_t frame, FfxApiRect2D rect, bool hudless);
 
  private:
   // The context and images for back buffers of this size and format, the context with FfxDebug's
@@ -102,7 +103,7 @@ class FrameGeneration {
   bool Resize(uint32_t width, uint32_t height, bool hdr, bool debug);
   void Destroy();
   D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t i) const;
-  bool CopyAtHud(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs);
+  bool CopyAtHud(CommandStream* list, uint64_t frame, const uint32_t* regs);
 
   D3D12Device& device_;
   Resolver& resolver_;

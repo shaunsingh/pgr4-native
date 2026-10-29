@@ -182,12 +182,12 @@ bool GpuTimer::Initialize(ID3D12Device* device, ID3D12CommandQueue* queue, uint3
   return true;
 }
 
-void GpuTimer::Stamp(ID3D12GraphicsCommandList* list) {
+void GpuTimer::Stamp(CommandStream* list) {
   Frame& f = frames_[slot_];
   list->EndQuery(heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * kMaxQueries + f.queries++);
 }
 
-void GpuTimer::BeginFrame(ID3D12GraphicsCommandList* list, uint32_t slot) {
+void GpuTimer::BeginFrame(CommandStream* list, uint32_t slot) {
   Collect(slot);
   slot_ = slot;
   Frame& f = frames_[slot];
@@ -200,7 +200,7 @@ void GpuTimer::BeginFrame(ID3D12GraphicsCommandList* list, uint32_t slot) {
   f.spans.push_back({kStart, 0});
 }
 
-void GpuTimer::Switch(ID3D12GraphicsCommandList* list, uint64_t key) {
+void GpuTimer::Switch(CommandStream* list, uint64_t key) {
   Frame& f = frames_[slot_];
   current_ = key;
   if (f.spans.size() >= kMaxSpans) {
@@ -220,7 +220,7 @@ void GpuTimer::Switch(ID3D12GraphicsCommandList* list, uint64_t key) {
   ++n;
 }
 
-void GpuTimer::EndFrame(ID3D12GraphicsCommandList* list) {
+void GpuTimer::EndFrame(CommandStream* list) {
   Frame& f = frames_[slot_];
   Stamp(list);
   list->ResolveQueryData(heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * kMaxQueries, f.queries,

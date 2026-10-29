@@ -148,7 +148,7 @@ bool Upscaler::CreateInputPass() {
   return !Failed(device_->CreateComputePipelineState(&pd, IID_PPV_ARGS(&input_pso_)), kName);
 }
 
-void Upscaler::ClampInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color) {
+void Upscaler::ClampInput(CommandStream* list, ID3D12Resource* color) {
   // In the frame's own views: those of a frame kFramesInFlight back, whose fence the device
   // waited for, are free.
   const uint32_t first = uint32_t(frame_ % D3D12Device::kFramesInFlight) * kViewsPerFrame;
@@ -178,7 +178,7 @@ void Upscaler::ClampInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color
   list->Dispatch((size[0] + 7) / 8, (size[1] + 7) / 8, 1);
 }
 
-void Upscaler::Time(ID3D12GraphicsCommandList* list, GpuTimer::UpscalePhase phase) {
+void Upscaler::Time(CommandStream* list, GpuTimer::UpscalePhase phase) {
   if (timer_) timer_->Pass(list, GpuTimer::KeyUpscale(phase, render_width_, render_height_));
 }
 
@@ -319,7 +319,7 @@ bool Upscaler::BeginFrame(uint64_t frame, uint64_t gpu_busy_ns, uint64_t paced_n
   return resized;
 }
 
-D3D12_CPU_DESCRIPTOR_HANDLE Upscaler::MotionTarget(ID3D12GraphicsCommandList* list) {
+D3D12_CPU_DESCRIPTOR_HANDLE Upscaler::MotionTarget(CommandStream* list) {
   const D3D12_CPU_DESCRIPTOR_HANDLE rtv = motion_rtv_->GetCPUDescriptorHandleForHeapStart();
   if (motion_state_ != D3D12_RESOURCE_STATE_RENDER_TARGET) {
     const D3D12_RESOURCE_BARRIER b =
@@ -335,7 +335,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE Upscaler::MotionTarget(ID3D12GraphicsCommandList* li
   return rtv;
 }
 
-RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& targets,
+RenderTarget* Upscaler::Upscale(CommandStream* list, RenderTargets& targets,
                                 const SurfaceRegs& regs) {
   if (upscaled_frame_ == frame_) return upscaled_ ? &output_ : nullptr;
   upscaled_frame_ = frame_;
@@ -376,7 +376,6 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   Time(list, GpuTimer::kUpscaleDispatch);
   ffxDispatchDescUpscale d = {};
   d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-  d.commandList = list;
   d.color = ffxApiGetResourceDX12(input_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
   d.depth = ffxApiGetResourceDX12(depth->resource.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
   d.motionVectors = ffxApiGetResourceDX12(motion_.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
@@ -397,10 +396,12 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   d.cameraFar = camera_->far_plane;
   d.cameraFovAngleVertical = camera_->fov_y;
   d.viewSpaceToMetersFactor = 1.0f;
-  if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK) {
-    PGR4_WARN_ONCE("PGR4 native upscaler: ffxDispatch failed ({})", rc);
-    return nullptr;
-  }
+  // On the stream's thread, which records the list: a failure shows from the next frame on.
+  list->Call([this, d](CommandStream::List* l) mutable {
+    d.commandList = l;
+    if (const ffxReturnCode_t rc = api_->dispatch(&context_, &d.header); rc != FFX_API_RETURN_OK)
+      PGR4_WARN_ONCE("PGR4 native upscaler: ffxDispatch failed ({})", rc);
+  });
   if (frame_generation_) {
     Time(list, GpuTimer::kUpscaleFrameGeneration);
     frame_generation_->Prepare(frame_, list, d.depth, d.motionVectors, d.renderSize, d.jitterOffset,

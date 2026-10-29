@@ -192,8 +192,8 @@ class RenderTargets {
   // touch (bottom of its scissor/viewport, clamped to 2048). Records the targets' pending
   // clears and the barriers to RENDER_TARGET / DEPTH_WRITE into `list`; the caller sets the
   // RTVs/DSV from `out`.
-  bool Bind(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t color_mask,
-            bool depth_used, uint32_t height, BoundTargets* out);
+  bool Bind(CommandStream* list, const SurfaceRegs& regs, uint32_t color_mask, bool depth_used,
+            uint32_t height, BoundTargets* out);
 
   // Guest Clear / ClearF (HookFn kClear / kClearF), after the guest call returned: the surfaces
   // bound in the device's register shadow and the clear values (reads guest memory only);
@@ -202,8 +202,8 @@ class RenderTargets {
   // is dropped: EndTiling's resolve clears the scene's tiles, and the next frame's BeginTiling
   // clears them again before anything reads them.
   static bool DecodeClear(const uint8_t* base, const HookArgs& args, ClearCall* out);
-  void Clear(ID3D12GraphicsCommandList* list, const SurfaceRegs& regs, uint32_t bound_colors,
-             bool depth_bound, uint32_t height, const ClearParams& p);
+  void Clear(CommandStream* list, const SurfaceRegs& regs, uint32_t bound_colors, bool depth_bound,
+             uint32_t height, const ClearParams& p);
 
   // The host target of guest color RT `index` (0..3) or of the depth surface, created if
   // missing (resolve sources). nullptr for an invalid format.
@@ -213,10 +213,9 @@ class RenderTargets {
   // Before reading rt's pixels in `r` outside a draw (resolve sources): records the EDRAM fills
   // over its tiles since its last use, and its pending clears if one touches `r`, in the order
   // the guest made them.
-  void PrepareRead(ID3D12GraphicsCommandList* list, RenderTarget* rt, const D3D12_RECT& r);
+  void PrepareRead(CommandStream* list, RenderTarget* rt, const D3D12_RECT& r);
 
-  static void Transition(ID3D12GraphicsCommandList* list, RenderTarget* rt,
-                         D3D12_RESOURCE_STATES state);
+  static void Transition(CommandStream* list, RenderTarget* rt, D3D12_RESOURCE_STATES state);
 
   // Once per frame before recording it (renderer start and after each Swap): `frame_fence`
   // is the fence the frame being recorded will signal, `completed_fence` the GPU's progress.
@@ -272,16 +271,16 @@ class RenderTargets {
   void DropFills(const RenderTarget& rt, uint32_t rows);
   // Clears color target `rt` to the EDRAM fills recorded over its tiles since its last use
   // (after its pending clears, which are older).
-  void SyncEdram(ID3D12GraphicsCommandList* list, RenderTarget* rt);
+  void SyncEdram(CommandStream* list, RenderTarget* rt);
 
   // Adds `v` over `rects` (guest pixels; none: all of the target) to rt's pending clears.
-  void Defer(ID3D12GraphicsCommandList* list, RenderTarget* rt, const ClearValue& v,
+  void Defer(CommandStream* list, RenderTarget* rt, const ClearValue& v,
              const std::vector<D3D12_RECT>& rects);
   // Drops rt's pending clears that a later write of planes `flags` over `rects` (host pixels, as
   // the pending clears are; none: all of the target) overwrites.
   void DropCovered(RenderTarget* rt, uint32_t flags, const D3D12_RECT* rects, size_t n);
   // Records rt's pending clears into `list`, oldest first.
-  void Flush(ID3D12GraphicsCommandList* list, RenderTarget* rt);
+  void Flush(CommandStream* list, RenderTarget* rt);
 
   RenderTarget* Get(bool depth, uint32_t surface_info, uint32_t info, uint32_t height);
   bool IsOverridden(uint32_t surface_info) const {
@@ -290,7 +289,8 @@ class RenderTargets {
   uint32_t HostSamples(uint32_t surface_info) const {
     return IsOverridden(surface_info) ? scene_samples_ : SurfaceSamples(surface_info);
   }
-  void Retire(ComPtr<ID3D12Resource> resource);
+  // Frees `resource` and the view (UINT32_MAX: none) once the GPU finished the current frame.
+  void Retire(ComPtr<ID3D12Resource> resource, uint32_t view_index, bool depth);
   bool Create(RenderTarget* rt, uint32_t height);
   uint32_t AllocView(bool depth);
 
@@ -310,6 +310,8 @@ class RenderTargets {
   struct Retired {
     ComPtr<ID3D12Resource> resource;
     uint64_t fence;
+    uint32_t view_index;
+    bool depth;
   };
   std::vector<Retired> retired_;
   uint64_t frame_ = 0, frame_fence_ = 0;

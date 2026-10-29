@@ -127,20 +127,20 @@ uint32_t OcclusionQueries::Acquire() {
   return uint32_t(next_++ % kPairs);
 }
 
-void OcclusionQueries::BeginPass(ID3D12GraphicsCommandList* list, uint32_t pair) const {
+void OcclusionQueries::BeginPass(CommandStream* list, uint32_t pair) const {
   list->BeginQuery(heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, 2 * pair);
 }
 
-void OcclusionQueries::EndPass(ID3D12GraphicsCommandList* list, uint32_t pair) const {
+void OcclusionQueries::EndPass(CommandStream* list, uint32_t pair) const {
   list->EndQuery(heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, 2 * pair);
 }
 
-void OcclusionQueries::BeginCoverage(ID3D12GraphicsCommandList* list, uint32_t pair) const {
+void OcclusionQueries::BeginCoverage(CommandStream* list, uint32_t pair) const {
   list->BeginQuery(heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, 2 * pair + 1);
 }
 
-void OcclusionQueries::EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair,
-                                   Coverage coverage, float guest_per_host) {
+void OcclusionQueries::EndCoverage(CommandStream* list, uint32_t pair, Coverage coverage,
+                                   float guest_per_host) {
   // Ended even without a draw: every query of a resolved range must have been issued.
   list->EndQuery(heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, 2 * pair + 1);
   coverage_[pair] = uint8_t(coverage);
@@ -148,7 +148,7 @@ void OcclusionQueries::EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pai
   unknown_pairs_ += coverage == Coverage::kUnknown;
 }
 
-void OcclusionQueries::Resolve(ID3D12GraphicsCommandList* list, uint64_t frame_fence) {
+void OcclusionQueries::Resolve(CommandStream* list, uint64_t frame_fence) {
   if (resolved_ == next_) return;
   const uint64_t n = next_ - resolved_;
   const uint32_t first = uint32_t(resolved_ % kPairs);

@@ -19,7 +19,9 @@
 // motion blur's mask (pixel shader 27A3898925DDCAF7), which keeps the player's car sharp. With
 // frame generation (frame_generation.h) the same depth and motion are its inputs.
 //
-// Threading: everything on the thread that records the frames (NativeRenderer::Execute*).
+// Threading: everything on the thread that records the frames (NativeRenderer::Execute*) but the
+// FidelityFX dispatch, which runs on the device's command stream (command_stream.h); the context is
+// made again only with the stream idle (D3D12Device::WaitIdle).
 #pragma once
 
 #include "d3d12_device.h"
@@ -113,13 +115,12 @@ class Upscaler {
   // (DxbcShaderTranslator's kMotionVectorRenderTarget, kMotionFormat), cleared to no motion at the
   // first call of a frame.
   static constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
-  D3D12_CPU_DESCRIPTOR_HANDLE MotionTarget(ID3D12GraphicsCommandList* list);
+  D3D12_CPU_DESCRIPTOR_HANDLE MotionTarget(CommandStream* list);
 
   // The upscaled scene color of this frame: at the first call of a frame (a resolve out of the
   // scene surface `regs`), records the upscaling of the surface's color and depth into `list`.
   // nullptr (logged once) when that failed; the resolves then copy the target as it is.
-  RenderTarget* Upscale(ID3D12GraphicsCommandList* list, RenderTargets& targets,
-                        const SurfaceRegs& regs);
+  RenderTarget* Upscale(CommandStream* list, RenderTargets& targets, const SurfaceRegs& regs);
   // Frame generation's inputs, recorded by each Upscale; nullptr: none.
   void set_frame_generation(FrameGeneration* fg) { frame_generation_ = fg; }
   // The scene's camera, the renderer's, read at each Upscale.
@@ -133,14 +134,14 @@ class Upscaler {
   bool CreateContext(bool debug);
   bool CreateTargets();
   // The commands recorded next belong to the upscaling pass `phase` (with GPU timing).
-  void Time(ID3D12GraphicsCommandList* list, GpuTimer::UpscalePhase phase);
+  void Time(CommandStream* list, GpuTimer::UpscalePhase phase);
   // The render size, LOD bias and jitter phases of a DynamicResolution level; false (logged)
   // without a phase count.
   bool SetLevel(uint32_t level);
   // The clamp of FSR's input (kInputHlsl); false (logged) on failure.
   bool CreateInputPass();
   // Records the clamp of the scene's `color` into input_ at the render size.
-  void ClampInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color);
+  void ClampInput(CommandStream* list, ID3D12Resource* color);
 
   ID3D12Device* device_ = nullptr;
   const FfxApi* api_ = nullptr;

@@ -61,9 +61,9 @@ class OcclusionQueries {
   bool counting() const { return !open_.empty(); }
   // The pair for the next draw, or kNoPair when the ring is full (the draw is not counted).
   uint32_t Acquire();
-  void BeginPass(ID3D12GraphicsCommandList* list, uint32_t pair) const;
-  void EndPass(ID3D12GraphicsCommandList* list, uint32_t pair) const;
-  void BeginCoverage(ID3D12GraphicsCommandList* list, uint32_t pair) const;
+  void BeginPass(CommandStream* list, uint32_t pair) const;
+  void EndPass(CommandStream* list, uint32_t pair) const;
+  void BeginCoverage(CommandStream* list, uint32_t pair) const;
   enum class Coverage : uint8_t {
     kCounted,  // the coverage draw ran
     kPasses,   // no depth target to test against: the coverage is the draw's ZPass
@@ -71,12 +71,11 @@ class OcclusionQueries {
   };
   // `guest_per_host`: guest samples per host sample of the draw's targets (fewer samples, or a
   // smaller render size).
-  void EndCoverage(ID3D12GraphicsCommandList* list, uint32_t pair, Coverage coverage,
-                   float guest_per_host);
+  void EndCoverage(CommandStream* list, uint32_t pair, Coverage coverage, float guest_per_host);
   // Pairs recorded kUnknown so far (the frames CSV's occ_unknown).
   uint64_t unknown_pairs() const { return unknown_pairs_; }
   // At the Swap, into the frame's last list, which signals `frame_fence`.
-  void Resolve(ID3D12GraphicsCommandList* list, uint64_t frame_fence);
+  void Resolve(CommandStream* list, uint64_t frame_fence);
   // After the Swap: the results of the guest queries whose frames completed, for WriteResult.
   void Retire(uint64_t completed_fence);
 
