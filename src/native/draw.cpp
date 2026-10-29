@@ -442,6 +442,25 @@ constexpr BlendFactor kBlendFactorAlphaMap[32] = {
     BlendFactor::kBlendFactor, BlendFactor::kInvBlendFactor,
     BlendFactor::kSrcAlphaSat,
 };
+// A render target's blending as RB_BLENDCONTROL<i> sets it: none is one, zero, add.
+struct RtBlend {
+  BlendFactor src = BlendFactor::kOne, dst = BlendFactor::kZero, src_a = BlendFactor::kOne,
+              dst_a = BlendFactor::kZero;
+  uint32_t op = 0, op_a = 0;
+  bool Blends() const {
+    return src != BlendFactor::kOne || dst != BlendFactor::kZero || op != 0 ||
+           src_a != BlendFactor::kOne || dst_a != BlendFactor::kZero || op_a != 0;
+  }
+};
+RtBlend GetRtBlend(const RegisterFile& regs, uint32_t i) {
+  const auto bc = regs.Get<reg::RB_BLENDCONTROL>(kBlendControlRegs[i]);
+  return {kBlendFactorMap[uint32_t(bc.color_srcblend) & 31],
+          kBlendFactorMap[uint32_t(bc.color_destblend) & 31],
+          kBlendFactorAlphaMap[uint32_t(bc.alpha_srcblend) & 31],
+          kBlendFactorAlphaMap[uint32_t(bc.alpha_destblend) & 31],
+          uint32_t(bc.color_comb_fcn),
+          uint32_t(bc.alpha_comb_fcn)};
+}
 constexpr D3D12_BLEND kD3DBlend[] = {
     D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,
     D3D12_BLEND_SRC_COLOR,     D3D12_BLEND_INV_SRC_COLOR,
@@ -2852,27 +2871,14 @@ PipelineKey DrawRenderer::Impl::BuildPipelineKey(
       key.rtv[i] = targets.color[i]->view_format;
       PipelineKey::Rt& rt = key.rt[i];
       rt.mask = uint8_t((color_mask >> (i * 4)) & 0xF);
-      BlendFactor src = BlendFactor::kOne, dst = BlendFactor::kZero, src_a = BlendFactor::kOne,
-                  dst_a = BlendFactor::kZero;
-      uint32_t op = 0, op_a = 0;
-      if (rt.mask) {
-        auto bc = regs.Get<reg::RB_BLENDCONTROL>(kBlendControlRegs[i]);
-        src = kBlendFactorMap[uint32_t(bc.color_srcblend) & 31];
-        dst = kBlendFactorMap[uint32_t(bc.color_destblend) & 31];
-        op = uint32_t(bc.color_comb_fcn);
-        src_a = kBlendFactorAlphaMap[uint32_t(bc.alpha_srcblend) & 31];
-        dst_a = kBlendFactorAlphaMap[uint32_t(bc.alpha_destblend) & 31];
-        op_a = uint32_t(bc.alpha_comb_fcn);
-      }
-      if (src != BlendFactor::kOne || dst != BlendFactor::kZero || op != 0 ||
-          src_a != BlendFactor::kOne || dst_a != BlendFactor::kZero || op_a != 0) {
+      if (const RtBlend b = rt.mask ? GetRtBlend(regs, i) : RtBlend{}; b.Blends()) {
         rt.blend = 1;
-        rt.src = uint8_t(src);
-        rt.dst = uint8_t(dst);
-        rt.op = uint8_t(op);
-        rt.src_a = uint8_t(src_a);
-        rt.dst_a = uint8_t(dst_a);
-        rt.op_a = uint8_t(op_a);
+        rt.src = uint8_t(b.src);
+        rt.dst = uint8_t(b.dst);
+        rt.op = uint8_t(b.op);
+        rt.src_a = uint8_t(b.src_a);
+        rt.dst_a = uint8_t(b.dst_a);
+        rt.op_a = uint8_t(b.op_a);
       } else {
         rt.src = uint8_t(BlendFactor::kOne);
         rt.src_a = uint8_t(BlendFactor::kOne);
@@ -3440,11 +3446,16 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   }
   ShaderModifications mods = mods_memo.mods;
   const reg::RB_DEPTHCONTROL depth_control = GetNormalizedDepthControl(regs);
-  // The upscaler's scene: the draws that write depth write their motion too.
+  // The upscaler's scene: its opaque draws write their motion too. Those are the ones that write
+  // depth, and the depth-tested ones that replace the color without writing depth: the sky, drawn
+  // after the opaque geometry where it left the cleared depth (td-408 draw log), whose own motion
+  // is the camera's turning.
   const Upscaler* const scene_upscaler =
       Upscaler::IsScene(sdr.rb_surface_info) ? r.upscaler() : nullptr;
-  const bool motion = mods.pixel_shader_used && depth_control.z_enable &&
-                      depth_control.z_write_enable && scene_upscaler;
+  const bool motion = scene_upscaler && mods.pixel_shader_used && depth_control.z_enable &&
+                      (depth_control.z_write_enable ||
+                       ((GetNormalizedColorMask(regs, ps->writes_color_targets()) & 0xF) &&
+                        !GetRtBlend(regs, 0).Blends()));
   if (motion) mods = WithMotionVectors(mods);
   const uint64_t generic_pixel_mod = mods.pixel;
   mods.pixel = SpecializePixelTextures(mods.pixel, s.fetch(0), mods_memo.ps_textures,
