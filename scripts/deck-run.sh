@@ -76,8 +76,9 @@
 # or extracted in title-update/) and userdata/ beside the exe (a fresh save), with only the
 # route's keyboard input and the measurement flags added.
 # --stretch scales every delay of the route, for a machine that loads slower than the PC it was
-# timed on. --cpus pins the game with taskset. --fgmod runs the game through ~/fgmod/fgmod, which
-# adds OptiScaler to the runtime dir as play.sh does (play.sh --install's runtime-fgmod/).
+# timed on. --cpus pins the game with taskset. --fgmod runs the game through ~/fgmod/fgmod, from
+# runtime-fgmod/ beside the runtime dir as play.sh does: fgmod adds OptiScaler to the folder it
+# runs and leaves it there, and Proton would load that dxgi.dll in every later run of the runtime.
 # Logs: ~/pgr4-proton/logs/.
 set -euo pipefail
 # The whole script is one block: bash parses it before running any of it, so editing this file
@@ -206,6 +207,11 @@ export SDL_GAMECONTROLLER_IGNORE_DEVICES=${SDL_GAMECONTROLLER_IGNORE_DEVICES:-0x
 # none, with MESA_SHADER_CACHE_DISABLE=true and --pgr4_native_pipeline_cache=false a cold start).
 export VKD3D_SHADER_CACHE_PATH=${VKD3D_SHADER_CACHE_PATH:-$top/cache/$(basename "$(dirname "$(dirname "$runtime")")")}
 [[ $VKD3D_SHADER_CACHE_PATH == 0 ]] || mkdir -p "$VKD3D_SHADER_CACHE_PATH"
+if (( fgmod )); then
+  rsync -a --delete --exclude=/game/ --exclude=/userdata/ --exclude=/logs/ --exclude='*.profraw' \
+    --exclude='draws-*.txt' "$runtime/" "$runtime-fgmod/"
+  runtime=$runtime-fgmod
+fi
 cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 [[ -n $cpus ]] && cmd=(taskset -c "$cpus" "${cmd[@]}")
 (( fgmod )) && cmd=("$HOME/fgmod/fgmod" "${cmd[@]}")
@@ -367,8 +373,11 @@ sample_stuck() {
 # Median draws over the last N frames of the CSV: a race draws 4000-5500 a frame after its start,
 # the menus about 2000.
 recent_draws() {
-  tail -n "$1" "$base-frames.csv" 2>/dev/null | cut -d, -f2 | sort -n | awk '{a[NR]=$1} END {print NR ? a[int((NR+1)/2)] : 0}'
+  tail -n "$1" "$base-frames.csv" 2>/dev/null | awk -F, '$2 ~ /^[0-9]+$/ {print $2}' | sort -n | awk '{a[NR]=$1} END {print NR ? a[int((NR+1)/2)] : 0}'
 }
+# Frames the native renderer drew (rows of the frame CSV): none while the Xenos plugin draws
+# (--pgr4_native_classic until F9 takes the game back).
+native_frames() { awk -F, 'NR > 1' "$base-frames.csv" 2>/dev/null | wc -l; }
 
 launched=$SECONDS; deadline=$((SECONDS + 600)); ok=0; startup_checked=0
 while (( SECONDS < deadline )); do
@@ -388,7 +397,9 @@ echo "route reached mark race: $ok $(date +%T)"
 # The route's marks are timed from the window appearing, and a slower load starts the race some
 # seconds after "mark race". The measurement starts when the frames look like a race: a median
 # of --race-draws (3000) or more over the last 30 frames (the grid and the menus draw fewer).
-if [[ $mode != none ]]; then
+if [[ $mode != none ]] && (( $(native_frames) == 0 )); then
+  echo "race mark $(date +%T): the Xenos plugin draws, so the race mark stands"
+elif [[ $mode != none ]]; then
   for (( waited = 0; waited < 30; ++waited )); do
     (( $(recent_draws 30) >= race_draws )) && break
     nap 1
