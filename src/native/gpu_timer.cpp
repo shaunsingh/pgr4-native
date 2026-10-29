@@ -28,9 +28,20 @@ constexpr uint32_t kMaxQueries = GpuTimer::kMaxSpans + 1;
 // the kind's fields from bit 8 in the order the Key* functions write them. Sample counts (1, 2,
 // 4) take 3 bits.
 // kShaders: draws keyed by their shader pair (per_shader_); counted as draws in the totals.
-enum Kind : uint32_t { kStart, kDraw, kClear, kResolve, kPresent, kShaders, kSubmit, kKindCount };
-constexpr const char* kKindNames[kKindCount] = {"start",   "draws",   "clears", "resolves",
-                                                "present", "shaders", "submits"};
+enum Kind : uint32_t {
+  kStart,
+  kDraw,
+  kClear,
+  kResolve,
+  kPresent,
+  kShaders,
+  kSubmit,
+  kUpscale,
+  kKindCount
+};
+constexpr const char* kKindNames[kKindCount] = {"start",   "draws",   "clears",  "resolves",
+                                                "present", "shaders", "submits", "upscale"};
+static_assert(kKindCount <= 8, "kinds take 3 bits");
 constexpr uint32_t kKindMask = 7;
 constexpr uint32_t kOccurrenceShift = 3, kOccurrenceMax = 31;
 constexpr uint32_t kFieldShift = 8;
@@ -126,6 +137,14 @@ std::string GpuTimer::Describe(uint64_t key) const {
                     width, height, samples, info ? info->name : "?",
                     clears & 1 ? ", clears color" : "", clears & 2 ? ", clears depth" : "",
                     kPhaseNames[phase]);
+      return s;
+    }
+    case kUpscale: {
+      const uint32_t phase = r.Get(2), width = r.Get(13), height = r.Get(13);
+      static constexpr const char* kPhaseNames[3] = {"input clamp", "FidelityFX dispatch",
+                                                     "frame generation inputs"};
+      std::snprintf(s, sizeof(s), "upscale %ux%u [%s]", width, height,
+                    phase < 3 ? kPhaseNames[phase] : "?");
       return s;
     }
     case kPresent:
@@ -335,6 +354,10 @@ uint64_t GpuTimer::KeyResolve(const ResolveParams& p, ResolvePhase phase) {
       .key();
 }
 
+uint64_t GpuTimer::KeyUpscale(UpscalePhase phase, uint32_t render_width, uint32_t render_height) {
+  return KeyWriter(kUpscale).Put(phase, 2).Put(render_width, 13).Put(render_height, 13).key();
+}
+
 uint64_t GpuTimer::KeyPresent() { return KeyWriter(kPresent).key(); }
 
 uint64_t GpuTimer::KeySubmit() { return KeyWriter(kSubmit).key(); }
@@ -367,12 +390,12 @@ void GpuTimer::Log() {
   REXLOG_INFO(
       "PGR4 native GPU: frames {} | GPU {:.2f} ms/frame (max {:.2f}), idle between "
       "frames {:.2f} ms, spans/frame {:.0f} | {} {:.2f}, {} {:.2f}, {} {:.2f}, {} {:.2f}, "
-      "{} {:.2f}, {} {:.2f} ms",
+      "{} {:.2f}, {} {:.2f}, {} {:.2f} ms",
       frames_collected_, ms(frame_ticks_), double(frame_ticks_max_) * ms_per_tick, ms(idle_ticks_),
       double(spans_collected_) / n, kKindNames[kDraw], kind_ms[kDraw], kKindNames[kClear],
-      kind_ms[kClear], kKindNames[kResolve], kind_ms[kResolve], kKindNames[kPresent],
-      kind_ms[kPresent], kKindNames[kSubmit], kind_ms[kSubmit], kKindNames[kStart],
-      kind_ms[kStart]);
+      kind_ms[kClear], kKindNames[kResolve], kind_ms[kResolve], kKindNames[kUpscale],
+      kind_ms[kUpscale], kKindNames[kPresent], kind_ms[kPresent], kKindNames[kSubmit],
+      kind_ms[kSubmit], kKindNames[kStart], kind_ms[kStart]);
   // The costliest groups, in frame order.
   constexpr size_t kTop = 24;
   const size_t shown = std::min(kTop, top.size());

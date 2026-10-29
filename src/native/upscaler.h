@@ -15,9 +15,9 @@
 // of it in a frame (EndTiling's depth resolve, before its color resolves clear the surface)
 // upscales its color, depth and motion into the output, which the color resolves copy from instead
 // of the target. FSR reads the color clamped to the range of its 7e3 EDRAM format, as the resolves
-// do, and the output then takes the scene's alpha, which FSR does not upscale: the motion blur's
-// mask, which keeps the player's car sharp. With frame generation (frame_generation.h) the same
-// depth and motion are its inputs.
+// do, and those copies take the alpha of the scene's target, which FSR does not upscale: the
+// motion blur's mask (pixel shader 27A3898925DDCAF7), which keeps the player's car sharp. With
+// frame generation (frame_generation.h) the same depth and motion are its inputs.
 //
 // Threading: everything on the thread that records the frames (NativeRenderer::Execute*).
 #pragma once
@@ -25,6 +25,7 @@
 #include "d3d12_device.h"
 #include "dynamic_resolution.h"
 #include "fidelityfx.h"
+#include "gpu_timer.h"
 #include "render_targets.h"
 
 #include <cstdint>
@@ -123,30 +124,30 @@ class Upscaler {
   void set_frame_generation(FrameGeneration* fg) { frame_generation_ = fg; }
   // The scene's camera, the renderer's, read at each Upscale.
   void set_camera(const FfxCamera* camera) { camera_ = camera; }
+  // With GPU timing: Upscale marks its passes (GpuTimer::UpscalePhase).
+  void set_gpu_timer(GpuTimer* timer) { timer_ = timer; }
 
  private:
   // The upscaling context, with debug visualization and the watermark or not; false (logged) on
   // failure.
   bool CreateContext(bool debug);
   bool CreateTargets();
+  // The commands recorded next belong to the upscaling pass `phase` (with GPU timing).
+  void Time(ID3D12GraphicsCommandList* list, GpuTimer::UpscalePhase phase);
   // The render size, LOD bias and jitter phases of a DynamicResolution level; false (logged)
   // without a phase count.
   bool SetLevel(uint32_t level);
-  // The compute passes around FSR: the clamp of its input (kInputHlsl), and the alpha of the
-  // output (kAlphaHlsl), left out (logged) without typed UAV loads of the output. False (logged)
-  // on failure.
-  bool CreatePasses();
-  // Records a pass that reads `src` and writes `dst` over a width x height grid, with the views in
-  // the frame's slot `slot` (of kViewsPerFrame / 2).
-  void RunPass(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, ID3D12Resource* src,
-               ID3D12Resource* dst, uint32_t slot, float scale_x, float scale_y, uint32_t width,
-               uint32_t height);
+  // The clamp of FSR's input (kInputHlsl); false (logged) on failure.
+  bool CreateInputPass();
+  // Records the clamp of the scene's `color` into input_ at the render size.
+  void ClampInput(ID3D12GraphicsCommandList* list, ID3D12Resource* color);
 
   ID3D12Device* device_ = nullptr;
   const FfxApi* api_ = nullptr;
   FrameGeneration* frame_generation_ = nullptr;
   const FfxCamera* camera_ = nullptr;  // the renderer's
-  void* context_ = nullptr;            // ffxContext
+  GpuTimer* timer_ = nullptr;
+  void* context_ = nullptr;  // ffxContext
   // The upscaled color (an R16G16B16A16_FLOAT UAV: the scene's host format), in the fields the
   // resolve reads; and the motion vectors.
   RenderTarget output_;
@@ -157,11 +158,10 @@ class Upscaler {
   // FSR's color input: the scene's color clamped, at the largest render size.
   ComPtr<ID3D12Resource> input_;
   D3D12_RESOURCE_STATES input_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  ComPtr<ID3D12RootSignature> pass_signature_;
+  ComPtr<ID3D12RootSignature> input_signature_;
   ComPtr<ID3D12PipelineState> input_pso_;
-  ComPtr<ID3D12PipelineState> alpha_pso_;  // null without typed UAV loads
-  ComPtr<ID3D12DescriptorHeap> pass_heap_;
-  uint32_t pass_stride_ = 0;
+  ComPtr<ID3D12DescriptorHeap> input_heap_;
+  uint32_t input_stride_ = 0;
   uint32_t max_width_ = kSceneWidth, max_height_ = 0;  // Initialize's, from the render height
   uint32_t render_width_ = kSceneWidth, render_height_ = 0;
   std::optional<DynamicResolution> dynamic_;  // with --pgr4_native_upscaler_target_fps

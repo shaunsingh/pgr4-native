@@ -178,9 +178,10 @@ class Resolver {
   // The image of `dest` for p's format and size, created if missing.
   Image* GetImage(const ResolveParams& p, Destination& dest);
   // Copies the clipped rectangle `src` of rt to (dx, dy) in an image of `dest` (p.dest_base's or
-  // own_).
+  // own_), with the alpha of `alpha` when not null (rt is the upscaler's output, alpha the scene
+  // target it upscaled).
   bool Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
-            const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest);
+            RenderTarget* alpha, const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest);
 
   // Oracle dumps and the self test (resolve_debug.cpp), and what they use of resolve.cpp.
   void InitializeOracles(ID3D12CommandQueue* queue);  // as their cvars ask

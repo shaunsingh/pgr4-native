@@ -2,11 +2,11 @@
 // (--pgr4_native_gpu_timing).
 //
 // The renderer names the pass each command it records belongs to: draws on one set of render
-// targets, a clear, a resolve, the present blit (Key*). Whenever the pass changes, a timestamp
-// goes into the frame's command list, so the span between two timestamps is the GPU time of
-// the pass recorded in it. EndFrame resolves the frame's timestamps into the readback slot of
-// its command allocator; BeginFrame reads them once that allocator comes round again
-// (D3D12Device::OpenList, after the slot's fence), so timing never stalls the GPU or the
+// targets, a clear, a resolve, a pass of the upscaler, the present blit (Key*). Whenever the pass
+// changes, a timestamp goes into the frame's command list, so the span between two timestamps is
+// the GPU time of the pass recorded in it. EndFrame resolves the frame's timestamps into the
+// readback slot of its command allocator; BeginFrame reads them once that allocator comes round
+// again (D3D12Device::OpenList, after the slot's fence), so timing never stalls the GPU or the
 // recording thread.
 //
 // Timestamps are written when the preceding work has finished at the bottom of the pipe:
@@ -62,6 +62,11 @@ class GpuTimer {
   // destination's transition back to shader reads, and the clear of the source rectangle.
   enum ResolvePhase : uint32_t { kResolveSource, kResolveCopy, kResolveRelease, kResolveClear };
   static uint64_t KeyResolve(const ResolveParams& p, ResolvePhase phase = kResolveSource);
+  // Upscaler::Upscale's passes, inside the resolve that upscales: the clamp of FSR's input, the
+  // FidelityFX dispatch (or the upscaler OptiScaler puts in its place), and frame generation's
+  // inputs. Keyed with the render size, which changes with dynamic resolution.
+  enum UpscalePhase : uint32_t { kUpscaleInput, kUpscaleDispatch, kUpscaleFrameGeneration };
+  static uint64_t KeyUpscale(UpscalePhase phase, uint32_t render_width, uint32_t render_height);
   static uint64_t KeyPresent();
   // The end of a list submitted mid-frame (D3D12Device::Submit): its span runs to the first
   // timestamp in the next list, the GPU's wait for that list.

@@ -178,11 +178,13 @@ cbuffer Params : register(b0) {
   uint cb_dest_format;  // xenos::TextureFormat
   uint cb_src_format;   // xenos::ColorRenderTargetFormat, or the depth format
   uint cb_flags;        // 1: swap, 4-6: sample select, 8-9: log2 of the samples, 10: the host's
-                        // own samples, 12-14: number, 15: also the converted color into dst_float
+                        // own samples, 11: alpha from src_alpha, 12-14: number, 15: also the
+                        // converted color into dst_float
   int cb_exp_bias;
   uint cb_dest_layout;  // DestLayout of dst
   uint pad;
   float2 src_scale;     // host pixels of the render target per guest pixel (RenderScale)
+  float2 alpha_scale;   // the same for src_alpha
 };
 // A specialized variant has the parameters of one kind of resolve compiled in, so the compiler
 // drops the paths and conversions it does not take; the generic shader reads them above.
@@ -213,6 +215,9 @@ Texture2DMS<float4> src : register(t0);
 #else
 Texture2D<float4> src : register(t0);
 #endif
+// Flag 11: src is the upscaler's output, which FSR leaves without alpha, and the alpha is the
+// scene target's under the pixel's center (the motion blur's mask, upscaler.h).
+Texture2D<float4> src_alpha : register(t1);
 #endif
 // The destination image through its UINT view (Xenos texel bits), or (B5G6R5, the R32_FLOAT
 // image of depth resolves, and the linear image of flag 15) as floats.
@@ -278,7 +283,7 @@ float4 EdramSample(float4 c) {
   return c;
 }
 
-float4 LoadColor(int2 p) {
+float4 LoadColor(int2 p, float2 center) {
 #if MSAA
   uint n = SampleCount(), s = SampleSelect();
   if (OwnSamples()) {
@@ -296,7 +301,9 @@ float4 LoadColor(int2 p) {
   }
   return (EdramSample(src.Load(p, 0)) + EdramSample(src.Load(p, 1))) * 0.5;
 #else
-  return EdramSample(src.Load(int3(p, 0)));
+  float4 c = src.Load(int3(p, 0));
+  if (flags & 0x800u) c.a = src_alpha.Load(int3(center * alpha_scale, 0)).a;
+  return EdramSample(c);
 #endif
 }
 
@@ -333,8 +340,9 @@ uint4 PackDest(float4 c) {
 }
 #endif
 
-// floats: the depth float image's value, or the converted color.
-uint4 PackPixel(int2 p, out float4 floats) {
+// p: the host pixel, center: the guest pixel's center. floats: the depth float image's value, or
+// the converted color.
+uint4 PackPixel(int2 p, float2 center, out float4 floats) {
 #if DEPTH
 #if MSAA
   // Depth is never averaged (ReXGlue SanitizeCopySampleSelect): 4x k23 -> sample 2, else 0.
@@ -351,7 +359,7 @@ uint4 PackPixel(int2 p, out float4 floats) {
   floats = (src_format == 1u ? F20e4ToF32(d24) : (float)d24 / 16777215.0).xxxx;
   return uint4((d24 << 8) | (stencil & 0xFFu), 0, 0, 0);
 #else
-  floats = Convert(LoadColor(p));
+  floats = Convert(LoadColor(p, center));
   return PackDest(floats);
 #endif
 }
@@ -374,8 +382,9 @@ uint4 Unpack(uint4 v) {
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= size.x || id.y >= size.y) return;
   float4 floats;
+  const float2 center = float2(src_origin + int2(id.xy)) + 0.5;
   // The host pixel under the guest pixel's center (the same pixel at a scale of 1).
-  uint4 v = PackPixel(int2((float2(src_origin + int2(id.xy)) + 0.5) * src_scale), floats);
+  uint4 v = PackPixel(int2(center * src_scale), center, floats);
   uint2 p = dest_origin + id.xy;
 #if DEPTH
   dst[p] = Unpack(v);
@@ -399,8 +408,9 @@ struct ShaderConstants {
   int32_t exp_bias;
   uint32_t dest_layout, pad;
   float src_scale[2];
+  float alpha_scale[2];
 };
-static_assert(sizeof(ShaderConstants) == 56);
+static_assert(sizeof(ShaderConstants) == 64);
 
 // What a copy pipeline is compiled for: the generic ones read the resolve's parameters from the
 // root constants, a specialized one has them compiled in (kShader's SPEC_* macros).
@@ -739,7 +749,8 @@ bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12Co
 }
 
 bool Resolver::CreatePipelines() {
-  // Root signature: b0 = 12 root constants, one table of t0-t1 (sources) and u0-u1 (images).
+  // Root signature: b0 = the root constants (ShaderConstants), one table of t0-t1 (sources) and
+  // u0-u1 (images).
   D3D12_DESCRIPTOR_RANGE ranges[2] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   ranges[0].NumDescriptors = 2;
@@ -880,13 +891,17 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, 
   bool ok = true;
   if (copy_x1 > x0 && copy_y1 > y0 && dx >= 0 && dy >= 0) {
     const D3D12_RECT src = {LONG(x0), LONG(y0), LONG(copy_x1), LONG(copy_y1)};
-    RenderTarget* source = rt;
+    RenderTarget *source = rt, *alpha = nullptr;
     if (upscaler_ && Upscaler::IsScene(p.regs.surface_info) && Upscaler::IsSceneWidth(p.x0, p.x1)) {
       RenderTarget* upscaled = upscaler_->Upscale(list, *targets_, p.regs);
-      if (upscaled && !depth) source = upscaled;
+      if (upscaled && !depth) {
+        source = upscaled;
+        alpha = rt;
+      }
+      if (timer_) timer_->Pass(list, GpuTimer::KeyResolve(p));
     }
     targets_->PrepareRead(list, rt, src);
-    ok = Copy(list, p, source, src, dx, dy, own ? *own : destinations_[p.dest_base]);
+    ok = Copy(list, p, source, alpha, src, dx, dy, own ? *own : destinations_[p.dest_base]);
   }
 
   // Clears of the source surfaces over the source rectangle (after the copy).
@@ -908,7 +923,8 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, 
 }
 
 bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, RenderTarget* rt,
-                    const D3D12_RECT& src, int32_t dx, int32_t dy, Destination& dest) {
+                    RenderTarget* alpha, const D3D12_RECT& src, int32_t dx, int32_t dy,
+                    Destination& dest) {
   const bool depth = p.source == 4;
   const DestStorage* storage = GetDestStorage(p.dest_format);
   const uint32_t w = uint32_t(src.right - src.left), h = uint32_t(src.bottom - src.top);
@@ -939,8 +955,9 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   // The image's second resource, in the same state as its texture.
   ID3D12Resource* const extra = img->depth_r32f ? img->depth_r32f.Get() : img->linear.Get();
 
-  // Descriptors: t0 = color / depth plane, t1 = stencil plane, u0 = the image's UINT view,
-  // u1 = its float view (B5G6R5), the depth float image or the linear image; null where unused.
+  // Descriptors: t0 = color / depth plane, t1 = stencil plane or alpha, u0 = the image's UINT
+  // view, u1 = its float view (B5G6R5), the depth float image or the linear image; null where
+  // unused.
   if (heap_next_ + kViewsPerResolve > kHeapPerFrame) {
     // The frame's earlier dispatches read their descriptors when the GPU runs them.
     PGR4_LOG_FIRST(4, WARN, "PGR4 native resolve: more than {} resolves in a frame; skipped",
@@ -968,12 +985,12 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
     if (rt->samples == 1) sd.Texture2D.PlaneSlice = 1;
     device_->CreateShaderResourceView(rt->resource.Get(), &sd, view(1));
   } else {
-    D3D12_SHADER_RESOURCE_VIEW_DESC nd = {};
-    nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    nd.Texture2D.MipLevels = 1;
-    device_->CreateShaderResourceView(nullptr, &nd, view(1));
+    D3D12_SHADER_RESOURCE_VIEW_DESC ad = {};
+    ad.Format = alpha ? alpha->srv_format : DXGI_FORMAT_R8G8B8A8_UNORM;
+    ad.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    ad.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    ad.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(alpha ? alpha->resource.Get() : nullptr, &ad, view(1));
   }
   const bool float_texels = storage->layout == kB5G6R5Unorm;
   D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
@@ -990,12 +1007,13 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
                                      nullptr, &ud, view(3));
 
   // Source readable by the compute shader, the image(s) writable: one barrier batch.
-  D3D12_RESOURCE_BARRIER bs[3];
+  D3D12_RESOURCE_BARRIER bs[4];
   uint32_t nb = 0;
   constexpr D3D12_RESOURCE_STATES kSourceState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-  if (rt->state != kSourceState) {
-    bs[nb++] = TransitionBarrier(rt->resource.Get(), rt->state, kSourceState);
-    rt->state = kSourceState;
+  for (RenderTarget* t : {rt, alpha}) {
+    if (!t || t->state == kSourceState) continue;
+    bs[nb++] = TransitionBarrier(t->resource.Get(), t->state, kSourceState);
+    t->state = kSourceState;
   }
   if (img->state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
     bs[nb++] =
@@ -1016,11 +1034,15 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   c.flags = (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) |
             (uint32_t(std::countr_zero(rt->samples)) << 8) |
             (rt->samples > 1 && rt->samples != rt->edram_samples ? 0x400u : 0u) |
-            (p.dest_number << 12) | (linear ? 0x8000u : 0u);
+            (alpha ? 0x800u : 0u) | (p.dest_number << 12) | (linear ? 0x8000u : 0u);
   c.exp_bias = p.exp_bias;
   c.dest_layout = storage->layout;
   c.src_scale[0] = rt->scale.factor(0);
   c.src_scale[1] = rt->scale.factor(1);
+  if (alpha) {
+    c.alpha_scale[0] = alpha->scale.factor(0);
+    c.alpha_scale[1] = alpha->scale.factor(1);
+  }
   ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
   list->SetDescriptorHeaps(1, heaps);
   list->SetComputeRootSignature(pipelines_->root_signature.Get());

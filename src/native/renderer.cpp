@@ -570,6 +570,7 @@ void NativeRenderer::SwitchUpscaler(bool on) {
     }
     upscaler_->set_frame_generation(frame_generation_.get());
     upscaler_->set_camera(&camera_);
+    upscaler_->set_gpu_timer(gpu_timer_);
   }
   upscaler_on_ = on;
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
