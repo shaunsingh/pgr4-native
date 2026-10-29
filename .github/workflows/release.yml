@@ -20,7 +20,7 @@ jobs:
         run: |
           echo 'Server = https://archive.archlinux.org/repos/2026/10/21/$repo/os/$arch' > /etc/pacman.d/mirrorlist
           pacman -Syyuu --noconfirm --needed clang lld llvm compiler-rt cmake ninja python git rsync openssh \
-            pkgconf libx11 wayland
+            pkgconf libx11 wayland lua diffutils
           clang-cl --version | head -1
 
       - uses: actions/checkout@v4

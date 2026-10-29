@@ -48,8 +48,8 @@
 #
 # --force rebuilds the codegen tool (sdk) and regenerates all game code (game).
 #
-# Needs clang-cl, lld-link and the llvm-* tools, cmake, ninja, python3, git, curl and a Lua (5.1
-# or later, or LuaJIT) to run Fennel. When clang-cl is not on PATH the script re-runs itself in
+# Needs clang-cl, lld-link and the llvm-* tools, cmake, ninja, python3, git, curl, cmp (diffutils)
+# and a Lua (5.1 or later, or LuaJIT) to run Fennel. When clang-cl is not on PATH the script re-runs itself in
 # the distrobox container named by $PGR4_DISTROBOX (default pgr4dev). Run: scripts/deck-run.sh.
 set -euo pipefail
 
