@@ -40,8 +40,8 @@ STFS packages goes in the game folder's `Content\`, next to the title update's p
 
 Settings go on the command line (`--name=value`) or in `pgr4_recompiled.toml` next to the
 executable. `games/pgr4/pgr4_recompiled.toml` holds the release settings. The game's Options
-menu has the port's own Display, Driving and Developer pages, which save to
-`userdata/pgr4_settings.toml` over `pgr4_recompiled.toml`.
+menu has the port's own Display, Driving and Developer pages, which save the options changed
+into `pgr4_recompiled.toml`, keeping its comments and its other values.
 
 | Flag | Default | Effect |
 |---|---|---|

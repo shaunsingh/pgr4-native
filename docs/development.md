@@ -390,10 +390,17 @@ options, the cvars each choice sets, and the `Pgr4` table the scripts call.
   first, so the screen adds them in reverse.
 - **Applying.** A setting the renderer can change while it runs is set at once, through
   `NativeRenderer`'s `Request*` taken at the next frame; the others are marked `*` until the
-  next start. Both are saved to `userdata/pgr4_settings.toml`, read after
-  `pgr4_recompiled.toml`. A flag on the command line holds for its session only: the file keeps
-  its own value for that cvar until the menu changes the option. Leaving a page with a `*`
-  choice changed shows the game's popup (`SetupCustomPopup`) saying a restart applies it.
+  next start. Both are saved into the configuration file, `pgr4_recompiled.toml`, as the SDK's
+  settings overlay saves its own (`rex::cvar::SaveConfig`), but in place: only the options
+  changed, each cvar's line taking the new value and keeping its comment, and a cvar without a
+  line added under `# Set in the game's Options menu.` unless the value is its default. An
+  option left alone keeps the file's value, even one between the menu's choices. FSR's sizes
+  are fractions of the scene, so a new aspect ratio saves them again. A flag on the command
+  line holds for its session only: the file keeps its own value for that cvar until the menu
+  changes the option. Leaving a page with a `*` choice changed shows the game's popup
+  (`SetupCustomPopup`) saying a restart applies it. A 0.3.0 settings file,
+  `userdata/pgr4_settings.toml`, has its values moved into the configuration file at the
+  first start, and is removed.
 - **Testing.** `scripts/routes/route-settings.keys` opens the pages on a fresh profile, changes
   a start-up and a live setting on Display and both of Driving's, saves and reopens.
   `route-pause-settings.keys` opens them from the pause menu of a race.

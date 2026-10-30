@@ -69,8 +69,9 @@ FSR's resolution, dynamic resolution and frame generation, texture filtering, th
 automatic gearbox's downshifts (the game's, or earlier) and the lights of every car and bike
 (the race's, on or off). Developer holds the debug keys, the FSR debug view and the renderer's
 diagnostics. A choice marked `*` takes effect at the next start; the others apply at once. The
-pages save to `userdata/pgr4_settings.toml`, which is read after `pgr4_recompiled.toml`; delete
-it to go back to the release settings.
+pages save the options you change into `pgr4_recompiled.toml`, beside the executable, keeping
+its comments and the values you set there yourself. Settings saved by 0.3.0, in
+`userdata/pgr4_settings.toml`, move into it at the first start.
 
 F5 switches the lights of every car on or off, from what the race gives them, until you change
 the Driving page's setting (`pgr4_headlights`: `race`, `on` or `off`), which holds for every

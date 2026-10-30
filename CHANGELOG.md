@@ -19,6 +19,12 @@ section before it is tagged; changes land under Unreleased until then.
 - A mesh new to a frame (coming into view, or a level of detail changing) moves with the camera
   instead of standing still, so FSR no longer smears a block of road or building where it stood.
 
+**Settings**
+- The Options menu's Display, Driving and Developer pages save into `pgr4_recompiled.toml`, the
+  file you edit, instead of a second file read over it, so an edit to it is no longer hidden by an
+  older menu choice. Only the options you change are written, and the file's comments stay.
+  Settings saved by 0.3.0 move into it at the first start.
+
 **Debugging**
 - The marks (F12) of an HDR session show the picture as it was, not rainbow bands.
 
