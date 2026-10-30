@@ -79,8 +79,17 @@ std::string Nearest(const Option& o, double n) {
 const std::vector<Option>& Options();
 const Option& Find(std::string_view id) { return *std::ranges::find(Options(), id, &Option::id); }
 
-// The scene's height in this run, and the extent of `percent` of it.
-uint32_t SceneHeight() { return FrameHeight(); }
+// Start-up options chosen since the start, by id: their cvars keep the running values.
+std::map<std::string_view, std::string> g_pending;
+
+// The scene's height from the next start: the aspect ratio chosen since this one, else this
+// run's. FSR's sizes are a fraction of it, so the settings file takes them to a new aspect ratio
+// with it; until the restart the renderer clamps them to this run's scene (upscaler.cpp).
+uint32_t SceneHeight() {
+  const auto it = g_pending.find("aspect");
+  return it != g_pending.end() ? uint32_t(std::atoi(it->second.c_str())) : FrameHeight();
+}
+// The extent of `percent` of `extent`.
 std::string Percent(uint32_t extent, int percent) {
   return std::to_string(uint32_t(std::lround(extent * percent / 100.0)));
 }
@@ -288,8 +297,6 @@ const std::vector<Option>& Options() {
 // The guest UI thread runs the menus; the lock is for the settings file's path.
 std::mutex g_mutex;
 std::filesystem::path g_file;
-// Start-up options chosen since the start, by id: their cvars keep the running values.
-std::map<std::string_view, std::string> g_pending;
 
 std::string Value(const Option& o) {
   if (const auto it = g_pending.find(o.id); it != g_pending.end()) return it->second;
