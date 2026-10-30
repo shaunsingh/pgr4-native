@@ -122,7 +122,8 @@ to `~/pgr4-proton/play/logs/<stamp>-*`.
   (`--pgr4_native_mark_audit=N`), with the findings in the game log. A Steam Input binding can
   send F12 from a back grip.
 - **Glitch catcher.** `--pgr4_native_glitch_catch` keeps the last 5 s of shown frames in memory
-  and writes the frames around each whole-image jump. `scripts/analysis/flicker.py` and
+  and writes the frames around each whole-image jump. It keeps the game's SDR image with HDR
+  output too, and only the frames drawn, not the generated ones. `scripts/analysis/flicker.py` and
   `marks.py` turn the dumps into PNG sheets with the frame CSV's counters.
 - **Renderer switch.** F9 switches to the Xenos plugin and back at the next Swap. A bug that
   stays with Xenos is in the game or the SDK, and one that goes away is the renderer's. The
@@ -133,7 +134,7 @@ to `~/pgr4-proton/play/logs/<stamp>-*`.
   the next frame, and F8 (`--pgr4_native_fsr_debug`) shows FSR's debug view: its color, depth,
   motion vector and reactiveness inputs and its output, in a grid, with frame generation's view
   of the generated frames and FSR 4's watermark of the model it runs. The motion vector tile
-  shows a draw whose motion is wrong (an unmatched draw is still, and ghosts). Through
+  shows a draw whose motion is wrong, which FSR smears and frame generation ghosts. Through
   OptiScaler only the watermark follows F8, and OptiScaler's menu has the debug view. The
   Developer settings turn the keys off (`--pgr4_native_debug_keys`). The achievements overlay
   is on F6.
