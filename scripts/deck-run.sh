@@ -54,7 +54,8 @@
 # cycle, fetch stalls, instruction cache fills and iTLB misses (pmu_summary.py).
 # --catch keeps the last 5 s of frames shown in memory and writes the frames around each
 # whole-image jump to ~/pgr4-proton/logs/<session>-glitch-<frame>.rec (--pgr4_native_glitch_catch;
-# scripts/analysis/flicker.py shows them).
+# scripts/analysis/flicker.py shows them), and those before each mark (F12, a route's "f12") to
+# <session>-mark-<frame>.rec, as play.sh --debug does (scripts/analysis/marks.py).
 # --keys FILE drives the game with that route_player.py script instead of scripts/routes/route-stpetersburg.keys;
 # frame_times.py checks the run against the route's draw counts in FILE's .draws, if there is one.
 # --race-draws N is the median draws per frame that shows the race is on (St Petersburg draws
@@ -183,7 +184,7 @@ capdir=$top/captures-$tag
 if [[ $mode == oracle ]]; then
   rm -rf "$capdir"; mkdir -p "$capdir"
   args+=(--pgr4_native --readback_resolve=fast "--pgr4_native_capture_dir=$(win "$capdir")")
-elif (( draw_log > 0 )); then
+elif (( draw_log > 0 || catch )); then
   rm -rf "$capdir"; mkdir -p "$capdir"
   args+=("--pgr4_native_capture_dir=$(win "$capdir")")
 fi
