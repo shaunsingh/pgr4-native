@@ -67,5 +67,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           pacman -S --noconfirm --needed github-cli
+          # The tag's section of CHANGELOG.md, then the player README.
+          awk -v v="## $GITHUB_REF_NAME" '$0 == v {on = 1; next} on && /^## / {exit} on' \
+            CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md || { echo "CHANGELOG.md has no $GITHUB_REF_NAME section" >&2; exit 1; }
+          printf '\n---\n\n' >> notes.md
+          cat scripts/release/README.md >> notes.md
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
-            --notes-file scripts/release/README.md out/*.zip out/*.zip.sha256
+            --notes-file notes.md out/*.zip out/*.zip.sha256
