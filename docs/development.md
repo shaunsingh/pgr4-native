@@ -345,19 +345,25 @@ and the HUD and menus keep their shape (square pixels, centered). The mechanism,
   of the frame's shape gets the frame's aspect and the vertical field of view widened by height /
   720 (`Pgr4ViewProjectionHook`), so the horizontal one stays the game's; v0.3.0 stretched the
   scene 11 % taller and narrowed the medals instead.
-- The UI scripts lay out in that space (`games/pgr4/ui/patches/`). `UIGlobals.fnl` makes the
-  screen and its safe area as tall as the frame, so the menus' items at the edges reach the
-  frame's top and bottom. `GUIBank.fnl` keeps the race's viewports on rows 0 to 480, because
-  the HUD places itself by fractions of their height. `HudHelper.fnl` then moves each HUD item
-  above its viewport's middle up with the frame's top, and each below it down with the bottom.
-  The widgets that place themselves in the game's code (the rev counter: `sub_8245C2A8`,
+- The UI scripts keep the game's screen (`games/pgr4/ui/patches/`). The menus and loading
+  screens lay out in rows 0 to 480 as the game composed them, so their items stay with their
+  frames and backgrounds; the 3D backgrounds of the menus fill the frame, and their 2D items sit
+  in its central 720 rows. A version that made the screen as tall as the frame (v0.3.0, v0.3.1)
+  sent what the menus anchor to the screen's edges to the frame's, away from the frames and art
+  placed from the middle, and needed a fix per screen. What belongs to the frame rather than to a
+  screen's layout uses `UIGlobals.frame` (`UIGlobals.fnl`): `HudHelper.fnl` moves each HUD item
+  above its viewport's middle up with the frame's top, and each below it down with the bottom;
+  the widgets that place themselves in the game's code (the rev counter: `sub_8245C2A8`,
   `sub_8245C310`) move the same way through `Pgr4HudWidgetHook` and `Pgr4HudWidgetBHook`.
-  `GUIBank.fnl` also moves the music player down with the bottom and has the screen's fades
-  (to a colour, and the previous screen's image) cover the frame. The UI's 3D models (`true_3d`
-  buttons) sit in frames placed from the safe top, which a taller screen raises; `UIGlobals.fnl`
-  raises them as far, through the world units a row spans at their depth in the UI's view
-  (field of view 1 rad). The loading screen's art stays 16:9, between bands.
-- `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
+  `GUIBank.fnl` moves the music player down with the bottom and has the previous screen's image,
+  which a screen fades from, cover the frame. `UIGlobals.fnl` has every wash, a graphic of one
+  colour over the whole screen (the fades to a colour, the backdrop that dims a race behind the
+  pause menu and its popups), cover the frame; textured art keeps its shape. The UI's 3D models
+  (the arcade's medals) need nothing: their view keeps the 720-row frame's rows about the middle
+  (`Pgr4ViewProjectionHook`), as the 2D items do.
+- FSR's sizes (`pgr4_native_upscaler_height`, `_min_height`) are rows of the scene, which the
+  settings keep as a fraction of the next start's height: a change of aspect ratio rewrites them
+  for it, and the renderer clamps them to the running scene until the restart.- `scripts/analysis/pgr4_resolution_sites.py` maps every 720/1280 load in the image to its
   function; the manifest's comments name the false positives it deliberately skips (VMX byte
   offsets, allocation sizes, string calls, the 1280 widths).
 
