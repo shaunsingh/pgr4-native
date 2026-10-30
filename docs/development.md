@@ -479,7 +479,9 @@ from a private repository) and publishes a ZIP made by `scripts/release/package_
 ZIP holds the executables, the ReXGlue DLLs, the settings from `games/*/`, the player README
 (`scripts/release/README.md`) and the licenses, taken from an explicit file list. The packager
 refuses an instrumented build. `deck-run.sh --mode release` runs an unpacked package the way a
-player starts it.
+player starts it. The release's notes are the tag's section of `CHANGELOG.md` above the player
+README; the workflow fails without that section, so a change for players goes under Unreleased
+when it lands, and that heading becomes the version before the tag is pushed.
 
 ## Rules
 
