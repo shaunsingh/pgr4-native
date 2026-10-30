@@ -540,10 +540,11 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* c
     const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     if (!found) list->ClearRenderTargetView(rtv, black, 0, nullptr);
     if (found) {
-      // The image's view: its linear one with HDR output, as the front buffer's.
-      const auto view = [&](const ResolvedImage& src) {
+      // The image's view: its linear one with HDR output (`hdr_view`), as the front buffer's.
+      const auto view = [&](const ResolvedImage& src, bool hdr_view) {
+        const bool lin = hdr_view && linear;
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
-        sd.Format = linear ? DXGI_FORMAT_R16G16B16A16_FLOAT : host->unorm;
+        sd.Format = lin ? DXGI_FORMAT_R16G16B16A16_FLOAT : host->unorm;
         sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sd.Shader4ComponentMapping = mapping;
         sd.Texture2D.MipLevels = 1;
@@ -552,7 +553,7 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* c
         cpu.ptr += size_t(slot) * heap_stride;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
         gpu.ptr += uint64_t(slot) * heap_stride;
-        device->CreateShaderResourceView(linear ? src.linear : src.texture, &sd, cpu);
+        device->CreateShaderResourceView(lin ? src.linear : src.texture, &sd, cpu);
         return gpu;
       };
       ID3D12DescriptorHeap* heaps[] = {heap.Get()};
@@ -600,7 +601,7 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* c
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       const auto blit = [&](const ResolvedImage& src, D3D12_CPU_DESCRIPTOR_HANDLE target) {
         if (clears) list->ClearRenderTargetView(target, black, clears, clear);
-        list->SetGraphicsRootDescriptorTable(0, view(src));
+        list->SetGraphicsRootDescriptorTable(0, view(src, true));
         list->OMSetRenderTargets(1, &target, FALSE, nullptr);
         list->DrawInstanced(3, 1, 0, 0);
       };
@@ -616,7 +617,12 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* c
       }
       blit(*image, rtv);
       if (glitch.on()) {
-        if (hdr) list->SetPipelineState(pso.Get());  // the catcher keeps SDR frames
+        // The catcher keeps SDR frames: the front buffer's display values through the ramp, as
+        // without HDR (the linear image's above 1 would index past the ramp's end).
+        if (hdr) {
+          list->SetPipelineState(pso.Get());
+          list->SetGraphicsRootDescriptorTable(0, view(*image, false));
+        }
         glitch.Record(device, list, ramp_slot, iw, ih, constants.ramp_mode, r.frame_index());
       }
     }
