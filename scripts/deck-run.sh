@@ -217,6 +217,14 @@ cmd=("$proton/proton" run "$runtime/pgr4_recompiled.exe" "${args[@]}")
 [[ -n $cpus ]] && cmd=(taskset -c "$cpus" "${cmd[@]}")
 (( fgmod )) && cmd=("$HOME/fgmod/fgmod" "${cmd[@]}")
 echo "${cmd[*]}" > "$base-cmdline.txt"
+# The Options menu saves into the runtime's pgr4_recompiled.toml; a run leaves that file as it
+# found it (a build tree has none), so a route that changes settings does not change later runs.
+settings=$runtime/pgr4_recompiled.toml
+settings_kept=$top/logs/pgr4-proton-$tag-$stamp-settings.toml
+[[ -f $settings ]] && cp "$settings" "$settings_kept"
+restore_settings() {
+  if [[ -f $settings_kept ]]; then mv "$settings_kept" "$settings"; else rm -f "$settings"; fi
+}
 
 stop_game() {
   WINEPREFIX=$top/prefix/pfx "$proton/files/bin/wineserver" -k 2>/dev/null || true
@@ -245,6 +253,7 @@ cleanup() {
   [[ -n ${perfrec:-} ]] && kill -INT "$perfrec" 2>/dev/null || true
   [[ -n ${pmustat:-} ]] && kill -INT "$pmustat" 2>/dev/null || true
   stop_game
+  restore_settings
   [[ -n $output ]] && qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript "$kwin_script" >/dev/null 2>&1 || true
   [[ -n ${shooter:-} ]] && kill "$shooter" 2>/dev/null || true
   [[ -n ${limiter:-} ]] && kill "$limiter" 2>/dev/null || true

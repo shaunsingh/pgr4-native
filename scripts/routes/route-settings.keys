@@ -1,6 +1,6 @@
 # route-settings.keys: fresh profile -> Main Menu -> OPTIONS -> the port's DISPLAY page: change
-# a start-up setting (Aspect ratio) and a live one (Antialiasing), save, reopen, then DRIVING:
-# the automatic and the lights, save, reopen, then DEVELOPER.
+# a start-up setting (Aspect ratio) and a live one (Antialiasing), save past the restart popup,
+# reopen, then DRIVING: the automatic and the lights, save, reopen, then DEVELOPER.
 # Shots at each step. Fresh save (deck-run.sh starts each run with one).
 30000 return          # skip the intro FMV
 +12000 return         # title: PRESS START -> Gamer Profiles "Welcome to PGR4!"
@@ -40,7 +40,9 @@
 +600 d 120            # -> MSAA 4x, applied at once
 +800 mark shot display-antialiasing
 +300 space            # A: apply and save
-+4000 mark shot saved
++4000 mark shot restart
++500 space            # A on the popup: the aspect ratio takes effect at the next start
++8000 mark shot saved # the game saves its profile on the way back to OPTIONS
 +500 space            # open DISPLAY again
 +2500 mark shot display-again
 +300 backspace        # B: leave unchanged
@@ -54,7 +56,7 @@
 +600 d 120            # -> On, applied at once
 +800 mark shot driving-lights
 +300 space            # A: apply and save
-+4000 mark shot driving-saved
++12000 mark shot driving-saved
 +500 space            # open DRIVING again
 +2500 mark shot driving-again
 +300 backspace        # B: leave unchanged

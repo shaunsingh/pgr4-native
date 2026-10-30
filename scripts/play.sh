@@ -29,7 +29,9 @@
 #                              newest under ~/helixsr by default) once its setup has built the
 #                              network on this PC (helixsr-setup.sh, HelixSR's README), and write
 #                              a desktop entry and a Steam shortcut (steam_shortcuts.py, with
-#                              Steam closed) for each way to play: alone and --debug
+#                              Steam closed) for each way to play: alone and --debug. Each
+#                              runtime keeps its pgr4_recompiled.toml, the settings the Options
+#                              menu saved (remove it for the release's again)
 #
 # Flags after these go to the game (--pgr4_native_upscaler, --pgr4_native_frame_generation...)
 # and override its settings for the session.
@@ -74,10 +76,16 @@ if [[ ${1:-} == --install ]]; then
   [[ -f $src/pgr4_recompiled.exe ]] || { echo "no exe in $src" >&2; exit 1; }
   check_no_game "the game is running; quit it first"
   mkdir -p "$top/runtime" "$top/userdata/cache" "$top/cache" "$top/logs" "$top/captures"
-  rsync -a --delete --exclude='*.profraw' "$src/" "$top/runtime/"
-  # The release's settings beside the executables, as a player's package has them; the flags
-  # below override the few that differ.
-  cp "$repo"/games/pgr4/pgr4_recompiled.toml "$repo"/games/gw/gw_recompiled.toml "$top/runtime/"
+  # Each runtime's pgr4_recompiled.toml stays: the Options menu saves the player's settings in it.
+  keep=(--exclude=/pgr4_recompiled.toml)
+  rsync -a --delete --exclude='*.profraw' "${keep[@]}" "$src/" "$top/runtime/"
+  # The release's settings beside the executables, as a player's package has them, where the
+  # runtime has none yet; the flags below override the few that differ.
+  release_settings() {
+    [[ -f $1/pgr4_recompiled.toml ]] || cp "$repo"/games/pgr4/pgr4_recompiled.toml "$1/"
+    cp "$repo"/games/gw/gw_recompiled.toml "$1/"
+  }
+  release_settings "$top/runtime"
 
   # Start from the bench's prefix and caches: no Proton first-run setup, and the pipelines the
   # bench runs already compiled.
@@ -122,7 +130,8 @@ DESKTOP
   git -C "$repo" status --short >> "$top/runtime/INSTALLED.txt" 2>/dev/null || true
   # The copy fgmod adds OptiScaler to at each start, which keeps the OptiScaler.ini it finds:
   # ~/fgmod's with fsr4-optiscaler.ini's settings.
-  rsync -a --delete "$top/runtime/" "$top/runtime-fgmod/"
+  rsync -a --delete "${keep[@]}" "$top/runtime/" "$top/runtime-fgmod/"
+  release_settings "$top/runtime-fgmod"
   [[ -f $fsr4/amdxcffx64.dll ]] && cp "$fsr4/amdxcffx64.dll" "$top/runtime-fgmod/"
   if [[ -f $HOME/fgmod/OptiScaler.ini ]]; then
     ini=$top/runtime-fgmod/OptiScaler.ini
@@ -137,7 +146,8 @@ DESKTOP
   hsr=$top/runtime-helixsr
   if [[ -n $helixsr && -f $helixsr/helixsr-scaler/OptiScaler.dll ]] &&
     python3 "$helixsr/setup/helixsr_setup.py" "$helixsr/HelixSR" --status | grep -q 'network=1'; then
-    rsync -a --delete "$top/runtime/" "$hsr/"
+    rsync -a --delete "${keep[@]}" "$top/runtime/" "$hsr/"
+    release_settings "$hsr"
     cp "$helixsr/helixsr-scaler/OptiScaler.dll" "$hsr/dxgi.dll"
     cp "$helixsr/helixsr-scaler/OptiScaler.ini" "$hsr/"
     cp -r "$helixsr/helixsr-scaler/OptiScaler" "$helixsr/HelixSR" "$hsr/"
