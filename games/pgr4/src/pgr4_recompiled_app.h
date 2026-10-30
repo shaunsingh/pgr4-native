@@ -20,9 +20,10 @@ class Pgr4RecompiledApp : public rex::ReXApp {
         new Pgr4RecompiledApp(ctx, "pgr4_recompiled", PPCImageConfig));
   }
 
-  // The Options menu's settings, over the configuration file's.
+  // The configuration file, which the Options menu saves its settings into.
+  void OnConfigurePaths(rex::PathConfig& paths) override { config_file_ = paths.config_path; }
   void OnPostInitLogging() override {
-    pgr4::settings::LoadSettings(user_data_root() / "pgr4_settings.toml");
+    pgr4::settings::LoadSettings(config_file_, user_data_root() / "pgr4_settings.toml");
   }
   void OnPostSetup() override { Pgr4Setup(); }
   void OnPostLoadXexImage() override { title_launch::Restore(runtime()); }
@@ -36,4 +37,7 @@ class Pgr4RecompiledApp : public rex::ReXApp {
       override {
     return nullptr;
   }
+
+ private:
+  std::filesystem::path config_file_;
 };
